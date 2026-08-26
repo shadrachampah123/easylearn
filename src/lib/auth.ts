@@ -1,6 +1,5 @@
 import { SignJWT, jwtVerify } from "jose";
 import bcrypt from "bcryptjs";
-import { db } from "@/db";
 import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
@@ -46,6 +45,8 @@ export async function getUserFromToken(token: string) {
   const payload = await verifyToken(token);
   if (!payload) return null;
 
+  const { db } = await import("@/db");
+
   const [user] = await db
     .select({
       id: users.id,
@@ -75,3 +76,4 @@ export function getTokenFromRequest(request: Request): string | null {
   }
   return null;
 }
+
