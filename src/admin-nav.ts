@@ -1,0 +1,14 @@
+export const adminNav = [
+  { name: "Dashboard", href: "/dashboard/admin", icon: "📊" },
+  { name: "Teachers", href: "/dashboard/admin/teachers", icon: "👩‍🏫" },
+  { name: "Learners", href: "/dashboard/admin/learners", icon: "🎓" },
+  { name: "Parents", href: "/dashboard/admin/parents", icon: "👨‍👩‍👧" },
+  { name: "Classes", href: "/dashboard/admin/classes", icon: "🏫" },
+  { name: "Subjects", href: "/dashboard/admin/subjects", icon: "📚" },
+  { name: "Departments", href: "/dashboard/admin/departments", icon: "🏢" },
+  { name: "Assignments", href: "/dashboard/admin/assignments", icon: "📝" },
+  { name: "Announcements", href: "/dashboard/admin/announcements", icon: "📢" },
+  { name: "Attendance", href: "/dashboard/admin/attendance", icon: "✅" },
+  { name: "Reports", href: "/dashboard/admin/reports", icon: "📈" },
+  { name: "Settings", href: "/dashboard/admin/settings", icon: "⚙️" },
+];
