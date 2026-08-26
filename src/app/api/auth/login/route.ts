@@ -1,23 +1,44 @@
 import { NextRequest } from "next/server";
-import { db } from "@/db";
 import { users } from "@/db/schema";
 import { verifyPassword, createToken } from "@/lib/auth";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
+import { getDatabaseErrorMessage } from "@/lib/database-errors";
 import { eq } from "drizzle-orm";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
-    const { email, password } = body;
+    const body: unknown = await request.json();
+    if (typeof body !== "object" || body === null) {
+      return errorResponse("Invalid request body");
+    }
 
-    if (!email || !password) {
+    const { email, password } = body as Record<string, unknown>;
+
+    if (typeof email !== "string" || typeof password !== "string") {
       return errorResponse("Email and password are required");
     }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail || !password) {
+      return errorResponse("Email and password are required");
+    }
+
+    if (!process.env.DATABASE_URL?.trim()) {
+      return errorResponse(
+        "DATABASE_URL is not configured in Vercel. Add it to Production, Preview, and Development, then redeploy.",
+        503
+      );
+    }
+
+    const { db } = await import("@/db");
 
     const [user] = await db
       .select()
       .from(users)
-      .where(eq(users.email, email.toLowerCase()))
+      .where(eq(users.email, normalizedEmail))
       .limit(1);
 
     if (!user) {
@@ -33,7 +54,6 @@ export async function POST(request: NextRequest) {
       return errorResponse("Invalid email or password", 401);
     }
 
-    // Update last login
     await db
       .update(users)
       .set({ lastLogin: new Date() })
@@ -66,6 +86,6 @@ export async function POST(request: NextRequest) {
     return response;
   } catch (error) {
     console.error("Login error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(getDatabaseErrorMessage(error), 503);
   }
 }
