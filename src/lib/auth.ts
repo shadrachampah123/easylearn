@@ -2,12 +2,17 @@ import { SignJWT, jwtVerify } from "jose";
 import bcrypt from "bcryptjs";
 import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
-
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.JWT_SECRET || "easylearn-cbism-secret-key-2024-very-secure"
-);
+import { getJwtSecret } from "@/lib/env";
 
 const TOKEN_EXPIRY = "24h";
+
+function getJwtKey(): Uint8Array {
+  const secret = getJwtSecret();
+  if (!secret) {
+    throw new Error("JWT_SECRET is required");
+  }
+  return new TextEncoder().encode(secret);
+}
 
 export async function hashPassword(password: string): Promise<string> {
   return bcrypt.hash(password, 12);
@@ -26,16 +31,31 @@ export async function createToken(payload: {
   role: string;
 }): Promise<string> {
   return new SignJWT(payload)
-    .setProtectedHeader({ alg: "HS256" })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuedAt()
     .setExpirationTime(TOKEN_EXPIRY)
-    .sign(JWT_SECRET);
+    .sign(getJwtKey());
 }
 
 export async function verifyToken(token: string) {
   try {
-    const { payload } = await jwtVerify(token, JWT_SECRET);
-    return payload as { userId: string; email: string; role: string };
+    const { payload } = await jwtVerify(token, getJwtKey(), {
+      algorithms: ["HS256"],
+    });
+
+    if (
+      typeof payload.userId !== "string" ||
+      typeof payload.email !== "string" ||
+      typeof payload.role !== "string"
+    ) {
+      return null;
+    }
+
+    return {
+      userId: payload.userId,
+      email: payload.email,
+      role: payload.role,
+    };
   } catch {
     return null;
   }
@@ -61,19 +81,21 @@ export async function getUserFromToken(token: string) {
     .where(eq(users.id, payload.userId))
     .limit(1);
 
-  return user || null;
+  return user?.isActive ? user : null;
 }
 
 export function getTokenFromRequest(request: Request): string | null {
   const authHeader = request.headers.get("authorization");
   if (authHeader?.startsWith("Bearer ")) {
-    return authHeader.slice(7);
+    const bearerToken = authHeader.slice(7).trim();
+    if (bearerToken) return bearerToken;
   }
+
   const cookieHeader = request.headers.get("cookie");
   if (cookieHeader) {
-    const match = cookieHeader.match(/el_token=([^;]+)/);
-    if (match) return match[1];
+    const match = cookieHeader.match(/(?:^|;\s*)el_token=([^;]+)/);
+    if (match) return decodeURIComponent(match[1]);
   }
+
   return null;
 }
-
