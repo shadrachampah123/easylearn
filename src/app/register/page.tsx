@@ -36,14 +36,21 @@ export default function RegisterPage() {
       const res = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        credentials: "include",
+        cache: "no-store",
+        body: JSON.stringify({ ...form, email: form.email.trim() }),
       });
 
-      const data = await res.json();
+      const contentType = res.headers.get("content-type") || "";
+      const data = contentType.includes("application/json")
+        ? await res.json()
+        : null;
 
-      if (!data.success) {
-        setError(data.error || "Registration failed");
-        setLoading(false);
+      if (!res.ok || !data?.success) {
+        setError(
+          data?.error ||
+          `Registration failed (HTTP ${res.status}). Check /api/health and the Vercel function logs.`
+        );
         return;
       }
 
@@ -54,8 +61,11 @@ export default function RegisterPage() {
       if (role === "parent") router.push("/dashboard/parent");
       else if (role === "teacher") router.push("/dashboard/teacher");
       else router.push("/dashboard/learner");
-    } catch {
-      setError("An error occurred. Please try again.");
+      router.refresh();
+    } catch (requestError) {
+      console.error("Registration request failed:", requestError);
+      setError("Unable to reach the registration service. Check your connection and Vercel deployment logs.");
+    } finally {
       setLoading(false);
     }
   }

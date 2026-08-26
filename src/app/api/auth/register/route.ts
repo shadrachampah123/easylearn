@@ -2,7 +2,8 @@ import { NextRequest } from "next/server";
 import { users } from "@/db/schema";
 import { hashPassword, createToken } from "@/lib/auth";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
-import { getDatabaseErrorMessage } from "@/lib/database-errors";
+import { getDatabaseErrorMessage, isUniqueViolation } from "@/lib/database-errors";
+import { getDatabaseConfigurationProblem, getJwtConfigurationProblem } from "@/lib/env";
 import { eq } from "drizzle-orm";
 
 export const runtime = "nodejs";
@@ -36,15 +37,18 @@ export async function POST(request: NextRequest) {
       return errorResponse("Email, password, first name, and last name are required");
     }
 
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      return errorResponse("Enter a valid email address");
+    }
+
     if (password.length < 6) {
       return errorResponse("Password must be at least 6 characters");
     }
 
-    if (!process.env.DATABASE_URL?.trim()) {
-      return errorResponse(
-        "DATABASE_URL is not configured in Vercel. Add it to Production, Preview, and Development, then redeploy.",
-        503
-      );
+    const configurationProblem =
+      getDatabaseConfigurationProblem() || getJwtConfigurationProblem();
+    if (configurationProblem) {
+      return errorResponse(configurationProblem, 503);
     }
 
     const { db } = await import("@/db");
@@ -56,7 +60,7 @@ export async function POST(request: NextRequest) {
       .limit(1);
 
     if (existing.length > 0) {
-      return errorResponse("Email already registered");
+      return errorResponse("Email already registered", 409);
     }
 
     const passwordHash = await hashPassword(password);
@@ -91,13 +95,19 @@ export async function POST(request: NextRequest) {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
-      maxAge: 86400,
+      maxAge: 60 * 60 * 24,
       path: "/",
     });
+    response.headers.set("Cache-Control", "no-store");
 
     return response;
   } catch (error) {
     console.error("Registration error:", error);
+
+    if (isUniqueViolation(error)) {
+      return errorResponse("Email already registered", 409);
+    }
+
     return errorResponse(getDatabaseErrorMessage(error), 503);
   }
 }

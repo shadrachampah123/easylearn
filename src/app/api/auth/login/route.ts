@@ -3,6 +3,7 @@ import { users } from "@/db/schema";
 import { verifyPassword, createToken } from "@/lib/auth";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { getDatabaseErrorMessage } from "@/lib/database-errors";
+import { getDatabaseConfigurationProblem, getJwtConfigurationProblem } from "@/lib/env";
 import { eq } from "drizzle-orm";
 
 export const runtime = "nodejs";
@@ -16,7 +17,6 @@ export async function POST(request: NextRequest) {
     }
 
     const { email, password } = body as Record<string, unknown>;
-
     if (typeof email !== "string" || typeof password !== "string") {
       return errorResponse("Email and password are required");
     }
@@ -26,11 +26,10 @@ export async function POST(request: NextRequest) {
       return errorResponse("Email and password are required");
     }
 
-    if (!process.env.DATABASE_URL?.trim()) {
-      return errorResponse(
-        "DATABASE_URL is not configured in Vercel. Add it to Production, Preview, and Development, then redeploy.",
-        503
-      );
+    const configurationProblem =
+      getDatabaseConfigurationProblem() || getJwtConfigurationProblem();
+    if (configurationProblem) {
+      return errorResponse(configurationProblem, 503);
     }
 
     const { db } = await import("@/db");
@@ -46,7 +45,7 @@ export async function POST(request: NextRequest) {
     }
 
     if (!user.isActive) {
-      return errorResponse("Account is deactivated. Contact admin.", 403);
+      return errorResponse("Account is deactivated. Contact the school administrator.", 403);
     }
 
     const isValid = await verifyPassword(password, user.passwordHash);
@@ -54,34 +53,37 @@ export async function POST(request: NextRequest) {
       return errorResponse("Invalid email or password", 401);
     }
 
-    await db
-      .update(users)
-      .set({ lastLogin: new Date() })
-      .where(eq(users.id, user.id));
-
     const token = await createToken({
       userId: user.id,
       email: user.email,
       role: user.role,
     });
 
-    const userData = {
-      id: user.id,
-      email: user.email,
-      role: user.role,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      avatarUrl: user.avatarUrl,
-    };
+    await db
+      .update(users)
+      .set({ lastLogin: new Date(), updatedAt: new Date() })
+      .where(eq(users.id, user.id));
 
-    const response = successResponse({ user: userData, token });
+    const response = successResponse({
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        avatarUrl: user.avatarUrl,
+      },
+      token,
+    });
+
     response.cookies.set("el_token", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
-      maxAge: 86400,
+      maxAge: 60 * 60 * 24,
       path: "/",
     });
+    response.headers.set("Cache-Control", "no-store");
 
     return response;
   } catch (error) {

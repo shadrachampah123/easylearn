@@ -21,22 +21,27 @@ export default function LoginPage() {
       const res = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        credentials: "include",
+        cache: "no-store",
+        body: JSON.stringify({ email: email.trim(), password }),
       });
 
-      const data = await res.json();
+      const contentType = res.headers.get("content-type") || "";
+      const data = contentType.includes("application/json")
+        ? await res.json()
+        : null;
 
-      if (!data.success) {
-        setError(data.error || "Login failed");
-        setLoading(false);
+      if (!res.ok || !data?.success) {
+        setError(
+          data?.error ||
+          `Login failed (HTTP ${res.status}). Check /api/health and the Vercel function logs.`
+        );
         return;
       }
 
-      // Store token
       localStorage.setItem("el_token", data.data.token);
       localStorage.setItem("el_user", JSON.stringify(data.data.user));
 
-      // Redirect based on role
       const role = data.data.user.role;
       if (role === "super_admin" || role === "school_admin") {
         router.push("/dashboard/admin");
@@ -47,8 +52,11 @@ export default function LoginPage() {
       } else {
         router.push("/dashboard/learner");
       }
-    } catch {
-      setError("An error occurred. Please try again.");
+      router.refresh();
+    } catch (requestError) {
+      console.error("Login request failed:", requestError);
+      setError("Unable to reach the authentication service. Check your connection and Vercel deployment logs.");
+    } finally {
       setLoading(false);
     }
   }
