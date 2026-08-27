@@ -77,6 +77,7 @@ export const quizQuestionTypeEnum = pgEnum("quiz_question_type", [
 /* ── Users ── */
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
+  username: varchar("username", { length: 100 }).unique(), 
   email: varchar("email", { length: 255 }).notNull().unique(),
   passwordHash: text("password_hash").notNull(),
   role: userRoleEnum("role").notNull().default("learner"),
@@ -86,6 +87,7 @@ export const users = pgTable("users", {
   avatarUrl: text("avatar_url"),
   gender: genderEnum("gender"),
   isActive: boolean("is_active").notNull().default(true),
+  mustChangePassword: boolean("must_change_password").notNull().default(false), 
   emailVerified: boolean("email_verified").notNull().default(false),
   lastLogin: timestamp("last_login"),
   createdAt: timestamp("created_at").notNull().defaultNow(),

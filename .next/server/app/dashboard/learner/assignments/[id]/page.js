@@ -1,0 +1,13 @@
+var R=require("../../../../../chunks/ssr/[turbopack]_runtime.js")("server/app/dashboard/learner/assignments/[id]/page.js")
+R.c("server/chunks/ssr/[root-of-the-server]__0bhvcvo._.js")
+R.c("server/chunks/ssr/node_modules_next_dist_esm_build_templates_app-page_0gkhou~.js")
+R.c("server/chunks/ssr/[root-of-the-server]__0_~ea67._.js")
+R.c("server/chunks/ssr/[root-of-the-server]__01i7tsd._.js")
+R.c("server/chunks/ssr/src_0cipyq-._.js")
+R.c("server/chunks/ssr/node_modules_next_dist_client_components_0inhx6q._.js")
+R.c("server/chunks/ssr/node_modules_next_dist_client_components_builtin_forbidden_0ghu-f7.js")
+R.c("server/chunks/ssr/node_modules_next_dist_client_components_builtin_unauthorized_0cjv-23.js")
+R.c("server/chunks/ssr/node_modules_next_dist_client_components_builtin_global-error_0lgvd_..js")
+R.c("server/chunks/ssr/0zjb_server_app_dashboard_learner_assignments_[id]_page_actions_0lwk269.js")
+R.m(41200)
+module.exports=R.m(41200).exports
