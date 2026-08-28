@@ -8,7 +8,7 @@ interface Resource {
   title: string;
   description: string | null;
   type: string;
-  fileUrl: string;
+  fileUrl: string | null;
   fileSize: number | null;
   topic: string | null;
   week: number | null;
@@ -197,11 +197,10 @@ export default function TeacherResourcesPage() {
 
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
-                  {formData.type === "link" ? "URL *" : "File URL *"}
+                  {formData.type === "link" ? "URL (optional)" : "File URL (optional)"}
                 </label>
                 <input
                   type="url"
-                  required
                   value={formData.fileUrl}
                   onChange={(e) => setFormData({ ...formData, fileUrl: e.target.value })}
                   className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-secondary-500 focus:border-transparent outline-none"
@@ -347,14 +346,20 @@ export default function TeacherResourcesPage() {
                 {resource.subjectName && <span className="flex items-center gap-1">📚 {resource.subjectName}</span>}
                 {resource.topic && <span>• {resource.topic}</span>}
               </div>
-              <a
-                href={resource.fileUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="block w-full py-2 text-center rounded-xl bg-secondary-50 text-secondary-600 font-semibold text-sm hover:bg-secondary-100 transition-colors"
-              >
-                View Resource →
-              </a>
+              {resource.fileUrl ? (
+                <a
+                  href={resource.fileUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block w-full py-2 text-center rounded-xl bg-secondary-50 text-secondary-600 font-semibold text-sm hover:bg-secondary-100 transition-colors"
+                >
+                  View Resource →
+                </a>
+              ) : (
+                <span className="block w-full py-2 text-center rounded-xl bg-slate-50 text-slate-400 font-semibold text-sm cursor-default">
+                  No link attached
+                </span>
+              )}
             </div>
           ))}
         </div>

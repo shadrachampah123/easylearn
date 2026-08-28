@@ -8,7 +8,7 @@ interface Resource {
   title: string;
   description: string | null;
   type: string;
-  fileUrl: string;
+  fileUrl: string | null;
   topic: string | null;
   week: number | null;
   isPinned: boolean;
@@ -204,14 +204,20 @@ function ResourceCard({ resource }: { resource: Resource }) {
         <span className="text-xs text-slate-400">
           By {resource.teacherFirstName} {resource.teacherLastName}
         </span>
-        <a
-          href={resource.fileUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="px-4 py-2 rounded-xl bg-accent-100 text-accent-600 text-sm font-semibold hover:bg-accent-200 transition-colors"
-        >
-          Open →
-        </a>
+        {resource.fileUrl ? (
+          <a
+            href={resource.fileUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-4 py-2 rounded-xl bg-accent-100 text-accent-600 text-sm font-semibold hover:bg-accent-200 transition-colors"
+          >
+            Open →
+          </a>
+        ) : (
+          <span className="px-4 py-2 rounded-xl bg-slate-100 text-slate-400 text-sm font-semibold cursor-default">
+            No link
+          </span>
+        )}
       </div>
     </div>
   );
