@@ -92,8 +92,8 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { title, description, type, fileUrl, fileSize, subjectId, classId, termId, topic, week, isPinned } = body;
 
-    if (!title || !type || !fileUrl) {
-      return errorResponse("Title, type, and file URL are required");
+    if (!title || !type) {
+      return errorResponse("Title and type are required");
     }
 
     // Auto-approve for admins
@@ -103,7 +103,7 @@ export async function POST(request: NextRequest) {
       title,
       description: description || null,
       type,
-      fileUrl,
+      fileUrl: fileUrl?.trim() || null,
       fileSize: fileSize || null,
       subjectId: subjectId || null,
       classId: classId || null,
