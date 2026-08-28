@@ -78,7 +78,7 @@ export const quizQuestionTypeEnum = pgEnum("quiz_question_type", [
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
   username: varchar("username", { length: 100 }).unique(), 
-  email: varchar("email", { length: 255 }).notNull().unique(),
+  email: varchar("email", { length: 255 }).unique(),
   passwordHash: text("password_hash").notNull(),
   role: userRoleEnum("role").notNull().default("learner"),
   firstName: varchar("first_name", { length: 100 }).notNull(),

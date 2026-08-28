@@ -61,13 +61,13 @@ export async function POST(request: NextRequest) {
 
     const token = await createToken({
       userId: user.id,
-      email: user.email,
+      email: user.email || undefined,
       role: user.role,
     });
 
     const userData = {
       id: user.id,
-      email: user.email,
+      email: user.email || undefined,
       role: user.role,
       firstName: user.firstName,
       lastName: user.lastName,

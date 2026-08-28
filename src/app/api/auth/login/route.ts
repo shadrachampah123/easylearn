@@ -16,14 +16,18 @@ export async function POST(request: NextRequest) {
       return errorResponse("Invalid request body");
     }
 
-    const { email, password } = body as Record<string, unknown>;
-    if (typeof email !== "string" || typeof password !== "string") {
-      return errorResponse("Email and password are required");
+    const { email, username, password } = body as Record<string, unknown>;
+    if (typeof password !== "string") {
+      return errorResponse("Password is required");
+    }
+    if (typeof email !== "string" && typeof username !== "string") {
+      return errorResponse("Email or username is required");
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
-    if (!normalizedEmail || !password) {
-      return errorResponse("Email and password are required");
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+    const normalizedUsername = typeof username === "string" ? username.trim() : "";
+    if ((!normalizedEmail && !normalizedUsername) || !password) {
+      return errorResponse("Email or username and password are required");
     }
 
     const configurationProblem =
@@ -34,14 +38,25 @@ export async function POST(request: NextRequest) {
 
     const { db } = await import("@/db");
 
-    const [user] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, normalizedEmail))
-      .limit(1);
+    // Search by email first, then by username
+    let user: any;
+    if (normalizedEmail) {
+      [user] = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, normalizedEmail))
+        .limit(1);
+    }
+    if (!user && normalizedUsername) {
+      [user] = await db
+        .select()
+        .from(users)
+        .where(eq(users.username, normalizedUsername))
+        .limit(1);
+    }
 
     if (!user) {
-      return errorResponse("Invalid email or password", 401);
+      return errorResponse("Invalid email/username or password", 401);
     }
 
     if (!user.isActive) {
@@ -55,7 +70,8 @@ export async function POST(request: NextRequest) {
 
     const token = await createToken({
       userId: user.id,
-      email: user.email,
+      email: user.email || undefined,
+      username: user.username || undefined,
       role: user.role,
     });
 
