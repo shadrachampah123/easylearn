@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { timetableEntries, teacherClasses } from "@/db/schema";
+import { timetableEntries } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import {
   successResponse,
@@ -8,10 +8,10 @@ import {
   unauthorizedResponse,
   notFoundResponse,
 } from "@/lib/api-helpers";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { TIMETABLE_DAYS } from "../route";
 
-const STAFF_ROLES = ["super_admin", "school_admin", "head_teacher"];
+const ADMIN_ROLES = ["super_admin", "school_admin", "head_teacher"];
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -26,29 +26,6 @@ function isTimetableDay(value: unknown): value is (typeof TIMETABLE_DAYS)[number
   );
 }
 
-async function canManageEntry(
-  role: string,
-  userId: string,
-  entry: { teacherId: string | null; createdBy: string | null; classId: string }
-) {
-  if (STAFF_ROLES.includes(role)) return true;
-  if (entry.teacherId === userId || entry.createdBy === userId) return true;
-
-  if (role === "teacher") {
-    const teaches = await db
-      .select({ id: teacherClasses.id })
-      .from(teacherClasses)
-      .where(
-        and(eq(teacherClasses.teacherId, userId), eq(teacherClasses.classId, entry.classId))
-      )
-      .limit(1);
-
-    if (teaches.length > 0) return true;
-  }
-
-  return false;
-}
-
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -59,8 +36,8 @@ export async function PUT(
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
-    if (![...STAFF_ROLES, "teacher"].includes(payload.role)) {
-      return errorResponse("Only teachers and administrators can edit the timetable", 403);
+    if (!ADMIN_ROLES.includes(payload.role)) {
+      return errorResponse("Only administrators can manage the timetable", 403);
     }
 
     const { id } = await params;
@@ -92,10 +69,6 @@ export async function PUT(
       .limit(1);
 
     if (!existing) return notFoundResponse("Timetable entry");
-
-    if (!(await canManageEntry(payload.role, payload.userId, existing))) {
-      return errorResponse("You can only edit periods for your own classes", 403);
-    }
 
     const finalStart = start ?? existing.startTime;
     const finalEnd = end ?? existing.endTime;
@@ -141,8 +114,8 @@ export async function DELETE(
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
-    if (![...STAFF_ROLES, "teacher"].includes(payload.role)) {
-      return errorResponse("Only teachers and administrators can edit the timetable", 403);
+    if (!ADMIN_ROLES.includes(payload.role)) {
+      return errorResponse("Only administrators can manage the timetable", 403);
     }
 
     const { id } = await params;
@@ -150,19 +123,12 @@ export async function DELETE(
     const [existing] = await db
       .select({
         id: timetableEntries.id,
-        classId: timetableEntries.classId,
-        teacherId: timetableEntries.teacherId,
-        createdBy: timetableEntries.createdBy,
       })
       .from(timetableEntries)
       .where(eq(timetableEntries.id, id))
       .limit(1);
 
     if (!existing) return notFoundResponse("Timetable entry");
-
-    if (!(await canManageEntry(payload.role, payload.userId, existing))) {
-      return errorResponse("You can only delete periods for your own classes", 403);
-    }
 
     await db.delete(timetableEntries).where(eq(timetableEntries.id, id));
 

@@ -29,7 +29,7 @@ export const TIMETABLE_DAYS = [
 
 type TimetableDay = (typeof TIMETABLE_DAYS)[number];
 
-const STAFF_ROLES = ["super_admin", "school_admin", "head_teacher"];
+const ADMIN_ROLES = ["super_admin", "school_admin", "head_teacher"];
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -151,8 +151,8 @@ export async function POST(request: NextRequest) {
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
-    if (![...STAFF_ROLES, "teacher"].includes(payload.role)) {
-      return errorResponse("Only teachers and administrators can edit the timetable", 403);
+    if (!ADMIN_ROLES.includes(payload.role)) {
+      return errorResponse("Only administrators can manage the timetable", 403);
     }
 
     const body = await request.json();
@@ -180,30 +180,12 @@ export async function POST(request: NextRequest) {
       return errorResponse("The end time must be after the start time");
     }
 
-    // Teachers may only add periods to classes they actually teach.
-    if (payload.role === "teacher") {
-      const teaches = await db
-        .select({ id: teacherClasses.id })
-        .from(teacherClasses)
-        .where(
-          and(
-            eq(teacherClasses.teacherId, payload.userId),
-            eq(teacherClasses.classId, classId)
-          )
-        )
-        .limit(1);
-
-      if (teaches.length === 0) {
-        return errorResponse("You can only add periods to your own classes", 403);
-      }
-    }
-
     const [newEntry] = await db
       .insert(timetableEntries)
       .values({
         classId,
         subjectId: subjectId || null,
-        teacherId: teacherId || (payload.role === "teacher" ? payload.userId : null),
+        teacherId: teacherId || null,
         termId: termId || null,
         academicYearId: academicYearId || null,
         dayOfWeek,
