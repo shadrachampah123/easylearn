@@ -104,20 +104,28 @@ export async function POST(request: NextRequest) {
     const baseUsername = (firstName.charAt(0).toLowerCase() + lastName.toLowerCase().replace(/\s+/g, ""));
     let generatedUsername = baseUsername;
     let suffix = 1;
+    
     // Check uniqueness
-    let existingUser = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.username, generatedUsername))
-      .limit(1);
-    while (existingUser.length > 0) {
-      generatedUsername = `${baseUsername}${suffix}`;
-      suffix++;
-      existingUser = await db
+    try {
+      let existingUser = await db
         .select({ id: users.id })
         .from(users)
         .where(eq(users.username, generatedUsername))
         .limit(1);
+      
+      while (existingUser.length > 0) {
+        generatedUsername = `${baseUsername}${suffix}`;
+        suffix++;
+        existingUser = await db
+          .select({ id: users.id })
+          .from(users)
+          .where(eq(users.username, generatedUsername))
+          .limit(1);
+      }
+    } catch (err) {
+      console.error("Username check error:", err);
+      // Fallback: use timestamp
+      generatedUsername = `${baseUsername}${Date.now().toString().slice(-4)}`;
     }
 
     // Check email uniqueness if provided
@@ -162,6 +170,7 @@ export async function POST(request: NextRequest) {
     return successResponse({ ...newUser, generatedPassword: password }, 201);
   } catch (error) {
     console.error("Create user error:", error);
-    return errorResponse("Internal server error", 500);
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    return errorResponse(`Internal server error: ${errorMessage}`, 500);
   }
 }
