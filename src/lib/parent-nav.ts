@@ -1,6 +1,7 @@
 export const parentNav = [
   { name: "Dashboard", href: "/dashboard/parent", icon: "🏠" },
   { name: "My Children", href: "/dashboard/parent/children", icon: "👧" },
+  { name: "Timetable", href: "/dashboard/parent/timetable", icon: "📅" },
   { name: "Grades", href: "/dashboard/parent/grades", icon: "📊" },
   { name: "Attendance", href: "/dashboard/parent/attendance", icon: "✅" },
   { name: "Assignments", href: "/dashboard/parent/assignments", icon: "📝" },
