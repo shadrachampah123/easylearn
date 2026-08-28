@@ -74,6 +74,16 @@ export const quizQuestionTypeEnum = pgEnum("quiz_question_type", [
   "essay",
 ]);
 
+export const timetableDayEnum = pgEnum("timetable_day", [
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+  "sunday",
+]);
+
 /* ── Users ── */
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -338,6 +348,35 @@ export const attendance = pgTable("attendance", {
   note: text("note"),
   markedById: uuid("marked_by_id").references(() => users.id),
   createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+/* ── Timetable (weekly class schedule) ── */
+export const timetableEntries = pgTable("timetable_entries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  classId: uuid("class_id")
+    .notNull()
+    .references(() => classes.id, { onDelete: "cascade" }),
+  subjectId: uuid("subject_id").references(() => subjects.id, {
+    onDelete: "set null",
+  }),
+  teacherId: uuid("teacher_id").references(() => users.id, {
+    onDelete: "set null",
+  }),
+  termId: uuid("term_id").references(() => terms.id, { onDelete: "set null" }),
+  academicYearId: uuid("academic_year_id").references(() => academicYears.id, {
+    onDelete: "set null",
+  }),
+  dayOfWeek: timetableDayEnum("day_of_week").notNull(),
+  startTime: varchar("start_time", { length: 5 }).notNull(),
+  endTime: varchar("end_time", { length: 5 }).notNull(),
+  room: varchar("room", { length: 50 }),
+  color: varchar("color", { length: 50 }),
+  notes: text("notes"),
+  createdBy: uuid("created_by").references(() => users.id, {
+    onDelete: "set null",
+  }),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
 /* ── Messages ── */

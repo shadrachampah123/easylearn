@@ -13,6 +13,7 @@ const adminNav = [
   { name: "Classes", href: "/dashboard/admin/classes", icon: "🏫" },
   { name: "Subjects", href: "/dashboard/admin/subjects", icon: "📚" },
   { name: "Departments", href: "/dashboard/admin/departments", icon: "🏢" },
+  { name: "Timetable", href: "/dashboard/admin/timetable", icon: "📅" },
   { name: "Assignments", href: "/dashboard/admin/assignments", icon: "📝" },
   { name: "Announcements", href: "/dashboard/admin/announcements", icon: "📢" },
   { name: "Attendance", href: "/dashboard/admin/attendance", icon: "✅" },

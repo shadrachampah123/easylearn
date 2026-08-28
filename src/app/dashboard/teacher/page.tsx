@@ -11,10 +11,10 @@ const teacherNav = [
   { name: "Quizzes", href: "/dashboard/teacher/quizzes", icon: "❓" },
   { name: "Resources", href: "/dashboard/teacher/resources", icon: "📚" },
   { name: "Attendance", href: "/dashboard/teacher/attendance", icon: "✅" },
+  { name: "Timetable", href: "/dashboard/teacher/timetable", icon: "📅" },
   { name: "Grades", href: "/dashboard/teacher/grades", icon: "📊" },
   { name: "Announcements", href: "/dashboard/teacher/announcements", icon: "📢" },
   { name: "Messages", href: "/dashboard/teacher/messages", icon: "💬" },
-  { name: "Timetable", href: "/dashboard/teacher/timetable", icon: "📅" },
   { name: "Reports", href: "/dashboard/teacher/reports", icon: "📈" },
 ];
 
