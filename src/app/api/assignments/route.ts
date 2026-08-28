@@ -68,7 +68,13 @@ export async function GET(request: NextRequest) {
       const assignmentsWithStatus = await Promise.all(
         results.map(async (assignment) => {
           const [submission] = await db
-            .select({ id: submissions.id, status: submissions.status, score: submissions.score })
+            .select({
+              id: submissions.id,
+              status: submissions.status,
+              score: submissions.score,
+              maxScore: submissions.maxScore,
+              percentage: submissions.percentage,
+            })
             .from(submissions)
             .where(and(
               eq(submissions.assignmentId, assignment.id),

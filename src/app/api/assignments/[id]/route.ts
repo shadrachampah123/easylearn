@@ -1,9 +1,9 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { assignments, classes, subjects, users, submissions } from "@/db/schema";
+import { assignments, classes, subjects, users, submissions, assignmentQuestions, assignmentAnswers, assignmentCorrections } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 
 export async function GET(
   request: NextRequest,
@@ -56,6 +56,8 @@ export async function GET(
           id: submissions.id,
           status: submissions.status,
           score: submissions.score,
+          maxScore: submissions.maxScore,
+          percentage: submissions.percentage,
           submittedAt: submissions.submittedAt,
           learnerFirstName: users.firstName,
           learnerLastName: users.lastName,
@@ -65,7 +67,13 @@ export async function GET(
         .leftJoin(users, eq(submissions.learnerId, users.id))
         .where(eq(submissions.assignmentId, id));
 
-      return successResponse({ ...assignment, submissions: submissionsList });
+      // Get questions with correct answers for teacher view
+      const questions = await db
+        .select()
+        .from(assignmentQuestions)
+        .where(eq(assignmentQuestions.assignmentId, id));
+
+      return successResponse({ ...assignment, submissions: submissionsList, questions });
     }
 
     // For learners, get their own submission
@@ -79,7 +87,49 @@ export async function GET(
         ))
         .limit(1);
 
-      return successResponse({ ...assignment, mySubmission: submission || null });
+      // Get questions (hide correct answers unless graded)
+      const questions = await db
+        .select()
+        .from(assignmentQuestions)
+        .where(eq(assignmentQuestions.assignmentId, id));
+
+      const showAnswers = submission && (submission.status === "graded" || submission.status === "submitted");
+
+      // Get answers for this submission
+      let answers: any[] = [];
+      if (submission) {
+        answers = await db
+          .select()
+          .from(assignmentAnswers)
+          .where(eq(assignmentAnswers.submissionId, submission.id));
+      }
+
+      // Get corrections
+      const corrections = await db
+        .select({
+          id: assignmentCorrections.id,
+          questionId: assignmentCorrections.questionId,
+          correctionText: assignmentCorrections.correctionText,
+          postedAt: assignmentCorrections.postedAt,
+          teacherName: users.firstName,
+          teacherLastName: users.lastName,
+        })
+        .from(assignmentCorrections)
+        .leftJoin(users, eq(assignmentCorrections.postedBy, users.id))
+        .where(eq(assignmentCorrections.assignmentId, id))
+        .orderBy(desc(assignmentCorrections.postedAt));
+
+      const sanitizedQuestions = showAnswers
+        ? questions
+        : questions.map((q) => ({ ...q, correctAnswer: null, explanation: null }));
+
+      return successResponse({
+        ...assignment,
+        mySubmission: submission || null,
+        questions: sanitizedQuestions,
+        myAnswers: answers,
+        corrections,
+      });
     }
 
     return successResponse(assignment);

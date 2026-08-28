@@ -8,7 +8,8 @@ interface Grade {
   type: string;
   title: string;
   score: number | null;
-  maxScore: number;
+  maxScore: number | null;
+  percentage: number | null;
   gradedAt: string | null;
   feedback: string | null;
   subjectName: string | null;
@@ -163,14 +164,14 @@ export default function LearnerGradesPage() {
           ) : (
             <div className="divide-y divide-slate-100">
               {data.grades.map((grade) => {
-                const percentage = grade.maxScore > 0 ? Math.round(((grade.score || 0) / grade.maxScore) * 100) : 0;
+                const percentage = grade.percentage ?? ((grade.maxScore && grade.maxScore > 0) ? Math.round(((grade.score || 0) / grade.maxScore) * 100) : 0);
                 const letterGrade = getGradeLetter(percentage);
                 return (
                   <div key={grade.id} className="p-4 flex items-center gap-4 hover:bg-slate-50">
                     <div className={`w-12 h-12 rounded-xl flex items-center justify-center text-white text-2xl ${
                       grade.type === "quiz" ? "bg-purple-500" : "bg-blue-500"
                     }`}>
-                      {grade.type === "quiz" ? "❓" : "📝"}
+                      {grade.type === "quiz" ? "" : "📝"}
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className="font-semibold text-slate-800 truncate">{grade.title}</p>
@@ -182,7 +183,7 @@ export default function LearnerGradesPage() {
                     </div>
                     <div className="text-right">
                       <p className="font-bold text-lg text-slate-800">
-                        {grade.score}/{grade.maxScore}
+                        {grade.score}/{grade.maxScore ?? 0}
                       </p>
                       <p className={`text-sm font-semibold ${letterGrade.color}`}>
                         {percentage}% ({letterGrade.letter})
