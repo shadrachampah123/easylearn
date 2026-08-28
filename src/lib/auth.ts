@@ -27,7 +27,8 @@ export async function verifyPassword(
 
 export async function createToken(payload: {
   userId: string;
-  email: string;
+  email?: string;
+  username?: string;
   role: string;
 }): Promise<string> {
   return new SignJWT(payload)
@@ -45,7 +46,6 @@ export async function verifyToken(token: string) {
 
     if (
       typeof payload.userId !== "string" ||
-      typeof payload.email !== "string" ||
       typeof payload.role !== "string"
     ) {
       return null;
@@ -53,7 +53,8 @@ export async function verifyToken(token: string) {
 
     return {
       userId: payload.userId,
-      email: payload.email,
+      email: typeof payload.email === "string" ? payload.email : undefined,
+      username: typeof payload.username === "string" ? payload.username : undefined,
       role: payload.role,
     };
   } catch {
@@ -71,6 +72,7 @@ export async function getUserFromToken(token: string) {
     .select({
       id: users.id,
       email: users.email,
+      username: users.username,
       role: users.role,
       firstName: users.firstName,
       lastName: users.lastName,

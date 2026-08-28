@@ -78,7 +78,7 @@ export const quizQuestionTypeEnum = pgEnum("quiz_question_type", [
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
   username: varchar("username", { length: 100 }).unique(), 
-  email: varchar("email", { length: 255 }).notNull().unique(),
+  email: varchar("email", { length: 255 }).unique(),
   passwordHash: text("password_hash").notNull(),
   role: userRoleEnum("role").notNull().default("learner"),
   firstName: varchar("first_name", { length: 100 }).notNull(),
@@ -201,10 +201,47 @@ export const submissions = pgTable("submissions", {
   attachments: jsonb("attachments"),
   status: submissionStatusEnum("status").notNull().default("pending"),
   score: integer("score"),
+  maxScore: integer("max_score"),
+  percentage: integer("percentage"),
   feedback: text("feedback"),
   submittedAt: timestamp("submitted_at"),
   gradedAt: timestamp("graded_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+/* ── Assignment Questions ── */
+export const assignmentQuestions = pgTable("assignment_questions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  assignmentId: uuid("assignment_id").notNull().references(() => assignments.id),
+  questionType: quizQuestionTypeEnum("question_type").notNull().default("mcq"),
+  questionText: text("question_text").notNull(),
+  options: jsonb("options"),
+  correctAnswer: text("correct_answer"),
+  points: integer("points").default(1),
+  orderIndex: integer("order_index").default(0),
+  explanation: text("explanation"),
+});
+
+/* ── Assignment Answers (per-question) ── */
+export const assignmentAnswers = pgTable("assignment_answers", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  submissionId: uuid("submission_id").notNull().references(() => submissions.id),
+  questionId: uuid("question_id").notNull().references(() => assignmentQuestions.id),
+  learnerId: uuid("learner_id").notNull().references(() => users.id),
+  answer: text("answer"),
+  isCorrect: boolean("is_correct").default(false),
+  pointsAwarded: integer("points_awarded").default(0),
+  pointsPossible: integer("points_possible").default(0),
+});
+
+/* ── Assignment Corrections ─ */
+export const assignmentCorrections = pgTable("assignment_corrections", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  assignmentId: uuid("assignment_id").notNull().references(() => assignments.id),
+  questionId: uuid("question_id").references(() => assignmentQuestions.id),
+  correctionText: text("correction_text").notNull(),
+  postedBy: uuid("posted_by").notNull().references(() => users.id),
+  postedAt: timestamp("posted_at").notNull().defaultNow(),
 });
 
 /* ── Resources / Study Materials ── */

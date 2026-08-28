@@ -4,7 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 
 interface UserRow {
   id: string;
-  email: string;
+  username: string | null;
+  email: string | null;
   firstName: string;
   lastName: string;
   role: string;
@@ -32,6 +33,13 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const [formSuccess, setFormSuccess] = useState("");
+  const [createdCredentials, setCreatedCredentials] = useState<{
+    username: string;
+    password: string;
+    firstName: string;
+    lastName: string;
+    role: string;
+  } | null>(null);
 
   const [newFirstName, setNewFirstName] = useState("");
   const [newLastName, setNewLastName] = useState("");
@@ -102,6 +110,16 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
       });
       const data = await res.json();
       if (data.success) {
+        // Show credentials if user was created without email
+        if (data.data.username && data.data.generatedPassword) {
+          setCreatedCredentials({
+            username: data.data.username,
+            password: data.data.generatedPassword,
+            firstName: newFirstName,
+            lastName: newLastName,
+            role,
+          });
+        }
         setFormSuccess(`${newFirstName} ${newLastName} added successfully!`);
         resetCreateForm();
         setShowCreateForm(false);
@@ -288,8 +306,10 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
                 </div>
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Email *</label>
-                <input type="email" required value={newEmail}
+                <label className="block text-sm font-medium text-slate-700 mb-1">
+                  Email {role === "teacher" ? "*" : "(optional)"}
+                </label>
+                <input type="email" required={role === "teacher"} value={newEmail}
                   onChange={(e) => setNewEmail(e.target.value)}
                   placeholder="e.g. john@cbism.edu"
                   className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm" />
@@ -360,7 +380,7 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
-                <input type="email" value={editingUser.email} disabled
+                <input type="email" value={editingUser.email || ""} disabled
                   className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 text-sm text-slate-400" />
               </div>
               <div className="grid grid-cols-2 gap-3">
@@ -415,7 +435,8 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
             <div className="p-6 space-y-4">
               {formError && <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-sm">❌ {formError}</div>}
               <p className="text-sm text-slate-600">
-                Reset password for <strong>{resetUser.firstName} {resetUser.lastName}</strong> ({resetUser.email})
+                Reset password for <strong>{resetUser.firstName} {resetUser.lastName}</strong>{" "}
+                ({resetUser.email || `@${resetUser.username}`})
               </p>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">New Password (min 6 chars)</label>
@@ -432,6 +453,62 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
                 <button onClick={handleResetPassword} disabled={saving || resetPwd.length < 6}
                   className="flex-1 py-3 rounded-xl bg-orange-500 text-white font-semibold hover:bg-orange-600 disabled:opacity-50">
                   {saving ? "Resetting..." : "Reset Password"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============ CREDENTIALS MODAL ============ */}
+      {createdCredentials && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50" onClick={() => setCreatedCredentials(null)}>
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-md animate-scale-in" onClick={(e) => e.stopPropagation()}>
+            <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+              <h2 className="text-xl font-bold text-slate-800">🔑 Login Credentials</h2>
+              <button onClick={() => setCreatedCredentials(null)} className="w-8 h-8 rounded-lg bg-slate-100 flex items-center justify-center text-slate-500 hover:bg-slate-200 text-lg">&times;</button>
+            </div>
+            <div className="p-6 space-y-4">
+              <div className="p-4 rounded-xl bg-blue-50 border border-blue-200">
+                <p className="text-sm text-blue-800 font-medium mb-2">
+                  Save these credentials for <strong>{createdCredentials.firstName} {createdCredentials.lastName}</strong>.
+                  Share them securely with the user.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                  <p className="text-xs text-slate-500 mb-1">Username (for login)</p>
+                  <p className="text-lg font-mono font-bold text-slate-800">{createdCredentials.username}</p>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                  <p className="text-xs text-slate-500 mb-1">Password</p>
+                  <p className="text-lg font-mono font-bold text-slate-800">{createdCredentials.password}</p>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-yellow-50 border border-yellow-200">
+                <p className="text-xs text-yellow-700">
+                  ⚠️ These credentials will not be shown again. Please copy or print them now.
+                  The user can login at the main login page using their <strong>username</strong>.
+                </p>
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => {
+                    const text = `Login Credentials for ${createdCredentials.firstName} ${createdCredentials.lastName}:\nUsername: ${createdCredentials.username}\nPassword: ${createdCredentials.password}`;
+                    navigator.clipboard.writeText(text).then(() => alert("Credentials copied to clipboard!"));
+                  }}
+                  className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-semibold hover:bg-blue-700 transition-colors"
+                >
+                  📋 Copy Credentials
+                </button>
+                <button
+                  onClick={() => setCreatedCredentials(null)}
+                  className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200"
+                >
+                  Done
                 </button>
               </div>
             </div>
@@ -483,7 +560,9 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
                   </div>
                   <div className="min-w-0">
                     <p className="font-semibold text-slate-800 truncate">{user.firstName} {user.lastName}</p>
-                    <p className="text-xs text-slate-400 truncate">{user.email}</p>
+                    <p className="text-xs text-slate-400 truncate">
+                      {user.email ? user.email : `@${user.username || "no-username"}`}
+                    </p>
                     <div className="flex items-center gap-2 mt-1">
                       {user.phone && <span className="text-xs text-slate-400">📞 {user.phone}</span>}
                       <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${

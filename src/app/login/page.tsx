@@ -17,10 +17,19 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
+      const identifier = email.trim();
+      const isEmail = identifier.includes("@");
+      const loginPayload: Record<string, string> = { password };
+      if (isEmail) {
+        loginPayload.email = identifier;
+      } else {
+        loginPayload.username = identifier;
+      }
+
       const res = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: email.trim(), password }),
+        body: JSON.stringify(loginPayload),
       });
       const data = await res.json();
 
@@ -61,7 +70,7 @@ export default function LoginPage() {
     <div className="min-h-screen flex items-center justify-center p-6 bg-slate-50">
       <div className="w-full max-w-md bg-white p-8 rounded-2xl shadow-xl border border-slate-100">
         <h2 className="text-2xl font-bold text-slate-800 mb-2">Log In</h2>
-        <p className="text-slate-500 text-sm mb-6">Enter your credentials to access your account.</p>
+        <p className="text-slate-500 text-sm mb-6">Enter your username or email and password.</p>
 
         {error && <div className="mb-4 p-3 bg-red-50 text-red-600 text-sm rounded-xl">{error}</div>}
 

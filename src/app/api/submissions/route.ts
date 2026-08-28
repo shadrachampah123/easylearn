@@ -21,6 +21,8 @@ export async function GET(request: NextRequest) {
         attachments: submissions.attachments,
         status: submissions.status,
         score: submissions.score,
+        maxScore: submissions.maxScore,
+        percentage: submissions.percentage,
         feedback: submissions.feedback,
         submittedAt: submissions.submittedAt,
         gradedAt: submissions.gradedAt,

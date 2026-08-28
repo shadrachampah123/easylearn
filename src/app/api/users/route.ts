@@ -37,6 +37,7 @@ export async function GET(request: NextRequest) {
     const results = await db
       .select({
         id: users.id,
+        username: users.username,
         email: users.email,
         firstName: users.firstName,
         lastName: users.lastName,
@@ -79,8 +80,14 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { email, password, firstName, lastName, role, phone, gender } = body;
 
-    if (!email || !password || !firstName || !lastName || !role) {
-      return errorResponse("Email, password, first name, last name and role are required");
+    if (!password || !firstName || !lastName || !role) {
+      return errorResponse("Password, first name, last name and role are required");
+    }
+
+    // Email is required for teachers/admins, optional for learners/parents
+    const needsEmail = ["teacher", "school_admin", "head_teacher"].includes(role);
+    if (needsEmail && !email) {
+      return errorResponse("Email is required for teachers and administrators");
     }
 
     if (password.length < 6) {
@@ -93,14 +100,45 @@ export async function POST(request: NextRequest) {
       return errorResponse("Invalid role");
     }
 
-    const existing = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.email, email.toLowerCase()))
-      .limit(1);
+    // Generate a username from name if not provided
+    const baseUsername = (firstName.charAt(0).toLowerCase() + lastName.toLowerCase().replace(/\s+/g, ""));
+    let generatedUsername = baseUsername;
+    let suffix = 1;
+    
+    // Check uniqueness
+    try {
+      let existingUser = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.username, generatedUsername))
+        .limit(1);
+      
+      while (existingUser.length > 0) {
+        generatedUsername = `${baseUsername}${suffix}`;
+        suffix++;
+        existingUser = await db
+          .select({ id: users.id })
+          .from(users)
+          .where(eq(users.username, generatedUsername))
+          .limit(1);
+      }
+    } catch (err) {
+      console.error("Username check error:", err);
+      // Fallback: use timestamp
+      generatedUsername = `${baseUsername}${Date.now().toString().slice(-4)}`;
+    }
 
-    if (existing.length > 0) {
-      return errorResponse("Email already registered");
+    // Check email uniqueness if provided
+    if (email) {
+      const existingEmail = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.email, email.toLowerCase()))
+        .limit(1);
+
+      if (existingEmail.length > 0) {
+        return errorResponse("Email already registered");
+      }
     }
 
     const passwordHash = await hashPassword(password);
@@ -108,7 +146,8 @@ export async function POST(request: NextRequest) {
     const [newUser] = await db
       .insert(users)
       .values({
-        email: email.toLowerCase(),
+        email: email ? email.toLowerCase() : null,
+        username: generatedUsername,
         passwordHash,
         firstName,
         lastName,
@@ -116,10 +155,11 @@ export async function POST(request: NextRequest) {
         phone: phone || null,
         gender: gender || null,
         isActive: true,
-        emailVerified: true,
+        emailVerified: email ? false : true,
       })
       .returning({
         id: users.id,
+        username: users.username,
         email: users.email,
         firstName: users.firstName,
         lastName: users.lastName,
@@ -127,9 +167,10 @@ export async function POST(request: NextRequest) {
         isActive: users.isActive,
       });
 
-    return successResponse(newUser, 201);
+    return successResponse({ ...newUser, generatedPassword: password }, 201);
   } catch (error) {
     console.error("Create user error:", error);
-    return errorResponse("Internal server error", 500);
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    return errorResponse(`Internal server error: ${errorMessage}`, 500);
   }
 }
