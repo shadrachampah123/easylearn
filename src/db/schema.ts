@@ -84,6 +84,24 @@ export const timetableDayEnum = pgEnum("timetable_day", [
   "sunday",
 ]);
 
+export const dashboardRoleEnum = pgEnum("dashboard_role", [
+  "admin",
+  "teacher",
+  "learner",
+  "parent",
+  "global",
+]);
+
+export const cardScopeTypeEnum = pgEnum("card_scope_type", [
+  "global",
+  "role",
+  "class",
+  "learner",
+  "parent",
+  "teacher",
+  "user",
+]);
+
 /* ── Users ── */
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -396,7 +414,32 @@ export const activityLogs = pgTable("activity_logs", {
   action: varchar("action", { length: 100 }).notNull(),
   details: text("details"),
   ipAddress: varchar("ip_address", { length: 50 }),
+  entityType: varchar("entity_type", { length: 100 }),
+  entityId: uuid("entity_id"),
+  description: text("description"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+/* ── Dashboard Card Overrides ── */
+export const dashboardCardOverrides = pgTable("dashboard_card_overrides", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  cardKey: varchar("card_key", { length: 150 }).notNull(),
+  dashboardRole: dashboardRoleEnum("dashboard_role").notNull().default("global"),
+  title: varchar("title", { length: 255 }),
+  label: varchar("label", { length: 255 }),
+  value: text("value"),
+  subtitle: varchar("subtitle", { length: 255 }),
+  description: text("description"),
+  trend: varchar("trend", { length: 100 }),
+  isVisible: boolean("is_visible").notNull().default(true),
+  sortOrder: integer("sort_order").notNull().default(0),
+  isEnabled: boolean("is_enabled").notNull().default(true),
+  overridePayload: jsonb("override_payload"),
+  scopeType: cardScopeTypeEnum("scope_type").notNull().default("global"),
+  scopeId: uuid("scope_id"),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
 /* ── Achievements / Badges ── */

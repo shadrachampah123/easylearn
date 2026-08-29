@@ -1,25 +1,98 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 "use client";
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import StatCard from "@/components/dashboard/StatCard";
 import TodaysSchedule from "@/components/dashboard/TodaysSchedule";
 import Link from "next/link";
+import { useEffect, useState } from "react";
+import { teacherNav } from "@/lib/teacher-nav";
 
-const teacherNav = [
-  { name: "Dashboard", href: "/dashboard/teacher", icon: "📊" },
-  { name: "My Classes", href: "/dashboard/teacher/classes", icon: "🏫" },
-  { name: "Assignments", href: "/dashboard/teacher/assignments", icon: "📝" },
-  { name: "Quizzes", href: "/dashboard/teacher/quizzes", icon: "❓" },
-  { name: "Resources", href: "/dashboard/teacher/resources", icon: "📚" },
-  { name: "Attendance", href: "/dashboard/teacher/attendance", icon: "✅" },
-  { name: "Timetable", href: "/dashboard/teacher/timetable", icon: "📅" },
-  { name: "Grades", href: "/dashboard/teacher/grades", icon: "📊" },
-  { name: "Announcements", href: "/dashboard/teacher/announcements", icon: "📢" },
-  { name: "Messages", href: "/dashboard/teacher/messages", icon: "💬" },
-  { name: "Reports", href: "/dashboard/teacher/reports", icon: "📈" },
-];
+interface DashboardData {
+  stats: Record<string, {
+    value: any;
+    label: string;
+    icon: string;
+    color: string;
+    trend?: string;
+    isOverridden?: boolean;
+    liveValue?: any;
+    isVisible?: boolean;
+    sortOrder?: number;
+  }>;
+  rawStats: {
+    myClasses: number;
+    assignments: number;
+    resources: number;
+    students: number;
+    pendingGrading: number;
+  };
+  classes: { classId: string; className: string; subjectName: string }[];
+  classPerformance: { classId: string; className: string; avg: number; submissions: number; topStudent: string | null }[];
+  pendingTasks: { task: string; count: number; icon: string; href: string }[];
+}
 
 export default function TeacherDashboard() {
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const token = localStorage.getItem("el_token");
+    if (!token) {
+      setLoading(false);
+      setError("Not authenticated");
+      return;
+    }
+
+    fetch("/api/dashboard/teacher", {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then((result) => {
+        if (result.success) setData(result.data);
+        else setError(result.error || "Failed to load dashboard");
+      })
+      .catch((err) => {
+        console.error(err);
+        setError("Failed to load dashboard data");
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) {
+    return (
+      <DashboardShell navItems={teacherNav} roleLabel="Teacher" roleColor="gradient-secondary">
+        <div className="animate-pulse space-y-6">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {[1, 2, 3, 4].map((i) => (
+              <div key={i} className="h-24 bg-slate-200 rounded-2xl" />
+            ))}
+          </div>
+          <div className="h-64 bg-slate-200 rounded-2xl" />
+        </div>
+      </DashboardShell>
+    );
+  }
+
+  if (error) {
+    return (
+      <DashboardShell navItems={teacherNav} roleLabel="Teacher" roleColor="gradient-secondary">
+        <div className="p-8 text-center bg-white rounded-2xl shadow-sm border border-slate-100">
+          <div className="text-4xl mb-3">⚠️</div>
+          <p className="text-slate-600">{error}</p>
+          <button onClick={() => window.location.reload()} className="mt-4 px-5 py-2 rounded-xl bg-secondary-500 text-white font-semibold">
+            Retry
+          </button>
+        </div>
+      </DashboardShell>
+    );
+  }
+
+  const statsArray = data?.stats
+    ? Object.entries(data.stats).filter(([_, v]) => v.isVisible !== false).sort((a, b) => (a[1].sortOrder || 0) - (b[1].sortOrder || 0))
+    : [];
+
   return (
     <DashboardShell navItems={teacherNav} roleLabel="Teacher" roleColor="gradient-secondary">
       <div className="mb-6">
@@ -27,12 +100,27 @@ export default function TeacherDashboard() {
         <p className="text-sm text-slate-500">Manage your classes, assignments, and learner progress</p>
       </div>
 
-      {/* Stats */}
+      {/* Stats - LIVE */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-        <StatCard icon="🏫" label="My Classes" value={3} color="bg-blue-100" />
-        <StatCard icon="📝" label="Assignments" value={12} change="+3" color="bg-green-100" />
-        <StatCard icon="📚" label="Resources" value={28} change="+5" color="bg-orange-100" />
-        <StatCard icon="🎓" label="Students" value={85} color="bg-purple-100" />
+        {statsArray.length > 0 ? (
+          statsArray.map(([key, stat]) => (
+            <div key={key} className="relative">
+              <StatCard icon={stat.icon} label={stat.label} value={stat.value} change={stat.trend} color={stat.color} />
+              {stat.isOverridden && (
+                <span className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-amber-400 text-white text-[10px] flex items-center justify-center font-bold" title={`Overridden (live: ${stat.liveValue})`}>
+                  !
+                </span>
+              )}
+            </div>
+          ))
+        ) : (
+          <>
+            <StatCard icon="🏫" label="My Classes" value={data?.rawStats.myClasses ?? "—"} color="bg-blue-100" />
+            <StatCard icon="📝" label="Assignments" value={data?.rawStats.assignments ?? "—"} color="bg-green-100" />
+            <StatCard icon="📚" label="Resources" value={data?.rawStats.resources ?? "—"} color="bg-orange-100" />
+            <StatCard icon="🎓" label="Students" value={data?.rawStats.students ?? "—"} color="bg-purple-100" />
+          </>
+        )}
       </div>
 
       <div className="grid lg:grid-cols-3 gap-6">
@@ -44,7 +132,6 @@ export default function TeacherDashboard() {
           viewAllHref="/dashboard/teacher/timetable"
         />
 
-        {/* Quick Actions */}
         <div className="space-y-6">
           <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
             <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
@@ -65,60 +152,72 @@ export default function TeacherDashboard() {
             </div>
           </div>
 
-          {/* Pending Tasks */}
+          {/* Pending Tasks - LIVE */}
           <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
             <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
               <span>⏳</span> Pending
             </h2>
-            <div className="space-y-2">
-              {[
-                { task: "Grade Math Homework", count: 15, icon: "📊" },
-                { task: "Review submissions", count: 8, icon: "📝" },
-                { task: "Mark attendance", count: 1, icon: "✅" },
-              ].map((t, i) => (
-                <div key={i} className="flex items-center justify-between p-3 rounded-xl bg-slate-50">
-                  <span className="text-sm text-slate-600 flex items-center gap-2">
-                    <span>{t.icon}</span>{t.task}
-                  </span>
-                  <span className="w-6 h-6 rounded-full bg-red-100 text-red-600 text-xs font-bold flex items-center justify-center">{t.count}</span>
-                </div>
-              ))}
-            </div>
+            {!data?.pendingTasks || data.pendingTasks.length === 0 ? (
+              <div className="text-center py-6">
+                <div className="text-2xl mb-2">✅</div>
+                <p className="text-slate-500 text-sm">All caught up!</p>
+                <p className="text-slate-400 text-xs">No pending tasks</p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {data.pendingTasks.map((t, i) => (
+                  <Link key={i} href={t.href} className="flex items-center justify-between p-3 rounded-xl bg-slate-50 hover:bg-slate-100 transition-colors">
+                    <span className="text-sm text-slate-600 flex items-center gap-2">
+                      <span>{t.icon}</span>
+                      {t.task}
+                    </span>
+                    <span className="w-6 h-6 rounded-full bg-red-100 text-red-600 text-xs font-bold flex items-center justify-center">
+                      {t.count}
+                    </span>
+                  </Link>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Class Performance */}
+      {/* Class Performance - LIVE */}
       <div className="mt-6 bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
         <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
           <span>📈</span> Class Performance
         </h2>
-        <div className="grid md:grid-cols-3 gap-4">
-          {[
-            { cls: "Primary 1", avg: 82, top: "Ama Asante", submissions: 28, color: "from-blue-400 to-blue-600" },
-            { cls: "Primary 2", avg: 78, top: "Kofi Mensah", submissions: 25, color: "from-green-400 to-green-600" },
-            { cls: "Primary 3", avg: 85, top: "Akua Boateng", submissions: 30, color: "from-orange-400 to-orange-600" },
-          ].map((c, i) => (
-            <div key={i} className="p-5 rounded-2xl bg-gradient-to-br text-white shadow-md" style={{ background: `linear-gradient(135deg, var(--tw-gradient-stops))` }}>
-              <div className={`p-5 rounded-2xl bg-gradient-to-br ${c.color} text-white shadow-md`}>
-                <h3 className="font-bold text-lg mb-3">{c.cls}</h3>
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <div>
-                    <p className="text-white/70 text-xs">Avg Score</p>
-                    <p className="font-bold text-lg">{c.avg}%</p>
+        {!data?.classPerformance || data.classPerformance.length === 0 ? (
+          <div className="text-center py-12">
+            <div className="text-4xl mb-3">📈</div>
+            <p className="text-slate-500 text-sm">No class performance data yet</p>
+            <p className="text-slate-400 text-xs mt-1">Performance will appear after assignments are graded</p>
+          </div>
+        ) : (
+          <div className="grid md:grid-cols-3 gap-4">
+            {data.classPerformance.map((c, i) => {
+              const colors = ["from-blue-400 to-blue-600", "from-green-400 to-green-600", "from-orange-400 to-orange-600"];
+              return (
+                <div key={c.classId} className={`p-5 rounded-2xl bg-gradient-to-br ${colors[i % colors.length]} text-white shadow-md`}>
+                  <h3 className="font-bold text-lg mb-3">{c.className}</h3>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <p className="text-white/70 text-xs">Avg Score</p>
+                      <p className="font-bold text-lg">{c.avg}%</p>
+                    </div>
+                    <div>
+                      <p className="text-white/70 text-xs">Submissions</p>
+                      <p className="font-bold text-lg">{c.submissions}</p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-white/70 text-xs">Submissions</p>
-                    <p className="font-bold text-lg">{c.submissions}</p>
+                  <div className="mt-3 pt-3 border-t border-white/20 text-xs">
+                    <span className="text-white/70">Top Student:</span> {c.topStudent || "—"} {c.topStudent ? "⭐" : ""}
                   </div>
                 </div>
-                <div className="mt-3 pt-3 border-t border-white/20 text-xs">
-                  <span className="text-white/70">Top Student:</span> {c.top} ⭐
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </DashboardShell>
   );

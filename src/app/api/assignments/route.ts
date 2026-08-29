@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { assignments, classes, subjects, users, submissions } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { logActivity } from "@/lib/activity";
 import { eq, desc, and, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -126,6 +127,15 @@ export async function POST(request: NextRequest) {
       attachments: attachments || null,
       status: status || "draft",
     }).returning();
+
+    await logActivity({
+      userId: payload.userId,
+      action: "create",
+      entityType: "assignment",
+      entityId: newAssignment.id,
+      description: `Created assignment ${newAssignment.title}`,
+      details: JSON.stringify({ title: newAssignment.title, classId: newAssignment.classId }),
+    });
 
     return successResponse(newAssignment, 201);
   } catch (error) {

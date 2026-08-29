@@ -15,6 +15,7 @@ import {
   errorResponse,
   unauthorizedResponse,
 } from "@/lib/api-helpers";
+import { logActivity } from "@/lib/activity";
 import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 
 export const TIMETABLE_DAYS = [

@@ -4,6 +4,7 @@ import { users } from "@/db/schema";
 import { getTokenFromRequest, verifyToken, hashPassword } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { eq, sql, ilike, or, desc } from "drizzle-orm";
+import { logActivity } from "@/lib/activity";
 
 export async function GET(request: NextRequest) {
   try {
@@ -84,7 +85,6 @@ export async function POST(request: NextRequest) {
       return errorResponse("Password, first name, last name and role are required");
     }
 
-    // Email is required for teachers/admins, optional for learners/parents
     const needsEmail = ["teacher", "school_admin", "head_teacher"].includes(role);
     if (needsEmail && !email) {
       return errorResponse("Email is required for teachers and administrators");
@@ -100,12 +100,10 @@ export async function POST(request: NextRequest) {
       return errorResponse("Invalid role");
     }
 
-    // Generate a username from name if not provided
     const baseUsername = (firstName.charAt(0).toLowerCase() + lastName.toLowerCase().replace(/\s+/g, ""));
     let generatedUsername = baseUsername;
     let suffix = 1;
     
-    // Check uniqueness
     try {
       let existingUser = await db
         .select({ id: users.id })
@@ -124,11 +122,9 @@ export async function POST(request: NextRequest) {
       }
     } catch (err) {
       console.error("Username check error:", err);
-      // Fallback: use timestamp
       generatedUsername = `${baseUsername}${Date.now().toString().slice(-4)}`;
     }
 
-    // Check email uniqueness if provided
     if (email) {
       const existingEmail = await db
         .select({ id: users.id })
@@ -166,6 +162,15 @@ export async function POST(request: NextRequest) {
         role: users.role,
         isActive: users.isActive,
       });
+
+    await logActivity({
+      userId: payload.userId,
+      action: "create",
+      entityType: "user",
+      entityId: newUser.id,
+      description: `Created user ${firstName} ${lastName} (${role})`,
+      details: JSON.stringify({ role, email: email ? "[REDACTED]" : null }),
+    });
 
     return successResponse({ ...newUser, generatedPassword: password }, 201);
   } catch (error) {

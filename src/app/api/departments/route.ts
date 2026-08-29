@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { departments, subjects } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { logActivity } from "@/lib/activity";
 import { eq, desc, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {

@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { resources, classes, subjects, users } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { logActivity } from "@/lib/activity";
 import { eq, desc, and, ilike, or } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -19,12 +20,10 @@ export async function GET(request: NextRequest) {
 
     const conditions = [];
 
-    // Teachers see their own resources
     if (payload.role === "teacher") {
       conditions.push(eq(resources.teacherId, payload.userId));
     }
 
-    // Learners only see approved resources
     if (payload.role === "learner" || payload.role === "parent") {
       conditions.push(eq(resources.isApproved, true));
     }
@@ -96,7 +95,6 @@ export async function POST(request: NextRequest) {
       return errorResponse("Title and type are required");
     }
 
-    // Auto-approve for admins
     const isApproved = ["super_admin", "school_admin", "head_teacher"].includes(payload.role);
 
     const [newResource] = await db.insert(resources).values({
@@ -114,6 +112,15 @@ export async function POST(request: NextRequest) {
       isPinned: isPinned || false,
       isApproved,
     }).returning();
+
+    await logActivity({
+      userId: payload.userId,
+      action: "create",
+      entityType: "resource",
+      entityId: newResource.id,
+      description: `Uploaded resource ${newResource.title}`,
+      details: JSON.stringify({ title: newResource.title, type: newResource.type }),
+    });
 
     return successResponse(newResource, 201);
   } catch (error) {
