@@ -68,14 +68,22 @@ export async function GET(request: NextRequest) {
 
     // Everyone only ever sees the timetable of classes they belong to.
     if (payload.role === "teacher") {
-      const ownClasses = db
+      // Classes the teacher teaches a subject in.
+      const subjectClasses = db
         .select({ id: teacherClasses.classId })
         .from(teacherClasses)
         .where(eq(teacherClasses.teacherId, payload.userId));
 
+      // Classes the teacher is the homeroom/class teacher of.
+      const homeroomClasses = db
+        .select({ id: classes.id })
+        .from(classes)
+        .where(eq(classes.classTeacherId, payload.userId));
+
       conditions.push(
         or(
-          inArray(timetableEntries.classId, ownClasses),
+          inArray(timetableEntries.classId, subjectClasses),
+          inArray(timetableEntries.classId, homeroomClasses),
           eq(timetableEntries.teacherId, payload.userId)
         )!
       );

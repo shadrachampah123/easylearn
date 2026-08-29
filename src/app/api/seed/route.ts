@@ -1,5 +1,19 @@
 import { db } from "@/db";
-import { users, academicYears, terms, departments, classes, subjects, announcements, faqs, achievements } from "@/db/schema";
+import {
+  users,
+  academicYears,
+  terms,
+  departments,
+  classes,
+  subjects,
+  announcements,
+  faqs,
+  achievements,
+  teacherClasses,
+  learnerClasses,
+  parentLearners,
+  timetableEntries,
+} from "@/db/schema";
 import { hashPassword } from "@/lib/auth";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { sql } from "drizzle-orm";
@@ -86,7 +100,7 @@ export async function POST() {
     ]).returning();
 
     // Classes
-    const [classP1] = await db.insert(classes).values([
+    const seededClasses = await db.insert(classes).values([
       { name: "Nursery 1", level: "nursery", capacity: 25, academicYearId: ay.id },
       { name: "Nursery 2", level: "nursery", capacity: 25, academicYearId: ay.id },
       { name: "KG 1", level: "kindergarten", capacity: 30, academicYearId: ay.id },
@@ -100,7 +114,7 @@ export async function POST() {
     ]).returning();
 
     // Subjects
-    await db.insert(subjects).values([
+    const seededSubjects = await db.insert(subjects).values([
       { name: "English Language", code: "ENG", departmentId: sciDept.id },
       { name: "Mathematics", code: "MATH", departmentId: sciDept.id },
       { name: "Integrated Science", code: "SCI", departmentId: sciDept.id },
@@ -111,6 +125,46 @@ export async function POST() {
       { name: "Religious & Moral Education", code: "RME", departmentId: sciDept.id },
       { name: "Ghanaian Language", code: "GHL", departmentId: sciDept.id },
       { name: "Physical Education", code: "PE", departmentId: sciDept.id },
+    ]).returning();
+
+    const primary1 = seededClasses.find((c) => c.name === "Primary 1")!;
+    const english = seededSubjects.find((s) => s.name === "English Language")!;
+    const mathematics = seededSubjects.find((s) => s.name === "Mathematics")!;
+    const science = seededSubjects.find((s) => s.name === "Integrated Science")!;
+    const [term1] = await db
+      .select({ id: terms.id })
+      .from(terms)
+      .where(sql`${terms.name} = 'term_1'`)
+      .limit(1);
+
+    // Link the teacher to the class (subject assignment) so teachers can see the timetable.
+    await db.insert(teacherClasses).values([
+      { teacherId: teacher1.id, classId: primary1.id, subjectId: english.id, academicYearId: ay.id },
+      { teacherId: teacher1.id, classId: primary1.id, subjectId: mathematics.id, academicYearId: ay.id },
+    ]);
+
+    // Enroll the demo learner into the class.
+    await db.insert(learnerClasses).values({
+      learnerId: learner1.id,
+      classId: primary1.id,
+      academicYearId: ay.id,
+    });
+
+    // Link the demo parent to the demo learner.
+    await db.insert(parentLearners).values({
+      parentId: parent1.id,
+      learnerId: learner1.id,
+      relationship: "parent",
+    });
+
+    // Publish a weekly timetable for the class so teachers, learners, and parents see periods.
+    await db.insert(timetableEntries).values([
+      { classId: primary1.id, subjectId: english.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "monday", startTime: "07:30", endTime: "08:30", room: "Room 1", createdBy: admin.id },
+      { classId: primary1.id, subjectId: mathematics.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "monday", startTime: "08:30", endTime: "09:30", room: "Room 1", createdBy: admin.id },
+      { classId: primary1.id, subjectId: science.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "tuesday", startTime: "09:00", endTime: "10:00", room: "Lab", createdBy: admin.id },
+      { classId: primary1.id, subjectId: english.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "wednesday", startTime: "10:00", endTime: "11:00", room: "Room 2", createdBy: admin.id },
+      { classId: primary1.id, subjectId: mathematics.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "thursday", startTime: "07:30", endTime: "08:30", room: "Room 1", createdBy: admin.id },
+      { classId: primary1.id, subjectId: science.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "friday", startTime: "11:00", endTime: "12:00", room: "Lab", createdBy: admin.id },
     ]);
 
     // Announcements
