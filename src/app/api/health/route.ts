@@ -16,6 +16,8 @@ export async function GET() {
     jwtSecretConfigured: !jwtProblem,
     databaseConnected: false,
     schemaReady: false,
+    optionalMigrations: {} as Record<string, boolean>,
+    migrationWarnings: [] as string[],
   };
 
   if (databaseProblem) {
@@ -54,6 +56,26 @@ export async function GET() {
     checks.schemaReady =
       connectionResult.rows[0]?.users_table === "users" &&
       Number(connectionResult.rows[0]?.users_columns) === 9;
+
+    // Read-only probe of the migrations that add optional objects, so an operator can see
+    // "overrides are disabled because 0004 was never applied" from one URL. Never runs DDL.
+    try {
+      const { probeSchemaFeatures } = await import("@/lib/schema-resilience");
+      const optional = await probeSchemaFeatures();
+      for (const item of optional) {
+        checks.optionalMigrations[item.feature] = item.present;
+        if (!item.present) {
+          checks.migrationWarnings.push(
+            `${item.migration} has not been applied (${item.feature} missing) - ` +
+              (item.repairEnabled
+                ? "EasyLearn creates it on demand, but run `node run-migration.js` to make it official."
+                : "AUTO_SCHEMA_REPAIR is off, so the related dashboard sections stay disabled.")
+          );
+        }
+      }
+    } catch (error) {
+      console.error("Health optional-schema probe failed:", error);
+    }
 
     if (!checks.schemaReady) {
       return Response.json(

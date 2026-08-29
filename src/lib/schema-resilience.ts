@@ -395,6 +395,37 @@ export function ensureUserIdentityColumns(): Promise<FeatureStatus> {
   return ensureSchemaFeature("optional_user_columns");
 }
 
+export interface OptionalSchemaStatus {
+  feature: SchemaFeature;
+  present: boolean;
+  migration: string;
+  repairEnabled: boolean;
+}
+
+/**
+ * Read-only catalog check for /api/health and admin diagnostics: reports which optional
+ * migration objects exist without ever running DDL or touching the repair cache.
+ */
+export async function probeSchemaFeatures(
+  features: SchemaFeature[] = ["dashboard_card_overrides", "activity_logs_enrichment", "optional_user_columns"]
+): Promise<OptionalSchemaStatus[]> {
+  const repairEnabled = autoSchemaRepairEnabled();
+  return Promise.all(
+    features.map(async (feature) => {
+      const spec = FEATURE_PROBE[feature];
+      let present = false;
+      try {
+        const probe = await pool.query(probeSql(spec));
+        present = probeSatisfied(spec, probe.rows[0]?.object);
+      } catch (error) {
+        console.error(`[schema] health probe for ${feature} failed:`, inspectDbError(error).text);
+        present = false;
+      }
+      return { feature, present, migration: FEATURE_MIGRATIONS[feature], repairEnabled };
+    })
+  );
+}
+
 /** Reset cached verdicts — used by tests and after running migrations by hand. */
 export function resetSchemaFeatureCache(): void {
   featureStates().clear();

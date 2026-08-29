@@ -74,6 +74,9 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 
 Notes:
 
+- Check `GET /api/health` any time: it reports `databaseConnected`, `jwtSecretConfigured`, and
+  `optionalMigrations` (`dashboard_card_overrides`, `activity_logs_enrichment`,
+  `optional_user_columns`) with a `migrationWarnings` entry per missing file.
 - The dashboards are **degrade-instead-of-crash**: a missing migration disables that section and
   shows a warning banner on the admin dashboard, it no longer returns a 500 blank page.
 - On request, EasyLearn will try to create the *optional* objects above itself using idempotent
