@@ -2,6 +2,7 @@
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import UsersManager from "@/components/admin/UsersManager";
+import ParentLearnerLinks from "@/components/admin/ParentLearnerLinks";
 import { adminNav } from "@/lib/admin-nav";
 
 export default function AdminParentsPage() {
@@ -13,6 +14,7 @@ export default function AdminParentsPage() {
         subtitle="Manage parent accounts and their linked children"
         emptyEmoji="👨‍👩‍👧"
       />
+      <ParentLearnerLinks />
     </DashboardShell>
   );
 }

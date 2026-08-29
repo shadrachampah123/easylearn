@@ -5,6 +5,10 @@ import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { hashPassword } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq } from "drizzle-orm";
+import {
+  ensureUserIdentityColumns,
+  schemaAwareErrorMessage,
+} from "@/lib/schema-resilience";
 
 export async function GET(
   request: NextRequest,
@@ -13,6 +17,7 @@ export async function GET(
   try {
     const token = getTokenFromRequest(request);
     if (!token) return unauthorizedResponse();
+    await ensureUserIdentityColumns();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
@@ -33,7 +38,10 @@ export async function GET(
     return successResponse(user);
   } catch (error) {
     console.error("Get user error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The user could not be loaded."),
+      503
+    );
   }
 }
 
@@ -44,6 +52,7 @@ export async function PUT(
   try {
     const token = getTokenFromRequest(request);
     if (!token) return unauthorizedResponse();
+    await ensureUserIdentityColumns();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
@@ -89,7 +98,10 @@ export async function PUT(
     return successResponse(updated);
   } catch (error) {
     console.error("Update user error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The account could not be updated."),
+      503
+    );
   }
 }
 
@@ -100,6 +112,7 @@ export async function DELETE(
   try {
     const token = getTokenFromRequest(request);
     if (!token) return unauthorizedResponse();
+    await ensureUserIdentityColumns();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
@@ -119,7 +132,10 @@ export async function DELETE(
     return successResponse({ message: "User deleted" });
   } catch (error) {
     console.error("Delete user error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The account could not be removed."),
+      503
+    );
   }
 }
 
@@ -131,6 +147,7 @@ export async function PATCH(
   try {
     const token = getTokenFromRequest(request);
     if (!token) return unauthorizedResponse();
+    await ensureUserIdentityColumns();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
@@ -164,6 +181,9 @@ export async function PATCH(
     return successResponse({ message: "Password reset successfully" });
   } catch (error) {
     console.error("Reset password error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The password could not be reset."),
+      503
+    );
   }
 }

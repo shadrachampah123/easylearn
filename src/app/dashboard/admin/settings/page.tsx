@@ -64,6 +64,9 @@ export default function AdminSettingsPage() {
   const [showOverrideForm, setShowOverrideForm] = useState(false);
   const [editingOverride, setEditingOverride] = useState<CardOverride | null>(null);
   const [saving, setSaving] = useState(false);
+  const [dataError, setDataError] = useState<string | null>(null);
+  const [dataNotice, setDataNotice] = useState<string | null>(null);
+  const [activityError, setActivityError] = useState<string | null>(null);
   const [yearForm, setYearForm] = useState({ name: "", startDate: "", endDate: "", isCurrent: false });
   const [termForm, setTermForm] = useState({ name: "term_1", academicYearId: "", startDate: "", endDate: "", isCurrent: false });
   const [overrideForm, setOverrideForm] = useState({
@@ -94,14 +97,26 @@ export default function AdminSettingsPage() {
         fetch("/api/terms", { headers: { Authorization: `Bearer ${token}` } }),
         fetch("/api/dashboard/overrides", { headers: { Authorization: `Bearer ${token}` } }),
       ]);
-      const yearData = await yearRes.json();
-      const termData = await termRes.json();
-      const overrideData = await overrideRes.json();
-      if (yearData.success) setYears(yearData.data);
-      if (termData.success) setTerms(termData.data);
-      if (overrideData.success) setOverrides(overrideData.data);
+      const yearData = await yearRes.json().catch(() => null);
+      const termData = await termRes.json().catch(() => null);
+      const overrideData = await overrideRes.json().catch(() => null);
+      if (yearData?.success) setYears(yearData.data);
+      if (termData?.success) setTerms(termData.data);
+      if (overrideData?.success) {
+        setOverrides(Array.isArray(overrideData.data) ? overrideData.data : []);
+        setDataNotice(overrideData?.meta?.warning?.message || null);
+        setDataError(null);
+      } else {
+        setOverrides([]);
+        setDataNotice(null);
+        setDataError(
+          overrideData?.error ||
+          `Card overrides could not be loaded (HTTP ${overrideRes.status}). If the database has not been migrated, run the pending files in drizzle/.`
+        );
+      }
     } catch (err) {
       console.error(err);
+      setDataError("Academic years, terms or overrides could not be loaded. Please retry.");
     } finally {
       setLoading(false);
     }
@@ -112,10 +127,17 @@ export default function AdminSettingsPage() {
     setActivityLoading(true);
     try {
       const res = await fetch("/api/activity-logs?limit=50", { headers: { Authorization: `Bearer ${token}` } });
-      const data = await res.json();
-      if (data.success) setActivityLogs(data.data.logs);
+      const data = await res.json().catch(() => null);
+      if (data?.success) {
+        setActivityLogs(Array.isArray(data.data?.logs) ? data.data.logs : []);
+        setActivityError(data?.data?.meta?.warning?.message || null);
+      } else {
+        setActivityLogs([]);
+        setActivityError(data?.error || `Activity log could not be loaded (HTTP ${res.status}).`);
+      }
     } catch (err) {
       console.error(err);
+      setActivityError("Activity log could not be loaded. Please retry.");
     } finally {
       setActivityLoading(false);
     }
@@ -349,6 +371,19 @@ export default function AdminSettingsPage() {
                 </p>
               </div>
 
+              {dataError && (
+                <div className="bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start justify-between gap-3">
+                  <p className="text-sm text-red-700">❌ {dataError}</p>
+                  <button onClick={() => loadData()} className="shrink-0 text-xs font-semibold text-red-700 hover:text-red-900">Retry</button>
+                </div>
+              )}
+
+              {dataNotice && !dataError && (
+                <div className="bg-sky-50 border border-sky-200 rounded-2xl p-4">
+                  <p className="text-sm text-sky-800">ℹ️ {dataNotice}</p>
+                </div>
+              )}
+
               <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="font-bold text-lg text-slate-800 flex items-center gap-2">
@@ -427,6 +462,13 @@ export default function AdminSettingsPage() {
                   {activityLoading ? "Loading..." : "🔄 Refresh"}
                 </button>
               </div>
+
+              {activityError && (
+                <div className="mb-4 p-4 rounded-xl bg-amber-50 border border-amber-200 flex items-start justify-between gap-3">
+                  <p className="text-sm text-amber-800">⚠️ {activityError}</p>
+                  <button onClick={loadActivity} className="shrink-0 text-xs font-semibold text-amber-700 hover:text-amber-900">Retry</button>
+                </div>
+              )}
 
               {activityLoading ? (
                 <div className="space-y-3">

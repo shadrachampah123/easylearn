@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { users } from "@/db/schema";
-import { verifyPassword, createToken } from "@/lib/auth";
+import { verifyPassword, createToken, findAuthUser } from "@/lib/auth";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { getDatabaseErrorMessage } from "@/lib/database-errors";
 import { getDatabaseConfigurationProblem, getJwtConfigurationProblem } from "@/lib/env";
@@ -38,21 +38,24 @@ export async function POST(request: NextRequest) {
 
     const { db } = await import("@/db");
 
-    // Search by email first, then by username
-    let user: any;
+    // Search by email first, then by username. Both reads go through findAuthUser so that a
+    // database without drizzle/0006 (users.username) can still sign people in - previously the
+    // `select()` picked every schema column and login itself threw.
+    let user: Record<string, any> | null = null;
     if (normalizedEmail) {
-      [user] = await db
-        .select()
-        .from(users)
-        .where(eq(users.email, normalizedEmail))
-        .limit(1);
+      user = await findAuthUser(eq(users.email, normalizedEmail), {
+        withPasswordHash: true,
+        repair: true,
+      });
     }
     if (!user && normalizedUsername) {
-      [user] = await db
-        .select()
-        .from(users)
-        .where(eq(users.username, normalizedUsername))
-        .limit(1);
+      const { isMissingColumn } = await import("@/lib/schema-resilience");
+      try {
+        user = await findAuthUser(eq(users.username, normalizedUsername), { withPasswordHash: true });
+      } catch (error) {
+        // Username login simply is not available before migration 0006; email login still is.
+        if (!isMissingColumn(error)) throw error;
+      }
     }
 
     if (!user) {
