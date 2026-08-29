@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { attendance, users, classes, learnerClasses } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { logActivity } from "@/lib/activity";
 import { eq, and, desc } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -22,7 +23,6 @@ export async function GET(request: NextRequest) {
     if (date) conditions.push(eq(attendance.date, date));
     if (learnerId) conditions.push(eq(attendance.learnerId, learnerId));
 
-    // Parents can only see their children's attendance
     if (payload.role === "learner") {
       conditions.push(eq(attendance.learnerId, payload.userId));
     }
@@ -75,7 +75,6 @@ export async function POST(request: NextRequest) {
       return errorResponse("Class ID, date, and attendance records are required");
     }
 
-    // Delete existing attendance for this class/date
     await db
       .delete(attendance)
       .where(and(
@@ -83,7 +82,6 @@ export async function POST(request: NextRequest) {
         eq(attendance.date, date)
       ));
 
-    // Insert new attendance records
     const attendanceRecords = records.map((r: { learnerId: string; isPresent: boolean; note?: string }) => ({
       learnerId: r.learnerId,
       classId,
@@ -97,6 +95,14 @@ export async function POST(request: NextRequest) {
       await db.insert(attendance).values(attendanceRecords);
     }
 
+    await logActivity({
+      userId: payload.userId,
+      action: "create",
+      entityType: "attendance",
+      description: `Marked attendance for class ${classId} on ${date}: ${attendanceRecords.filter((r: any) => r.isPresent).length}/${attendanceRecords.length} present`,
+      details: JSON.stringify({ classId, date, count: attendanceRecords.length }),
+    });
+
     return successResponse({ message: "Attendance saved", count: attendanceRecords.length }, 201);
   } catch (error) {
     console.error("Save attendance error:", error);
@@ -104,7 +110,6 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Get learners for a class (to show attendance form)
 export async function PUT(request: NextRequest) {
   try {
     const token = getTokenFromRequest(request);
@@ -119,7 +124,6 @@ export async function PUT(request: NextRequest) {
       return errorResponse("Class ID is required");
     }
 
-    // Get all learners enrolled in this class
     const learners = await db
       .select({
         id: users.id,

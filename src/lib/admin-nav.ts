@@ -11,5 +11,6 @@ export const adminNav = [
   { name: "Announcements", href: "/dashboard/admin/announcements", icon: "📢" },
   { name: "Attendance", href: "/dashboard/admin/attendance", icon: "✅" },
   { name: "Reports", href: "/dashboard/admin/reports", icon: "📈" },
+  { name: "Card Overrides", href: "/dashboard/admin/overrides", icon: "🎛️" },
   { name: "Settings", href: "/dashboard/admin/settings", icon: "⚙️" },
 ];

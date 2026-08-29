@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { announcements, users } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { logActivity } from "@/lib/activity";
 import { desc, eq } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -59,6 +60,14 @@ export async function POST(request: NextRequest) {
       isPinned: isPinned || false,
       isPublic: isPublic || false,
     }).returning();
+
+    await logActivity({
+      userId: payload.userId,
+      action: "create",
+      entityType: "announcement",
+      entityId: announcement.id,
+      description: `Created announcement ${announcement.title}`,
+    });
 
     return successResponse(announcement, 201);
   } catch (error) {

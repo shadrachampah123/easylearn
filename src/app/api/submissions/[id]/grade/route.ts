@@ -4,6 +4,7 @@ import { submissions, assignments, notifications, learnerPoints } from "@/db/sch
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq } from "drizzle-orm";
+import { logActivity } from "@/lib/activity";
 
 export async function POST(
   request: NextRequest,
@@ -27,7 +28,6 @@ export async function POST(
       return errorResponse("Score is required");
     }
 
-    // Get submission with assignment info
     const [submission] = await db
       .select({
         id: submissions.id,
@@ -46,17 +46,14 @@ export async function POST(
       return notFoundResponse("Submission");
     }
 
-    // Verify teacher owns this assignment
     if (payload.role === "teacher" && submission.teacherId !== payload.userId) {
       return errorResponse("You can only grade submissions for your own assignments", 403);
     }
 
-    // Validate score
     if (score < 0 || (submission.maxScore && score > submission.maxScore)) {
       return errorResponse(`Score must be between 0 and ${submission.maxScore}`);
     }
 
-    // Update submission
     const [updated] = await db
       .update(submissions)
       .set({
@@ -68,7 +65,6 @@ export async function POST(
       .where(eq(submissions.id, id))
       .returning();
 
-    // Create notification for learner
     await db.insert(notifications).values({
       userId: submission.learnerId!,
       type: "grade",
@@ -77,7 +73,6 @@ export async function POST(
       link: `/dashboard/learner/assignments/${submission.assignmentId}`,
     });
 
-    // Award points based on score percentage
     const percentage = submission.maxScore ? (score / submission.maxScore) * 100 : 0;
     let points = 0;
     if (percentage >= 90) points = 50;
@@ -93,6 +88,15 @@ export async function POST(
         reason: `Scored ${score}/${submission.maxScore} on "${submission.title}"`,
       });
     }
+
+    await logActivity({
+      userId: payload.userId,
+      action: "grade",
+      entityType: "submission",
+      entityId: id,
+      description: `Graded submission for ${submission.title}: ${score}/${submission.maxScore}`,
+      details: JSON.stringify({ assignmentId: submission.assignmentId, learnerId: submission.learnerId, score }),
+    });
 
     return successResponse(updated);
   } catch (error) {

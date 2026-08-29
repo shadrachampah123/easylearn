@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { learnerClasses, users, classes } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { logActivity } from "@/lib/activity";
 import { eq, and, desc } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -86,6 +87,14 @@ export async function POST(request: NextRequest) {
       classId,
       academicYearId: academicYearId || null,
     }).returning();
+
+    await logActivity({
+      userId: payload.userId,
+      action: "enroll",
+      entityType: "enrollment",
+      entityId: enrollment.id,
+      description: `Enrolled learner ${enrollment.learnerId} to class ${enrollment.classId}`,
+    });
 
     return successResponse(enrollment, 201);
   } catch (error) {

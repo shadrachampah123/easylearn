@@ -4,6 +4,7 @@ import { classes } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { desc } from "drizzle-orm";
+import { logActivity } from "@/lib/activity";
 
 export async function GET(request: NextRequest) {
   try {
@@ -49,6 +50,15 @@ export async function POST(request: NextRequest) {
       classTeacherId: classTeacherId || null,
       academicYearId: academicYearId || null,
     }).returning();
+
+    await logActivity({
+      userId: payload.userId,
+      action: "create",
+      entityType: "class",
+      entityId: newClass.id,
+      description: `Created class ${name} (${level})`,
+      details: JSON.stringify({ name, level }),
+    });
 
     return successResponse(newClass, 201);
   } catch (error) {
