@@ -2,6 +2,7 @@
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import StatCard from "@/components/dashboard/StatCard";
+import TodaysSchedule from "@/components/dashboard/TodaysSchedule";
 
 const learnerNav = [
   { name: "Dashboard", href: "/dashboard/learner", icon: "🏠" },
@@ -108,27 +109,11 @@ export default function LearnerDashboard() {
             </div>
           </div>
 
-          {/* Today's Classes */}
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
-            <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
-              <span>📅</span> Today
-            </h2>
-            <div className="space-y-2">
-              {[
-                { subject: "Mathematics", time: "7:30 AM", teacher: "Mrs. Mensah" },
-                { subject: "English", time: "8:45 AM", teacher: "Mr. Osei" },
-                { subject: "Science", time: "10:00 AM", teacher: "Mrs. Mensah" },
-              ].map((c, i) => (
-                <div key={i} className="p-3 rounded-xl bg-slate-50 flex items-center gap-3">
-                  <span className="text-xs font-mono text-slate-400 w-16">{c.time}</span>
-                  <div>
-                    <p className="text-sm font-medium text-slate-700">{c.subject}</p>
-                    <p className="text-xs text-slate-400">{c.teacher}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
+          <TodaysSchedule
+            title="Today's Classes"
+            emptyMessage="You have no classes scheduled for today."
+            viewAllHref="/dashboard/learner/timetable"
+          />
         </div>
       </div>
 
