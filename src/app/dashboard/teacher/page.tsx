@@ -2,6 +2,7 @@
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import StatCard from "@/components/dashboard/StatCard";
+import TodaysSchedule from "@/components/dashboard/TodaysSchedule";
 import Link from "next/link";
 
 const teacherNav = [
@@ -35,34 +36,13 @@ export default function TeacherDashboard() {
       </div>
 
       <div className="grid lg:grid-cols-3 gap-6">
-        {/* Today's Schedule */}
-        <div className="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
-          <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
-            <span>📅</span> Today&apos;s Schedule
-          </h2>
-          <div className="space-y-3">
-            {[
-              { time: "7:30 - 8:30", subject: "Mathematics", class: "Primary 1", status: "completed", color: "border-l-blue-500 bg-blue-50" },
-              { time: "8:45 - 9:45", subject: "English Language", class: "Primary 2", status: "current", color: "border-l-green-500 bg-green-50" },
-              { time: "10:00 - 11:00", subject: "Integrated Science", class: "Primary 1", status: "upcoming", color: "border-l-orange-500 bg-orange-50" },
-              { time: "11:15 - 12:15", subject: "Mathematics", class: "Primary 3", status: "upcoming", color: "border-l-purple-500 bg-purple-50" },
-            ].map((item, i) => (
-              <div key={i} className={`p-4 rounded-xl border-l-4 ${item.color} flex items-center justify-between`}>
-                <div>
-                  <p className="font-semibold text-sm text-slate-700">{item.subject}</p>
-                  <p className="text-xs text-slate-500">{item.class} • {item.time}</p>
-                </div>
-                <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                  item.status === "completed" ? "bg-green-100 text-green-600" :
-                  item.status === "current" ? "bg-blue-100 text-blue-600" :
-                  "bg-slate-100 text-slate-500"
-                }`}>
-                  {item.status === "completed" ? "✓ Done" : item.status === "current" ? "● Live" : "Upcoming"}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
+        <TodaysSchedule
+          className="lg:col-span-2"
+          showClass
+          showTeacher={false}
+          emptyMessage="No periods are scheduled for you today."
+          viewAllHref="/dashboard/teacher/timetable"
+        />
 
         {/* Quick Actions */}
         <div className="space-y-6">

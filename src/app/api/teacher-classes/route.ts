@@ -19,8 +19,8 @@ export async function GET(request: NextRequest) {
     if (classId) conditions.push(eq(teacherClasses.classId, classId));
     if (teacherId) conditions.push(eq(teacherClasses.teacherId, teacherId));
 
-    // Teachers see their own assignments
-    if (payload.role === "teacher" && !teacherId) {
+    // Teachers can only see their own class assignments, regardless of query parameters.
+    if (payload.role === "teacher") {
       conditions.push(eq(teacherClasses.teacherId, payload.userId));
     }
 
@@ -28,7 +28,7 @@ export async function GET(request: NextRequest) {
       ? conditions.reduce((a, b) => and(a, b)!)
       : undefined;
 
-    const results = await db
+    const assignments = await db
       .select({
         id: teacherClasses.id,
         teacherId: teacherClasses.teacherId,
@@ -50,7 +50,50 @@ export async function GET(request: NextRequest) {
       .where(whereClause)
       .orderBy(desc(teacherClasses.createdAt));
 
-    return successResponse(results);
+    if (payload.role !== "teacher" || (teacherId && teacherId !== payload.userId)) {
+      return successResponse(assignments);
+    }
+
+    // A class teacher may not have a subject-level teacher_classes record.
+    // Include those homeroom classes so they can still access their class list.
+    const homeroomClasses = await db
+      .select({
+        id: classes.id,
+        name: classes.name,
+        level: classes.level,
+        academicYearId: classes.academicYearId,
+        createdAt: classes.createdAt,
+      })
+      .from(classes)
+      .where(
+        classId
+          ? and(
+              eq(classes.classTeacherId, payload.userId),
+              eq(classes.id, classId)
+            )
+          : eq(classes.classTeacherId, payload.userId)
+      )
+      .orderBy(desc(classes.createdAt));
+
+    const assignedClassIds = new Set(assignments.map((assignment) => assignment.classId));
+    const homeroomAssignments = homeroomClasses
+      .filter((homeroomClass) => !assignedClassIds.has(homeroomClass.id))
+      .map((homeroomClass) => ({
+        id: `homeroom-${homeroomClass.id}`,
+        teacherId: payload.userId,
+        classId: homeroomClass.id,
+        subjectId: null,
+        academicYearId: homeroomClass.academicYearId,
+        createdAt: homeroomClass.createdAt,
+        teacherFirstName: null,
+        teacherLastName: null,
+        teacherEmail: null,
+        className: homeroomClass.name,
+        classLevel: homeroomClass.level,
+        subjectName: "Homeroom Teacher",
+      }));
+
+    return successResponse([...assignments, ...homeroomAssignments]);
   } catch (error) {
     console.error("Teacher classes error:", error);
     return errorResponse("Internal server error", 500);

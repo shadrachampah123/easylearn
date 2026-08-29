@@ -2,6 +2,7 @@
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import StatCard from "@/components/dashboard/StatCard";
+import TodaysSchedule from "@/components/dashboard/TodaysSchedule";
 import Link from "next/link";
 
 const parentNav = [
@@ -89,6 +90,13 @@ export default function ParentDashboard() {
 
         {/* Right Column */}
         <div className="space-y-6">
+          <TodaysSchedule
+            title="Today's Classes"
+            showClass
+            emptyMessage="Your child has no classes scheduled for today."
+            viewAllHref="/dashboard/parent/timetable"
+          />
+
           {/* Upcoming */}
           <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
             <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
