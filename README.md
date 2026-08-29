@@ -50,6 +50,39 @@ DATABASE_URL="your-neon-connection-string" npx drizzle-kit push
 
 Then open your deployed app and go to `/api/seed` (POST request) to create demo data.
 
+#### Step 4b: Keep migrations up to date
+
+`drizzle-kit push` creates the base schema, but every feature since then ships a numbered SQL
+file in `drizzle/`. Apply them after deploys:
+
+```bash
+# all pending migrations (idempotent - safe to re-run)
+DATABASE_URL="your-neon-connection-string" node run-migration.js
+
+# a single file
+DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_identity_columns.sql
+```
+
+| File | What it adds |
+| --- | --- |
+| `0001_assignment_grading.sql` | Auto-grading: questions, submissions, corrections |
+| `0002_optional_email.sql` | Optional email + username login |
+| `0003_timetable.sql` | `timetable_entries` |
+| `0004_dashboard_overrides.sql` | `dashboard_card_overrides` (manual dashboard card values) |
+| `0005_activity_enhancements.sql` | `activity_logs.entity_type/entity_id/description` (admin activity feed) |
+| `0006_user_identity_columns.sql` | `users.username`, `users.must_change_password` (these existed in `src/db/schema.ts` but in no migration) |
+
+Notes:
+
+- The dashboards are **degrade-instead-of-crash**: a missing migration disables that section and
+  shows a warning banner on the admin dashboard, it no longer returns a 500 blank page.
+- On request, EasyLearn will try to create the *optional* objects above itself using idempotent
+  DDL (logged as "created automatically"). Set `AUTO_SCHEMA_REPAIR=false` if your database role is
+  not allowed to run DDL.
+- `0004`/`0005` used to contain shell-escaped `\"` quotes, so they failed with a syntax error that
+  the old runner swallowed. The files are fixed and `run-migration.js` now exits non-zero whenever
+  a statement genuinely could not be applied.
+
 #### Step 5: Your Permanent PWA Link! 🎉
 
 Your app will be live at: `https://easylearn-xxx.vercel.app`

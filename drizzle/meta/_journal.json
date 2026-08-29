@@ -43,6 +43,13 @@
       "when": 1756400000004,
       "tag": "0005_activity_enhancements",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1756400000005,
+      "tag": "0006_user_identity_columns",
+      "breakpoints": true
     }
   ]
 }

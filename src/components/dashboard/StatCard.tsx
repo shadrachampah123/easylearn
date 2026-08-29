@@ -15,13 +15,13 @@ export default function StatCard({ icon, label, value, change, color }: StatCard
         <div className={`w-12 h-12 rounded-xl ${color} flex items-center justify-center text-xl group-hover:scale-110 transition-transform`}>
           {icon}
         </div>
-        {change && (
+        {typeof change === "string" && change.length > 0 && (
           <span className={`text-xs font-semibold px-2 py-1 rounded-lg ${change.startsWith("+") ? "bg-green-100 text-green-600" : "bg-red-100 text-red-600"}`}>
             {change}
           </span>
         )}
       </div>
-      <p className="text-2xl font-bold text-slate-800">{value}</p>
+      <p className="text-2xl font-bold text-slate-800">{value ?? "—"}</p>
       <p className="text-xs text-slate-500 mt-1">{label}</p>
     </div>
   );

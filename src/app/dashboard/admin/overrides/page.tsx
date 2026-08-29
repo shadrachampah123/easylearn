@@ -30,6 +30,8 @@ export default function AdminOverridesPage() {
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<CardOverride | null>(null);
   const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [form, setForm] = useState({
     cardKey: "",
@@ -54,9 +56,21 @@ export default function AdminOverridesPage() {
     setLoading(true);
     try {
       const res = await fetch("/api/dashboard/overrides", { headers: { Authorization: `Bearer ${token}` } });
-      const data = await res.json();
-      if (data.success) setOverrides(data.data);
-    } catch (err) { console.error(err); } finally { setLoading(false); }
+      const data = await res.json().catch(() => null);
+      if (data?.success) {
+        setOverrides(Array.isArray(data.data) ? data.data : []);
+        setNotice(data?.meta?.warning?.message || null);
+        setLoadError(null);
+      } else {
+        // Missing migration or DB outage: explain instead of silently showing an empty list.
+        setOverrides([]);
+        setNotice(null);
+        setLoadError(data?.error || `Could not load overrides (HTTP ${res.status})`);
+      }
+    } catch (err) {
+      console.error(err);
+      setLoadError("Could not reach the server. Check your connection and retry.");
+    } finally { setLoading(false); }
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -71,14 +85,22 @@ export default function AdminOverridesPage() {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ ...form, scopeId: form.scopeId || null, sortOrder: Number(form.sortOrder) || 0 }),
       });
-      const data = await res.json();
-      if (data.success) {
+      const data = await res.json().catch(() => null);
+      if (data?.success) {
         setShowForm(false);
         setEditing(null);
+        setLoadError(null);
         setForm({ cardKey: "", dashboardRole: "admin", title: "", label: "", value: "", subtitle: "", description: "", trend: "", isVisible: true, sortOrder: 0, isEnabled: true, scopeType: "global", scopeId: "" });
         load();
-      } else alert(data.error);
-    } catch (err) { console.error(err); } finally { setSaving(false); }
+      } else {
+        const message = data?.error || `Could not save the override (HTTP ${res.status})`;
+        setLoadError(message);
+        alert(message);
+      }
+    } catch (err) {
+      console.error(err);
+      setLoadError("Could not save the override. Please retry.");
+    } finally { setSaving(false); }
   }
 
   function openEdit(ov: CardOverride) {
@@ -106,16 +128,22 @@ export default function AdminOverridesPage() {
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch(`/api/dashboard/overrides/${id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
-      const data = await res.json();
-      if (data.success) load();
-      else alert(data.error);
+      const data = await res.json().catch(() => null);
+      if (data?.success) load();
+      else {
+        const message = data?.error || `Could not delete the override (HTTP ${res.status})`;
+        setLoadError(message);
+        alert(message);
+      }
     } catch (err) { console.error(err); }
   }
 
   async function toggle(ov: CardOverride) {
     const token = localStorage.getItem("el_token");
     try {
-      await fetch(`/api/dashboard/overrides/${ov.id}`, { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ isEnabled: !ov.isEnabled }) });
+      const res = await fetch(`/api/dashboard/overrides/${ov.id}`, { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ isEnabled: !ov.isEnabled }) });
+      const data = await res.json().catch(() => null);
+      if (!data?.success) setLoadError(data?.error || `Could not update the override (HTTP ${res.status})`);
       load();
     } catch (err) { console.error(err); }
   }
@@ -137,6 +165,19 @@ export default function AdminOverridesPage() {
           + New Override
         </button>
       </div>
+
+      {loadError && (
+        <div className="bg-red-50 border border-red-200 rounded-2xl p-4 mb-6 flex items-start justify-between gap-3">
+          <p className="text-sm text-red-700">❌ {loadError}</p>
+          <button onClick={() => load()} className="shrink-0 text-xs font-semibold text-red-700 hover:text-red-900">Retry</button>
+        </div>
+      )}
+
+      {notice && !loadError && (
+        <div className="bg-sky-50 border border-sky-200 rounded-2xl p-4 mb-6">
+          <p className="text-sm text-sky-800">ℹ️ {notice}</p>
+        </div>
+      )}
 
       <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-6">
         <h3 className="font-semibold text-amber-800 flex items-center gap-2">💡 How overrides work</h3>
@@ -184,7 +225,7 @@ export default function AdminOverridesPage() {
                   <p className="text-sm text-slate-700"><span className="text-slate-400">Title:</span> {ov.title || ov.label || "—"} | <span className="text-slate-400">Value:</span> <strong className="text-primary-600">{ov.value || "—"}</strong> {ov.trend && <span className="text-slate-500">({ov.trend})</span>}</p>
                   {ov.subtitle && <p className="text-xs text-slate-500 mt-1">Subtitle: {ov.subtitle}</p>}
                   {ov.description && <p className="text-xs text-slate-500">Description: {ov.description}</p>}
-                  <p className="text-xs text-slate-400 mt-2">Sort: {ov.sortOrder} • Updated: {new Date(ov.updatedAt).toLocaleString()}</p>
+                  <p className="text-xs text-slate-400 mt-2">Sort: {ov.sortOrder ?? 0} • Updated: {ov.updatedAt && !Number.isNaN(new Date(ov.updatedAt).getTime()) ? new Date(ov.updatedAt).toLocaleString() : "—"}{ov.scopeId ? ` • Scope id: ${ov.scopeId.slice(0, 8)}` : ""}</p>
                 </div>
                 <div className="flex items-center gap-1">
                   <button onClick={() => toggle(ov)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold ${ov.isEnabled ? "bg-amber-100 text-amber-700 hover:bg-amber-200" : "bg-green-100 text-green-700 hover:bg-green-200"}`}>{ov.isEnabled ? "Disable" : "Enable"}</button>
