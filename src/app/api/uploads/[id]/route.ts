@@ -6,6 +6,7 @@ import { uploadedFiles } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { deleteObject, getObjectStorageConfig } from "@/lib/object-storage";
 import { eq } from "drizzle-orm";
 import { uploadStorageDir } from "@/lib/upload-storage";
 
@@ -44,10 +45,14 @@ export async function DELETE(
     }
 
     // Remove the database row first so nothing can resolve it mid-delete,
-    // then remove the bytes (best effort — a missing file on disk is fine).
+    // then remove the bytes (best effort — a missing object/file is fine).
     await db.delete(uploadedFiles).where(eq(uploadedFiles.id, id));
 
-    await unlink(path.join(uploadStorageDir(), row.storedName)).catch(() => undefined);
+    if (row.storageBackend === "object") {
+      await deleteObject(getObjectStorageConfig(), row.storedName);
+    } else {
+      await unlink(path.join(uploadStorageDir(), row.storedName)).catch(() => undefined);
+    }
 
     return successResponse({ message: "File deleted" });
   } catch (error) {

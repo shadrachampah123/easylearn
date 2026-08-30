@@ -265,6 +265,10 @@ export const uploadedFiles = pgTable("uploaded_files", {
   mimeType: varchar("mime_type", { length: 150 }),
   category: varchar("category", { length: 20 }).notNull(), // document | image | audio | video | zip
   sizeBytes: integer("size_bytes").notNull(),
+  // Where the bytes live: "local" (disk under UPLOAD_DIR) or "object" (cloud
+  // object storage such as S3/R2 — stored_name then holds the object key).
+  // (Added by drizzle/0010_object_storage.sql.)
+  storageBackend: varchar("storage_backend", { length: 20 }).notNull().default("local"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 

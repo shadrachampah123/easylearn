@@ -7,6 +7,7 @@ import { db } from "@/db";
 import { assignments, uploadedFiles } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { getObjectStorageConfig, objectDownloadUrl } from "@/lib/object-storage";
 import { uploadStorageDir } from "@/lib/upload-storage";
 import { isInlinePreviewable } from "@/lib/uploads";
 import { eq } from "drizzle-orm";
@@ -89,6 +90,27 @@ export async function GET(
       }
     }
     // Purpose "assignment": any authenticated user may read it.
+
+    /* ── Cloud object storage: redirect to a presigned (or public) URL ──
+       Media/PDF clients follow the redirect and then issue Range requests
+       directly against the object store, so large video/audio streams never
+       pass through this serverless function. */
+    if (row.storageBackend === "object") {
+      const config = getObjectStorageConfig();
+      if (!config.enabled) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: "This file is stored in cloud object storage, which is not configured.",
+          }),
+          { status: 404, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response(null, {
+        status: 307,
+        headers: { Location: objectDownloadUrl(config, row.storedName) },
+      });
+    }
 
     const absolutePath = path.join(uploadStorageDir(), row.storedName);
 

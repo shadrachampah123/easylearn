@@ -74,6 +74,7 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 | `0007_quiz_images.sql` | `quiz_questions.image_url` (Kahoot question images) |
 | `0008_easyai_grading.sql` | EasyAI: `assignments.ai_grading_enabled`/`ai_max_marks`, `submissions.graded_by`/`ai_report` |
 | `0009_file_uploads.sql` | Local file uploads: `assignments.allow_file_uploads` (teacher-controlled learner-upload gate) + `uploaded_files` registry |
+| `0010_object_storage.sql` | Cloud object storage: `uploaded_files.storage_backend` (`local` \| `object`) so file bytes can live in S3 / Cloudflare R2 / MinIO |
 
 Notes:
 
@@ -155,6 +156,50 @@ Notes:
   admins) and supports HTTP byte-range requests so video/audio players can seek.
 - Requires migration `0009_file_uploads.sql` (apply with `node run-migration.js`; the routes also
   self-heal it on demand while `AUTO_SCHEMA_REPAIR` is on).
+
+#### Cloud object storage (bypasses the Vercel ~4.5 MB body limit)
+
+Serverless hosts like Vercel cap request bodies (~4.5 MB), so large video uploads fail when the
+file is POSTed through the app. When object storage is configured, the browser uploads **directly
+to the bucket** via presigned URLs and the bytes never touch the serverless function — allowing
+the full 100 MB video limit.
+
+- **How it works.** The uploader first calls `GET /api/uploads` to discover the backend. With
+  object storage enabled it posts file metadata (name, type, size — *not* the bytes) to
+  `POST /api/uploads/presign`, which runs the same role/purpose/assignment checks as the multipart
+  endpoint, registers the file in `uploaded_files` (with `storage_backend = 'object'`), and
+  returns a **presigned PUT URL**. The browser then PUTs the bytes straight to the bucket. Downloads
+  `GET /api/files/[id]` redirect (307) to a fresh presigned GET URL, so the bucket can stay
+  **fully private** and Range-seeking video still works.
+- **Providers.** AWS S3 or any S3-compatible store (Cloudflare R2, MinIO). Signature Version 4 is
+  implemented in `src/lib/object-storage.ts` with no SDK dependency, so there is nothing extra to
+  install.
+- **Configuration** (see `.env.example`):
+
+  ```env
+  # AWS S3
+  OBJECT_STORAGE_BUCKET=easylearn-files
+  OBJECT_STORAGE_REGION=us-east-1
+  OBJECT_STORAGE_ACCESS_KEY_ID=AKIA...
+  OBJECT_STORAGE_SECRET_ACCESS_KEY=...
+
+  # Cloudflare R2 (alternative)
+  OBJECT_STORAGE_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
+  OBJECT_STORAGE_REGION=auto
+  ```
+
+  Optional: `OBJECT_STORAGE_FORCE_PATH_STYLE`, `OBJECT_STORAGE_PUBLIC_URL` (public-read buckets),
+  `OBJECT_STORAGE_UPLOAD_EXPIRY`, `OBJECT_STORAGE_DOWNLOAD_EXPIRY`.
+- **Bucket CORS.** The browser PUTs to the bucket, so allow the app origin:
+
+  - AllowedOrigins: `https://your-app.vercel.app`
+  - AllowedMethods: `PUT, GET, HEAD, DELETE`
+  - AllowedHeaders: `content-type`
+  - ExposeHeaders: `ETag`
+- **Fallback.** With no bucket configured, uploads keep using local disk (`POST /api/uploads`),
+  exactly as before. The same `uploaded_files` rows and access-control rules apply either way.
+- Requires migration `0010_object_storage.sql` (`uploaded_files.storage_backend`), which the routes
+  also self-heal on demand while `AUTO_SCHEMA_REPAIR` is on.
 
 #### Step 5: Your Permanent PWA Link! 🎉
 
@@ -252,4 +297,10 @@ src/
 ```env
 DATABASE_URL=postgresql://user:pass@host:5432/dbname
 JWT_SECRET=your-secret-key
+
+# Optional: cloud object storage for large file uploads (see the section above)
+OBJECT_STORAGE_BUCKET=easylearn-files
+OBJECT_STORAGE_ACCESS_KEY_ID=...
+OBJECT_STORAGE_SECRET_ACCESS_KEY=...
+# R2 only: OBJECT_STORAGE_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com and OBJECT_STORAGE_REGION=auto
 ```

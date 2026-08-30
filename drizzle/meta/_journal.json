@@ -71,6 +71,13 @@
       "when": 1756400000008,
       "tag": "0009_file_uploads",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1756400000009,
+      "tag": "0010_object_storage",
+      "breakpoints": true
     }
   ]
 }

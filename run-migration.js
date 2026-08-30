@@ -87,6 +87,7 @@ async function run() {
           "0007_quiz_images.sql",
           "0008_easyai_grading.sql",
           "0009_file_uploads.sql",
+          "0010_object_storage.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root
