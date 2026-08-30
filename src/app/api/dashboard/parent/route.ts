@@ -202,6 +202,36 @@ export async function GET(request: NextRequest) {
       });
     }
 
+    const { quizzes, quizAttempts } = await import("@/db/schema");
+    const parentQuizzes = classId
+      ? await db
+          .select({
+            id: quizzes.id,
+            title: quizzes.title,
+            createdAt: quizzes.createdAt,
+          })
+          .from(quizzes)
+          .where(and(eq(quizzes.classId, classId), eq(quizzes.isPublished, true)))
+          .limit(5)
+      : [];
+
+    const parentQuizAttempts = await db
+      .select({ quizId: quizAttempts.quizId })
+      .from(quizAttempts)
+      .where(and(eq(quizAttempts.learnerId, targetLearnerId), sql`${quizAttempts.completedAt} IS NOT NULL`));
+    const completedParentQuizIds = new Set(parentQuizAttempts.map(a => a.quizId));
+
+    for (const q of parentQuizzes) {
+      if (!completedParentQuizIds.has(q.id)) {
+        filteredHomework.push({
+          id: q.id,
+          title: `[Quiz] ${q.title}`,
+          due: null,
+          status: "pending",
+        });
+      }
+    }
+
     // Announcements
     const recentAnnouncements = await db
       .select({

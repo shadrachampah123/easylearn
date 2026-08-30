@@ -13,6 +13,7 @@ import {
   learnerPoints,
   learnerAchievements,
   achievements,
+  quizzes,
 } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
@@ -149,6 +150,35 @@ export async function GET(request: NextRequest) {
           .limit(5)
       : [];
 
+    const publishedQuizzes = classId
+      ? await db
+          .select({
+            id: quizzes.id,
+            title: quizzes.title,
+            subjectName: sql<string>`(SELECT name FROM subjects WHERE id = ${quizzes.subjectId})`,
+          })
+          .from(quizzes)
+          .where(and(eq(quizzes.classId, classId), eq(quizzes.isPublished, true)))
+          .limit(5)
+      : [];
+
+    const completedQuizAttempts = await db
+      .select({ quizId: quizAttempts.quizId })
+      .from(quizAttempts)
+      .where(and(eq(quizAttempts.learnerId, learnerId), sql`${quizAttempts.completedAt} IS NOT NULL`));
+    const completedQuizIds = new Set(completedQuizAttempts.map(a => a.quizId));
+
+    const upcomingQuizzes = publishedQuizzes
+      .filter(q => !completedQuizIds.has(q.id))
+      .map(q => ({
+        id: q.id,
+        title: q.title,
+        subject: q.subjectName,
+        due: null,
+        type: "quiz",
+        urgency: "normal",
+      }));
+
     // Recent grades
     const recentGrades = await db
       .select({
@@ -222,7 +252,8 @@ export async function GET(request: NextRequest) {
         subject: d.subjectName,
         due: d.dueDate,
         urgency: d.dueDate && new Date(d.dueDate).getTime() - now.getTime() < 24 * 60 * 60 * 1000 ? "urgent" : "normal",
-      })),
+        type: "assignment",
+      })).concat(upcomingQuizzes),
       recentGrades: recentGrades.map(g => ({
         id: g.id,
         title: g.assignmentTitle,

@@ -315,6 +315,7 @@ export const quizQuestions = pgTable("quiz_questions", {
   quizId: uuid("quiz_id").notNull().references(() => quizzes.id),
   questionType: quizQuestionTypeEnum("question_type").notNull(),
   questionText: text("question_text").notNull(),
+  imageUrl: text("image_url"),
   options: jsonb("options"),
   correctAnswer: text("correct_answer"),
   points: integer("points").default(1),

@@ -84,6 +84,7 @@ async function run() {
           "0004_dashboard_overrides.sql",
           "0005_activity_enhancements.sql",
           "0006_user_identity_columns.sql",
+          "0007_quiz_images.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root
