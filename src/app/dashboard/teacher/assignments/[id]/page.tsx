@@ -21,10 +21,31 @@ interface Submission {
   score: number | null;
   maxScore: number | null;
   percentage: number | null;
+  feedback: string | null;
+  content: string | null;
   submittedAt: string | null;
+  gradedAt: string | null;
   learnerFirstName: string;
   learnerLastName: string;
   learnerId: string;
+}
+
+interface GradedAnswer {
+  questionId: string;
+  questionText: string;
+  questionType: string;
+  options: string[] | null;
+  correctAnswer: string | null;
+  explanation: string | null;
+  answer: string | null;
+  isCorrect: boolean;
+  pointsAwarded: number;
+  pointsPossible: number;
+}
+
+interface SubmissionDetail extends Submission {
+  answers: GradedAnswer[];
+  assignmentTitle: string;
 }
 
 interface Assignment {
@@ -41,6 +62,8 @@ interface Assignment {
   createdAt: string;
   submissions: Submission[];
   questions: Question[];
+  pendingLearners: { learnerId: string; firstName: string | null; lastName: string | null }[];
+  awaitingGrading: number;
 }
 
 const teacherNav = [
@@ -54,8 +77,12 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
   const resolvedParams = use(params);
   const [assignment, setAssignment] = useState<Assignment | null>(null);
   const [loading, setLoading] = useState(true);
-  const [grading, setGrading] = useState<string | null>(null);
-  const [gradeForm, setGradeForm] = useState({ score: 0, feedback: "" });
+  const [grading, setGrading] = useState<SubmissionDetail | null>(null);
+  const [gradeLoading, setGradeLoading] = useState(false);
+  const [gradeSaving, setGradeSaving] = useState(false);
+  const [gradeError, setGradeError] = useState<string | null>(null);
+  const [questionMarks, setQuestionMarks] = useState<Record<string, number>>({});
+  const [gradeForm, setGradeForm] = useState({ score: 0, maxScore: 100, feedback: "" });
   const [showQuestionBuilder, setShowQuestionBuilder] = useState(false);
   const [questionForm, setQuestionForm] = useState({
     questionType: "mcq",
@@ -89,29 +116,88 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
     }
   }
 
-  async function handleGrade(submissionId: string) {
+  /** Open the grading panel and pull in what the learner actually wrote. */
+  async function openGrading(sub: Submission) {
+    setGradeError(null);
+    setGradeLoading(true);
+    setGrading({ ...sub, answers: [], assignmentTitle: assignment?.title || "" } as SubmissionDetail);
     const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/submissions/${submissionId}/grade`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(gradeForm),
-      });
+      const res = await fetch(`/api/submissions/${sub.id}`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
       if (data.success) {
-        setGrading(null);
-        setGradeForm({ score: 0, feedback: "" });
-        loadAssignment();
+        const detail = data.data as SubmissionDetail;
+        setGrading(detail);
+        const marks: Record<string, number> = {};
+        for (const a of detail.answers) marks[a.questionId] = a.pointsAwarded ?? 0;
+        setQuestionMarks(marks);
+
+        const questionMax = detail.answers.reduce((sum, a) => sum + (a.pointsPossible || 0), 0);
+        const max = detail.maxScore ?? (questionMax > 0 ? questionMax : (assignment?.maxScore ?? 100));
+        setGradeForm({
+          score: detail.score ?? detail.answers.reduce((sum, a) => sum + (a.pointsAwarded || 0), 0),
+          maxScore: max || 100,
+          feedback: detail.feedback ?? "",
+        });
       } else {
-        alert(data.error);
+        setGradeError(data.error || "This submission could not be loaded.");
       }
     } catch (err) {
       console.error(err);
+      setGradeError("This submission could not be loaded.");
+    } finally {
+      setGradeLoading(false);
     }
   }
+
+  function closeGrading() {
+    setGrading(null);
+    setQuestionMarks({});
+    setGradeError(null);
+  }
+
+  async function handleGrade() {
+    if (!grading) return;
+    setGradeSaving(true);
+    setGradeError(null);
+
+    const token = localStorage.getItem("el_token");
+    // Question-by-question when the assignment has questions, otherwise a single mark.
+    const payload = grading.answers.length > 0
+      ? {
+          feedback: gradeForm.feedback,
+          answers: grading.answers.map((a) => ({
+            questionId: a.questionId,
+            pointsAwarded: Number(questionMarks[a.questionId] ?? 0),
+          })),
+        }
+      : { score: Number(gradeForm.score), maxScore: Number(gradeForm.maxScore), feedback: gradeForm.feedback };
+
+    try {
+      const res = await fetch(`/api/submissions/${grading.id}/grade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.success) {
+        closeGrading();
+        loadAssignment();
+      } else {
+        setGradeError(data.error || "The grade could not be saved.");
+      }
+    } catch (err) {
+      console.error(err);
+      setGradeError("The grade could not be saved.");
+    } finally {
+      setGradeSaving(false);
+    }
+  }
+
+  const awardedTotal = grading
+    ? grading.answers.reduce((sum, a) => sum + (Number(questionMarks[a.questionId]) || 0), 0)
+    : 0;
+  const possibleTotal = grading ? grading.answers.reduce((sum, a) => sum + (a.pointsPossible || 0), 0) : 0;
 
   async function handleAddQuestion(e: React.FormEvent) {
     e.preventDefault();
@@ -617,94 +703,244 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
 
       {/* Submissions List */}
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100">
-        <div className="p-4 border-b border-slate-100">
+        <div className="p-4 border-b border-slate-100 flex items-center justify-between">
           <h2 className="font-bold text-lg text-slate-800">Submissions</h2>
+          {assignment.awaitingGrading > 0 && (
+            <span className="px-3 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-bold">
+              {assignment.awaitingGrading} waiting to be graded
+            </span>
+          )}
         </div>
+
         {assignment.submissions.length === 0 ? (
-          <div className="p-8 text-center text-slate-500">No submissions yet</div>
+          <div className="p-8 text-center text-slate-500">
+            No submissions yet.
+            {assignment.pendingLearners?.length > 0 && (
+              <p className="text-sm mt-2 text-slate-400">
+                {assignment.pendingLearners.length} learner(s) in {assignment.className} have not submitted.
+              </p>
+            )}
+          </div>
         ) : (
           <div className="divide-y divide-slate-100">
-            {assignment.submissions.map((sub) => (
-              <div key={sub.id} className="p-4 flex items-center justify-between hover:bg-slate-50">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-secondary-100 flex items-center justify-center text-secondary-600 font-bold">
-                    {sub.learnerFirstName?.[0]}{sub.learnerLastName?.[0]}
+            {assignment.submissions.map((sub) => {
+              const isGraded = sub.status === "graded";
+              const awaiting = sub.status === "submitted" || sub.status === "late";
+              return (
+                <div key={sub.id} className="p-4 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-50">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-secondary-100 flex items-center justify-center text-secondary-600 font-bold">
+                      {sub.learnerFirstName?.[0]}{sub.learnerLastName?.[0]}
+                    </div>
+                    <div>
+                      <p className="font-medium text-slate-700">{sub.learnerFirstName} {sub.learnerLastName}</p>
+                      <p className="text-xs text-slate-400">
+                        {sub.submittedAt ? `Submitted ${new Date(sub.submittedAt).toLocaleString()}` : "Not submitted"}
+                        {sub.gradedAt ? ` · graded ${new Date(sub.gradedAt).toLocaleString()}` : ""}
+                      </p>
+                    </div>
+                    {sub.status === "late" && (
+                      <span className="px-2 py-1 rounded bg-orange-100 text-orange-600 text-xs font-semibold">Late</span>
+                    )}
+                    {awaiting && (
+                      <span className="px-2 py-1 rounded bg-amber-100 text-amber-700 text-xs font-semibold">Needs grading</span>
+                    )}
                   </div>
-                  <div>
-                    <p className="font-medium text-slate-700">{sub.learnerFirstName} {sub.learnerLastName}</p>
-                    <p className="text-xs text-slate-400">
-                      {sub.submittedAt ? `Submitted: ${new Date(sub.submittedAt).toLocaleString()}` : "Not submitted"}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  {sub.status === "graded" ? (
-                    <div className="flex items-center gap-2">
+
+                  <div className="flex items-center gap-2">
+                    {isGraded && (
                       <span className="px-3 py-1.5 rounded-lg bg-green-100 text-green-700 font-bold text-sm">
-                        {sub.score}/{sub.maxScore} ({sub.percentage}%)
+                        {sub.score}/{sub.maxScore ?? assignment.maxScore}
+                        {sub.percentage !== null && sub.percentage !== undefined ? ` (${sub.percentage}%)` : ""}
                       </span>
+                    )}
+                    {isGraded && (
                       <button
                         onClick={() => handleViewResults(sub.learnerId)}
                         className="px-3 py-1.5 rounded-lg bg-blue-100 text-blue-600 text-sm font-semibold hover:bg-blue-200"
                       >
                         View Details
                       </button>
-                    </div>
-                  ) : sub.status === "submitted" || sub.status === "late" ? (
-                    grading === sub.id ? (
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          min={0}
-                          max={assignment.maxScore}
-                          value={gradeForm.score}
-                          onChange={(e) => setGradeForm({ ...gradeForm, score: parseInt(e.target.value) || 0 })}
-                          className="w-20 px-3 py-2 rounded-lg border border-slate-200 text-sm"
-                          placeholder="Score"
-                        />
-                        <input
-                          type="text"
-                          value={gradeForm.feedback}
-                          onChange={(e) => setGradeForm({ ...gradeForm, feedback: e.target.value })}
-                          className="w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm"
-                          placeholder="Feedback"
-                        />
-                        <button
-                          onClick={() => handleGrade(sub.id)}
-                          className="px-3 py-2 rounded-lg bg-green-500 text-white text-sm font-semibold"
-                        >
-                          Save
-                        </button>
-                        <button
-                          onClick={() => setGrading(null)}
-                          className="px-3 py-2 rounded-lg bg-slate-200 text-slate-600 text-sm"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
+                    )}
+                    {(awaiting || isGraded) && (
                       <button
-                        onClick={() => {
-                          setGrading(sub.id);
-                          setGradeForm({ score: 0, feedback: "" });
-                        }}
-                        className="px-4 py-2 rounded-lg bg-secondary-100 text-secondary-600 text-sm font-semibold hover:bg-secondary-200"
+                        onClick={() => openGrading(sub)}
+                        className={`px-4 py-2 rounded-lg text-sm font-semibold ${
+                          awaiting
+                            ? "bg-secondary-500 text-white hover:bg-secondary-600"
+                            : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                        }`}
                       >
-                        Grade
+                        {isGraded ? "Re-grade" : "Grade"}
                       </button>
-                    )
-                  ) : (
-                    <span className="text-sm text-slate-400">Pending</span>
-                  )}
-                  {sub.status === "late" && (
-                    <span className="px-2 py-1 rounded bg-orange-100 text-orange-600 text-xs">Late</span>
-                  )}
+                    )}
+                    {sub.status === "pending" && <span className="text-sm text-slate-400">Pending</span>}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
+          </div>
+        )}
+
+        {assignment.pendingLearners?.length > 0 && assignment.submissions.length > 0 && (
+          <div className="p-4 border-t border-slate-100 text-xs text-slate-500">
+            Not submitted yet:{" "}
+            {assignment.pendingLearners
+              .map((p: { firstName: string | null; lastName: string | null }) => `${p.firstName ?? ""} ${p.lastName ?? ""}`.trim())
+              .join(", ")}
           </div>
         )}
       </div>
+
+      {/* Grading Panel */}
+      {grading && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={closeGrading}>
+          <div
+            className="bg-white rounded-2xl max-w-3xl w-full max-h-[88vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="p-5 border-b border-slate-100 sticky top-0 bg-white z-10 flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-bold text-slate-800">
+                  Grade {grading.learnerFirstName} {grading.learnerLastName}
+                </h3>
+                <p className="text-xs text-slate-500">{grading.assignmentTitle}</p>
+              </div>
+              <button onClick={closeGrading} className="text-slate-400 hover:text-slate-600 text-2xl">✕</button>
+            </div>
+
+            {gradeLoading ? (
+              <div className="p-10 text-center text-slate-500">Loading the submission…</div>
+            ) : (
+              <div className="p-5 space-y-5">
+                {gradeError && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-sm">{gradeError}</div>
+                )}
+
+                {grading.content && (
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-700 mb-2">Learner&apos;s written answer</h4>
+                    <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-700 whitespace-pre-wrap max-h-64 overflow-y-auto">
+                      {grading.content}
+                    </div>
+                  </div>
+                )}
+
+                {grading.answers.length > 0 ? (
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-sm font-semibold text-slate-700">Award marks per question</h4>
+                      <span className="text-sm font-bold text-slate-800">
+                        {awardedTotal} / {possibleTotal} pts
+                      </span>
+                    </div>
+                    <div className="space-y-3">
+                      {grading.answers.map((a, i) => (
+                        <div key={a.questionId} className="p-4 rounded-xl border border-slate-200">
+                          <div className="flex items-start justify-between gap-3 mb-2">
+                            <div className="flex-1">
+                              <p className="text-sm font-semibold text-slate-700">Q{i + 1}. {a.questionText}</p>
+                              <p className="text-xs text-slate-500 mt-1">
+                                Answer: <span className="font-semibold">{a.answer || "(no answer)"}</span>
+                                {a.correctAnswer ? <> · Key: <span className="text-green-700 font-semibold">{a.correctAnswer}</span></> : null}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <input
+                                type="number"
+                                min={0}
+                                max={a.pointsPossible}
+                                value={questionMarks[a.questionId] ?? 0}
+                                onChange={(e) => {
+                                  const value = Math.min(Math.max(Number(e.target.value) || 0, 0), a.pointsPossible);
+                                  setQuestionMarks({ ...questionMarks, [a.questionId]: value });
+                                }}
+                                className="w-20 px-2 py-1.5 rounded-lg border border-slate-300 text-sm text-center font-semibold"
+                              />
+                              <span className="text-sm text-slate-500">/ {a.pointsPossible}</span>
+                            </div>
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setQuestionMarks({ ...questionMarks, [a.questionId]: a.pointsPossible })}
+                              className="px-2.5 py-1 rounded-lg bg-green-100 text-green-700 text-xs font-semibold hover:bg-green-200"
+                            >
+                              Full marks
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setQuestionMarks({ ...questionMarks, [a.questionId]: 0 })}
+                              className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-700 text-xs font-semibold hover:bg-rose-200"
+                            >
+                              Zero
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-1">Score</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={gradeForm.maxScore}
+                        value={gradeForm.score}
+                        onChange={(e) => setGradeForm({ ...gradeForm, score: Number(e.target.value) || 0 })}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm font-semibold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-1">Out of</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={gradeForm.maxScore}
+                        onChange={(e) => setGradeForm({ ...gradeForm, maxScore: Number(e.target.value) || 1 })}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm font-semibold"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-1">Feedback for the learner</label>
+                  <textarea
+                    value={gradeForm.feedback}
+                    onChange={(e) => setGradeForm({ ...gradeForm, feedback: e.target.value })}
+                    rows={3}
+                    placeholder="What went well, what to improve…"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-3 pt-2 border-t border-slate-100">
+                  <p className="text-xs text-slate-400">
+                    {grading.status === "graded"
+                      ? "This submission is already graded — saving will update the grade and notify the learner again."
+                      : "The learner is notified as soon as you save."}
+                  </p>
+                  <div className="flex gap-2 shrink-0">
+                    <button onClick={closeGrading} className="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 text-sm font-semibold">
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleGrade}
+                      disabled={gradeSaving}
+                      className="px-6 py-2 rounded-xl bg-green-600 text-white text-sm font-bold hover:bg-green-700 disabled:opacity-50"
+                    >
+                      {gradeSaving ? "Saving…" : "Save grade"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Results Modal */}
       {viewingResults && results && (

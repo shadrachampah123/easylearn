@@ -1,9 +1,20 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { quizzes, quizQuestions, classes, subjects, users } from "@/db/schema";
+import {
+  quizzes,
+  quizQuestions,
+  quizAttempts,
+  classes,
+  subjects,
+  users,
+  learnerClasses,
+} from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq, asc } from "drizzle-orm";
+import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { eq, asc, and, sql } from "drizzle-orm";
+
+const QUESTION_TYPES = ["mcq", "true_false", "fill_blank", "matching", "short_answer", "essay"] as const;
 
 export async function GET(
   request: NextRequest,
@@ -14,6 +25,10 @@ export async function GET(
     if (!token) return unauthorizedResponse();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
+
+    // Without quiz_questions.image_url (drizzle/0007) the `select().from(quizQuestions)`
+    // below throws 42703 and the quiz page renders "Quiz not found".
+    await ensureQuizImageColumn();
 
     const { id } = await params;
 
@@ -48,6 +63,21 @@ export async function GET(
       return notFoundResponse("Quiz");
     }
 
+    const isStaff = ["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role);
+
+    if (payload.role === "learner") {
+      if (!quiz.isPublished) {
+        return errorResponse("This quiz has not been published by your teacher yet", 403);
+      }
+      const enrolled = await db
+        .select({ classId: learnerClasses.classId })
+        .from(learnerClasses)
+        .where(eq(learnerClasses.learnerId, payload.userId));
+      if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
+        return errorResponse("This quiz was set for a different class", 403);
+      }
+    }
+
     // Get questions
     let questions = await db
       .select()
@@ -64,14 +94,30 @@ export async function GET(
 
       // Shuffle if enabled
       if (quiz.shuffleQuestions) {
-        questions = questions.sort(() => Math.random() - 0.5);
+        questions = [...questions].sort(() => Math.random() - 0.5);
       }
     }
 
-    return successResponse({ ...quiz, questions });
+    const attempts = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(quizAttempts)
+      .where(and(
+        eq(quizAttempts.quizId, id),
+        isStaff ? sql`true` : eq(quizAttempts.learnerId, payload.userId)
+      ));
+
+    return successResponse({
+      ...quiz,
+      questions,
+      attemptsUsed: Number(attempts[0]?.count ?? 0),
+      isOwner: quiz.teacherId === payload.userId,
+    });
   } catch (error) {
     console.error("Get quiz error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The quiz could not be loaded. Please retry."),
+      503
+    );
   }
 }
 
@@ -85,11 +131,16 @@ export async function PUT(
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
+    await ensureQuizImageColumn();
+
     const { id } = await params;
 
     // Check ownership
     const [existing] = await db
-      .select({ teacherId: quizzes.teacherId })
+      .select({
+        teacherId: quizzes.teacherId,
+        isPublished: quizzes.isPublished,
+      })
       .from(quizzes)
       .where(eq(quizzes.id, id))
       .limit(1);
@@ -101,48 +152,108 @@ export async function PUT(
     }
 
     const body = await request.json();
-    const { title, description, timeLimitMinutes, shuffleQuestions, shuffleAnswers, showResults, maxAttempts, isPublished, questions } = body;
+    const {
+      title,
+      description,
+      timeLimitMinutes,
+      shuffleQuestions,
+      shuffleAnswers,
+      showResults,
+      maxAttempts,
+      isPublished,
+      questions,
+    } = body;
 
-    const [updated] = await db
-      .update(quizzes)
-      .set({
-        title,
-        description,
-        timeLimitMinutes,
-        shuffleQuestions,
-        shuffleAnswers,
-        showResults,
-        maxAttempts,
-        isPublished,
-      })
-      .where(eq(quizzes.id, id))
-      .returning();
+    const replacesQuestions = Array.isArray(questions);
 
-    // Update questions if provided
-    if (questions && Array.isArray(questions)) {
-      // Delete existing questions
-      await db.delete(quizQuestions).where(eq(quizQuestions.quizId, id));
+    if (replacesQuestions) {
+      const [{ count }] = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(quizQuestions)
+        .where(eq(quizQuestions.quizId, id));
 
-      // Insert new questions
-      if (questions.length > 0) {
-        const questionsToInsert = questions.map((q: { questionType: string; questionText: string; options: unknown; correctAnswer: string; points: number }, idx: number) => ({
-          quizId: id,
-          questionType: q.questionType as "mcq" | "true_false" | "fill_blank" | "matching" | "short_answer" | "essay",
-          questionText: q.questionText,
-          options: q.options || null,
-          correctAnswer: q.correctAnswer || null,
-          points: q.points || 1,
-          orderIndex: idx,
-        }));
+      const [{ attempts }] = await db
+        .select({ attempts: sql<number>`count(*)` })
+        .from(quizAttempts)
+        .where(eq(quizAttempts.quizId, id));
 
-        await db.insert(quizQuestions).values(questionsToInsert);
+      // Attempts store their answers keyed by question id, so replacing the question set
+      // would silently orphan every result recorded so far.
+      if (Number(count) > 0 && Number(attempts) > 0) {
+        return errorResponse(
+          "Learners have already attempted this quiz, so its questions can no longer be replaced. Create a new quiz instead.",
+          409
+        );
+      }
+
+      const nextPublished = isPublished ?? existing.isPublished;
+      if (nextPublished && questions.length === 0) {
+        return errorResponse("Add at least one question before publishing this quiz to learners");
       }
     }
+
+    // Only the fields the caller actually sent are written, so a publish toggle can no
+    // longer wipe the quiz title/description by omitting them.
+    const updates: Record<string, unknown> = {};
+    if (title !== undefined) updates.title = title;
+    if (description !== undefined) updates.description = description;
+    if (timeLimitMinutes !== undefined) updates.timeLimitMinutes = timeLimitMinutes;
+    if (shuffleQuestions !== undefined) updates.shuffleQuestions = shuffleQuestions;
+    if (shuffleAnswers !== undefined) updates.shuffleAnswers = shuffleAnswers;
+    if (showResults !== undefined) updates.showResults = showResults;
+    if (maxAttempts !== undefined) updates.maxAttempts = maxAttempts;
+    if (isPublished !== undefined) updates.isPublished = Boolean(isPublished);
+
+    if (Object.keys(updates).length > 0 || replacesQuestions) {
+      await db.transaction(async (tx) => {
+        if (Object.keys(updates).length > 0) {
+          await tx
+            .update(quizzes)
+            .set(updates)
+            .where(eq(quizzes.id, id));
+        }
+
+        if (replacesQuestions) {
+          await tx.delete(quizQuestions).where(eq(quizQuestions.quizId, id));
+
+          if (questions.length > 0) {
+            const rows = questions
+              .filter((q: { questionText?: string }) => typeof q?.questionText === "string" && q.questionText.trim())
+              .map((q: {
+                questionType: string;
+                questionText: string;
+                options?: unknown;
+                correctAnswer?: string;
+                points?: number;
+                imageUrl?: string | null;
+              }, idx: number) => ({
+                quizId: id,
+                questionType: (QUESTION_TYPES.includes(q.questionType as (typeof QUESTION_TYPES)[number])
+                  ? q.questionType
+                  : "mcq") as (typeof QUESTION_TYPES)[number],
+                questionText: q.questionText.trim(),
+                imageUrl: typeof q.imageUrl === "string" && q.imageUrl.trim() ? q.imageUrl.trim() : null,
+                options: q.options ?? null,
+                correctAnswer: q.correctAnswer || null,
+                points: q.points || 1,
+                orderIndex: idx,
+              }));
+
+            if (rows.length > 0) await tx.insert(quizQuestions).values(rows);
+          }
+        }
+      });
+    }
+
+    const [updated] = await db.select().from(quizzes).where(eq(quizzes.id, id)).limit(1);
 
     return successResponse(updated);
   } catch (error) {
     console.error("Update quiz error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The quiz could not be updated. Please retry."),
+      503
+    );
   }
 }
 
@@ -170,14 +281,19 @@ export async function DELETE(
       return errorResponse("You can only delete your own quizzes", 403);
     }
 
-    // Delete questions first
-    await db.delete(quizQuestions).where(eq(quizQuestions.quizId, id));
-    // Delete quiz
-    await db.delete(quizzes).where(eq(quizzes.id, id));
+    // Attempts reference the quiz, so clear the whole tree or the delete fails on the FK.
+    await db.transaction(async (tx) => {
+      await tx.delete(quizAttempts).where(eq(quizAttempts.quizId, id));
+      await tx.delete(quizQuestions).where(eq(quizQuestions.quizId, id));
+      await tx.delete(quizzes).where(eq(quizzes.id, id));
+    });
 
     return successResponse({ message: "Quiz deleted" });
   } catch (error) {
     console.error("Delete quiz error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The quiz could not be deleted. Please retry."),
+      503
+    );
   }
 }

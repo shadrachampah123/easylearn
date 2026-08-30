@@ -1,6 +1,16 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { assignments, classes, subjects, users, submissions, assignmentQuestions, assignmentAnswers, assignmentCorrections } from "@/db/schema";
+import {
+  assignments,
+  classes,
+  subjects,
+  users,
+  submissions,
+  assignmentQuestions,
+  assignmentAnswers,
+  assignmentCorrections,
+  learnerClasses,
+} from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and, desc } from "drizzle-orm";
@@ -50,7 +60,7 @@ export async function GET(
     }
 
     // Get submissions count for teachers
-    if (payload.role === "teacher" || payload.role === "super_admin") {
+    if (["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
       const submissionsList = await db
         .select({
           id: submissions.id,
@@ -58,22 +68,48 @@ export async function GET(
           score: submissions.score,
           maxScore: submissions.maxScore,
           percentage: submissions.percentage,
+          feedback: submissions.feedback,
+          // The teacher needs to read what the learner actually wrote before grading it.
+          content: submissions.content,
           submittedAt: submissions.submittedAt,
+          gradedAt: submissions.gradedAt,
           learnerFirstName: users.firstName,
           learnerLastName: users.lastName,
           learnerId: submissions.learnerId,
         })
         .from(submissions)
         .leftJoin(users, eq(submissions.learnerId, users.id))
-        .where(eq(submissions.assignmentId, id));
+        .where(eq(submissions.assignmentId, id))
+        .orderBy(desc(submissions.submittedAt));
 
       // Get questions with correct answers for teacher view
       const questions = await db
         .select()
         .from(assignmentQuestions)
-        .where(eq(assignmentQuestions.assignmentId, id));
+        .where(eq(assignmentQuestions.assignmentId, id))
+        .orderBy(assignmentQuestions.orderIndex);
 
-      return successResponse({ ...assignment, submissions: submissionsList, questions });
+      // Learners enrolled in the class who have not handed anything in yet.
+      const enrolledLearners = await db
+        .select({
+          learnerId: learnerClasses.learnerId,
+          firstName: users.firstName,
+          lastName: users.lastName,
+        })
+        .from(learnerClasses)
+        .leftJoin(users, eq(learnerClasses.learnerId, users.id))
+        .where(eq(learnerClasses.classId, assignment.classId));
+
+      const submittedIds = new Set(submissionsList.map((s) => s.learnerId));
+      const missing = enrolledLearners.filter((row) => !submittedIds.has(row.learnerId));
+
+      return successResponse({
+        ...assignment,
+        submissions: submissionsList,
+        questions,
+        pendingLearners: missing,
+        awaitingGrading: submissionsList.filter((s) => s.status === "submitted" || s.status === "late").length,
+      });
     }
 
     // For learners, get their own submission

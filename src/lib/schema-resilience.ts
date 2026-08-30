@@ -125,6 +125,9 @@ const AREA_LABELS: Record<string, string> = {
   resources: "Resources",
   announcements: "Announcements",
   stats: "Dashboard counts",
+  quizzes: "Quizzes",
+  quizQuestions: "Quiz questions",
+  submissions: "Submissions",
 };
 
 
@@ -150,6 +153,12 @@ const MIGRATION_BY_OBJECT: Record<string, string> = {
   "users.must_change_password": "drizzle/0006_user_identity_columns.sql",
   username: "drizzle/0006_user_identity_columns.sql",
   must_change_password: "drizzle/0006_user_identity_columns.sql",
+  // drizzle/0007 adds quiz_questions.image_url. It is declared in src/db/schema.ts, so
+  // drizzle emits the column in every INSERT/SELECT against quiz_questions - on a database
+  // that never ran it, creating or opening a quiz fails with 42703 and the learner sees no
+  // quizzes at all. Keyed on the qualified name only: gallery_items and news have an
+  // image_url column too, and pointing those at 0007 would send an operator to the wrong file.
+  "quiz_questions.image_url": "drizzle/0007_quiz_images.sql",
 };
 
 export function migrationFor(objectName: string | null): string | undefined {
@@ -205,7 +214,8 @@ export function clientSafeErrorMessage(error: unknown, fallback = "The database 
 export type SchemaFeature =
   | "dashboard_card_overrides"
   | "activity_logs_enrichment"
-  | "optional_user_columns";
+  | "optional_user_columns"
+  | "quiz_question_images";
 
 const FEATURE_STATUS_TTL_MS = 60_000;
 
@@ -213,6 +223,7 @@ const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   dashboard_card_overrides: "drizzle/0004_dashboard_overrides.sql",
   activity_logs_enrichment: "drizzle/0005_activity_enhancements.sql",
   optional_user_columns: "drizzle/0006_user_identity_columns.sql",
+  quiz_question_images: "drizzle/0007_quiz_images.sql",
 };
 
 /** DDL mirrors the idempotent migration files; safe to run repeatedly. */
@@ -265,6 +276,9 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
     `ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "must_change_password" boolean DEFAULT false NOT NULL;`,
     `CREATE UNIQUE INDEX IF NOT EXISTS "users_username_unique_idx" ON "users" ("username") WHERE "username" IS NOT NULL;`,
   ],
+  quiz_question_images: [
+    `ALTER TABLE "quiz_questions" ADD COLUMN IF NOT EXISTS "image_url" text;`,
+  ],
 };
 
 /**
@@ -286,6 +300,11 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     mode: "columns",
     table: "users",
     columns: ["username", "must_change_password"],
+  },
+  quiz_question_images: {
+    mode: "columns",
+    table: "quiz_questions",
+    columns: ["image_url"],
   },
 };
 
@@ -395,6 +414,18 @@ export function ensureUserIdentityColumns(): Promise<FeatureStatus> {
   return ensureSchemaFeature("optional_user_columns");
 }
 
+/**
+ * `quiz_questions.image_url` is declared in src/db/schema.ts but only ever added by
+ * drizzle/0007_quiz_images.sql. Drizzle lists every schema column in the SQL it generates,
+ * so on a database that never ran 0007 *every* quiz insert and every quiz-question read
+ * fails with `column "image_url" of relation "quiz_questions" does not exist` - which is
+ * exactly the "quizzes set by the teacher never appear" symptom. Every quiz route calls
+ * this before touching quiz_questions.
+ */
+export function ensureQuizImageColumn(): Promise<FeatureStatus> {
+  return ensureSchemaFeature("quiz_question_images");
+}
+
 export interface OptionalSchemaStatus {
   feature: SchemaFeature;
   present: boolean;
@@ -407,7 +438,12 @@ export interface OptionalSchemaStatus {
  * migration objects exist without ever running DDL or touching the repair cache.
  */
 export async function probeSchemaFeatures(
-  features: SchemaFeature[] = ["dashboard_card_overrides", "activity_logs_enrichment", "optional_user_columns"]
+  features: SchemaFeature[] = [
+    "dashboard_card_overrides",
+    "activity_logs_enrichment",
+    "optional_user_columns",
+    "quiz_question_images",
+  ]
 ): Promise<OptionalSchemaStatus[]> {
   const repairEnabled = autoSchemaRepairEnabled();
   return Promise.all(

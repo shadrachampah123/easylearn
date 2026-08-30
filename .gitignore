@@ -1,5 +1,8 @@
 node_modules
 
+# Local verification / scratch workspace (not part of the app)
+.arena/
+
 # Environment files - NEVER commit secrets
 .env
 .env.local

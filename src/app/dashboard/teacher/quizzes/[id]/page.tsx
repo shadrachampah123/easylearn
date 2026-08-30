@@ -89,7 +89,9 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ ...quiz, isPublished: !quiz.isPublished }),
+        // Send only the flag. Sending the whole quiz back used to re-submit `questions`
+        // too, which deleted and re-created every question on a simple publish toggle.
+        body: JSON.stringify({ isPublished: !quiz.isPublished }),
       });
       const data = await res.json();
       if (data.success) {
