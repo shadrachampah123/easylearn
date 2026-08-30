@@ -3,10 +3,12 @@ import { randomUUID } from "node:crypto";
 import { mkdir, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { db } from "@/db";
-import { assignments, uploadedFiles } from "@/db/schema";
+import { uploadedFiles } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { authorizeUpload } from "@/lib/upload-auth";
+import { isObjectStorageEnabled } from "@/lib/object-storage";
 import {
   MAX_FILES_PER_REQUEST,
   MAX_REQUEST_SIZE_BYTES,
@@ -18,15 +20,29 @@ import {
   type AttachmentCategory,
   type StoredAttachment,
 } from "@/lib/uploads";
-import { eq } from "drizzle-orm";
 import { uploadStorageDir } from "@/lib/upload-storage";
 
 export const runtime = "nodejs";
 
-const TEACHER_ROLES = new Set(["super_admin", "school_admin", "head_teacher", "teacher"]);
+/**
+ * Report which upload backend the client should use. When cloud object storage
+ * is configured the browser uploads straight to the bucket via POST
+ * /api/uploads/presign (bypassing the serverless request-body limit); otherwise
+ * it posts a multipart form here and the bytes land on local disk.
+ */
+export async function GET(request: NextRequest) {
+  const token = getTokenFromRequest(request);
+  if (!token) return unauthorizedResponse();
+  const payload = await verifyToken(token);
+  if (!payload) return unauthorizedResponse();
+
+  return successResponse({
+    storage: isObjectStorageEnabled() ? "object" : "local",
+  });
+}
 
 /**
- * Upload one or more files from a local device.
+ * Upload one or more files from a local device to LOCAL DISK.
  *
  * multipart/form-data fields:
  *  - purpose:     "assignment" (teacher materials) | "submission" (learner work)
@@ -37,6 +53,9 @@ const TEACHER_ROLES = new Set(["super_admin", "school_admin", "head_teacher", "t
  *  - Videos: strict 100 MB per file.
  *  - Other files: 50 MB per file.
  *  - Request body: 100 MB + multipart overhead.
+ *
+ * When object storage is enabled, large uploads bypass this endpoint entirely —
+ * see POST /api/uploads/presign.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -79,47 +98,14 @@ export async function POST(request: NextRequest) {
 
     await ensureFileUploadSchema();
 
-    /* ── Role + purpose authorization ── */
-    if (purpose === "assignment") {
-      if (!TEACHER_ROLES.has(payload.role)) {
-        return errorResponse("Only teachers can upload assignment files", 403);
-      }
-    } else {
-      if (payload.role !== "learner") {
-        return errorResponse("Only learners can upload submission files", 403);
-      }
-      if (!assignmentId) {
-        return errorResponse("Assignment ID is required for submission files");
-      }
-      const [assignment] = await db
-        .select({
-          id: assignments.id,
-          status: assignments.status,
-          dueDate: assignments.dueDate,
-          allowLate: assignments.allowLate,
-          allowFileUploads: assignments.allowFileUploads,
-        })
-        .from(assignments)
-        .where(eq(assignments.id, assignmentId))
-        .limit(1);
-
-      if (!assignment) {
-        return errorResponse("Assignment not found", 404);
-      }
-      if (assignment.status !== "published") {
-        return errorResponse("This assignment is not accepting submissions");
-      }
-      // The teacher must explicitly enable file uploads for this assignment.
-      if (!assignment.allowFileUploads) {
-        return errorResponse(
-          "File uploads are not enabled for this assignment. Your teacher must allow submissions with files first.",
-          403
-        );
-      }
-      const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
-      if (isLate && !assignment.allowLate) {
-        return errorResponse("Late submissions are not allowed for this assignment");
-      }
+    /* ── Role + purpose authorization (shared with the presign flow) ── */
+    const authorization = await authorizeUpload({
+      role: payload.role,
+      purpose,
+      assignmentId: purpose === "submission" ? assignmentId : null,
+    });
+    if (!authorization.ok) {
+      return errorResponse(authorization.error || "Upload not allowed", authorization.status || 400);
     }
 
     /* ── Validate every file, then store it on disk and register it ── */
@@ -170,6 +156,7 @@ export async function POST(request: NextRequest) {
             mimeType: (file.type || "application/octet-stream").slice(0, 150),
             category,
             sizeBytes: file.size,
+            storageBackend: "local",
           })
           .returning();
 

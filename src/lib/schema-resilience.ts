@@ -164,6 +164,9 @@ const MIGRATION_BY_OBJECT: Record<string, string> = {
   // ran 0009 every upload/attachment query fails until the objects exist.
   "assignments.allow_file_uploads": "drizzle/0009_file_uploads.sql",
   uploaded_files: "drizzle/0009_file_uploads.sql",
+  // drizzle/0010 adds uploaded_files.storage_backend (also declared in the
+  // schema), which every upload/attachment query selects.
+  "uploaded_files.storage_backend": "drizzle/0010_object_storage.sql",
 };
 
 export function migrationFor(objectName: string | null): string | undefined {
@@ -222,7 +225,8 @@ export type SchemaFeature =
   | "optional_user_columns"
   | "quiz_question_images"
   | "uploaded_files"
-  | "assignment_file_uploads";
+  | "assignment_file_uploads"
+  | "uploaded_files_object_storage";
 
 const FEATURE_STATUS_TTL_MS = 60_000;
 
@@ -233,6 +237,7 @@ const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   quiz_question_images: "drizzle/0007_quiz_images.sql",
   uploaded_files: "drizzle/0009_file_uploads.sql",
   assignment_file_uploads: "drizzle/0009_file_uploads.sql",
+  uploaded_files_object_storage: "drizzle/0010_object_storage.sql",
 };
 
 /** DDL mirrors the idempotent migration files; safe to run repeatedly. */
@@ -316,6 +321,10 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
   assignment_file_uploads: [
     `ALTER TABLE "assignments" ADD COLUMN IF NOT EXISTS "allow_file_uploads" boolean DEFAULT false NOT NULL;`,
   ],
+  uploaded_files_object_storage: [
+    `ALTER TABLE "uploaded_files" ADD COLUMN IF NOT EXISTS "storage_backend" varchar(20) DEFAULT 'local' NOT NULL;`,
+    `CREATE INDEX IF NOT EXISTS "uploaded_files_storage_backend_idx" ON "uploaded_files" USING btree ("storage_backend");`,
+  ],
 };
 
 /**
@@ -348,6 +357,11 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     mode: "columns",
     table: "assignments",
     columns: ["allow_file_uploads"],
+  },
+  uploaded_files_object_storage: {
+    mode: "columns",
+    table: "uploaded_files",
+    columns: ["storage_backend"],
   },
 };
 
@@ -470,15 +484,17 @@ export function ensureQuizImageColumn(): Promise<FeatureStatus> {
 }
 
 /**
- * `assignments.allow_file_uploads` and the `uploaded_files` table are declared
- * in src/db/schema.ts but only added by drizzle/0009_file_uploads.sql. Every
- * upload / attachment route calls this before touching either object, so an
+ * `assignments.allow_file_uploads`, the `uploaded_files` table and its
+ * `storage_backend` column are declared in src/db/schema.ts but only added by
+ * drizzle/0009_file_uploads.sql and drizzle/0010_object_storage.sql. Every
+ * upload / attachment route calls this before touching those objects, so an
  * un-migrated database self-heals instead of 500ing.
  */
 export function ensureFileUploadSchema(): Promise<FeatureStatus[]> {
   return Promise.all([
     ensureSchemaFeature("uploaded_files"),
     ensureSchemaFeature("assignment_file_uploads"),
+    ensureSchemaFeature("uploaded_files_object_storage"),
   ]);
 }
 
@@ -501,6 +517,7 @@ export async function probeSchemaFeatures(
     "quiz_question_images",
     "uploaded_files",
     "assignment_file_uploads",
+    "uploaded_files_object_storage",
   ]
 ): Promise<OptionalSchemaStatus[]> {
   const repairEnabled = autoSchemaRepairEnabled();

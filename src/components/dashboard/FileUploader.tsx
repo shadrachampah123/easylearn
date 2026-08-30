@@ -34,13 +34,31 @@ interface UploadTask {
   progress: number;
 }
 
+type UploadMode = "local" | "object";
+
+interface PresignedUpload {
+  fileId: string;
+  attachment: StoredAttachment;
+  upload: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+    expiresInSeconds: number;
+  };
+}
+
 /**
  * Local-device file uploader used by the assignment creation form (teacher)
  * and the assignment submission form (learner).
  *
  * Client-side validation mirrors the server rules (type allow-list, strict
- * 100 MB video limit, 50 MB for other files) so users get instant feedback;
- * the /api/uploads route enforces the same rules server-side.
+ * 100 MB video limit, 50 MB for other files) so users get instant feedback.
+ *
+ * The upload backend is detected once on mount: when cloud object storage
+ * (S3 / Cloudflare R2 / MinIO) is configured, files are PUT straight to the
+ * bucket via a presigned URL — bypassing the serverless request-body limit so
+ * 100 MB videos upload reliably. Otherwise a multipart POST to /api/uploads
+ * stores the bytes on local disk (the original behaviour).
  */
 export default function FileUploader({
   purpose,
@@ -56,12 +74,27 @@ export default function FileUploader({
   const [dragging, setDragging] = useState(false);
   const [tasks, setTasks] = useState<UploadTask[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setMode] = useState<UploadMode>("local");
 
   const uploading = tasks.length > 0;
 
   useEffect(() => {
     onUploadingChange?.(uploading);
   }, [uploading, onUploadingChange]);
+
+  // Detect the upload backend once. On any failure we keep "local" (multipart)
+  // so uploads still work on a plain disk-backed deployment.
+  useEffect(() => {
+    const token = localStorage.getItem("el_token");
+    fetch("/api/uploads", { headers: { Authorization: `Bearer ${token}` } })
+      .then((response) => response.json())
+      .then((data: { success?: boolean; data?: { storage?: UploadMode } }) => {
+        if (data?.success && data?.data?.storage === "object") setMode("object");
+      })
+      .catch(() => {
+        /* stay on "local" */
+      });
+  }, []);
 
   function validateFile(file: File): string | null {
     const category = categoryForFile(file.name, file.type || undefined);
@@ -80,7 +113,85 @@ export default function FileUploader({
     return null;
   }
 
+  function trackProgress(fileName: string) {
+    return (event: ProgressEvent) => {
+      if (event.lengthComputable) {
+        const progress = Math.round((event.loaded / event.total) * 100);
+        setTasks((prev) =>
+          prev.map((task) => (task.fileName === fileName ? { ...task, progress } : task))
+        );
+      }
+    };
+  }
+
   function uploadOne(file: File): Promise<StoredAttachment> {
+    return mode === "object" ? uploadOneDirect(file) : uploadOneMultipart(file);
+  }
+
+  /* ── Direct to cloud object storage via presigned PUT ── */
+  function uploadOneDirect(file: File): Promise<StoredAttachment> {
+    return new Promise((resolve, reject) => {
+      const token = localStorage.getItem("el_token");
+
+      fetch("/api/uploads/presign", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          purpose,
+          assignmentId: assignmentId || undefined,
+          name: file.name,
+          mimeType: file.type || "application/octet-stream",
+          size: file.size,
+        }),
+      })
+        .then((response) => response.json().then((data) => ({ response, data })))
+        .then(({ response, data }) => {
+          if (!(response.ok && data?.success)) {
+            throw new Error(data?.error || "The upload could not be prepared. Please try again.");
+          }
+          const presigned = data.data as PresignedUpload;
+          return putFile(presigned.attachment, presigned.upload, file);
+        })
+        .then(resolve)
+        .catch((uploadError) =>
+          reject(uploadError instanceof Error ? uploadError : new Error(String(uploadError)))
+        );
+    });
+  }
+
+  function putFile(
+    attachment: StoredAttachment,
+    upload: PresignedUpload["upload"],
+    file: File
+  ): Promise<StoredAttachment> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(upload.method || "PUT", upload.url);
+      for (const [header, value] of Object.entries(upload.headers || {})) {
+        xhr.setRequestHeader(header, value);
+      }
+      xhr.upload.onprogress = trackProgress(file.name);
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(attachment);
+        } else {
+          reject(
+            new Error(
+              `The upload to cloud storage failed (HTTP ${xhr.status}). Please try again.`
+            )
+          );
+        }
+      };
+      xhr.onerror = () => reject(new Error("Network error — the upload could not be completed."));
+      xhr.send(file);
+    });
+  }
+
+  /* ── Legacy multipart upload to local disk ── */
+  function uploadOneMultipart(file: File): Promise<StoredAttachment> {
     return new Promise((resolve, reject) => {
       const token = localStorage.getItem("el_token");
       const xhr = new XMLHttpRequest();
@@ -92,14 +203,7 @@ export default function FileUploader({
       if (assignmentId) form.append("assignmentId", assignmentId);
       form.append("file", file);
 
-      xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable) {
-          const progress = Math.round((event.loaded / event.total) * 100);
-          setTasks((prev) =>
-            prev.map((task) => (task.fileName === file.name ? { ...task, progress } : task))
-          );
-        }
-      };
+      xhr.upload.onprogress = trackProgress(file.name);
       xhr.onload = () => {
         let data: { success?: boolean; data?: StoredAttachment[]; error?: string } = {};
         try {
@@ -165,7 +269,8 @@ export default function FileUploader({
     const next = value.filter((entry) => entry.fileId !== attachment.fileId);
     onChange(next);
 
-    // Best-effort server-side cleanup so the file does not linger on disk.
+    // Best-effort server-side cleanup so the file does not linger on disk
+    // (or in the object-storage bucket when that backend is enabled).
     const token = localStorage.getItem("el_token");
     try {
       await fetch(`/api/uploads/${attachment.fileId}`, {
