@@ -50,6 +50,13 @@
       "when": 1756400000005,
       "tag": "0006_user_identity_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1756400000006,
+      "tag": "0007_quiz_images",
+      "breakpoints": true
     }
   ]
 }

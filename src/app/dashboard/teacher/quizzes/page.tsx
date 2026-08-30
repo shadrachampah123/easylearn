@@ -22,6 +22,7 @@ interface Question {
   options: string[];
   correctAnswer: string;
   points: number;
+  imageUrl: string;
 }
 
 const teacherNav = [
@@ -48,6 +49,7 @@ export default function TeacherQuizzesPage() {
     shuffleQuestions: false,
     shuffleAnswers: false,
     maxAttempts: 1,
+    isPublished: true,
   });
   const [questions, setQuestions] = useState<Question[]>([]);
   const [saving, setSaving] = useState(false);
@@ -84,13 +86,13 @@ export default function TeacherQuizzesPage() {
   function addQuestion() {
     setQuestions([
       ...questions,
-      { questionType: "mcq", questionText: "", options: ["", "", "", ""], correctAnswer: "", points: 1 },
+      { questionType: "mcq", questionText: "", options: ["", "", "", ""], correctAnswer: "", points: 1, imageUrl: "" },
     ]);
   }
 
   function updateQuestion(index: number, field: keyof Question, value: string | string[] | number) {
     const updated = [...questions];
-    if (field === "questionType" || field === "questionText" || field === "correctAnswer") {
+    if (field === "questionType" || field === "questionText" || field === "correctAnswer" || field === "imageUrl") {
       updated[index][field] = value as string;
     } else if (field === "options") {
       updated[index][field] = value as string[];
@@ -110,6 +112,27 @@ export default function TeacherQuizzesPage() {
     setQuestions(questions.filter((_, i) => i !== index));
   }
 
+  async function togglePublish(quiz: Quiz, e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const token = localStorage.getItem("el_token");
+    try {
+      const res = await fetch(`/api/quizzes/${quiz.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ isPublished: !quiz.isPublished }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setQuizzes((prev) => prev.map((q) => (q.id === quiz.id ? { ...q, isPublished: !q.isPublished } : q)));
+      } else {
+        alert(data.error);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (questions.length === 0) {
@@ -126,7 +149,10 @@ export default function TeacherQuizzesPage() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ ...formData, questions }),
+        body: JSON.stringify({
+          ...formData,
+          questions: questions.map((q) => ({ ...q, imageUrl: q.imageUrl.trim() || null })),
+        }),
       });
 
       const data = await res.json();
@@ -141,6 +167,7 @@ export default function TeacherQuizzesPage() {
           shuffleQuestions: false,
           shuffleAnswers: false,
           maxAttempts: 1,
+          isPublished: true,
         });
         setQuestions([]);
         loadData();
@@ -242,6 +269,23 @@ export default function TeacherQuizzesPage() {
                 </div>
               </div>
 
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={formData.isPublished}
+                    onChange={(e) => setFormData({ ...formData, isPublished: e.target.checked })}
+                    className="w-5 h-5 mt-0.5 rounded border-slate-300"
+                  />
+                  <span>
+                    <span className="block text-sm font-semibold text-slate-700">Publish to learners immediately</span>
+                    <span className="block text-xs text-slate-500">
+                      Learners only see published quizzes. Leave this off to keep the quiz as a draft and publish it later.
+                    </span>
+                  </span>
+                </label>
+              </div>
+
               <div className="flex items-center gap-6">
                 <label className="flex items-center gap-2 text-sm text-slate-600">
                   <input
@@ -321,6 +365,14 @@ export default function TeacherQuizzesPage() {
                           placeholder="Enter question text..."
                           rows={2}
                           className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm resize-none mb-3"
+                        />
+
+                        <input
+                          type="url"
+                          value={q.imageUrl}
+                          onChange={(e) => updateQuestion(qIdx, "imageUrl", e.target.value)}
+                          placeholder="Question image URL (optional) — shown above the question"
+                          className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm mb-3"
                         />
 
                         {q.questionType === "mcq" && (
@@ -427,13 +479,12 @@ export default function TeacherQuizzesPage() {
       ) : (
         <div className="grid gap-4">
           {quizzes.map((quiz) => (
-            <Link
+            <div
               key={quiz.id}
-              href={`/dashboard/teacher/quizzes/${quiz.id}`}
               className="p-6 rounded-2xl bg-white shadow-sm border border-slate-100 hover:shadow-md hover:border-secondary-200 transition-all group"
             >
-              <div className="flex items-start justify-between">
-                <div className="flex-1">
+              <div className="flex items-start justify-between gap-4">
+                <Link href={`/dashboard/teacher/quizzes/${quiz.id}`} className="flex-1 min-w-0">
                   <div className="flex items-center gap-3 mb-2">
                     <h3 className="font-bold text-lg text-slate-800 group-hover:text-secondary-600 transition-colors">
                       {quiz.title}
@@ -445,7 +496,7 @@ export default function TeacherQuizzesPage() {
                     </span>
                   </div>
                   <p className="text-slate-500 text-sm mb-3 line-clamp-2">{quiz.description || "No description"}</p>
-                  <div className="flex items-center gap-4 text-xs text-slate-400">
+                  <div className="flex flex-wrap items-center gap-4 text-xs text-slate-400">
                     <span className="flex items-center gap-1">
                       <span>🏫</span> {quiz.className}
                     </span>
@@ -461,10 +512,36 @@ export default function TeacherQuizzesPage() {
                       </span>
                     )}
                   </div>
+                </Link>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={(e) => togglePublish(quiz, e)}
+                    title={quiz.isPublished ? "Hide from learners" : "Show to learners"}
+                    className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${
+                      quiz.isPublished
+                        ? "bg-amber-100 text-amber-700 hover:bg-amber-200"
+                        : "bg-green-600 text-white hover:bg-green-700"
+                    }`}
+                  >
+                    {quiz.isPublished ? "Unpublish" : "Publish"}
+                  </button>
+                  <Link
+                    href={`/dashboard/teacher/quizzes/${quiz.id}`}
+                    className="text-slate-300 group-hover:text-secondary-400 transition-colors text-xl px-1"
+                    aria-label={`Open ${quiz.title}`}
+                  >
+                    →
+                  </Link>
                 </div>
-                <span className="text-slate-300 group-hover:text-secondary-400 transition-colors text-xl">→</span>
               </div>
-            </Link>
+
+              {!quiz.isPublished && (
+                <p className="mt-3 text-xs text-amber-600">
+                  Draft — learners cannot see this quiz yet. Publish it to make it appear in their Quizzes list.
+                </p>
+              )}
+            </div>
           ))}
         </div>
       )}

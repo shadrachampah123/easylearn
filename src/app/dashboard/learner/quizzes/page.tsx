@@ -14,6 +14,10 @@ interface Quiz {
   maxAttempts: number;
   className: string | null;
   subjectName: string | null;
+  teacherFirstName: string | null;
+  teacherLastName: string | null;
+  attemptsUsed: number;
+  attemptsLeft: number | null;
   myAttempt: {
     id: string;
     score: number | null;
@@ -91,7 +95,11 @@ export default function LearnerQuizzesPage() {
                   <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-purple-400 to-purple-600 flex items-center justify-center text-white text-2xl group-hover:scale-110 transition-transform">
                     ❓
                   </div>
-                  {isCompleted ? (
+                  {quiz.attemptsLeft === 0 ? (
+                    <div className="px-3 py-1.5 rounded-xl bg-slate-100 text-slate-500 font-bold text-sm">
+                      {isCompleted ? `Score: ${score}` : "No attempts left"}
+                    </div>
+                  ) : isCompleted ? (
                     <div className="px-3 py-1.5 rounded-xl bg-green-100 text-green-600 font-bold text-sm">
                       Score: {score}
                     </div>
@@ -111,6 +119,9 @@ export default function LearnerQuizzesPage() {
 
                 <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
                   <span className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-100">
+                    <span>🏫</span> {quiz.className}
+                  </span>
+                  <span className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-100">
                     <span>📚</span> {quiz.subjectName}
                   </span>
                   <span className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-100">
@@ -122,6 +133,11 @@ export default function LearnerQuizzesPage() {
                     </span>
                   )}
                 </div>
+
+                <p className="mt-3 text-xs text-slate-400">
+                  Set by {quiz.teacherFirstName} {quiz.teacherLastName}
+                  {quiz.maxAttempts ? ` · attempt ${Math.min(quiz.attemptsUsed + 1, quiz.maxAttempts)} of ${quiz.maxAttempts}` : ""}
+                </p>
               </Link>
             );
           })}

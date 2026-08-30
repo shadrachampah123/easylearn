@@ -71,12 +71,14 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 | `0004_dashboard_overrides.sql` | `dashboard_card_overrides` (manual dashboard card values) |
 | `0005_activity_enhancements.sql` | `activity_logs.entity_type/entity_id/description` (admin activity feed) |
 | `0006_user_identity_columns.sql` | `users.username`, `users.must_change_password` (these existed in `src/db/schema.ts` but in no migration) |
+| `0007_quiz_images.sql` | `quiz_questions.image_url` (Kahoot question images) |
 
 Notes:
 
 - Check `GET /api/health` any time: it reports `databaseConnected`, `jwtSecretConfigured`, and
   `optionalMigrations` (`dashboard_card_overrides`, `activity_logs_enrichment`,
-  `optional_user_columns`) with a `migrationWarnings` entry per missing file.
+  `optional_user_columns`, `quiz_question_images`) with a `migrationWarnings` entry per missing
+  file.
 - The dashboards are **degrade-instead-of-crash**: a missing migration disables that section and
   shows a warning banner on the admin dashboard, it no longer returns a 500 blank page.
 - On request, EasyLearn will try to create the *optional* objects above itself using idempotent
@@ -85,6 +87,33 @@ Notes:
 - `0004`/`0005` used to contain shell-escaped `\"` quotes, so they failed with a syntax error that
   the old runner swallowed. The files are fixed and `run-migration.js` now exits non-zero whenever
   a statement genuinely could not be applied.
+- `0007` was missing from `drizzle/meta/_journal.json`, so `drizzle-kit` never applied it. Because
+  `quiz_questions.image_url` is declared in `src/db/schema.ts`, Drizzle listed the column in every
+  quiz insert and read, so **every** quiz creation and quiz page failed with
+  `column "image_url" of relation "quiz_questions" does not exist` (SQLSTATE 42703) and learners
+  saw an empty quiz list. It is registered in the journal now, and the quiz routes also repair it
+  on demand through `ensureQuizImageColumn()`.
+
+#### Quizzes and grading
+
+- **Publishing.** A quiz is only visible to learners once it is published. The teacher's
+  *Create Quiz* form publishes by default (uncheck *"Publish to learners immediately"* to keep a
+  draft), and every quiz card has a one-click **Publish / Unpublish** button. Publishing requires
+  at least one question.
+- **Visibility.** Learners see published quizzes set for a class they are enrolled in
+  (`learner_classes`). If a school has recorded no enrollments at all, the list falls back to every
+  published quiz rather than showing nothing.
+- **Kahoot game.** `/dashboard/learner/quizzes/[id]` runs the quiz as a timed game: per-question
+  countdown, four coloured answer tiles, instant right/wrong feedback from
+  `POST /api/quizzes/[id]/check` (correct answers are never sent to the learner up front), a speed
+  bonus, a streak counter and a class podium. The graded score is still written by
+  `PUT /api/quizzes/[id]/attempt`.
+- **Grading assignments.** On `/dashboard/teacher/assignments/[id]`, *Grade* opens a panel that
+  shows what the learner actually wrote, awards marks per question (or a single score for written
+  work), and saves feedback. `POST /api/submissions/[id]/grade` always records `score`, `max_score`
+  **and** `percentage` - manual grading used to leave the last two NULL, which showed up as
+  `82/null (null%)` for the teacher and averaged to 0% in the learner's grade book. Re-grading is
+  allowed and does not award XP twice.
 
 #### Step 5: Your Permanent PWA Link! 🎉
 

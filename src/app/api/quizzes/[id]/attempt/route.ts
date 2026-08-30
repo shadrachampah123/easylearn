@@ -1,9 +1,18 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { quizzes, quizQuestions, quizAttempts, notifications, learnerPoints } from "@/db/schema";
+import {
+  quizzes,
+  quizQuestions,
+  quizAttempts,
+  notifications,
+  learnerPoints,
+  learnerClasses,
+  users,
+} from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq, and, sql } from "drizzle-orm";
+import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { eq, and, sql, desc } from "drizzle-orm";
 
 // Start a quiz attempt
 export async function POST(
@@ -32,6 +41,15 @@ export async function POST(
     if (!quiz) return notFoundResponse("Quiz");
     if (!quiz.isPublished) return errorResponse("This quiz is not available");
 
+    // Only learners enrolled in the quiz's class may sit it.
+    const enrolled = await db
+      .select({ classId: learnerClasses.classId })
+      .from(learnerClasses)
+      .where(eq(learnerClasses.learnerId, payload.userId));
+    if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
+      return errorResponse("This quiz was set for a different class", 403);
+    }
+
     // Check existing attempts
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
@@ -57,9 +75,9 @@ export async function POST(
       .limit(1);
 
     if (incompleteAttempt) {
-      return successResponse({ 
-        attempt: incompleteAttempt, 
-        message: "Resuming existing attempt" 
+      return successResponse({
+        attempt: incompleteAttempt,
+        message: "Resuming existing attempt",
       });
     }
 
@@ -74,7 +92,10 @@ export async function POST(
     return successResponse({ attempt: newAttempt }, 201);
   } catch (error) {
     console.error("Start quiz attempt error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The quiz attempt could not be started. Please retry."),
+      503
+    );
   }
 }
 
@@ -92,6 +113,10 @@ export async function PUT(
     if (payload.role !== "learner") {
       return errorResponse("Only learners can submit quizzes", 403);
     }
+
+    // The grading read below pulls every quiz_questions column, so the optional
+    // image_url column has to exist first.
+    await ensureQuizImageColumn();
 
     const { id } = await params;
     const body = await request.json();
@@ -221,6 +246,41 @@ export async function PUT(
       });
     }
 
+    // Kahoot-style podium: the best scores on this quiz, with the learner's own row flagged.
+    const leaderboard = await db
+      .select({
+        learnerId: quizAttempts.learnerId,
+        score: quizAttempts.score,
+        completedAt: quizAttempts.completedAt,
+        firstName: users.firstName,
+        lastName: users.lastName,
+      })
+      .from(quizAttempts)
+      .leftJoin(users, eq(quizAttempts.learnerId, users.id))
+      .where(and(
+        eq(quizAttempts.quizId, id),
+        sql`${quizAttempts.completedAt} IS NOT NULL`
+      ))
+      .orderBy(desc(sql`COALESCE(${quizAttempts.score}, 0)`))
+      .limit(10);
+
+    const bestScorePerLearner = new Map<string, { name: string; score: number; isMe: boolean }>();
+    for (const row of leaderboard) {
+      const name = `${row.firstName ?? ""} ${row.lastName ?? ""}`.trim() || "Learner";
+      const entry = { name, score: row.score ?? 0, isMe: row.learnerId === payload.userId };
+      const existing = bestScorePerLearner.get(row.learnerId);
+      if (!existing || entry.score > existing.score) bestScorePerLearner.set(row.learnerId, entry);
+    }
+
+    const podium = [...bestScorePerLearner.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map((entry, index) => ({ rank: index + 1, ...entry }));
+
+    const myRank = [...bestScorePerLearner.values()]
+      .sort((a, b) => b.score - a.score)
+      .findIndex((entry) => entry.isMe);
+
     return successResponse({
       attempt: updatedAttempt,
       results: {
@@ -229,10 +289,15 @@ export async function PUT(
         percentage,
         pointsEarned: points,
         answers: quiz.showResults ? gradedAnswers : undefined,
+        podium,
+        rank: myRank >= 0 ? myRank + 1 : null,
       },
     });
   } catch (error) {
     console.error("Submit quiz error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The quiz could not be submitted. Please retry."),
+      503
+    );
   }
 }
