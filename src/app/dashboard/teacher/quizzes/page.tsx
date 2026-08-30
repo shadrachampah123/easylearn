@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import QuestionImagePicker from "@/components/dashboard/QuestionImagePicker";
 import Link from "next/link";
 
 interface Quiz {
@@ -367,12 +368,11 @@ export default function TeacherQuizzesPage() {
                           className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm resize-none mb-3"
                         />
 
-                        <input
-                          type="url"
+                        <QuestionImagePicker
+                          questionText={q.questionText}
+                          subjectName={subjects.find((subject) => subject.id === formData.subjectId)?.name}
                           value={q.imageUrl}
-                          onChange={(e) => updateQuestion(qIdx, "imageUrl", e.target.value)}
-                          placeholder="Question image URL (optional) — shown above the question"
-                          className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm mb-3"
+                          onChange={(value) => updateQuestion(qIdx, "imageUrl", value)}
                         />
 
                         {q.questionType === "mcq" && (
@@ -526,6 +526,12 @@ export default function TeacherQuizzesPage() {
                   >
                     {quiz.isPublished ? "Unpublish" : "Publish"}
                   </button>
+                  <Link
+                    href={`/dashboard/teacher/quizzes/${quiz.id}`}
+                    className="px-3 py-2 rounded-xl bg-secondary-50 text-secondary-700 text-sm font-semibold hover:bg-secondary-100 transition-colors"
+                  >
+                    Edit
+                  </Link>
                   <Link
                     href={`/dashboard/teacher/quizzes/${quiz.id}`}
                     className="text-slate-300 group-hover:text-secondary-400 transition-colors text-xl px-1"

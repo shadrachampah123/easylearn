@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import LearnerProgressPanel from "@/components/dashboard/LearnerProgressPanel";
 import { adminNav } from "@/lib/admin-nav";
 
 interface Reports {
@@ -21,7 +22,14 @@ export default function AdminReportsPage() {
   const [data, setData] = useState<Reports | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => { loadData(); }, []);
+  useEffect(() => {
+    const token = localStorage.getItem("el_token");
+    fetch("/api/reports", { headers: { Authorization: `Bearer ${token}` } })
+      .then((res) => res.json())
+      .then((result) => { if (result.success) setData(result.data); })
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  }, []);
 
   async function loadData() {
     const token = localStorage.getItem("el_token");
@@ -166,6 +174,8 @@ export default function AdminReportsPage() {
           </div>
         </>
       )}
+
+      <LearnerProgressPanel />
     </DashboardShell>
   );
 }

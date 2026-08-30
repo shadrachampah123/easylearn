@@ -4,6 +4,7 @@ import { submissions, assignments, quizAttempts, quizzes, subjects, classes, use
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { eq, and, sql, desc } from "drizzle-orm";
+import { getAccessibleLearnerIds } from "@/lib/report-access";
 
 export async function GET(request: NextRequest) {
   try {
@@ -15,9 +16,20 @@ export async function GET(request: NextRequest) {
     const learnerId = request.nextUrl.searchParams.get("learnerId") || payload.userId;
     const subjectId = request.nextUrl.searchParams.get("subjectId");
 
-    // Only allow viewing own grades or children's grades (for parents) or any (for teachers/admin)
+    // Learners can only view their own grades. Teachers are scoped to the learners
+    // enrolled in their classes or who have used one of their assessments; this also
+    // protects the standalone grades API from cross-teacher data access.
     if (payload.role === "learner" && learnerId !== payload.userId) {
       return errorResponse("You can only view your own grades", 403);
+    }
+    if (payload.role === "teacher") {
+      const accessibleLearners = await getAccessibleLearnerIds(payload);
+      if (!accessibleLearners.has(learnerId)) {
+        return errorResponse("You can only view grades for learners in your scope", 403);
+      }
+    }
+    if (!["learner", "parent", "super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+      return errorResponse("You are not authorized to view grades", 403);
     }
 
     // Get assignment grades
@@ -41,7 +53,8 @@ export async function GET(request: NextRequest) {
       .where(and(
         eq(submissions.learnerId, learnerId),
         eq(submissions.status, "graded"),
-        subjectId ? eq(assignments.subjectId, subjectId) : undefined
+        subjectId ? eq(assignments.subjectId, subjectId) : undefined,
+        payload.role === "teacher" ? eq(assignments.teacherId, payload.userId) : undefined
       ))
       .orderBy(desc(submissions.gradedAt));
 
@@ -66,7 +79,8 @@ export async function GET(request: NextRequest) {
       .where(and(
         eq(quizAttempts.learnerId, learnerId),
         sql`${quizAttempts.completedAt} IS NOT NULL`,
-        subjectId ? eq(quizzes.subjectId, subjectId) : undefined
+        subjectId ? eq(quizzes.subjectId, subjectId) : undefined,
+        payload.role === "teacher" ? eq(quizzes.teacherId, payload.userId) : undefined
       ))
       .orderBy(desc(quizAttempts.completedAt));
 

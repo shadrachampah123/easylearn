@@ -1,18 +1,15 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import {
-  announcements,
+  assignments,
   assignmentAnswers,
   assignmentCorrections,
   assignmentQuestions,
-  assignments,
-  attendance,
-  classes,
-  learnerClasses,
   quizAttempts,
   quizQuestions,
   quizzes,
   resources,
+  subjects,
   submissions,
   teacherClasses,
   timetableEntries,
@@ -23,52 +20,56 @@ import { eq, inArray } from "drizzle-orm";
 
 const ADMIN_ROLES = ["super_admin", "school_admin"];
 
+async function requireAdmin(request: NextRequest) {
+  const token = getTokenFromRequest(request);
+  if (!token) return unauthorizedResponse();
+  const payload = await verifyToken(token);
+  if (!payload) return unauthorizedResponse();
+  if (!ADMIN_ROLES.includes(payload.role)) {
+    return errorResponse("Only administrators can manage subjects", 403);
+  }
+  return payload;
+}
+
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
-
-    if (!ADMIN_ROLES.includes(payload.role)) {
-      return errorResponse("Only administrators can update classes", 403);
-    }
+    const auth = await requireAdmin(request);
+    if (auth instanceof Response) return auth;
 
     const { id } = await params;
     const body = await request.json();
-    const { name, level, capacity, classTeacherId, academicYearId } = body;
+    const { name, code, departmentId, description } = body;
 
     if (name !== undefined && (typeof name !== "string" || !name.trim())) {
-      return errorResponse("Class name is required");
+      return errorResponse("Subject name is required");
     }
 
     const [existing] = await db
-      .select({ id: classes.id })
-      .from(classes)
-      .where(eq(classes.id, id))
+      .select({ id: subjects.id })
+      .from(subjects)
+      .where(eq(subjects.id, id))
       .limit(1);
 
-    if (!existing) return notFoundResponse("Class");
+    if (!existing) return notFoundResponse("Subject");
 
     const [updated] = await db
-      .update(classes)
+      .update(subjects)
       .set({
         name: name !== undefined ? name.trim() : undefined,
-        level: level ?? undefined,
-        capacity: capacity !== undefined ? Number(capacity) : undefined,
-        classTeacherId: classTeacherId !== undefined ? classTeacherId || null : undefined,
-        academicYearId: academicYearId ?? undefined,
+        code: code !== undefined ? (code?.trim() || null) : undefined,
+        departmentId: departmentId !== undefined ? departmentId || null : undefined,
+        description: description !== undefined ? (description?.trim() || null) : undefined,
       })
-      .where(eq(classes.id, id))
+      .where(eq(subjects.id, id))
       .returning();
 
     return successResponse(updated);
   } catch (error) {
-    console.error("Update class error:", error);
-    return errorResponse("The class could not be updated. Please retry.", 500);
+    console.error("Update subject error:", error);
+    return errorResponse("The subject could not be updated. Please retry.", 500);
   }
 }
 
@@ -77,33 +78,27 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
-
-    if (!ADMIN_ROLES.includes(payload.role)) {
-      return errorResponse("Only administrators can delete classes", 403);
-    }
+    const auth = await requireAdmin(request);
+    if (auth instanceof Response) return auth;
 
     const { id } = await params;
     const [existing] = await db
-      .select({ id: classes.id })
-      .from(classes)
-      .where(eq(classes.id, id))
+      .select({ id: subjects.id })
+      .from(subjects)
+      .where(eq(subjects.id, id))
       .limit(1);
 
-    if (!existing) return notFoundResponse("Class");
+    if (!existing) return notFoundResponse("Subject");
 
-    // Several legacy foreign keys use ON DELETE NO ACTION. Clean up the dependent
-    // content explicitly so an administrator can remove a class at any point rather
-    // than receiving a database constraint error halfway through the operation.
+    // A subject is referenced by required assignment/quiz relationships. Remove
+    // those content trees in the same transaction, while preserving resources and
+    // timetable rows by clearing their optional subject relationship.
     await db.transaction(async (tx) => {
-      const classAssignments = await tx
+      const subjectAssignments = await tx
         .select({ id: assignments.id })
         .from(assignments)
-        .where(eq(assignments.classId, id));
-      const assignmentIds = classAssignments.map((assignment) => assignment.id);
+        .where(eq(assignments.subjectId, id));
+      const assignmentIds = subjectAssignments.map((assignment) => assignment.id);
 
       if (assignmentIds.length > 0) {
         const assignmentSubmissions = await tx
@@ -133,11 +128,11 @@ export async function DELETE(
         await tx.delete(assignments).where(inArray(assignments.id, assignmentIds));
       }
 
-      const classQuizzes = await tx
+      const subjectQuizzes = await tx
         .select({ id: quizzes.id })
         .from(quizzes)
-        .where(eq(quizzes.classId, id));
-      const quizIds = classQuizzes.map((quiz) => quiz.id);
+        .where(eq(quizzes.subjectId, id));
+      const quizIds = subjectQuizzes.map((quiz) => quiz.id);
 
       if (quizIds.length > 0) {
         await tx.delete(quizAttempts).where(inArray(quizAttempts.quizId, quizIds));
@@ -145,18 +140,15 @@ export async function DELETE(
         await tx.delete(quizzes).where(inArray(quizzes.id, quizIds));
       }
 
-      await tx.update(announcements).set({ classId: null }).where(eq(announcements.classId, id));
-      await tx.update(resources).set({ classId: null }).where(eq(resources.classId, id));
-      await tx.delete(attendance).where(eq(attendance.classId, id));
-      await tx.delete(learnerClasses).where(eq(learnerClasses.classId, id));
-      await tx.delete(teacherClasses).where(eq(teacherClasses.classId, id));
-      await tx.delete(timetableEntries).where(eq(timetableEntries.classId, id));
-      await tx.delete(classes).where(eq(classes.id, id));
+      await tx.delete(teacherClasses).where(eq(teacherClasses.subjectId, id));
+      await tx.update(resources).set({ subjectId: null }).where(eq(resources.subjectId, id));
+      await tx.update(timetableEntries).set({ subjectId: null }).where(eq(timetableEntries.subjectId, id));
+      await tx.delete(subjects).where(eq(subjects.id, id));
     });
 
-    return successResponse({ message: "Class deleted" });
+    return successResponse({ message: "Subject deleted" });
   } catch (error) {
-    console.error("Delete class error:", error);
-    return errorResponse("The class could not be deleted. Please retry.", 500);
+    console.error("Delete subject error:", error);
+    return errorResponse("The subject could not be deleted. Please retry.", 500);
   }
 }

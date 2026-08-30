@@ -59,6 +59,12 @@ export async function GET(
       return notFoundResponse("Assignment");
     }
 
+    // Teachers may only inspect and grade assignments they manage. Administrators may
+    // inspect any assignment in the school.
+    if (payload.role === "teacher" && assignment.teacherId !== payload.userId) {
+      return errorResponse("You can only view your own assignments", 403);
+    }
+
     // Get submissions count for teachers
     if (["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
       const submissionsList = await db

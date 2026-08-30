@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import LearnerProgressPanel from "@/components/dashboard/LearnerProgressPanel";
 import { teacherNav } from "@/lib/teacher-nav";
 
 interface Reports {
@@ -91,6 +92,8 @@ export default function TeacherReportsPage() {
           </div>
         </>
       )}
+
+      <LearnerProgressPanel />
     </DashboardShell>
   );
 }

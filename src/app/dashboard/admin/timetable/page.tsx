@@ -72,12 +72,21 @@ export default function AdminTimetablePage() {
         setSubjects(subjectData.data.map((s: { id: string; name: string }) => ({ id: s.id, name: s.name })));
       }
       if (teacherData.success) {
-        setTeachers(
-          teacherData.data.map((t: { id: string; firstName: string; lastName: string }) => ({
-            id: t.id,
-            name: `${t.firstName} ${t.lastName}`,
-          }))
-        );
+        // /api/users returns paginated data: { users, pagination }. The old code
+        // treated the wrapper as an array, so this threw and left the teacher
+        // selector empty. Without a selected teacher, the teacher timetable API
+        // has no way to associate an admin-created period with its owner.
+        const teacherRows = Array.isArray(teacherData.data)
+          ? teacherData.data
+          : teacherData.data?.users;
+        if (Array.isArray(teacherRows)) {
+          setTeachers(
+            teacherRows.map((t: { id: string; firstName: string; lastName: string }) => ({
+              id: t.id,
+              name: `${t.firstName} ${t.lastName}`,
+            }))
+          );
+        }
       }
     } catch (err) {
       console.error(err);
@@ -290,6 +299,7 @@ export default function AdminTimetablePage() {
                       <option key={t.id} value={t.id}>{t.name}</option>
                     ))}
                   </select>
+                  <p className="text-xs text-slate-400 mt-1">Assign a teacher so this period appears on their timetable.</p>
                 </div>
               </div>
 
