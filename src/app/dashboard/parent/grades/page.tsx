@@ -12,6 +12,7 @@ interface GradeRow {
   maxScore: number;
   subjectName: string | null;
   gradedAt: string | null;
+  gradedBy: string | null;
 }
 
 interface GradesData {
@@ -157,11 +158,18 @@ export default function ParentGradesPage() {
             <div className="divide-y divide-slate-100">
               {data.grades.map((grade) => (
                 <div key={grade.id} className="p-4 flex items-center gap-4">
-                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-white ${grade.type === "quiz" ? "bg-purple-500" : "bg-blue-500"}`}>
-                    {grade.type === "quiz" ? "❓" : "📝"}
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-white ${grade.type === "quiz" ? "bg-purple-500" : grade.gradedBy === "easyai" ? "bg-gradient-to-br from-violet-500 to-indigo-500" : "bg-blue-500"}`}>
+                    {grade.type === "quiz" ? "❓" : grade.gradedBy === "easyai" ? "✨" : "📝"}
                   </div>
                   <div className="flex-1">
-                    <p className="font-medium text-slate-700">{grade.title}</p>
+                    <p className="font-medium text-slate-700 flex items-center gap-2">
+                      {grade.title}
+                      {grade.gradedBy === "easyai" && (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-100 text-violet-700 border border-violet-200 whitespace-nowrap">
+                          EasyAI
+                        </span>
+                      )}
+                    </p>
                     <p className="text-xs text-slate-400">{grade.subjectName}</p>
                   </div>
                   <span className="font-bold text-lg text-slate-800">{grade.score}/{grade.maxScore}</span>

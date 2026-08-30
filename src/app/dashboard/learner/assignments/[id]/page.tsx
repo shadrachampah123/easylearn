@@ -26,6 +26,25 @@ interface Answer {
   explanation: string | null;
 }
 
+interface AiCriterion {
+  key: string;
+  label: string;
+  score: number;
+  maxScore: number;
+  comment: string;
+}
+
+interface AiReport {
+  engine: string;
+  mode: string;
+  percentage: number;
+  summary: string;
+  criteria: AiCriterion[];
+  strengths: string[];
+  improvements: string[];
+  metrics?: { words: number; sentences: number; paragraphs: number; attachments: number };
+}
+
 interface Assignment {
   id: string;
   title: string;
@@ -34,6 +53,8 @@ interface Assignment {
   dueDate: string | null;
   maxScore: number;
   allowLate: boolean;
+  aiGradingEnabled: boolean | null;
+  aiMaxMarks: number | null;
   className: string | null;
   subjectName: string | null;
   teacherFirstName: string | null;
@@ -46,6 +67,8 @@ interface Assignment {
     maxScore: number | null;
     percentage: number | null;
     feedback: string | null;
+    gradedBy: string | null;
+    aiReport: AiReport | null;
     submittedAt: string | null;
   } | null;
   questions: Question[];
@@ -206,9 +229,19 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
                   <span>👩‍🏫 {assignment.teacherFirstName} {assignment.teacherLastName}</span>
                 </div>
               </div>
-              <span className="px-3 py-1.5 rounded-xl bg-accent-100 text-accent-700 font-bold text-lg">
-                {hasQuestions ? `${totalQuestionPoints} pts` : `${assignment.maxScore} pts`}
-              </span>
+              <div className="flex flex-col items-end gap-2">
+                <span className="px-3 py-1.5 rounded-xl bg-accent-100 text-accent-700 font-bold text-lg">
+                  {hasQuestions ? `${totalQuestionPoints} pts` : `${assignment.aiGradingEnabled ? assignment.aiMaxMarks : assignment.maxScore} pts`}
+                </span>
+                {assignment.aiGradingEnabled && (
+                  <span
+                    title="Your submission will be evaluated instantly by EasyAI"
+                    className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-700 border border-violet-200"
+                  >
+                    ✨ Graded by EasyAI
+                  </span>
+                )}
+              </div>
             </div>
 
             {assignment.description && (
@@ -228,11 +261,107 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
             )}
           </div>
 
-          {/* Results - if auto-graded */}
-          {isGraded && hasQuestions ? (
+          {/* Results - graded free-text submission (e.g. graded by EasyAI or the teacher) */}
+          {isGraded && !hasQuestions ? (
             <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
               <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
                 <span>📊</span> Your Results
+                {assignment.mySubmission?.gradedBy === "easyai" && (
+                  <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-700 border border-violet-200">
+                    ✨ Graded by EasyAI
+                  </span>
+                )}
+              </h2>
+
+              <div className="flex items-center justify-center gap-4 mb-6 p-6 rounded-xl bg-gradient-to-br from-violet-50 to-indigo-50 border border-violet-200">
+                <div className="text-center">
+                  <p className="text-4xl font-bold text-violet-600">
+                    {assignment.mySubmission?.score}/{assignment.mySubmission?.maxScore}
+                  </p>
+                  <p className="text-sm text-violet-500">{assignment.mySubmission?.percentage}%</p>
+                </div>
+                <div className="text-6xl">
+                  {(assignment.mySubmission?.percentage || 0) >= 90 ? "" :
+                   (assignment.mySubmission?.percentage || 0) >= 70 ? "⭐" :
+                   (assignment.mySubmission?.percentage || 0) >= 50 ? "👍" : ""}
+                </div>
+              </div>
+
+              <p className="text-sm text-slate-500 text-center mb-6">
+                Submitted on {assignment.mySubmission?.submittedAt ? new Date(assignment.mySubmission.submittedAt).toLocaleString() : "N/A"}
+                {assignment.mySubmission?.gradedBy === "easyai" ? " · graded instantly by EasyAI" : ""}
+              </p>
+
+              {assignment.mySubmission?.feedback && (
+                <div className={`p-4 rounded-xl border mb-4 ${
+                  assignment.mySubmission?.gradedBy === "easyai"
+                    ? "bg-violet-50 border-violet-200"
+                    : "bg-slate-50 border-slate-200"
+                }`}>
+                  <h3 className="font-semibold text-slate-700 mb-2">
+                    {assignment.mySubmission?.gradedBy === "easyai" ? "✨ EasyAI Feedback" : "Teacher Feedback"}
+                  </h3>
+                  <p className="text-slate-600 text-sm whitespace-pre-wrap">{assignment.mySubmission.feedback}</p>
+                </div>
+              )}
+
+              {assignment.mySubmission?.aiReport && (assignment.mySubmission.aiReport.criteria || []).length > 0 && (
+                <div className="space-y-3 mb-4">
+                  <h3 className="font-semibold text-slate-700">EasyAI Marking Breakdown</h3>
+                  {assignment.mySubmission.aiReport.criteria.map((c) => {
+                    const ratio = c.maxScore > 0 ? c.score / c.maxScore : 0;
+                    return (
+                      <div key={c.key} className="p-4 rounded-xl bg-slate-50 border border-slate-200">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-semibold text-slate-700">{c.label}</span>
+                          <span className={`px-2 py-1 rounded-lg text-xs font-bold ${
+                            ratio >= 0.75 ? "bg-green-200 text-green-700" :
+                            ratio >= 0.5 ? "bg-yellow-100 text-yellow-700" :
+                            "bg-red-100 text-red-700"
+                          }`}>
+                            {c.score}/{c.maxScore}
+                          </span>
+                        </div>
+                        <div className="h-2 rounded-full bg-slate-200 overflow-hidden mb-2">
+                          <div
+                            className={`h-full rounded-full ${ratio >= 0.75 ? "bg-green-500" : ratio >= 0.5 ? "bg-yellow-500" : "bg-red-400"}`}
+                            style={{ width: `${Math.round(ratio * 100)}%` }}
+                          />
+                        </div>
+                        <p className="text-xs text-slate-500">{c.comment}</p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {assignment.mySubmission?.aiReport && (assignment.mySubmission.aiReport.improvements || []).length > 0 && (
+                <div className="p-4 rounded-xl bg-blue-50 border border-blue-100 mb-4">
+                  <h3 className="font-semibold text-blue-800 mb-2">💡 How to Improve</h3>
+                  <ul className="text-sm text-blue-700 space-y-1 list-disc list-inside">
+                    {assignment.mySubmission.aiReport.improvements.map((tip, i) => (
+                      <li key={i}>{tip}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {assignment.mySubmission?.content && (
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200">
+                  <h3 className="font-semibold text-slate-700 mb-2">Your Answer</h3>
+                  <p className="text-slate-600 text-sm whitespace-pre-wrap">{assignment.mySubmission.content}</p>
+                </div>
+              )}
+            </div>
+          ) : isSubmitted && hasQuestions ? (
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
+              <h2 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
+                <span>📊</span> Your Results
+                {assignment.mySubmission?.gradedBy === "easyai" && (
+                  <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-700 border border-violet-200">
+                    ✨ Graded by EasyAI
+                  </span>
+                )}
               </h2>
 
               <div className="flex items-center justify-center gap-4 mb-6 p-6 rounded-xl bg-gradient-to-br from-green-50 to-emerald-50 border border-green-200">
@@ -250,9 +379,15 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
               </div>
 
               {assignment.mySubmission?.feedback && (
-                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 mb-4">
-                  <h3 className="font-semibold text-slate-700 mb-2">Teacher Feedback</h3>
-                  <p className="text-slate-600 text-sm">{assignment.mySubmission.feedback}</p>
+                <div className={`p-4 rounded-xl border mb-4 ${
+                  assignment.mySubmission?.gradedBy === "easyai"
+                    ? "bg-violet-50 border-violet-200"
+                    : "bg-slate-50 border-slate-200"
+                }`}>
+                  <h3 className="font-semibold text-slate-700 mb-2">
+                    {assignment.mySubmission?.gradedBy === "easyai" ? "✨ EasyAI Feedback" : "Teacher Feedback"}
+                  </h3>
+                  <p className="text-slate-600 text-sm whitespace-pre-wrap">{assignment.mySubmission.feedback}</p>
                 </div>
               )}
 
@@ -429,14 +564,22 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
                 </div>
               ) : (
                 /* Free-text form */
-                <textarea
-                  value={freeContent}
-                  onChange={(e) => setFreeContent(e.target.value)}
-                  rows={10}
-                  disabled={!canSubmit}
-                  className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-accent-500 focus:border-transparent outline-none resize-none disabled:bg-slate-100 disabled:text-slate-400"
-                  placeholder="Type your answer here..."
-                />
+                <div>
+                  {assignment.aiGradingEnabled && (
+                    <div className="mb-4 p-4 rounded-xl bg-violet-50 border border-violet-200 text-sm text-violet-700">
+                      ✨ <span className="font-semibold">EasyAI will grade this the moment you submit</span> — out of{" "}
+                      {assignment.aiMaxMarks ?? assignment.maxScore} total marks set by your teacher.
+                    </div>
+                  )}
+                  <textarea
+                    value={freeContent}
+                    onChange={(e) => setFreeContent(e.target.value)}
+                    rows={10}
+                    disabled={!canSubmit}
+                    className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-accent-500 focus:border-transparent outline-none resize-none disabled:bg-slate-100 disabled:text-slate-400"
+                    placeholder="Type your answer here..."
+                  />
+                </div>
               )}
 
               <div className="mt-4 flex gap-3">
@@ -445,7 +588,13 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
                   disabled={!canSubmit || submitting}
                   className="flex-1 py-3 rounded-xl bg-gradient-to-r from-accent-500 to-accent-600 text-white font-semibold shadow-lg hover:shadow-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {submitting ? "Submitting..." : hasQuestions ? "Submit & Auto-Grade 🚀" : "Submit Assignment 🚀"}
+                  {submitting
+                    ? "Submitting..."
+                    : hasQuestions
+                      ? "Submit & Auto-Grade 🚀"
+                      : assignment.aiGradingEnabled
+                        ? "Submit & Get AI Marks ✨"
+                        : "Submit Assignment 🚀"}
                 </button>
               </div>
             </form>
@@ -468,14 +617,19 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
           </div>
 
           {/* Points Card */}
-          <div className="p-5 rounded-2xl bg-gradient-to-br from-accent-500 to-accent-600 text-white">
-            <h3 className="font-semibold text-sm text-accent-100 mb-1">
-              {hasQuestions ? "Total Points" : "Maximum Points"}
+          <div className={`p-5 rounded-2xl text-white ${assignment.aiGradingEnabled ? "bg-gradient-to-br from-violet-500 to-indigo-600" : "bg-gradient-to-br from-accent-500 to-accent-600"}`}>
+            <h3 className={`font-semibold text-sm mb-1 ${assignment.aiGradingEnabled ? "text-violet-100" : "text-accent-100"}`}>
+              {hasQuestions ? "Total Points" : assignment.aiGradingEnabled ? "EasyAI Total Marks" : "Maximum Points"}
             </h3>
             <p className="font-bold text-3xl">
-              {hasQuestions ? totalQuestionPoints : assignment.maxScore}
+              {hasQuestions ? totalQuestionPoints : assignment.aiGradingEnabled ? (assignment.aiMaxMarks ?? assignment.maxScore) : assignment.maxScore}
             </p>
-            {hasQuestions && (
+            {assignment.aiGradingEnabled && (
+              <p className="text-xs text-violet-100 mt-1">
+                ✨ Marks awarded instantly by EasyAI
+              </p>
+            )}
+            {hasQuestions && !assignment.aiGradingEnabled && (
               <p className="text-xs text-accent-100 mt-1">
                 {assignment.questions?.length || 0} question{assignment.questions?.length !== 1 ? "s" : ""}
               </p>

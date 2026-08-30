@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 
 // Usage:
-//   node run-migration.js                -> runs all migrations in order (0000 ... 0006)
+//   node run-migration.js                -> runs all migrations in order (0000 ... 0008)
 //   node run-migration.js 0001_assignment_grading.sql -> runs single file
 // The migration .sql files are idempotent (IF NOT EXISTS / guarded DO blocks), so it is
 // always safe to re-run this after a deploy. Exit code is non-zero when a statement failed
@@ -85,6 +85,7 @@ async function run() {
           "0005_activity_enhancements.sql",
           "0006_user_identity_columns.sql",
           "0007_quiz_images.sql",
+          "0008_easyai_grading.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root

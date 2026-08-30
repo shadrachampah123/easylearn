@@ -12,6 +12,7 @@ interface Grade {
   percentage: number | null;
   gradedAt: string | null;
   feedback: string | null;
+  gradedBy: string | null;
   subjectName: string | null;
   className: string | null;
 }
@@ -169,17 +170,29 @@ export default function LearnerGradesPage() {
                 return (
                   <div key={grade.id} className="p-4 flex items-center gap-4 hover:bg-slate-50">
                     <div className={`w-12 h-12 rounded-xl flex items-center justify-center text-white text-2xl ${
-                      grade.type === "quiz" ? "bg-purple-500" : "bg-blue-500"
+                      grade.type === "quiz" ? "bg-purple-500" : grade.gradedBy === "easyai" ? "bg-gradient-to-br from-violet-500 to-indigo-500" : "bg-blue-500"
                     }`}>
-                      {grade.type === "quiz" ? "" : "📝"}
+                      {grade.type === "quiz" ? "" : grade.gradedBy === "easyai" ? "✨" : "📝"}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="font-semibold text-slate-800 truncate">{grade.title}</p>
+                      <p className="font-semibold text-slate-800 truncate flex items-center gap-2">
+                        {grade.title}
+                        {grade.gradedBy === "easyai" && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-100 text-violet-700 border border-violet-200 whitespace-nowrap">
+                            EasyAI
+                          </span>
+                        )}
+                      </p>
                       <div className="flex items-center gap-2 text-xs text-slate-400">
                         <span>{grade.subjectName}</span>
                         <span>•</span>
                         <span>{grade.gradedAt ? new Date(grade.gradedAt).toLocaleDateString() : "N/A"}</span>
                       </div>
+                      {grade.gradedBy === "easyai" && grade.feedback && (
+                        <p className="text-xs text-violet-500 truncate mt-0.5" title={grade.feedback}>
+                          {grade.feedback}
+                        </p>
+                      )}
                     </div>
                     <div className="text-right">
                       <p className="font-bold text-lg text-slate-800">

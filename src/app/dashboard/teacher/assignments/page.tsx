@@ -11,6 +11,8 @@ interface Assignment {
   status: string;
   dueDate: string | null;
   maxScore: number;
+  aiGradingEnabled: boolean | null;
+  aiMaxMarks: number | null;
   className: string | null;
   subjectName: string | null;
   createdAt: string;
@@ -44,6 +46,8 @@ export default function TeacherAssignmentsPage() {
     maxScore: 100,
     allowLate: false,
     status: "draft",
+    aiGradingEnabled: false,
+    aiMaxMarks: 100,
   });
   const [saving, setSaving] = useState(false);
 
@@ -80,6 +84,12 @@ export default function TeacherAssignmentsPage() {
     e.preventDefault();
     setSaving(true);
 
+    if (formData.aiGradingEnabled && (!Number.isInteger(formData.aiMaxMarks) || formData.aiMaxMarks < 1 || formData.aiMaxMarks > 1000)) {
+      alert("EasyAI total marks must be a whole number between 1 and 1000.");
+      setSaving(false);
+      return;
+    }
+
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch("/api/assignments", {
@@ -88,7 +98,10 @@ export default function TeacherAssignmentsPage() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({
+          ...formData,
+          aiMaxMarks: formData.aiGradingEnabled ? formData.aiMaxMarks : null,
+        }),
       });
 
       const data = await res.json();
@@ -104,6 +117,8 @@ export default function TeacherAssignmentsPage() {
           maxScore: 100,
           allowLate: false,
           status: "draft",
+          aiGradingEnabled: false,
+          aiMaxMarks: 100,
         });
         loadData();
       } else {
@@ -250,6 +265,47 @@ export default function TeacherAssignmentsPage() {
                 />
                 <label htmlFor="allowLate" className="text-sm text-slate-600">Allow late submissions</label>
               </div>
+
+              {/* EasyAI grading configuration */}
+              <div className="p-4 rounded-xl border border-violet-200 bg-violet-50/60 space-y-3">
+                <div className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    id="aiGradingEnabled"
+                    checked={formData.aiGradingEnabled}
+                    onChange={(e) => setFormData({ ...formData, aiGradingEnabled: e.target.checked })}
+                    className="mt-1 w-4 h-4 rounded border-violet-300 text-violet-600"
+                  />
+                  <div className="flex-1">
+                    <label htmlFor="aiGradingEnabled" className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+                      <span aria-hidden>✨</span> Grade instantly with EasyAI
+                    </label>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      When learners submit, EasyAI evaluates their text and files immediately and awards
+                      marks out of the total you set below — no manual grading needed.
+                    </p>
+                  </div>
+                </div>
+                {formData.aiGradingEnabled && (
+                  <div className="pl-7">
+                    <label className="block text-sm font-medium text-slate-700 mb-1">
+                      EasyAI total maximum marks *
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={1000}
+                      required
+                      value={formData.aiMaxMarks}
+                      onChange={(e) => setFormData({ ...formData, aiMaxMarks: parseInt(e.target.value) || 0 })}
+                      className="w-40 px-4 py-2.5 rounded-xl border border-slate-200 focus:ring-2 focus:ring-violet-500 focus:border-transparent outline-none"
+                    />
+                    <p className="text-xs text-slate-500 mt-1">
+                      The AI will allocate each learner&apos;s marks out of this total (e.g. 50 → graded as x/50).
+                    </p>
+                  </div>
+                )}
+              </div>
               <div className="flex gap-3 pt-4">
                 <button type="button" onClick={() => setShowForm(false)} className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 transition-colors">
                   Cancel
@@ -299,6 +355,14 @@ export default function TeacherAssignmentsPage() {
                     <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold ${statusColors[assignment.status] || statusColors.draft}`}>
                       {assignment.status}
                     </span>
+                    {assignment.aiGradingEnabled && (
+                      <span
+                        title={`EasyAI grades submissions instantly out of ${assignment.aiMaxMarks ?? assignment.maxScore} total marks`}
+                        className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-700 border border-violet-200"
+                      >
+                        ✨ EasyAI · /{assignment.aiMaxMarks ?? assignment.maxScore}
+                      </span>
+                    )}
                   </div>
                   <p className="text-slate-500 text-sm mb-3 line-clamp-2">{assignment.description || "No description"}</p>
                   <div className="flex items-center gap-4 text-xs text-slate-400">

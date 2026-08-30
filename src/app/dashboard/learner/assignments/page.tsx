@@ -11,6 +11,8 @@ interface Assignment {
   status: string;
   dueDate: string | null;
   maxScore: number;
+  aiGradingEnabled: boolean | null;
+  aiMaxMarks: number | null;
   className: string | null;
   subjectName: string | null;
   createdAt: string;
@@ -18,6 +20,9 @@ interface Assignment {
     id: string;
     status: string;
     score: number | null;
+    maxScore: number | null;
+    percentage: number | null;
+    gradedBy: string | null;
   } | null;
 }
 
@@ -70,7 +75,10 @@ export default function LearnerAssignmentsPage() {
         : { text: "Not Started", color: "bg-slate-100 text-slate-600" };
     }
     if (assignment.submission.status === "graded") {
-      return { text: `${assignment.submission.score}/${assignment.maxScore}`, color: "bg-green-100 text-green-600" };
+      return {
+        text: `${assignment.submission.score ?? 0}/${assignment.submission.maxScore ?? assignment.aiMaxMarks ?? assignment.maxScore}${assignment.submission.gradedBy === "easyai" ? " ✨" : ""}`,
+        color: "bg-green-100 text-green-600",
+      };
     }
     if (assignment.submission.status === "late") {
       return { text: "Submitted Late", color: "bg-orange-100 text-orange-600" };
@@ -153,7 +161,7 @@ export default function LearnerAssignmentsPage() {
                         <span>📚</span> {assignment.subjectName}
                       </span>
                       <span className="flex items-center gap-1">
-                        <span>📊</span> {assignment.maxScore} points
+                        <span>📊</span> {assignment.aiGradingEnabled ? `${assignment.aiMaxMarks ?? assignment.maxScore} marks (EasyAI ✨)` : `${assignment.maxScore} points`}
                       </span>
                       {assignment.dueDate && (
                         <span className={`flex items-center gap-1 ${isOverdue ? "text-red-500" : ""}`}>
