@@ -13,7 +13,9 @@ import {
 } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
+import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, desc } from "drizzle-orm";
 
 export async function GET(
@@ -25,6 +27,9 @@ export async function GET(
     if (!token) return unauthorizedResponse();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
+
+    // allow_file_uploads lives in the schema but only 0009 adds the column.
+    await ensureFileUploadSchema();
 
     const { id } = await params;
 
@@ -38,6 +43,7 @@ export async function GET(
         dueDate: assignments.dueDate,
         maxScore: assignments.maxScore,
         allowLate: assignments.allowLate,
+        allowFileUploads: assignments.allowFileUploads,
         aiGradingEnabled: assignments.aiGradingEnabled,
         aiMaxMarks: assignments.aiMaxMarks,
         attachments: assignments.attachments,
@@ -81,6 +87,8 @@ export async function GET(
           gradedBy: submissions.gradedBy,
           // The teacher needs to read what the learner actually wrote before grading it.
           content: submissions.content,
+          // Files the learner uploaded with their submission.
+          attachments: submissions.attachments,
           submittedAt: submissions.submittedAt,
           gradedAt: submissions.gradedAt,
           learnerFirstName: users.firstName,
@@ -181,7 +189,10 @@ export async function GET(
     return successResponse(assignment);
   } catch (error) {
     console.error("Get assignment error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The assignment could not be loaded. Please try again."),
+      500
+    );
   }
 }
 
@@ -211,7 +222,20 @@ export async function PUT(
     }
 
     const body = await request.json();
-    const { title, description, instructions, dueDate, maxScore, allowLate, attachments, status, aiGradingEnabled, aiMaxMarks } = body;
+    const { title, description, instructions, dueDate, maxScore, allowLate, attachments, allowFileUploads, status, aiGradingEnabled, aiMaxMarks } = body;
+
+    // Every attached file must be one the teacher actually uploaded.
+    let resolvedAttachments = attachments;
+    if (attachments !== undefined) {
+      const resolved = await resolveUploadedAttachments(attachments, {
+        uploaderId: payload.userId,
+        purpose: "assignment",
+      });
+      if (!resolved.ok) {
+        return errorResponse(resolved.error || "The attached files could not be verified");
+      }
+      resolvedAttachments = resolved.attachments.length > 0 ? resolved.attachments : null;
+    }
 
     // EasyAI configuration is only touched when the caller sends it, so partial
     // updates (e.g. the publish/close toggle) never wipe the AI settings.
@@ -241,7 +265,8 @@ export async function PUT(
         dueDate: dueDate ? new Date(dueDate) : null,
         maxScore,
         allowLate,
-        attachments,
+        ...(attachments !== undefined ? { attachments: resolvedAttachments } : {}),
+        ...(allowFileUploads !== undefined ? { allowFileUploads: allowFileUploads === true } : {}),
         status,
         ...easyAiUpdate,
         updatedAt: new Date(),
@@ -252,7 +277,10 @@ export async function PUT(
     return successResponse(updated);
   } catch (error) {
     console.error("Update assignment error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The assignment could not be updated. Please try again."),
+      500
+    );
   }
 }
 

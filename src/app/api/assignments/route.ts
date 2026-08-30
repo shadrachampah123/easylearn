@@ -4,7 +4,9 @@ import { assignments, classes, subjects, users, submissions } from "@/db/schema"
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
+import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
+import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, desc, and, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -13,6 +15,9 @@ export async function GET(request: NextRequest) {
     if (!token) return unauthorizedResponse();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
+
+    // allow_file_uploads lives in the schema but only 0009 adds the column.
+    await ensureFileUploadSchema();
 
     const classId = request.nextUrl.searchParams.get("classId");
     const subjectId = request.nextUrl.searchParams.get("subjectId");
@@ -28,6 +33,7 @@ export async function GET(request: NextRequest) {
         dueDate: assignments.dueDate,
         maxScore: assignments.maxScore,
         allowLate: assignments.allowLate,
+        allowFileUploads: assignments.allowFileUploads,
         aiGradingEnabled: assignments.aiGradingEnabled,
         aiMaxMarks: assignments.aiMaxMarks,
         attachments: assignments.attachments,
@@ -111,10 +117,19 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { title, description, instructions, classId, subjectId, termId, dueDate, maxScore, allowLate, attachments, status, aiGradingEnabled, aiMaxMarks } = body;
+    const { title, description, instructions, classId, subjectId, termId, dueDate, maxScore, allowLate, attachments, allowFileUploads, status, aiGradingEnabled, aiMaxMarks } = body;
 
     if (!title || !classId || !subjectId) {
       return errorResponse("Title, class, and subject are required");
+    }
+
+    // Every attached file must be one the teacher actually uploaded.
+    const resolved = await resolveUploadedAttachments(attachments, {
+      uploaderId: payload.userId,
+      purpose: "assignment",
+    });
+    if (!resolved.ok) {
+      return errorResponse(resolved.error || "The attached files could not be verified");
     }
 
     // EasyAI configuration: when AI grading is on the teacher must set the total
@@ -142,7 +157,8 @@ export async function POST(request: NextRequest) {
       dueDate: dueDate ? new Date(dueDate) : null,
       maxScore: maxScore || 100,
       allowLate: allowLate || false,
-      attachments: attachments || null,
+      attachments: resolved.attachments.length > 0 ? resolved.attachments : null,
+      allowFileUploads: allowFileUploads === true,
       aiGradingEnabled: easyAiEnabled,
       aiMaxMarks: easyAiMaxMarks,
       status: status || "draft",
@@ -160,6 +176,9 @@ export async function POST(request: NextRequest) {
     return successResponse(newAssignment, 201);
   } catch (error) {
     console.error("Create assignment error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The assignment could not be created. Please try again."),
+      500
+    );
   }
 }

@@ -159,6 +159,11 @@ const MIGRATION_BY_OBJECT: Record<string, string> = {
   // quizzes at all. Keyed on the qualified name only: gallery_items and news have an
   // image_url column too, and pointing those at 0007 would send an operator to the wrong file.
   "quiz_questions.image_url": "drizzle/0007_quiz_images.sql",
+  // drizzle/0009 adds assignments.allow_file_uploads and the uploaded_files
+  // table. Both are declared in src/db/schema.ts, so on a database that never
+  // ran 0009 every upload/attachment query fails until the objects exist.
+  "assignments.allow_file_uploads": "drizzle/0009_file_uploads.sql",
+  uploaded_files: "drizzle/0009_file_uploads.sql",
 };
 
 export function migrationFor(objectName: string | null): string | undefined {
@@ -215,7 +220,9 @@ export type SchemaFeature =
   | "dashboard_card_overrides"
   | "activity_logs_enrichment"
   | "optional_user_columns"
-  | "quiz_question_images";
+  | "quiz_question_images"
+  | "uploaded_files"
+  | "assignment_file_uploads";
 
 const FEATURE_STATUS_TTL_MS = 60_000;
 
@@ -224,6 +231,8 @@ const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   activity_logs_enrichment: "drizzle/0005_activity_enhancements.sql",
   optional_user_columns: "drizzle/0006_user_identity_columns.sql",
   quiz_question_images: "drizzle/0007_quiz_images.sql",
+  uploaded_files: "drizzle/0009_file_uploads.sql",
+  assignment_file_uploads: "drizzle/0009_file_uploads.sql",
 };
 
 /** DDL mirrors the idempotent migration files; safe to run repeatedly. */
@@ -279,6 +288,34 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
   quiz_question_images: [
     `ALTER TABLE "quiz_questions" ADD COLUMN IF NOT EXISTS "image_url" text;`,
   ],
+  uploaded_files: [
+    `CREATE TABLE IF NOT EXISTS "uploaded_files" (
+       "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+       "uploader_id" uuid NOT NULL,
+       "purpose" varchar(30) NOT NULL,
+       "assignment_id" uuid,
+       "original_name" varchar(255) NOT NULL,
+       "stored_name" varchar(255) NOT NULL,
+       "mime_type" varchar(150),
+       "category" varchar(20) NOT NULL,
+       "size_bytes" integer NOT NULL,
+       "created_at" timestamp DEFAULT now() NOT NULL
+     );`,
+    `DO $$ BEGIN
+       ALTER TABLE "uploaded_files" ADD CONSTRAINT "uploaded_files_uploader_id_users_id_fk"
+         FOREIGN KEY ("uploader_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;
+     EXCEPTION WHEN duplicate_object THEN null; END $$;`,
+    `DO $$ BEGIN
+       ALTER TABLE "uploaded_files" ADD CONSTRAINT "uploaded_files_assignment_id_assignments_id_fk"
+         FOREIGN KEY ("assignment_id") REFERENCES "public"."assignments"("id") ON DELETE set null ON UPDATE no action;
+     EXCEPTION WHEN duplicate_object THEN null; END $$;`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "uploaded_files_stored_name_unique" ON "uploaded_files" USING btree ("stored_name");`,
+    `CREATE INDEX IF NOT EXISTS "uploaded_files_uploader_purpose_idx" ON "uploaded_files" USING btree ("uploader_id", "purpose");`,
+    `CREATE INDEX IF NOT EXISTS "uploaded_files_assignment_idx" ON "uploaded_files" USING btree ("assignment_id");`,
+  ],
+  assignment_file_uploads: [
+    `ALTER TABLE "assignments" ADD COLUMN IF NOT EXISTS "allow_file_uploads" boolean DEFAULT false NOT NULL;`,
+  ],
 };
 
 /**
@@ -305,6 +342,12 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     mode: "columns",
     table: "quiz_questions",
     columns: ["image_url"],
+  },
+  uploaded_files: { mode: "relation", relation: "uploaded_files" },
+  assignment_file_uploads: {
+    mode: "columns",
+    table: "assignments",
+    columns: ["allow_file_uploads"],
   },
 };
 
@@ -426,6 +469,19 @@ export function ensureQuizImageColumn(): Promise<FeatureStatus> {
   return ensureSchemaFeature("quiz_question_images");
 }
 
+/**
+ * `assignments.allow_file_uploads` and the `uploaded_files` table are declared
+ * in src/db/schema.ts but only added by drizzle/0009_file_uploads.sql. Every
+ * upload / attachment route calls this before touching either object, so an
+ * un-migrated database self-heals instead of 500ing.
+ */
+export function ensureFileUploadSchema(): Promise<FeatureStatus[]> {
+  return Promise.all([
+    ensureSchemaFeature("uploaded_files"),
+    ensureSchemaFeature("assignment_file_uploads"),
+  ]);
+}
+
 export interface OptionalSchemaStatus {
   feature: SchemaFeature;
   present: boolean;
@@ -443,6 +499,8 @@ export async function probeSchemaFeatures(
     "activity_logs_enrichment",
     "optional_user_columns",
     "quiz_question_images",
+    "uploaded_files",
+    "assignment_file_uploads",
   ]
 ): Promise<OptionalSchemaStatus[]> {
   const repairEnabled = autoSchemaRepairEnabled();

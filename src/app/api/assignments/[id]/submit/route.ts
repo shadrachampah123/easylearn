@@ -3,6 +3,8 @@ import { db } from "@/db";
 import { assignments, submissions, assignmentQuestions, assignmentAnswers, notifications, learnerPoints } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import { resolveUploadedAttachments } from "@/lib/attachment-auth";
+import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import {
   buildLearnerFeedback,
   evaluateFreeResponse,
@@ -43,6 +45,9 @@ export async function POST(
     const body = await request.json();
     const { answers, content, attachments } = body; // answers = { [questionId]: answerText }
 
+    // allow_file_uploads lives in the schema but only 0009 adds the column.
+    await ensureFileUploadSchema();
+
     // Get the assignment
     const [assignment] = await db
       .select()
@@ -60,6 +65,27 @@ export async function POST(
     const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
     if (isLate && !assignment.allowLate) {
       return errorResponse("Late submissions are not allowed for this assignment");
+    }
+
+    /* ── File upload gate: the teacher must explicitly enable uploads ── */
+    let resolvedAttachments: { fileId: string; name: string; type: string; size: number; url: string }[] = [];
+    const submittedFiles = Array.isArray(attachments) ? attachments : [];
+    if (submittedFiles.length > 0 && !assignment.allowFileUploads) {
+      return errorResponse(
+        "File uploads are not enabled for this assignment. Your teacher must allow submissions with files first.",
+        403
+      );
+    }
+    if (submittedFiles.length > 0) {
+      const resolved = await resolveUploadedAttachments(submittedFiles, {
+        uploaderId: payload.userId,
+        purpose: "submission",
+        assignmentId,
+      });
+      if (!resolved.ok) {
+        return errorResponse(resolved.error || "The attached files could not be verified");
+      }
+      resolvedAttachments = resolved.attachments;
     }
 
     // Check for existing submission
@@ -95,7 +121,7 @@ export async function POST(
         assignmentId,
         learnerId: payload.userId,
         content: content || null,
-        attachments: attachments || null,
+        attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
         status,
         submittedAt: new Date(),
       })
@@ -116,7 +142,7 @@ export async function POST(
         description: assignment.description,
         instructions: assignment.instructions,
         content,
-        attachments,
+        attachments: resolvedAttachments,
       });
       const score = marksFromPercentage(report.percentage, aiMaxMarks);
       const percentage = Math.round((score / aiMaxMarks) * 100);
@@ -357,6 +383,9 @@ export async function POST(
     });
   } catch (error) {
     console.error("Submit assignment error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "Your submission could not be saved. Please try again."),
+      500
+    );
   }
 }

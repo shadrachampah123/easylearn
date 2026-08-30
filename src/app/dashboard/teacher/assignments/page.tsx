@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import FileUploader, { type StoredAttachment } from "@/components/dashboard/FileUploader";
 import Link from "next/link";
 
 interface Assignment {
@@ -11,6 +12,7 @@ interface Assignment {
   status: string;
   dueDate: string | null;
   maxScore: number;
+  allowFileUploads: boolean | null;
   aiGradingEnabled: boolean | null;
   aiMaxMarks: number | null;
   className: string | null;
@@ -45,10 +47,13 @@ export default function TeacherAssignmentsPage() {
     dueDate: "",
     maxScore: 100,
     allowLate: false,
+    allowFileUploads: false,
     status: "draft",
     aiGradingEnabled: false,
     aiMaxMarks: 100,
   });
+  const [attachments, setAttachments] = useState<StoredAttachment[]>([]);
+  const [uploadingFiles, setUploadingFiles] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -100,6 +105,7 @@ export default function TeacherAssignmentsPage() {
         },
         body: JSON.stringify({
           ...formData,
+          attachments: attachments.length > 0 ? attachments : undefined,
           aiMaxMarks: formData.aiGradingEnabled ? formData.aiMaxMarks : null,
         }),
       });
@@ -107,6 +113,7 @@ export default function TeacherAssignmentsPage() {
       const data = await res.json();
       if (data.success) {
         setShowForm(false);
+        setAttachments([]);
         setFormData({
           title: "",
           description: "",
@@ -116,6 +123,7 @@ export default function TeacherAssignmentsPage() {
           dueDate: "",
           maxScore: 100,
           allowLate: false,
+          allowFileUploads: false,
           status: "draft",
           aiGradingEnabled: false,
           aiMaxMarks: 100,
@@ -266,6 +274,39 @@ export default function TeacherAssignmentsPage() {
                 <label htmlFor="allowLate" className="text-sm text-slate-600">Allow late submissions</label>
               </div>
 
+              {/* Assignment materials: upload files from the local device */}
+              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 space-y-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-800 mb-0.5">📎 Assignment files</p>
+                  <p className="text-xs text-slate-500 mb-3">
+                    Upload documents, PDFs, images, audio or videos from your device for learners to view and download.
+                  </p>
+                  <FileUploader
+                    purpose="assignment"
+                    value={attachments}
+                    onChange={setAttachments}
+                    onUploadingChange={setUploadingFiles}
+                  />
+                </div>
+                <div className="flex items-start gap-2 pt-2 border-t border-slate-200">
+                  <input
+                    type="checkbox"
+                    id="allowFileUploads"
+                    checked={formData.allowFileUploads}
+                    onChange={(e) => setFormData({ ...formData, allowFileUploads: e.target.checked })}
+                    className="mt-1 w-4 h-4 rounded border-slate-300"
+                  />
+                  <div>
+                    <label htmlFor="allowFileUploads" className="text-sm font-semibold text-slate-800">
+                      Allow learners to upload files with their submission
+                    </label>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Learners can only attach files when you enable this for the assignment.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
               {/* EasyAI grading configuration */}
               <div className="p-4 rounded-xl border border-violet-200 bg-violet-50/60 space-y-3">
                 <div className="flex items-start gap-3">
@@ -307,11 +348,11 @@ export default function TeacherAssignmentsPage() {
                 )}
               </div>
               <div className="flex gap-3 pt-4">
-                <button type="button" onClick={() => setShowForm(false)} className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 transition-colors">
+                <button type="button" onClick={() => { setAttachments([]); setShowForm(false); }} className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 transition-colors">
                   Cancel
                 </button>
-                <button type="submit" disabled={saving} className="flex-1 py-3 rounded-xl gradient-secondary text-white font-semibold shadow-lg disabled:opacity-50">
-                  {saving ? "Creating..." : "Create Assignment"}
+                <button type="submit" disabled={saving || uploadingFiles} className="flex-1 py-3 rounded-xl gradient-secondary text-white font-semibold shadow-lg disabled:opacity-50">
+                  {saving ? "Creating..." : uploadingFiles ? "Uploading files..." : "Create Assignment"}
                 </button>
               </div>
             </form>
@@ -361,6 +402,14 @@ export default function TeacherAssignmentsPage() {
                         className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-700 border border-violet-200"
                       >
                         ✨ EasyAI · /{assignment.aiMaxMarks ?? assignment.maxScore}
+                      </span>
+                    )}
+                    {assignment.allowFileUploads && (
+                      <span
+                        title="Learners can upload files with their submission"
+                        className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700 border border-emerald-200"
+                      >
+                        📎 File submissions enabled
                       </span>
                     )}
                   </div>

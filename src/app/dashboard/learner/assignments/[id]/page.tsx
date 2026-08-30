@@ -2,6 +2,9 @@
 
 import { useEffect, useState, use } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import AttachmentList from "@/components/dashboard/AttachmentList";
+import FileUploader, { type StoredAttachment } from "@/components/dashboard/FileUploader";
+import { storedAttachments } from "@/lib/uploads";
 import Link from "next/link";
 
 interface Question {
@@ -53,6 +56,8 @@ interface Assignment {
   dueDate: string | null;
   maxScore: number;
   allowLate: boolean;
+  allowFileUploads: boolean | null;
+  attachments: unknown | null;
   aiGradingEnabled: boolean | null;
   aiMaxMarks: number | null;
   className: string | null;
@@ -62,6 +67,7 @@ interface Assignment {
   mySubmission: {
     id: string;
     content: string | null;
+    attachments: unknown | null;
     status: string;
     score: number | null;
     maxScore: number | null;
@@ -100,6 +106,8 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
   const [freeContent, setFreeContent] = useState("");
   const [results, setResults] = useState<any>(null);
   const [showCorrections, setShowCorrections] = useState(false);
+  const [attachments, setAttachments] = useState<StoredAttachment[]>([]);
+  const [uploadingFiles, setUploadingFiles] = useState(false);
 
   useEffect(() => {
     loadAssignment();
@@ -142,8 +150,9 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
         }
       }
     } else {
-      if (!freeContent.trim()) {
-        alert("Please enter your answer");
+      const hasFiles = attachments.length > 0;
+      if (!freeContent.trim() && !hasFiles) {
+        alert("Please enter your answer or attach a file");
         return;
       }
     }
@@ -161,11 +170,13 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
         body: JSON.stringify({
           answers: hasQuestions ? answers : undefined,
           content: hasQuestions ? undefined : freeContent,
+          attachments: attachments.length > 0 ? attachments : undefined,
         }),
       });
 
       const data = await res.json();
       if (data.success) {
+        setAttachments([]);
         setResults(data.data.results);
         loadAssignment();
       } else {
@@ -259,6 +270,19 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
                 <p className="text-blue-700 text-sm whitespace-pre-wrap">{assignment.instructions}</p>
               </div>
             )}
+
+            {storedAttachments(assignment.attachments).length > 0 && (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 mt-4">
+                <h3 className="font-semibold text-slate-700 mb-3 flex items-center gap-2">
+                  <span>📎</span> Assignment Files
+                  <span className="text-xs font-normal text-slate-400">
+                    ({storedAttachments(assignment.attachments).length} file
+                    {storedAttachments(assignment.attachments).length === 1 ? "" : "s"})
+                  </span>
+                </h3>
+                <AttachmentList attachments={assignment.attachments} />
+              </div>
+            )}
           </div>
 
           {/* Results - graded free-text submission (e.g. graded by EasyAI or the teacher) */}
@@ -350,6 +374,15 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
                 <div className="p-4 rounded-xl bg-slate-50 border border-slate-200">
                   <h3 className="font-semibold text-slate-700 mb-2">Your Answer</h3>
                   <p className="text-slate-600 text-sm whitespace-pre-wrap">{assignment.mySubmission.content}</p>
+                </div>
+              )}
+
+              {storedAttachments(assignment.mySubmission?.attachments).length > 0 && (
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 mt-4">
+                  <h3 className="font-semibold text-slate-700 mb-2">
+                    📎 Your uploaded files ({storedAttachments(assignment.mySubmission?.attachments).length})
+                  </h3>
+                  <AttachmentList attachments={assignment.mySubmission?.attachments} compact />
                 </div>
               )}
             </div>
@@ -471,6 +504,14 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
                   <p className="text-slate-600 text-sm whitespace-pre-wrap">{assignment.mySubmission.content}</p>
                 </div>
               )}
+              {storedAttachments(assignment.mySubmission?.attachments).length > 0 && (
+                <div className="mt-4 p-4 rounded-xl bg-slate-50">
+                  <h3 className="font-semibold text-slate-700 mb-2">
+                    📎 Your uploaded files ({storedAttachments(assignment.mySubmission?.attachments).length})
+                  </h3>
+                  <AttachmentList attachments={assignment.mySubmission?.attachments} compact />
+                </div>
+              )}
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6">
@@ -582,19 +623,44 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
                 </div>
               )}
 
+              {/* File uploads: only when the teacher explicitly enabled them */}
+              {assignment.allowFileUploads ? (
+                <div className="mt-4 p-4 rounded-xl border border-slate-200 bg-slate-50/60">
+                  <p className="text-sm font-semibold text-slate-800 mb-0.5">📎 Attach files (optional)</p>
+                  <p className="text-xs text-slate-500 mb-3">
+                    Upload documents, PDFs, images, audio or videos from your device. Videos: max 100 MB · other files: max 50 MB.
+                  </p>
+                  <FileUploader
+                    purpose="submission"
+                    assignmentId={assignment.id}
+                    value={attachments}
+                    onChange={setAttachments}
+                    onUploadingChange={setUploadingFiles}
+                    disabled={!canSubmit}
+                  />
+                </div>
+              ) : (
+                <div className="mt-4 p-4 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-700">
+                  📎 Your teacher has <span className="font-semibold">not enabled file uploads</span> for this
+                  assignment, so you can only submit a written answer.
+                </div>
+              )}
+
               <div className="mt-4 flex gap-3">
                 <button
                   type="submit"
-                  disabled={!canSubmit || submitting}
+                  disabled={!canSubmit || submitting || uploadingFiles}
                   className="flex-1 py-3 rounded-xl bg-gradient-to-r from-accent-500 to-accent-600 text-white font-semibold shadow-lg hover:shadow-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {submitting
                     ? "Submitting..."
-                    : hasQuestions
-                      ? "Submit & Auto-Grade 🚀"
-                      : assignment.aiGradingEnabled
-                        ? "Submit & Get AI Marks ✨"
-                        : "Submit Assignment 🚀"}
+                    : uploadingFiles
+                      ? "Uploading files..."
+                      : hasQuestions
+                        ? "Submit & Auto-Grade 🚀"
+                        : assignment.aiGradingEnabled
+                          ? "Submit & Get AI Marks ✨"
+                          : "Submit Assignment 🚀"}
                 </button>
               </div>
             </form>

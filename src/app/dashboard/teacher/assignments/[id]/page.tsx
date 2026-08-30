@@ -2,6 +2,8 @@
 
 import { useEffect, useState, use } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import AttachmentList from "@/components/dashboard/AttachmentList";
+import { storedAttachments } from "@/lib/uploads";
 import Link from "next/link";
 
 interface Question {
@@ -24,6 +26,7 @@ interface Submission {
   feedback: string | null;
   gradedBy: string | null;
   content: string | null;
+  attachments: unknown | null;
   submittedAt: string | null;
   gradedAt: string | null;
   learnerFirstName: string;
@@ -58,6 +61,8 @@ interface Assignment {
   dueDate: string | null;
   maxScore: number;
   allowLate: boolean;
+  allowFileUploads: boolean | null;
+  attachments: unknown | null;
   aiGradingEnabled: boolean | null;
   aiMaxMarks: number | null;
   className: string | null;
@@ -328,6 +333,28 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
       });
       const data = await res.json();
       if (data.success) loadAssignment();
+      else if (data.error) alert(data.error);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  /** Teacher-controlled gate: learners may upload files only when enabled. */
+  async function toggleFileUploads() {
+    const token = localStorage.getItem("el_token");
+    const enabled = !assignment?.allowFileUploads;
+    try {
+      const res = await fetch(`/api/assignments/${resolvedParams.id}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ ...assignment, allowFileUploads: enabled }),
+      });
+      const data = await res.json();
+      if (data.success) loadAssignment();
+      else if (data.error) alert(data.error);
     } catch (err) {
       console.error(err);
     }
@@ -357,6 +384,7 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
     );
   }
 
+  const assignmentFiles = storedAttachments(assignment.attachments);
   const submittedCount = assignment.submissions.filter((s) => s.status !== "pending").length;
   const gradedCount = assignment.submissions.filter((s) => s.status === "graded").length;
   const avgScore = gradedCount > 0
@@ -400,7 +428,22 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
               )}
             </div>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-col sm:flex-row gap-2">
+            <button
+              onClick={toggleFileUploads}
+              title={
+                assignment.allowFileUploads
+                  ? "Learners can currently upload files with their submission. Click to disable."
+                  : "Learners cannot upload files. Click to allow file submissions."
+              }
+              className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors border ${
+                assignment.allowFileUploads
+                  ? "bg-emerald-100 text-emerald-700 border-emerald-200 hover:bg-emerald-200"
+                  : "bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200"
+              }`}
+            >
+              📎 {assignment.allowFileUploads ? "File submissions: ON" : "File submissions: OFF"}
+            </button>
             <button
               onClick={toggleStatus}
               className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${
@@ -422,9 +465,21 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
         )}
 
         {assignment.instructions && (
-          <div>
+          <div className="mb-4">
             <h3 className="font-semibold text-slate-700 mb-1">Instructions</h3>
             <p className="text-slate-600 text-sm whitespace-pre-wrap">{assignment.instructions}</p>
+          </div>
+        )}
+
+        {assignmentFiles.length > 0 && (
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200">
+            <h3 className="font-semibold text-slate-700 mb-3 flex items-center gap-2">
+              <span>📎</span> Assignment Files
+              <span className="text-xs font-normal text-slate-400">
+                ({assignmentFiles.length} file{assignmentFiles.length === 1 ? "" : "s"})
+              </span>
+            </h3>
+            <AttachmentList attachments={assignment.attachments} />
           </div>
         )}
       </div>
@@ -753,6 +808,14 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
                     {sub.status === "late" && (
                       <span className="px-2 py-1 rounded bg-orange-100 text-orange-600 text-xs font-semibold">Late</span>
                     )}
+                    {storedAttachments(sub.attachments).length > 0 && (
+                      <span
+                        title={`${storedAttachments(sub.attachments).length} file(s) attached`}
+                        className="px-2 py-1 rounded bg-slate-100 text-slate-600 text-xs font-semibold"
+                      >
+                        📎 {storedAttachments(sub.attachments).length}
+                      </span>
+                    )}
                     {sub.gradedBy === "easyai" && (
                       <span className="px-2 py-1 rounded bg-violet-100 text-violet-700 text-xs font-semibold border border-violet-200">✨ Graded by EasyAI</span>
                     )}
@@ -837,6 +900,15 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
                     <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-700 whitespace-pre-wrap max-h-64 overflow-y-auto">
                       {grading.content}
                     </div>
+                  </div>
+                )}
+
+                {storedAttachments(grading.attachments).length > 0 && (
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-700 mb-2">
+                      Learner&apos;s uploaded files ({storedAttachments(grading.attachments).length})
+                    </h4>
+                    <AttachmentList attachments={grading.attachments} compact />
                   </div>
                 )}
 
