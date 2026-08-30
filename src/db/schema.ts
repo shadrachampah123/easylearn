@@ -216,6 +216,10 @@ export const assignments = pgTable("assignments", {
   maxScore: integer("max_score").default(100),
   allowLate: boolean("allow_late").default(false),
   attachments: jsonb("attachments"),
+  // Teacher-controlled gate for learner file uploads. Learners may only attach
+  // files to their submission when the teacher explicitly enables this.
+  // (Added by drizzle/0009_file_uploads.sql.)
+  allowFileUploads: boolean("allow_file_uploads").notNull().default(false),
   // EasyAI — automated grading: when enabled, learner submissions are evaluated
   // instantly by EasyAI and marked out of `aiMaxMarks` (the total the teacher
   // allows the AI to allocate) instead of waiting for manual teacher grading.
@@ -243,6 +247,24 @@ export const submissions = pgTable("submissions", {
   aiReport: jsonb("ai_report"),
   submittedAt: timestamp("submitted_at"),
   gradedAt: timestamp("graded_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+/* ── Uploaded Files ──
+   Every file uploaded from a local device (assignment materials by teachers,
+   submission files by learners) is registered here. The `attachments` jsonb on
+   assignments/submissions references these rows by `fileId`. Files themselves
+   live on disk under the upload storage directory (UPLOAD_DIR). */
+export const uploadedFiles = pgTable("uploaded_files", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  uploaderId: uuid("uploader_id").notNull().references(() => users.id),
+  purpose: varchar("purpose", { length: 30 }).notNull(), // "assignment" | "submission"
+  assignmentId: uuid("assignment_id").references(() => assignments.id),
+  originalName: varchar("original_name", { length: 255 }).notNull(),
+  storedName: varchar("stored_name", { length: 255 }).notNull().unique(),
+  mimeType: varchar("mime_type", { length: 150 }),
+  category: varchar("category", { length: 20 }).notNull(), // document | image | audio | video | zip
+  sizeBytes: integer("size_bytes").notNull(),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 

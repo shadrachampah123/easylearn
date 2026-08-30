@@ -73,6 +73,7 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 | `0006_user_identity_columns.sql` | `users.username`, `users.must_change_password` (these existed in `src/db/schema.ts` but in no migration) |
 | `0007_quiz_images.sql` | `quiz_questions.image_url` (Kahoot question images) |
 | `0008_easyai_grading.sql` | EasyAI: `assignments.ai_grading_enabled`/`ai_max_marks`, `submissions.graded_by`/`ai_report` |
+| `0009_file_uploads.sql` | Local file uploads: `assignments.allow_file_uploads` (teacher-controlled learner-upload gate) + `uploaded_files` registry |
 
 Notes:
 
@@ -131,6 +132,29 @@ Notes:
   **and** `percentage` - manual grading used to leave the last two NULL, which showed up as
   `82/null (null%)` for the teacher and averaged to 0% in the learner's grade book. Re-grading is
   allowed and does not award XP twice.
+
+#### File uploads (documents, PDFs, audio, images, videos)
+
+- **Local devices, not URLs.** Teachers attach files straight from their device while creating an
+  assignment (`/dashboard/teacher/assignments`), and learners attach files to their submission on
+  `/dashboard/learner/assignments/[id]` — no external URLs needed.
+- **Size limits (enforced server-side, mirrored in the UI):** a **strict 100 MB per video** limit,
+  and **50 MB** for any other file. Supported types: documents (PDF, Word, PowerPoint, Excel,
+  text), images, audio, video and ZIP.
+- **Teacher-controlled learner uploads.** Learners can only upload files when the teacher has
+  explicitly switched on **"Allow learners to upload files with their submission"** for that
+  assignment (`assignments.allow_file_uploads`, default `false`). When it is off, the learner sees
+  a notice instead of an upload box, and the API rejects file attachments (`403`) — both at upload
+  time (`POST /api/uploads`) and at submission time (`POST /api/assignments/[id]/submit`).
+- **Storage.** Uploaded bytes live on disk under `UPLOAD_DIR` (default `./storage/uploads`,
+  git-ignored). Every file is registered in `uploaded_files`; the `attachments` jsonb on
+  assignments/submissions references those rows, and attachment metadata sent by the client is
+  always re-verified against them (uploader + purpose + assignment must match).
+- **Serving.** `GET /api/files/[id]?token=…` streams the file with authentication and access
+  control (submission files are only readable by the uploader, the assignment's teacher and
+  admins) and supports HTTP byte-range requests so video/audio players can seek.
+- Requires migration `0009_file_uploads.sql` (apply with `node run-migration.js`; the routes also
+  self-heal it on demand while `AUTO_SCHEMA_REPAIR` is on).
 
 #### Step 5: Your Permanent PWA Link! 🎉
 

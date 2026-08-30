@@ -3,6 +3,8 @@ import { db } from "@/db";
 import { submissions, assignments, users } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { resolveUploadedAttachments } from "@/lib/attachment-auth";
+import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, desc } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -79,6 +81,9 @@ export async function POST(request: NextRequest) {
       return errorResponse("Assignment ID is required");
     }
 
+    // allow_file_uploads lives in the schema but only 0009 adds the column.
+    await ensureFileUploadSchema();
+
     // Check assignment exists and is published
     const [assignment] = await db
       .select()
@@ -92,6 +97,27 @@ export async function POST(request: NextRequest) {
 
     if (assignment.status !== "published") {
       return errorResponse("This assignment is not accepting submissions");
+    }
+
+    /* ── File upload gate: the teacher must explicitly enable uploads ── */
+    let resolvedAttachments: { fileId: string; name: string; type: string; size: number; url: string }[] = [];
+    const submittedFiles = Array.isArray(attachments) ? attachments : [];
+    if (submittedFiles.length > 0 && !assignment.allowFileUploads) {
+      return errorResponse(
+        "File uploads are not enabled for this assignment. Your teacher must allow submissions with files first.",
+        403
+      );
+    }
+    if (submittedFiles.length > 0) {
+      const resolved = await resolveUploadedAttachments(submittedFiles, {
+        uploaderId: payload.userId,
+        purpose: "submission",
+        assignmentId,
+      });
+      if (!resolved.ok) {
+        return errorResponse(resolved.error || "The attached files could not be verified");
+      }
+      resolvedAttachments = resolved.attachments;
     }
 
     // Check for existing submission
@@ -116,7 +142,7 @@ export async function POST(request: NextRequest) {
         .update(submissions)
         .set({
           content,
-          attachments: attachments || null,
+          attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
           status: isLate ? "late" : "submitted",
           submittedAt: new Date(),
         })
@@ -137,7 +163,7 @@ export async function POST(request: NextRequest) {
       assignmentId,
       learnerId: payload.userId,
       content: content || null,
-      attachments: attachments || null,
+      attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
       status: isLate ? "late" : "submitted",
       submittedAt: new Date(),
     }).returning();
@@ -145,6 +171,9 @@ export async function POST(request: NextRequest) {
     return successResponse(newSubmission, 201);
   } catch (error) {
     console.error("Create submission error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse(
+      schemaAwareErrorMessage(error, "The submission could not be saved. Please try again."),
+      500
+    );
   }
 }
