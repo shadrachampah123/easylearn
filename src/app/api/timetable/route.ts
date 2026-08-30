@@ -16,7 +16,7 @@ import {
   unauthorizedResponse,
 } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 
 export const TIMETABLE_DAYS = [
   "monday",
@@ -69,24 +69,39 @@ export async function GET(request: NextRequest) {
 
     // Everyone only ever sees the timetable of classes they belong to.
     if (payload.role === "teacher") {
-      // Classes the teacher teaches a subject in.
-      const subjectClasses = db
-        .select({ id: teacherClasses.classId })
-        .from(teacherClasses)
-        .where(eq(teacherClasses.teacherId, payload.userId));
+      const [subjectClasses, homeroomClasses, scheduledClasses] = await Promise.all([
+        // Classes the teacher teaches a subject in.
+        db
+          .select({ classId: teacherClasses.classId })
+          .from(teacherClasses)
+          .where(eq(teacherClasses.teacherId, payload.userId)),
+        // Classes the teacher is the homeroom/class teacher of.
+        db
+          .select({ classId: classes.id })
+          .from(classes)
+          .where(eq(classes.classTeacherId, payload.userId)),
+        // Admins can also assign a teacher directly on timetable rows, even when
+        // there is no separate teacher_classes record yet. Once a teacher owns at
+        // least one published period in a class, they should be able to open the
+        // whole class timetable rather than seeing an empty timetable page.
+        db
+          .select({ classId: timetableEntries.classId })
+          .from(timetableEntries)
+          .where(eq(timetableEntries.teacherId, payload.userId)),
+      ]);
 
-      // Classes the teacher is the homeroom/class teacher of.
-      const homeroomClasses = db
-        .select({ id: classes.id })
-        .from(classes)
-        .where(eq(classes.classTeacherId, payload.userId));
+      const teacherClassIds = [
+        ...new Set(
+          [...subjectClasses, ...homeroomClasses, ...scheduledClasses]
+            .map((row) => row.classId)
+            .filter((value): value is string => Boolean(value))
+        ),
+      ];
 
       conditions.push(
-        or(
-          inArray(timetableEntries.classId, subjectClasses),
-          inArray(timetableEntries.classId, homeroomClasses),
-          eq(timetableEntries.teacherId, payload.userId)
-        )!
+        teacherClassIds.length > 0
+          ? inArray(timetableEntries.classId, teacherClassIds)
+          : sql`false`
       );
     } else if (payload.role === "learner") {
       const ownClasses = db
