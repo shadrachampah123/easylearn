@@ -528,6 +528,12 @@ export default function TeacherQuizzesPage() {
                   </button>
                   <Link
                     href={`/dashboard/teacher/quizzes/${quiz.id}`}
+                    className="px-3 py-2 rounded-xl bg-secondary-50 text-secondary-700 text-sm font-semibold hover:bg-secondary-100 transition-colors"
+                  >
+                    Edit
+                  </Link>
+                  <Link
+                    href={`/dashboard/teacher/quizzes/${quiz.id}`}
                     className="text-slate-300 group-hover:text-secondary-400 transition-colors text-xl px-1"
                     aria-label={`Open ${quiz.title}`}
                   >

@@ -155,6 +155,8 @@ export async function PUT(
     const {
       title,
       description,
+      classId,
+      subjectId,
       timeLimitMinutes,
       shuffleQuestions,
       shuffleAnswers,
@@ -165,31 +167,53 @@ export async function PUT(
     } = body;
 
     const replacesQuestions = Array.isArray(questions);
+    const [{ questionCount }] = await db
+      .select({ questionCount: sql<number>`count(*)` })
+      .from(quizQuestions)
+      .where(eq(quizQuestions.quizId, id));
+    const [{ attemptCount }] = await db
+      .select({ attemptCount: sql<number>`count(*)` })
+      .from(quizAttempts)
+      .where(eq(quizAttempts.quizId, id));
 
-    if (replacesQuestions) {
-      const [{ count }] = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(quizQuestions)
-        .where(eq(quizQuestions.quizId, id));
+    // Attempts store their answers keyed by question id, so replacing the question set
+    // would silently orphan every result recorded so far. The editor therefore keeps
+    // questions read-only once a learner has started this quiz.
+    if (replacesQuestions && Number(attemptCount) > 0) {
+      return errorResponse(
+        "Learners have already attempted this quiz, so its questions can no longer be replaced. Update the quiz details or create a new quiz instead.",
+        409
+      );
+    }
 
-      const [{ attempts }] = await db
-        .select({ attempts: sql<number>`count(*)` })
-        .from(quizAttempts)
-        .where(eq(quizAttempts.quizId, id));
+    const questionRows = replacesQuestions
+      ? questions
+        .filter((q: { questionText?: string }) => typeof q?.questionText === "string" && q.questionText.trim())
+        .map((q: {
+          questionType: string;
+          questionText: string;
+          options?: unknown;
+          correctAnswer?: string;
+          points?: number;
+          imageUrl?: string | null;
+        }, idx: number) => ({
+          quizId: id,
+          questionType: (QUESTION_TYPES.includes(q.questionType as (typeof QUESTION_TYPES)[number])
+            ? q.questionType
+            : "mcq") as (typeof QUESTION_TYPES)[number],
+          questionText: q.questionText.trim(),
+          imageUrl: typeof q.imageUrl === "string" && q.imageUrl.trim() ? q.imageUrl.trim() : null,
+          options: q.options ?? null,
+          correctAnswer: q.correctAnswer || null,
+          points: q.points || 1,
+          orderIndex: idx,
+        }))
+      : null;
 
-      // Attempts store their answers keyed by question id, so replacing the question set
-      // would silently orphan every result recorded so far.
-      if (Number(count) > 0 && Number(attempts) > 0) {
-        return errorResponse(
-          "Learners have already attempted this quiz, so its questions can no longer be replaced. Create a new quiz instead.",
-          409
-        );
-      }
-
-      const nextPublished = isPublished ?? existing.isPublished;
-      if (nextPublished && questions.length === 0) {
-        return errorResponse("Add at least one question before publishing this quiz to learners");
-      }
+    const nextPublished = isPublished === undefined ? existing.isPublished : Boolean(isPublished);
+    const nextQuestionCount = questionRows ? questionRows.length : Number(questionCount);
+    if (nextPublished && nextQuestionCount === 0) {
+      return errorResponse("Add at least one question before publishing this quiz to learners");
     }
 
     // Only the fields the caller actually sent are written, so a publish toggle can no
@@ -197,6 +221,8 @@ export async function PUT(
     const updates: Record<string, unknown> = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
+    if (classId !== undefined) updates.classId = classId;
+    if (subjectId !== undefined) updates.subjectId = subjectId;
     if (timeLimitMinutes !== undefined) updates.timeLimitMinutes = timeLimitMinutes;
     if (shuffleQuestions !== undefined) updates.shuffleQuestions = shuffleQuestions;
     if (shuffleAnswers !== undefined) updates.shuffleAnswers = shuffleAnswers;
@@ -216,30 +242,8 @@ export async function PUT(
         if (replacesQuestions) {
           await tx.delete(quizQuestions).where(eq(quizQuestions.quizId, id));
 
-          if (questions.length > 0) {
-            const rows = questions
-              .filter((q: { questionText?: string }) => typeof q?.questionText === "string" && q.questionText.trim())
-              .map((q: {
-                questionType: string;
-                questionText: string;
-                options?: unknown;
-                correctAnswer?: string;
-                points?: number;
-                imageUrl?: string | null;
-              }, idx: number) => ({
-                quizId: id,
-                questionType: (QUESTION_TYPES.includes(q.questionType as (typeof QUESTION_TYPES)[number])
-                  ? q.questionType
-                  : "mcq") as (typeof QUESTION_TYPES)[number],
-                questionText: q.questionText.trim(),
-                imageUrl: typeof q.imageUrl === "string" && q.imageUrl.trim() ? q.imageUrl.trim() : null,
-                options: q.options ?? null,
-                correctAnswer: q.correctAnswer || null,
-                points: q.points || 1,
-                orderIndex: idx,
-              }));
-
-            if (rows.length > 0) await tx.insert(quizQuestions).values(rows);
+          if (questionRows && questionRows.length > 0) {
+            await tx.insert(quizQuestions).values(questionRows);
           }
         }
       });
