@@ -31,6 +31,12 @@ export async function GET(
 
     if (!assignment) return notFoundResponse("Assignment");
 
+    // A teacher can only inspect results for assignments they manage. This check applies
+    // to both the summary and learner-specific result views.
+    if (payload.role === "teacher" && assignment.teacherId !== payload.userId) {
+      return errorResponse("You can only view results for your own assignments", 403);
+    }
+
     // GET QUESTIONS (for context)
     const questions = await db
       .select()

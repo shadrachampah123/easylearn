@@ -63,6 +63,12 @@ export async function GET(
       return notFoundResponse("Quiz");
     }
 
+    // Teachers can only inspect quizzes they manage; administrators can inspect all
+    // school quizzes. This also protects the attempt count returned below.
+    if (payload.role === "teacher" && quiz.teacherId !== payload.userId) {
+      return errorResponse("You can only view your own quizzes", 403);
+    }
+
     const isStaff = ["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role);
 
     if (payload.role === "learner") {

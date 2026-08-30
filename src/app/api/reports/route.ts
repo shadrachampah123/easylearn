@@ -1,9 +1,20 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { assignments, submissions, quizAttempts, attendance, users, classes, learnerClasses } from "@/db/schema";
+import {
+  assignments,
+  attendance,
+  classes,
+  learnerClasses,
+  quizAttempts,
+  quizzes,
+  submissions,
+  teacherClasses,
+  users,
+} from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
-import { eq, sql, and } from "drizzle-orm";
+import { getAccessibleLearnerIds, STAFF_REPORT_ROLES } from "@/lib/report-access";
+import { asc, eq, inArray, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
   try {
@@ -12,48 +23,81 @@ export async function GET(request: NextRequest) {
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!STAFF_REPORT_ROLES.includes(payload.role as (typeof STAFF_REPORT_ROLES)[number])) {
       return errorResponse("Forbidden", 403);
     }
 
-    // Assignment completion stats
-    const [{ totalAssignments, publishedAssignments, totalSubmissions, gradedSubmissions }] = await db
+    const isTeacher = payload.role === "teacher";
+    const accessibleLearnerIds = await getAccessibleLearnerIds(payload);
+
+    // Teachers see metrics only for activities they manage. Administrators retain the
+    // school-wide aggregate view.
+    const [assignmentTotals] = await db
       .select({
         totalAssignments: sql<number>`count(*)`,
         publishedAssignments: sql<number>`count(*) FILTER (WHERE ${assignments.status} = 'published')`,
-        totalSubmissions: sql<number>`(SELECT count(*) FROM ${submissions})`,
-        gradedSubmissions: sql<number>`(SELECT count(*) FROM ${submissions} WHERE status = 'graded')`,
       })
-      .from(assignments);
+      .from(assignments)
+      .where(isTeacher ? eq(assignments.teacherId, payload.userId) : undefined);
 
-    // Quiz performance
-    const [{ quizAttemptsCount, avgQuizScore }] = await db
+    const [submissionTotals] = await db
+      .select({
+        totalSubmissions: sql<number>`count(*)`,
+        gradedSubmissions: sql<number>`count(*) FILTER (WHERE ${submissions.status} = 'graded')`,
+      })
+      .from(submissions)
+      .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+      .where(isTeacher ? eq(assignments.teacherId, payload.userId) : undefined);
+
+    const [quizTotals] = await db
       .select({
         quizAttemptsCount: sql<number>`count(*)`,
         avgQuizScore: sql<number>`COALESCE(AVG(${quizAttempts.score}), 0)`,
       })
-      .from(quizAttempts);
+      .from(quizAttempts)
+      .innerJoin(quizzes, eq(quizAttempts.quizId, quizzes.id))
+      .where(isTeacher ? eq(quizzes.teacherId, payload.userId) : undefined);
 
-    // Attendance stats
-    const [{ totalAttendance, presentAttendance }] = await db
+    let teacherClassIds: string[] = [];
+    if (isTeacher) {
+      const [assignedClasses, homeroomClasses] = await Promise.all([
+        db
+          .select({ classId: teacherClasses.classId })
+          .from(teacherClasses)
+          .where(eq(teacherClasses.teacherId, payload.userId)),
+        db
+          .select({ classId: classes.id })
+          .from(classes)
+          .where(eq(classes.classTeacherId, payload.userId)),
+      ]);
+      teacherClassIds = [...new Set([
+        ...assignedClasses.map((row) => row.classId),
+        ...homeroomClasses.map((row) => row.classId),
+      ])];
+    }
+
+    const attendanceQuery = db
       .select({
         totalAttendance: sql<number>`count(*)`,
         presentAttendance: sql<number>`count(*) FILTER (WHERE ${attendance.isPresent} = true)`,
       })
-      .from(attendance);
+      .from(attendance)
+      .$dynamic();
+    const attendanceStats = isTeacher
+      ? teacherClassIds.length > 0
+        ? await attendanceQuery.where(inArray(attendance.classId, teacherClassIds))
+        : await attendanceQuery.where(sql`false`)
+      : await attendanceQuery;
+    const [{ totalAttendance, presentAttendance }] = attendanceStats;
 
-    const attendanceRate = totalAttendance > 0
-      ? Math.round((Number(presentAttendance) / Number(totalAttendance)) * 100)
-      : 0;
+    const learnerCount = isTeacher
+      ? accessibleLearnerIds.size
+      : Number((await db
+        .select({ learnerCount: sql<number>`count(*)` })
+        .from(users)
+        .where(eq(users.role, "learner")))[0]?.learnerCount ?? 0);
 
-    // Learner count
-    const [{ learnerCount }] = await db
-      .select({ learnerCount: sql<number>`count(*)` })
-      .from(users)
-      .where(eq(users.role, "learner"));
-
-    // Class distribution
-    const classDistribution = await db
+    const classDistributionQuery = db
       .select({
         className: classes.name,
         classLevel: classes.level,
@@ -61,33 +105,53 @@ export async function GET(request: NextRequest) {
       })
       .from(classes)
       .leftJoin(learnerClasses, eq(classes.id, learnerClasses.classId))
-      .groupBy(classes.id)
-      .orderBy(classes.name);
+      .$dynamic();
+    const classDistribution = isTeacher
+      ? teacherClassIds.length > 0
+        ? await classDistributionQuery
+          .where(inArray(classes.id, teacherClassIds))
+          .groupBy(classes.id)
+          .orderBy(asc(classes.name))
+        : []
+      : await classDistributionQuery
+        .groupBy(classes.id)
+        .orderBy(asc(classes.name));
+
+    const totalAssignments = Number(assignmentTotals?.totalAssignments ?? 0);
+    const publishedAssignments = Number(assignmentTotals?.publishedAssignments ?? 0);
+    const totalSubmissions = Number(submissionTotals?.totalSubmissions ?? 0);
+    const gradedSubmissions = Number(submissionTotals?.gradedSubmissions ?? 0);
+    const quizAttemptsCount = Number(quizTotals?.quizAttemptsCount ?? 0);
+    const avgQuizScore = Number(quizTotals?.avgQuizScore ?? 0);
+    const attendanceTotal = Number(totalAttendance ?? 0);
+    const attendancePresent = Number(presentAttendance ?? 0);
 
     return successResponse({
       overview: {
-        totalAssignments: Number(totalAssignments),
-        publishedAssignments: Number(publishedAssignments),
-        totalSubmissions: Number(totalSubmissions),
-        gradedSubmissions: Number(gradedSubmissions),
-        submissionRate: totalAssignments > 0 ? Math.round((Number(totalSubmissions) / (Number(learnerCount) * Math.max(1, Number(publishedAssignments)))) * 100) : 0,
+        totalAssignments,
+        publishedAssignments,
+        totalSubmissions,
+        gradedSubmissions,
+        submissionRate: publishedAssignments > 0 && learnerCount > 0
+          ? Math.round((totalSubmissions / (learnerCount * publishedAssignments)) * 100)
+          : 0,
       },
       quizzes: {
-        totalAttempts: Number(quizAttemptsCount),
-        averageScore: Math.round(Number(avgQuizScore)),
+        totalAttempts: quizAttemptsCount,
+        averageScore: Math.round(avgQuizScore),
       },
       attendance: {
-        rate: attendanceRate,
-        total: Number(totalAttendance),
-        present: Number(presentAttendance),
+        rate: attendanceTotal > 0 ? Math.round((attendancePresent / attendanceTotal) * 100) : 0,
+        total: attendanceTotal,
+        present: attendancePresent,
       },
       learners: {
-        total: Number(learnerCount),
+        total: learnerCount,
         classDistribution,
       },
     });
   } catch (error) {
     console.error("Reports error:", error);
-    return errorResponse("Internal server error", 500);
+    return errorResponse("The reports could not be loaded. Please retry.", 503);
   }
 }

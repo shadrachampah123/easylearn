@@ -41,6 +41,11 @@ export async function GET(request: NextRequest) {
 
     if (payload.role === "learner") {
       query = query.where(eq(submissions.learnerId, payload.userId));
+    } else if (payload.role === "teacher") {
+      // Teachers only see submissions for assignments they manage.
+      query = query.where(eq(assignments.teacherId, payload.userId));
+    } else if (!["super_admin", "school_admin", "head_teacher"].includes(payload.role)) {
+      return errorResponse("You are not authorized to view submissions", 403);
     }
 
     if (assignmentId) {
