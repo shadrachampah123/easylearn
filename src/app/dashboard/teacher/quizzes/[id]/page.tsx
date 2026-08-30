@@ -3,6 +3,7 @@
 import { use, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import QuestionImagePicker from "@/components/dashboard/QuestionImagePicker";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
@@ -759,13 +760,12 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
                         className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm resize-none mb-3 disabled:bg-slate-100"
                       />
 
-                      <input
-                        type="url"
+                      <QuestionImagePicker
+                        questionText={question.questionText}
+                        subjectName={quiz.subjectName || undefined}
                         value={question.imageUrl}
+                        onChange={(value) => updateEditQuestion(questionIndex, { imageUrl: value })}
                         disabled={questionEditingLocked}
-                        onChange={(event) => updateEditQuestion(questionIndex, { imageUrl: event.target.value })}
-                        placeholder="Question image URL (optional)"
-                        className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm mb-3 disabled:bg-slate-100"
                       />
 
                       {question.questionType === "mcq" && (
