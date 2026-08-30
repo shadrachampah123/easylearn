@@ -12,6 +12,8 @@ interface Assignment {
   status: string;
   dueDate: string | null;
   maxScore: number;
+  aiGradingEnabled: boolean | null;
+  aiMaxMarks: number | null;
   className: string | null;
   subjectName: string | null;
   teacherFirstName: string | null;
@@ -99,6 +101,11 @@ export default function AdminAssignmentsPage() {
                     <span>🏫 {a.className}</span>
                     <span>👩‍🏫 {a.teacherFirstName} {a.teacherLastName}</span>
                     <span>📊 Max: {a.maxScore}</span>
+                    {a.aiGradingEnabled && (
+                      <span className="px-2 py-0.5 rounded-full bg-violet-100 text-violet-700 border border-violet-200 font-semibold">
+                        ✨ EasyAI · /{a.aiMaxMarks ?? a.maxScore}
+                      </span>
+                    )}
                     {a.dueDate && <span>📅 {new Date(a.dueDate).toLocaleDateString()}</span>}
                   </div>
                 </div>

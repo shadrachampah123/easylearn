@@ -72,6 +72,7 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 | `0005_activity_enhancements.sql` | `activity_logs.entity_type/entity_id/description` (admin activity feed) |
 | `0006_user_identity_columns.sql` | `users.username`, `users.must_change_password` (these existed in `src/db/schema.ts` but in no migration) |
 | `0007_quiz_images.sql` | `quiz_questions.image_url` (Kahoot question images) |
+| `0008_easyai_grading.sql` | EasyAI: `assignments.ai_grading_enabled`/`ai_max_marks`, `submissions.graded_by`/`ai_report` |
 
 Notes:
 
@@ -96,6 +97,22 @@ Notes:
 
 #### Quizzes and grading
 
+- **EasyAI — automated assignment grading.** When creating an assignment
+  (`/dashboard/teacher/assignments`), teachers can switch on **✨ Grade instantly with EasyAI**
+  and set the **total maximum marks the AI may allocate** (e.g. 50 → every learner is graded as
+  `x/50`). The moment a learner submits, `POST /api/assignments/[id]/submit` runs the EasyAI
+  engine (`src/lib/easyai.ts`) server-side — no external API, deterministic and instant:
+  - **Free-text / file submissions** are analysed against the assignment brief (relevance to the
+    topic, depth, structure, language, vocabulary, attached files) and marked out of the
+    teacher's total.
+  - **Question-based assignments** keep exact-match grading for objective questions, while
+    EasyAI awards partial credit on essays / short answers; the result is scaled to the
+    teacher's total.
+  - The score, percentage and a written feedback report are stored on the submission
+    (`score`, `max_score`, `percentage`, `graded_by = 'easyai'`, `ai_report`), so the marks show
+    up **immediately** on the learner's grade page with an ✨ EasyAI badge and a marking
+    breakdown. A teacher can still review and re-grade any EasyAI submission; the manual grade
+    then replaces the AI's.
 - **Publishing.** A quiz is only visible to learners once it is published. The teacher's
   *Create Quiz* form publishes by default (uncheck *"Publish to learners immediately"* to keep a
   draft), and every quiz card has a one-click **Publish / Unpublish** button. Publishing requires

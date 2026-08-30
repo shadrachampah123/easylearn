@@ -216,6 +216,11 @@ export const assignments = pgTable("assignments", {
   maxScore: integer("max_score").default(100),
   allowLate: boolean("allow_late").default(false),
   attachments: jsonb("attachments"),
+  // EasyAI — automated grading: when enabled, learner submissions are evaluated
+  // instantly by EasyAI and marked out of `aiMaxMarks` (the total the teacher
+  // allows the AI to allocate) instead of waiting for manual teacher grading.
+  aiGradingEnabled: boolean("ai_grading_enabled").notNull().default(false),
+  aiMaxMarks: integer("ai_max_marks"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
@@ -232,6 +237,10 @@ export const submissions = pgTable("submissions", {
   maxScore: integer("max_score"),
   percentage: integer("percentage"),
   feedback: text("feedback"),
+  // EasyAI audit trail: who graded ("easyai" | "teacher") and, for AI-graded
+  // submissions, the full EasyAI evaluation report (criteria, strengths, tips).
+  gradedBy: varchar("graded_by", { length: 20 }),
+  aiReport: jsonb("ai_report"),
   submittedAt: timestamp("submitted_at"),
   gradedAt: timestamp("graded_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),

@@ -4,6 +4,7 @@ import { assignments, classes, subjects, users, submissions } from "@/db/schema"
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
+import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
 import { eq, desc, and, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -27,6 +28,8 @@ export async function GET(request: NextRequest) {
         dueDate: assignments.dueDate,
         maxScore: assignments.maxScore,
         allowLate: assignments.allowLate,
+        aiGradingEnabled: assignments.aiGradingEnabled,
+        aiMaxMarks: assignments.aiMaxMarks,
         attachments: assignments.attachments,
         createdAt: assignments.createdAt,
         className: classes.name,
@@ -75,6 +78,7 @@ export async function GET(request: NextRequest) {
               score: submissions.score,
               maxScore: submissions.maxScore,
               percentage: submissions.percentage,
+              gradedBy: submissions.gradedBy,
             })
             .from(submissions)
             .where(and(
@@ -107,10 +111,24 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { title, description, instructions, classId, subjectId, termId, dueDate, maxScore, allowLate, attachments, status } = body;
+    const { title, description, instructions, classId, subjectId, termId, dueDate, maxScore, allowLate, attachments, status, aiGradingEnabled, aiMaxMarks } = body;
 
     if (!title || !classId || !subjectId) {
       return errorResponse("Title, class, and subject are required");
+    }
+
+    // EasyAI configuration: when AI grading is on the teacher must set the total
+    // maximum marks the AI is allowed to allocate.
+    const easyAiEnabled = aiGradingEnabled === true;
+    let easyAiMaxMarks: number | null = null;
+    if (easyAiEnabled) {
+      const parsed = Number(aiMaxMarks);
+      if (!Number.isInteger(parsed) || parsed < EASYAI_MAX_MARKS_MIN || parsed > EASYAI_MAX_MARKS_MAX) {
+        return errorResponse(
+          `Set the EasyAI total marks (a whole number between ${EASYAI_MAX_MARKS_MIN} and ${EASYAI_MAX_MARKS_MAX}) when enabling EasyAI grading`
+        );
+      }
+      easyAiMaxMarks = parsed;
     }
 
     const [newAssignment] = await db.insert(assignments).values({
@@ -125,6 +143,8 @@ export async function POST(request: NextRequest) {
       maxScore: maxScore || 100,
       allowLate: allowLate || false,
       attachments: attachments || null,
+      aiGradingEnabled: easyAiEnabled,
+      aiMaxMarks: easyAiMaxMarks,
       status: status || "draft",
     }).returning();
 

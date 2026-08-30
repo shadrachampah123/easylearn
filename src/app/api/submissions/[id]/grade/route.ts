@@ -154,6 +154,9 @@ export async function POST(
         percentage,
         feedback: feedback === undefined ? null : feedback,
         status: "graded",
+        // A manual grade always overrides EasyAI's attribution (and its report).
+        gradedBy: "teacher",
+        aiReport: null,
         gradedAt: new Date(),
       })
       .where(eq(submissions.id, id))

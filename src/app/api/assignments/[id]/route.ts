@@ -13,6 +13,7 @@ import {
 } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
 import { eq, and, desc } from "drizzle-orm";
 
 export async function GET(
@@ -37,6 +38,8 @@ export async function GET(
         dueDate: assignments.dueDate,
         maxScore: assignments.maxScore,
         allowLate: assignments.allowLate,
+        aiGradingEnabled: assignments.aiGradingEnabled,
+        aiMaxMarks: assignments.aiMaxMarks,
         attachments: assignments.attachments,
         createdAt: assignments.createdAt,
         classId: assignments.classId,
@@ -75,6 +78,7 @@ export async function GET(
           maxScore: submissions.maxScore,
           percentage: submissions.percentage,
           feedback: submissions.feedback,
+          gradedBy: submissions.gradedBy,
           // The teacher needs to read what the learner actually wrote before grading it.
           content: submissions.content,
           submittedAt: submissions.submittedAt,
@@ -195,7 +199,7 @@ export async function PUT(
 
     // Check ownership
     const [existing] = await db
-      .select({ teacherId: assignments.teacherId })
+      .select({ teacherId: assignments.teacherId, aiMaxMarks: assignments.aiMaxMarks })
       .from(assignments)
       .where(eq(assignments.id, id))
       .limit(1);
@@ -207,7 +211,26 @@ export async function PUT(
     }
 
     const body = await request.json();
-    const { title, description, instructions, dueDate, maxScore, allowLate, attachments, status } = body;
+    const { title, description, instructions, dueDate, maxScore, allowLate, attachments, status, aiGradingEnabled, aiMaxMarks } = body;
+
+    // EasyAI configuration is only touched when the caller sends it, so partial
+    // updates (e.g. the publish/close toggle) never wipe the AI settings.
+    const easyAiUpdate: { aiGradingEnabled?: boolean; aiMaxMarks?: number | null } = {};
+    if (aiGradingEnabled !== undefined) {
+      const enabled = aiGradingEnabled === true;
+      if (enabled) {
+        const parsed = Number(aiMaxMarks ?? existing.aiMaxMarks ?? maxScore ?? 100);
+        if (!Number.isInteger(parsed) || parsed < EASYAI_MAX_MARKS_MIN || parsed > EASYAI_MAX_MARKS_MAX) {
+          return errorResponse(
+            `EasyAI total marks must be a whole number between ${EASYAI_MAX_MARKS_MIN} and ${EASYAI_MAX_MARKS_MAX}`
+          );
+        }
+        easyAiUpdate.aiMaxMarks = parsed;
+      } else {
+        easyAiUpdate.aiMaxMarks = null;
+      }
+      easyAiUpdate.aiGradingEnabled = enabled;
+    }
 
     const [updated] = await db
       .update(assignments)
@@ -220,6 +243,7 @@ export async function PUT(
         allowLate,
         attachments,
         status,
+        ...easyAiUpdate,
         updatedAt: new Date(),
       })
       .where(eq(assignments.id, id))

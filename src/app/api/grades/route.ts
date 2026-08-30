@@ -43,6 +43,7 @@ export async function GET(request: NextRequest) {
         percentage: submissions.percentage,
         gradedAt: submissions.gradedAt,
         feedback: submissions.feedback,
+        gradedBy: submissions.gradedBy,
         subjectName: subjects.name,
         className: classes.name,
       })
@@ -69,6 +70,7 @@ export async function GET(request: NextRequest) {
         percentage: sql<number>`CASE WHEN (SELECT SUM(points) FROM quiz_questions WHERE quiz_id = ${quizAttempts.quizId}) > 0 THEN ROUND(${quizAttempts.score}::numeric * 100 / (SELECT SUM(points) FROM quiz_questions WHERE quiz_id = ${quizAttempts.quizId})) ELSE 0 END`,
         gradedAt: quizAttempts.completedAt,
         feedback: sql<string>`null`,
+        gradedBy: sql<string>`'quiz'`,
         subjectName: subjects.name,
         className: classes.name,
       })

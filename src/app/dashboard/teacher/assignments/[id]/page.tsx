@@ -22,6 +22,7 @@ interface Submission {
   maxScore: number | null;
   percentage: number | null;
   feedback: string | null;
+  gradedBy: string | null;
   content: string | null;
   submittedAt: string | null;
   gradedAt: string | null;
@@ -57,6 +58,8 @@ interface Assignment {
   dueDate: string | null;
   maxScore: number;
   allowLate: boolean;
+  aiGradingEnabled: boolean | null;
+  aiMaxMarks: number | null;
   className: string | null;
   subjectName: string | null;
   createdAt: string;
@@ -384,6 +387,14 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
               <span>📚 {assignment.subjectName}</span>
               <span>🏫 {assignment.className}</span>
               <span>📊 Max Score: {assignment.maxScore}</span>
+              {assignment.aiGradingEnabled && (
+                <span
+                  title={`Submissions are graded instantly by EasyAI out of ${assignment.aiMaxMarks ?? assignment.maxScore} total marks`}
+                  className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-violet-100 text-violet-700 border border-violet-200"
+                >
+                  ✨ EasyAI · /{assignment.aiMaxMarks ?? assignment.maxScore}
+                </span>
+              )}
               {assignment.dueDate && (
                 <span>📅 Due: {new Date(assignment.dueDate).toLocaleString()}</span>
               )}
@@ -741,6 +752,9 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
                     </div>
                     {sub.status === "late" && (
                       <span className="px-2 py-1 rounded bg-orange-100 text-orange-600 text-xs font-semibold">Late</span>
+                    )}
+                    {sub.gradedBy === "easyai" && (
+                      <span className="px-2 py-1 rounded bg-violet-100 text-violet-700 text-xs font-semibold border border-violet-200">✨ Graded by EasyAI</span>
                     )}
                     {awaiting && (
                       <span className="px-2 py-1 rounded bg-amber-100 text-amber-700 text-xs font-semibold">Needs grading</span>
