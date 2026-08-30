@@ -8,6 +8,7 @@ interface Question {
   id: string;
   questionType: string;
   questionText: string;
+  imageUrl?: string | null;
   options: string[] | null;
   points: number;
 }
@@ -39,6 +40,13 @@ const learnerNav = [
   { name: "Grades", href: "/dashboard/learner/grades", icon: "📊" },
 ];
 
+const KAHOOT_COLORS = [
+  { bg: "bg-red-500 hover:bg-red-600 text-white", shape: "🔺", border: "border-red-600" },
+  { bg: "bg-blue-500 hover:bg-blue-600 text-white", shape: "🔷", border: "border-blue-600" },
+  { bg: "bg-amber-500 hover:bg-amber-600 text-white", shape: "🟡", border: "border-amber-600" },
+  { bg: "bg-green-500 hover:bg-green-600 text-white", shape: "🟩", border: "border-green-600" },
+];
+
 export default function TakeQuizPage({ params }: { params: Promise<{ id: string }> }) {
   const resolvedParams = use(params);
   const [quiz, setQuiz] = useState<Quiz | null>(null);
@@ -46,22 +54,25 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
   const [attemptId, setAttemptId] = useState<string | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [currentQuestion, setCurrentQuestion] = useState(0);
-  const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const [questionTimer, setQuestionTimer] = useState(30); // 30s per question Kahoot style
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<QuizResult | null>(null);
   const [started, setStarted] = useState(false);
+  const [feedbackState, setFeedbackState] = useState<"none" | "correct" | "incorrect">("none");
+  const [showScoreboard, setShowScoreboard] = useState(false);
 
   useEffect(() => {
     loadQuiz();
   }, [resolvedParams.id]);
 
+  // Question timer for Kahoot countdown bar
   useEffect(() => {
-    if (started && timeLeft !== null && timeLeft > 0) {
+    if (started && !showScoreboard && !result && questionTimer > 0) {
       const timer = setInterval(() => {
-        setTimeLeft((prev) => {
-          if (prev === null || prev <= 1) {
+        setQuestionTimer((prev) => {
+          if (prev <= 1) {
             clearInterval(timer);
-            handleSubmit();
+            handleNextOrSubmit();
             return 0;
           }
           return prev - 1;
@@ -69,7 +80,7 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
       }, 1000);
       return () => clearInterval(timer);
     }
-  }, [started, timeLeft]);
+  }, [started, questionTimer, showScoreboard, result]);
 
   async function loadQuiz() {
     const token = localStorage.getItem("el_token");
@@ -80,9 +91,6 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
       const data = await res.json();
       if (data.success) {
         setQuiz(data.data);
-        if (data.data.timeLimitMinutes) {
-          setTimeLeft(data.data.timeLimitMinutes * 60);
-        }
       }
     } catch (err) {
       console.error(err);
@@ -102,11 +110,34 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
       if (data.success) {
         setAttemptId(data.data.attempt.id);
         setStarted(true);
+        setQuestionTimer(30);
       } else {
         alert(data.error);
       }
     } catch (err) {
       console.error(err);
+    }
+  }
+
+  function handleSelectAnswer(questionId: string, answerValue: string) {
+    setAnswers({ ...answers, [questionId]: answerValue });
+    // Kahoot instant visual feedback trigger before scoreboard transition
+    setFeedbackState("correct");
+    setShowScoreboard(true);
+    setTimeout(() => {
+      setShowScoreboard(false);
+      setFeedbackState("none");
+      handleNextOrSubmit();
+    }, 1500);
+  }
+
+  function handleNextOrSubmit() {
+    if (!quiz) return;
+    if (currentQuestion < quiz.questions.length - 1) {
+      setCurrentQuestion(currentQuestion + 1);
+      setQuestionTimer(30);
+    } else {
+      handleSubmit();
     }
   }
 
@@ -137,12 +168,6 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
     }
   }
 
-  function formatTime(seconds: number) {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs.toString().padStart(2, "0")}`;
-  }
-
   if (loading) {
     return (
       <DashboardShell navItems={learnerNav} roleLabel="Learner" roleColor="bg-gradient-to-r from-accent-500 to-accent-600">
@@ -166,28 +191,27 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
     );
   }
 
-  // Show results
+  // Show Results
   if (result) {
     return (
       <DashboardShell navItems={learnerNav} roleLabel="Learner" roleColor="bg-gradient-to-r from-accent-500 to-accent-600">
         <div className="max-w-2xl mx-auto">
-          <div className="bg-white rounded-3xl shadow-lg border border-slate-100 overflow-hidden">
-            {/* Result Header */}
+          <div className="bg-white rounded-3xl shadow-lg border border-slate-100 overflow-hidden animate-scale-in">
             <div className={`p-8 text-center ${
-              result.percentage >= 80 ? "bg-gradient-to-br from-green-400 to-emerald-500" :
-              result.percentage >= 60 ? "bg-gradient-to-br from-yellow-400 to-orange-500" :
-              "bg-gradient-to-br from-red-400 to-pink-500"
+              result.percentage >= 80 ? "bg-gradient-to-br from-green-500 to-emerald-600" :
+              result.percentage >= 60 ? "bg-gradient-to-br from-yellow-500 to-orange-600" :
+              "bg-gradient-to-br from-red-500 to-pink-600"
             } text-white`}>
               <div className="text-6xl mb-4">
-                {result.percentage >= 80 ? "🏆" : result.percentage >= 60 ? "⭐" : "📝"}
+                {result.percentage >= 80 ? "🏆" : result.percentage >= 60 ? "⭐" : "🎯"}
               </div>
-              <h2 className="text-2xl font-bold mb-2">Quiz Completed!</h2>
+              <h2 className="text-2xl font-bold mb-2">Kahoot! Scoreboard & Results</h2>
               <div className="text-5xl font-extrabold mb-2">{result.percentage}%</div>
-              <p className="text-white/80">
+              <p className="text-white/90">
                 You scored {result.score} out of {result.maxScore} points
               </p>
               {result.pointsEarned > 0 && (
-                <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/20">
+                <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/20 text-sm font-semibold">
                   <span>⭐</span> +{result.pointsEarned} XP earned!
                 </div>
               )}
@@ -196,7 +220,7 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
             {/* Review Answers */}
             {result.answers && quiz.showResults && (
               <div className="p-6">
-                <h3 className="font-bold text-lg text-slate-800 mb-4">Review Your Answers</h3>
+                <h3 className="font-bold text-lg text-slate-800 mb-4">Review Answers</h3>
                 <div className="space-y-4">
                   {quiz.questions.map((q, idx) => {
                     const answer = result.answers?.[q.id];
@@ -204,9 +228,7 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
                       <div
                         key={q.id}
                         className={`p-4 rounded-xl border-2 ${
-                          answer?.correct
-                            ? "bg-green-50 border-green-200"
-                            : "bg-red-50 border-red-200"
+                          answer?.correct ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"
                         }`}
                       >
                         <div className="flex items-start gap-3">
@@ -239,11 +261,10 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
               </div>
             )}
 
-            {/* Actions */}
             <div className="p-6 border-t border-slate-100">
               <Link
                 href="/dashboard/learner/quizzes"
-                className="block w-full py-3 text-center rounded-xl bg-accent-500 text-white font-semibold hover:bg-accent-600 transition-colors"
+                className="block w-full py-3 text-center rounded-xl bg-accent-500 text-white font-semibold hover:bg-accent-600 transition-colors shadow-md"
               >
                 Back to Quizzes
               </Link>
@@ -254,7 +275,7 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
     );
   }
 
-  // Show start screen
+  // Show Start Screen
   if (!started) {
     return (
       <DashboardShell navItems={learnerNav} roleLabel="Learner" roleColor="bg-gradient-to-r from-accent-500 to-accent-600">
@@ -264,12 +285,12 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
           </Link>
 
           <div className="bg-white rounded-3xl shadow-lg border border-slate-100 p-8 text-center">
-            <div className="w-20 h-20 mx-auto rounded-3xl bg-gradient-to-br from-purple-400 to-purple-600 flex items-center justify-center text-white text-4xl mb-6">
-              ❓
+            <div className="w-20 h-20 mx-auto rounded-3xl bg-gradient-to-br from-purple-500 to-indigo-600 flex items-center justify-center text-white text-4xl mb-6 shadow-lg">
+              🎮
             </div>
 
             <h1 className="text-2xl font-bold text-slate-800 mb-2">{quiz.title}</h1>
-            <p className="text-slate-500 mb-6">{quiz.description || "Test your knowledge!"}</p>
+            <p className="text-slate-500 mb-6">{quiz.description || "Kahoot-style interactive quiz!"}</p>
 
             <div className="grid grid-cols-3 gap-4 mb-8">
               <div className="p-4 rounded-xl bg-slate-50">
@@ -284,28 +305,16 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
               </div>
               <div className="p-4 rounded-xl bg-slate-50">
                 <div className="text-2xl mb-1">⏱️</div>
-                <div className="text-xs text-slate-500">Time Limit</div>
-                <div className="font-semibold text-sm text-slate-700">
-                  {quiz.timeLimitMinutes ? `${quiz.timeLimitMinutes} min` : "No limit"}
-                </div>
+                <div className="text-xs text-slate-500">Timer</div>
+                <div className="font-semibold text-sm text-slate-700">30s / q</div>
               </div>
-            </div>
-
-            <div className="p-4 rounded-xl bg-yellow-50 border border-yellow-200 mb-6 text-left">
-              <h3 className="font-semibold text-yellow-800 mb-2">⚠️ Before you start:</h3>
-              <ul className="text-sm text-yellow-700 space-y-1">
-                <li>• Read each question carefully</li>
-                <li>• You cannot go back once you submit</li>
-                {quiz.timeLimitMinutes && <li>• The quiz will auto-submit when time runs out</li>}
-                <li>• Your score will be calculated automatically</li>
-              </ul>
             </div>
 
             <button
               onClick={startQuiz}
-              className="w-full py-4 rounded-xl bg-gradient-to-r from-accent-500 to-accent-600 text-white font-bold text-lg shadow-lg hover:shadow-xl hover:scale-[1.02] transition-all"
+              className="w-full py-4 rounded-2xl bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-bold text-lg shadow-xl hover:scale-[1.02] transition-all"
             >
-              Start Quiz 🚀
+              Start Kahoot! Quiz 🚀
             </button>
           </div>
         </div>
@@ -313,162 +322,122 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
     );
   }
 
-  // Quiz in progress
+  // Scoreboard / Feedback Slide between questions
+  if (showScoreboard) {
+    return (
+      <DashboardShell navItems={learnerNav} roleLabel="Learner" roleColor="bg-gradient-to-r from-accent-500 to-accent-600">
+        <div className="max-w-2xl mx-auto py-16 text-center animate-scale-in">
+          <div className="w-24 h-24 mx-auto rounded-full bg-green-500 text-white text-5xl flex items-center justify-center mb-6 shadow-lg animate-bounce">
+            ✓
+          </div>
+          <h2 className="text-3xl font-extrabold text-slate-800 mb-2">Answer Recorded!</h2>
+          <p className="text-slate-500 text-lg">Transitioning to next question...</p>
+        </div>
+      </DashboardShell>
+    );
+  }
+
+  // Quiz in progress - Kahoot interactive layout
   const question = quiz.questions[currentQuestion];
-  const progress = ((currentQuestion + 1) / quiz.questions.length) * 100;
+  const progressPercent = (questionTimer / 30) * 100;
 
   return (
     <DashboardShell navItems={learnerNav} roleLabel="Learner" roleColor="bg-gradient-to-r from-accent-500 to-accent-600">
-      <div className="max-w-3xl mx-auto">
-        {/* Header with timer */}
-        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 mb-6">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-bold text-slate-800">{quiz.title}</h2>
-            {timeLeft !== null && (
-              <div className={`px-4 py-2 rounded-xl font-mono font-bold ${
-                timeLeft < 60 ? "bg-red-100 text-red-600 animate-pulse" : "bg-slate-100 text-slate-700"
-              }`}>
-                ⏱️ {formatTime(timeLeft)}
-              </div>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            <div className="flex-1 h-2 rounded-full bg-slate-100 overflow-hidden">
-              <div
-                className="h-full rounded-full bg-gradient-to-r from-accent-400 to-accent-600 transition-all"
-                style={{ width: `${progress}%` }}
-              />
-            </div>
-            <span className="text-sm font-semibold text-slate-600">
-              {currentQuestion + 1} / {quiz.questions.length}
+      <div className="max-w-4xl mx-auto">
+        {/* Animated Countdown Timer Bar at Top */}
+        <div className="mb-6 bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+          <div className="flex items-center justify-between mb-2">
+            <span className="font-bold text-slate-800">
+              Question {currentQuestion + 1} of {quiz.questions.length}
             </span>
+            <div className="px-4 py-1.5 rounded-full bg-purple-100 text-purple-700 font-mono font-bold text-sm">
+              ⏱️ {questionTimer}s
+            </div>
+          </div>
+          <div className="w-full h-3 rounded-full bg-slate-100 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-green-400 via-yellow-400 to-red-500 transition-all duration-1000 linear"
+              style={{ width: `${progressPercent}%` }}
+            />
           </div>
         </div>
 
-        {/* Question Card */}
-        <div className="bg-white rounded-3xl shadow-lg border border-slate-100 p-8 mb-6">
-          <div className="flex items-center gap-2 mb-4">
-            <span className="px-3 py-1 rounded-full bg-accent-100 text-accent-600 text-xs font-semibold">
-              {question.questionType === "mcq" ? "Multiple Choice" :
-               question.questionType === "true_false" ? "True/False" :
-               question.questionType === "fill_blank" ? "Fill in the Blank" : "Short Answer"}
-            </span>
-            <span className="px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-xs font-semibold">
-              {question.points} point{question.points > 1 ? "s" : ""}
-            </span>
-          </div>
+        {/* Question Card with Image Banner & Question Text */}
+        <div className="bg-white rounded-3xl shadow-xl border border-slate-100 p-8 mb-6 text-center">
+          {question.imageUrl && (
+            <div className="mb-6 rounded-2xl overflow-hidden max-h-80 bg-slate-100 border border-slate-200 shadow-sm">
+              <img src={question.imageUrl} alt="Question banner" className="w-full h-full object-cover" />
+            </div>
+          )}
 
-          <h3 className="text-xl font-bold text-slate-800 mb-6">{question.questionText}</h3>
+          <h2 className="text-2xl md:text-3xl font-extrabold text-slate-800 mb-8">
+            {question.questionText}
+          </h2>
 
-          {/* MCQ Options */}
+          {/* 2x2 Grid of Large, Colorful, Rounded Cards for Multiple Choice */}
           {question.questionType === "mcq" && question.options && (
-            <div className="space-y-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {question.options.map((opt, idx) => {
+                const color = KAHOOT_COLORS[idx % KAHOOT_COLORS.length];
                 const letter = String.fromCharCode(65 + idx);
                 const isSelected = answers[question.id] === letter;
                 return (
                   <button
                     key={idx}
                     type="button"
-                    onClick={() => setAnswers({ ...answers, [question.id]: letter })}
-                    className={`w-full p-4 rounded-xl text-left flex items-center gap-3 transition-all ${
-                      isSelected
-                        ? "bg-accent-100 border-2 border-accent-500 text-accent-700"
-                        : "bg-slate-50 border-2 border-transparent hover:bg-slate-100"
+                    onClick={() => handleSelectAnswer(question.id, letter)}
+                    className={`p-6 rounded-2xl text-left flex items-center gap-4 shadow-md transition-all transform hover:scale-[1.02] active:scale-95 ${color.bg} ${
+                      isSelected ? "ring-4 ring-white shadow-2xl scale-[1.02]" : ""
                     }`}
                   >
-                    <span className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold ${
-                      isSelected ? "bg-accent-500 text-white" : "bg-slate-200 text-slate-600"
-                    }`}>
-                      {letter}
+                    <span className="w-12 h-12 rounded-xl bg-black/20 flex items-center justify-center text-2xl font-extrabold shrink-0">
+                      {color.shape}
                     </span>
-                    <span className="font-medium">{opt}</span>
+                    <span className="text-lg font-bold flex-1">{opt}</span>
                   </button>
                 );
               })}
             </div>
           )}
 
-          {/* True/False */}
+          {/* True / False */}
           {question.questionType === "true_false" && (
-            <div className="flex gap-4">
-              {["True", "False"].map((opt) => (
-                <button
-                  key={opt}
-                  type="button"
-                  onClick={() => setAnswers({ ...answers, [question.id]: opt.toLowerCase() })}
-                  className={`flex-1 p-4 rounded-xl text-center font-bold transition-all ${
-                    answers[question.id] === opt.toLowerCase()
-                      ? "bg-accent-100 border-2 border-accent-500 text-accent-700"
-                      : "bg-slate-50 border-2 border-transparent hover:bg-slate-100"
-                  }`}
-                >
-                  {opt}
-                </button>
-              ))}
+            <div className="grid grid-cols-2 gap-4">
+              {["True", "False"].map((opt, idx) => {
+                const color = KAHOOT_COLORS[idx];
+                return (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => handleSelectAnswer(question.id, opt.toLowerCase())}
+                    className={`p-8 rounded-2xl text-center text-xl font-bold shadow-md transition-all transform hover:scale-[1.02] ${color.bg}`}
+                  >
+                    {opt}
+                  </button>
+                );
+              })}
             </div>
           )}
 
           {/* Fill in blank / Short answer */}
           {(question.questionType === "fill_blank" || question.questionType === "short_answer") && (
-            <input
-              type="text"
-              value={answers[question.id] || ""}
-              onChange={(e) => setAnswers({ ...answers, [question.id]: e.target.value })}
-              className="w-full px-4 py-3 rounded-xl border-2 border-slate-200 focus:border-accent-500 outline-none text-lg"
-              placeholder="Type your answer here..."
-            />
-          )}
-        </div>
-
-        {/* Navigation */}
-        <div className="flex gap-3">
-          <button
-            onClick={() => setCurrentQuestion(Math.max(0, currentQuestion - 1))}
-            disabled={currentQuestion === 0}
-            className="px-6 py-3 rounded-xl bg-slate-100 text-slate-600 font-semibold disabled:opacity-50"
-          >
-            ← Previous
-          </button>
-          <div className="flex-1" />
-          {currentQuestion < quiz.questions.length - 1 ? (
-            <button
-              onClick={() => setCurrentQuestion(currentQuestion + 1)}
-              className="px-6 py-3 rounded-xl bg-accent-500 text-white font-semibold hover:bg-accent-600 transition-colors"
-            >
-              Next →
-            </button>
-          ) : (
-            <button
-              onClick={handleSubmit}
-              disabled={submitting}
-              className="px-8 py-3 rounded-xl bg-green-500 text-white font-bold hover:bg-green-600 transition-colors disabled:opacity-50"
-            >
-              {submitting ? "Submitting..." : "Submit Quiz ✓"}
-            </button>
-          )}
-        </div>
-
-        {/* Question Navigator */}
-        <div className="mt-6 bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
-          <p className="text-xs font-semibold text-slate-500 mb-3">QUESTION NAVIGATOR</p>
-          <div className="flex flex-wrap gap-2">
-            {quiz.questions.map((q, idx) => (
+            <div className="space-y-4 max-w-lg mx-auto">
+              <input
+                type="text"
+                value={answers[question.id] || ""}
+                onChange={(e) => setAnswers({ ...answers, [question.id]: e.target.value })}
+                placeholder="Type your answer here..."
+                className="w-full px-6 py-4 rounded-2xl border-2 border-slate-300 focus:border-purple-600 outline-none text-xl text-center font-semibold"
+              />
               <button
-                key={q.id}
-                onClick={() => setCurrentQuestion(idx)}
-                className={`w-9 h-9 rounded-lg text-sm font-bold transition-all ${
-                  idx === currentQuestion
-                    ? "bg-accent-500 text-white"
-                    : answers[q.id]
-                    ? "bg-green-100 text-green-600 border border-green-200"
-                    : "bg-slate-100 text-slate-500 hover:bg-slate-200"
-                }`}
+                type="button"
+                onClick={() => handleNextOrSubmit()}
+                className="px-8 py-4 rounded-2xl bg-purple-600 text-white font-bold text-lg shadow-lg hover:bg-purple-700 transition-colors w-full"
               >
-                {idx + 1}
+                Submit Answer ➔
               </button>
-            ))}
-          </div>
+            </div>
+          )}
         </div>
       </div>
     </DashboardShell>

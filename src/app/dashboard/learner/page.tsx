@@ -183,15 +183,15 @@ export default function LearnerDashboard() {
             </div>
           ) : (
             <div className="space-y-3">
-              {data.upcomingDeadlines.map((item) => (
-                <Link key={item.id} href={`/dashboard/learner/assignments/${item.id}`} className="flex items-center gap-4 p-4 rounded-xl hover:bg-slate-50 transition-colors border border-slate-100">
-                  <div className={`w-3 h-3 rounded-full ${item.urgency === "urgent" ? "bg-red-500 animate-pulse" : "bg-yellow-500"}`} />
+              {data.upcomingDeadlines.map((item: any) => (
+                <Link key={item.id} href={item.type === "quiz" ? `/dashboard/learner/quizzes/${item.id}` : `/dashboard/learner/assignments/${item.id}`} className="flex items-center gap-4 p-4 rounded-xl hover:bg-slate-50 transition-colors border border-slate-100">
+                  <div className={`w-3 h-3 rounded-full ${item.urgency === "urgent" ? "bg-red-500 animate-pulse" : item.type === "quiz" ? "bg-purple-500" : "bg-yellow-500"}`} />
                   <div className="flex-1 min-w-0">
                     <p className="font-medium text-sm text-slate-700 truncate">{item.title}</p>
-                    <p className="text-xs text-slate-400">{item.subject}</p>
+                    <p className="text-xs text-slate-400">{item.subject} {item.type === "quiz" ? "• ❓ Quiz" : ""}</p>
                   </div>
-                  <span className={`text-xs font-semibold px-3 py-1 rounded-full ${item.urgency === "urgent" ? "bg-red-100 text-red-600" : "bg-slate-100 text-slate-500"}`}>
-                    {item.due ? new Date(item.due).toLocaleDateString() : "No due date"}
+                  <span className={`text-xs font-semibold px-3 py-1 rounded-full ${item.urgency === "urgent" ? "bg-red-100 text-red-600" : item.type === "quiz" ? "bg-purple-100 text-purple-600" : "bg-slate-100 text-slate-500"}`}>
+                    {item.type === "quiz" ? "Available Now 🚀" : (item.due ? new Date(item.due).toLocaleDateString() : "No due date")}
                   </span>
                 </Link>
               ))}

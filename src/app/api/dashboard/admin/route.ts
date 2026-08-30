@@ -9,6 +9,7 @@ import {
   attendance,
   announcements,
   resources,
+  quizzes,
   activityLogs,
 } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
@@ -50,6 +51,7 @@ type RawStats = {
   classes: number;
   subjects: number;
   assignments: number;
+  quizzes: number;
   resources: number;
   announcements: number;
 };
@@ -100,7 +102,7 @@ function createWarningCollector() {
 }
 
 function countFrom(
-  table: typeof users | typeof classes | typeof subjects | typeof assignments | typeof resources | typeof announcements,
+  table: typeof users | typeof classes | typeof subjects | typeof assignments | typeof resources | typeof announcements | typeof quizzes,
   where?: ReturnType<typeof sql>
 ) {
   const query = where
@@ -257,6 +259,7 @@ export async function GET(request: NextRequest) {
       ["classes", () => countFrom(classes)],
       ["subjects", () => countFrom(subjects)],
       ["assignments", () => countFrom(assignments)],
+      ["quizzes", () => countFrom(quizzes)],
       ["resources", () => countFrom(resources)],
       ["announcements", () => countFrom(announcements)],
     ];
@@ -336,6 +339,7 @@ export async function GET(request: NextRequest) {
       admin_total_classes: { value: rawStats.classes, label: "Classes", icon: "🏫", color: "bg-orange-100" },
       admin_total_subjects: { value: rawStats.subjects, label: "Subjects", icon: "📚", color: "bg-pink-100" },
       admin_total_assignments: { value: rawStats.assignments, label: "Assignments", icon: "📝", color: "bg-yellow-100" },
+      admin_total_quizzes: { value: rawStats.quizzes, label: "Total Quizzes", icon: "❓", color: "bg-purple-100" },
       admin_total_resources: { value: rawStats.resources, label: "Resources", icon: "📚", color: "bg-cyan-100" },
       admin_total_announcements: { value: rawStats.announcements, label: "Announcements", icon: "📢", color: "bg-indigo-100" },
     };
