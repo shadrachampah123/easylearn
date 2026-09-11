@@ -91,6 +91,7 @@ async function run() {
           "0011_attendance_unique_constraint.sql",
           "0012_login_attempts.sql",
           "0013_multi_school_foundation.sql",
+          "0014_drop_single_school_guard.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root

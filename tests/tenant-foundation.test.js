@@ -111,11 +111,16 @@ test('Schema: same user cannot be added to the same school twice', () => {
   );
 });
 
-test('Schema: single-school-era guard (one active membership per user)', () => {
+test('Schema: multi-school membership supported (no single-school guard)', () => {
   const schema = readFile('src/db/schema.ts');
-  const block = schema.slice(schema.indexOf('pgTable("school_users"'), schema.indexOf('schoolUsersRelations'));
-  assert(block.includes('school_users_one_school_per_user'), 'one-school-per-user guard index must exist');
-  assert(block.includes("uniqueIndex("), 'guard must be a unique (partial) index');
+  assert(
+    !schema.includes('school_users_one_school_per_user'),
+    'the single-school guard index must NOT exist: users may belong to multiple schools'
+  );
+  assert(
+    schema.includes('unique("school_users_school_user_unique").on(table.schoolId, table.userId)'),
+    '(school_id, user_id) uniqueness must remain'
+  );
 });
 
 test('Schema: relations declared for school ↔ school_users ↔ user', () => {
@@ -131,6 +136,7 @@ test('Schema: relations declared for school ↔ school_users ↔ user', () => {
 /* ── 3. Migration file & runner ── */
 
 const ROOT_MIGRATION = '0013_multi_school_foundation.sql';
+const GUARD_DROP_MIGRATION = '0014_drop_single_school_guard.sql';
 
 test('Migration: 0013 exists in root and drizzle/ (project convention)', () => {
   assert(fs.existsSync(path.join(__dirname, '..', ROOT_MIGRATION)), 'root migration file missing');
@@ -170,8 +176,45 @@ test('Migration: slug uniqueness, membership uniqueness and FKs present', () => 
   );
   assert(
     sql.includes('"school_users_one_school_per_user"') && sql.includes("WHERE"),
-    'single-school-era partial unique index missing'
+    '0013 historically creates the guard index (dropped by 0014)'
   );
+});
+
+test('Migration: 0014 exists in root and drizzle/, drops the single-school guard', () => {
+  assert(fs.existsSync(path.join(__dirname, '..', GUARD_DROP_MIGRATION)), 'root 0014 missing');
+  assert(
+    fs.existsSync(path.join(__dirname, '..', 'drizzle', GUARD_DROP_MIGRATION)),
+    'drizzle/ 0014 copy missing'
+  );
+  assert(
+    readFile(GUARD_DROP_MIGRATION) === readFile(path.join('drizzle', GUARD_DROP_MIGRATION)),
+    'root and drizzle 0014 copies must be identical'
+  );
+  const sql = readFile(GUARD_DROP_MIGRATION);
+  assert(
+    sql.includes('DROP INDEX IF EXISTS "school_users_one_school_per_user"'),
+    '0014 must drop the single-school guard index'
+  );
+  // Check executable statements only (strip '--' comments) — comments may quote 0013.
+  const statements = sql
+    .split('--> statement-breakpoint')
+    .map((chunk) =>
+      chunk
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('--'))
+        .join('\n')
+    )
+    .join('\n');
+  assert(
+    /CREATE INDEX IF NOT EXISTS "school_users_one_school_per_user"/.test(statements) &&
+      !/CREATE UNIQUE INDEX IF NOT EXISTS "school_users_one_school_per_user"/.test(statements),
+    '0014 must recreate the name as a NON-UNIQUE placeholder so 0013 re-runs stay no-ops'
+  );
+  assert(
+    !/CREATE TABLE|ALTER TABLE|UPDATE |DELETE FROM|INSERT INTO/i.test(statements),
+    '0014 must only manage the index — no other DDL/DML'
+  );
+  assert(sql.includes('--> statement-breakpoint'), 'must use the project statement separator');
 });
 
 test('Migration: idempotent (IF NOT EXISTS / guarded DO blocks)', () => {
@@ -181,11 +224,16 @@ test('Migration: idempotent (IF NOT EXISTS / guarded DO blocks)', () => {
   assert(sql.includes('--> statement-breakpoint'), 'must use the project statement separator');
 });
 
-test('Runner: run-migration.js registers 0013 in its files array', () => {
+test('Runner: run-migration.js registers 0013 and 0014 in order', () => {
   const runner = readFile('run-migration.js');
   assert(
-    runner.includes('"0013_multi_school_foundation.sql"'),
-    'run-migration.js files array must include the new migration (its drizzle/ scan result is never iterated)'
+    runner.includes('"0013_multi_school_foundation.sql"') &&
+      runner.includes('"0014_drop_single_school_guard.sql"'),
+    'run-migration.js files array must include the new migrations (its drizzle/ scan result is never iterated)'
+  );
+  assert(
+    runner.indexOf('"0013_multi_school_foundation.sql"') < runner.indexOf('"0014_drop_single_school_guard.sql"'),
+    '0014 must run after 0013'
   );
   assert(
     runner.includes("'schools','school_users'"),

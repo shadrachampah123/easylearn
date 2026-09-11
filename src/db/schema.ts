@@ -10,7 +10,6 @@ import {
   date,
   jsonb,
   unique,
-  uniqueIndex,
   index,
   check,
 } from "drizzle-orm/pg-core";
@@ -615,8 +614,9 @@ export const schools = pgTable("schools", {
 ]);
 
 /* ── School Users (Phase 2A — school membership) ──
-   `users` remains the global identity store; this table records which school a
-   user belongs to and with which school-level role (plan §6). The existing
+   `users` remains the global identity store; this table records school
+   membership. A user MAY belong to multiple schools (one row per school);
+   within a single school a user can appear only once. The existing
    `users.role` system is untouched; Phase 2B will read membership roles from
    here and issue them into sessions.
    Note: 'super_admin' is a PLATFORM role (plan §7) — it must never be written
@@ -638,18 +638,14 @@ export const schoolUsers = pgTable("school_users", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
-  // A user can be added to the same school only once.
+  // A user can be added to the same school only once. Membership in multiple
+  // DIFFERENT schools is allowed (multi-school-capable from day one — the
+  // single-school guard from 0013 was removed by 0014).
   unique("school_users_school_user_unique").on(table.schoolId, table.userId),
   check(
     "school_users_membership_status_check",
     sql`${table.status} in ('active', 'invited', 'disabled')`
   ),
-  // Single-school-era guard (plan §6.2): a user holds at most one non-disabled
-  // membership across ALL schools. Replace this index when true multi-school
-  // membership ships in a later phase.
-  uniqueIndex("school_users_one_school_per_user")
-    .on(table.userId)
-    .where(sql`${table.status} <> 'disabled'`),
   index("school_users_school_role_idx").on(table.schoolId, table.role, table.status),
   index("school_users_user_idx").on(table.userId),
 ]);

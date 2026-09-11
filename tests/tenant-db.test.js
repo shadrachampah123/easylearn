@@ -10,8 +10,8 @@
  *   3. a user can belong to a school via school_users
  *   4. the same user cannot have duplicate membership in the same school (23505)
  *   5. foreign keys are valid (23503) and cascade correctly
- *   6. the single-school-era guard rejects a second active membership (23505)
- *      while a 'disabled' membership frees the user for another school
+ *   6. multi-school membership: the SAME user can belong to School A AND
+ *      School B (the single-school guard from 0013 is dropped by 0014)
  *   7. migrations are idempotent (running twice exits 0)
  *   8. no legacy table gained a school_id column
  *
@@ -116,7 +116,7 @@ async function main() {
 
     let result = runMigrations();
     await test("Migration runner applies 0000…0013 successfully", () => {
-      assertEq(result.status, 0, `run-migration.js exited ${result.status}:\n${(result.stdout || "") + (result.stderr || "")}`.slice(0, 2000));
+      assertEq(result.status, 0, `run-migration.js exited ${result.status}:\n${(result.stdout || "") + (result.stderr || "")}`.slice(0, 8000));
       if (!String(result.stdout).includes("🎉 Migration complete")) {
         throw new Error("runner did not report completion");
       }
@@ -264,42 +264,64 @@ async function main() {
       );
     });
 
-    /* ── 6. Single-school-era guard ── */
+    /* ── 6. Multi-school membership (0014 dropped the single-school guard) ── */
 
-    await test("Guard: a second ACTIVE membership in another school is rejected", async () => {
+    await test("Multi-school: the same user can belong to School A", async () => {
+      const { rows } = await db.query(
+        `SELECT count(*)::int AS n FROM "school_users" WHERE "user_id" = $1 AND "school_id" = $2`,
+        [user1.id, schoolA.id]
+      );
+      assertEq(rows[0].n, 1, "user1 must hold exactly one School A membership");
+    });
+
+    await test("Multi-school: the same user can ALSO belong to School B", async () => {
+      const { rows } = await db.query(
+        `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'teacher') RETURNING *`,
+        [schoolB.id, user1.id]
+      );
+      assertEq(rows.length, 1, "second-school membership inserted");
+      const { rows: both } = await db.query(
+        `SELECT count(*)::int AS n FROM "school_users" WHERE "user_id" = $1`,
+        [user1.id]
+      );
+      assertEq(both[0].n, 2, "user1 must now hold memberships in TWO schools");
+    });
+
+    await test("Multi-school: the same user cannot be added twice to School A", async () => {
       await expectError(
         `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'teacher')`,
-        [schoolB.id, user1.id],
+        [schoolA.id, user1.id],
         "23505",
-        "second school for same user"
-      );
-    });
-
-    await test("Guard: a DISABLED membership frees the user for another school", async () => {
-      await db.query(`UPDATE "school_users" SET "status" = 'disabled' WHERE "id" = $1`, [membership1.id]);
-      const { rows } = await db.query(
-        `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'teacher') RETURNING id`,
-        [schoolB.id, user1.id]
-      );
-      assert(/^[0-9a-f-]{36}$/i.test(rows[0].id), "membership in school B allowed after disabling school A");
-      await db.query(`DELETE FROM "school_users" WHERE "id" = $1`, [rows[0].id]);
-      await db.query(`UPDATE "school_users" SET "status" = 'active' WHERE "id" = $1`, [membership1.id]);
-    });
-
-    await test("Guard: re-enabling a second active membership is rejected too", async () => {
-      // Defensive cleanup in case an earlier step left rows behind.
-      await db.query(`DELETE FROM "school_users" WHERE "school_id" = $1 AND "user_id" = $2`, [schoolB.id, user1.id]);
-      // Create it disabled, then try to activate while A is active.
-      await db.query(
-        `INSERT INTO "school_users" ("school_id", "user_id", "role", "status") VALUES ($1, $2, 'teacher', 'disabled')`,
-        [schoolB.id, user1.id]
+        "duplicate membership in School A"
       );
       await expectError(
-        `UPDATE "school_users" SET "status" = 'active' WHERE "school_id" = $1 AND "user_id" = $2`,
-        [schoolB.id, user1.id],
+        `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'learner')`,
+        [schoolA.id, user1.id],
         "23505",
-        "activate second membership"
+        "duplicate membership in School A with a different role"
       );
+    });
+
+    await test("Multi-school: guard is a NON-UNIQUE placeholder, (school_id, user_id) unique remains", async () => {
+      // 0014 replaces 0013's unique guard with a non-unique same-name placeholder
+      // so that re-running 0013 (CREATE ... IF NOT EXISTS) never resurrects the
+      // single-school restriction.
+      const placeholder = await db.query(
+        `SELECT i."indisunique" FROM "pg_indexes" x
+           JOIN "pg_class" c ON c."relname" = x."indexname"
+           JOIN "pg_index" i ON i."indexrelid" = c."oid"
+          WHERE x."indexname" = 'school_users_one_school_per_user'`
+      );
+      assertEq(placeholder.rowCount, 1, "placeholder index must exist");
+      assertEq(placeholder.rows[0].indisunique, false, "placeholder must be NON-unique (multi-school allowed)");
+      const pairUnique = await db.query(
+        `SELECT i."indisunique" FROM "pg_indexes" x
+           JOIN "pg_class" c ON c."relname" = x."indexname"
+           JOIN "pg_index" i ON i."indexrelid" = c."oid"
+          WHERE x."indexname" = 'school_users_school_user_unique'`
+      );
+      assertEq(pairUnique.rowCount, 1, "(school_id, user_id) unique index must exist");
+      assertEq(pairUnique.rows[0].indisunique, true, "(school_id, user_id) must be UNIQUE");
     });
 
     await test("Membership: membership status is constrained", async () => {
@@ -315,7 +337,7 @@ async function main() {
 
     await test("Cascade: deleting a school removes its memberships", async () => {
       const { rows } = await db.query(
-        `INSERT INTO "school_users" ("school_id", "user_id", "role", "status") VALUES ($1, $2, 'learner', 'disabled')`,
+        `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'learner')`,
         [schoolA.id, user2.id]
       );
       await db.query(`DELETE FROM "schools" WHERE "id" = $1`, [schoolA.id]);
@@ -339,7 +361,28 @@ async function main() {
 
     await test("Migrations are idempotent (second run exits 0)", () => {
       const second = runMigrations();
-      assertEq(second.status, 0, `second run exited ${second.status}:\n${(second.stdout || "") + (second.stderr || "")}`.slice(0, 2000));
+      assertEq(second.status, 0, `second run exited ${second.status}:\n${(second.stdout || "") + (second.stderr || "")}`.slice(0, 8000));
+    });
+
+    await test("Multi-school still works after the second full migration run", async () => {
+      // A naive follow-up fix would let 0013's CREATE UNIQUE INDEX IF NOT EXISTS
+      // resurrect the single-school guard on every re-run (failing once multi-school
+      // data exists). Prove the end state survives: insert a fresh user into BOTH
+      // schools and confirm the existing two-school membership is intact.
+      await db.query(
+        `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'learner')`,
+        [schoolA.id, user2.id]
+      );
+      const { rows } = await db.query(
+        `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'learner') RETURNING id`,
+        [schoolB.id, user2.id]
+      );
+      assert(/^[0-9a-f-]{36}$/i.test(rows[0].id), "user2 joined both schools after the re-run");
+      const { rows: user1Pairs } = await db.query(
+        `SELECT count(*)::int AS n FROM "school_users" WHERE "user_id" = $1`,
+        [user1.id]
+      );
+      assertEq(user1Pairs[0].n, 2, "user1's two pre-existing memberships must survive re-runs");
     });
 
     /* ── 8. Legacy schema untouched ── */

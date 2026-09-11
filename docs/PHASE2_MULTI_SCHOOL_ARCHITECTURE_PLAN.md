@@ -447,7 +447,7 @@ CREATE TABLE school_users (
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now()
 );
--- Single-school era guard (replace this index when multi-school ships):
+-- Single-school era guard (see decision note below — REMOVED by 0014):
 CREATE UNIQUE INDEX school_users_one_school_per_user
   ON school_users (user_id) WHERE status <> 'disabled';
 CREATE UNIQUE INDEX school_users_school_user_key ON school_users (school_id, user_id);
@@ -455,12 +455,19 @@ CREATE INDEX school_users_school_role_idx ON school_users (school_id, role, stat
 CREATE INDEX school_users_user_idx ON school_users (user_id);
 ```
 
+> **Decision update (Phase 2A, follow-up migration `0014_drop_single_school_guard.sql`):**
+> the plan originally proposed the `school_users_one_school_per_user` partial unique
+> index as a single-school-era guard. Since `users` is the global identity store and
+> `school_users` must support a user belonging to **multiple schools**, that index was
+> dropped in the same phase. Multi-school membership is supported from day one; the
+> `UNIQUE (school_id, user_id)` constraint still prevents duplicate membership within
+> one school. No replacement single-school restriction exists.
+
 ### 6.3 How this satisfies every requirement
 
-- **One school initially:** the partial unique index makes a second membership
-  structurally impossible.
-- **Multi-school later:** replace one index; add school-switch UX; the session gains
-  `schoolId`+`membershipId` chosen at login/switch (§9).
+- **Multi-school-capable membership:** a user can belong to School A and School B
+  simultaneously (one membership row per school); duplicates within one school are
+  structurally impossible via `UNIQUE (school_id, user_id)`.
 - **School-specific roles:** role lives on the membership — the same person can be a
   `teacher` in School A and `school_admin` in School B.
 - **Platform `super_admin`:** stays on `users.role` (or, better, a dedicated
