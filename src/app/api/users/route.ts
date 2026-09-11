@@ -21,6 +21,11 @@ export async function GET(request: NextRequest) {
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
+    // Only administrators may enumerate users
+    if (!["super_admin", "school_admin", "head_teacher"].includes(payload.role)) {
+      return errorResponse("Only administrators can view user directory", 403);
+    }
+
     const role = request.nextUrl.searchParams.get("role");
     const search = request.nextUrl.searchParams.get("search");
     const page = parseInt(request.nextUrl.searchParams.get("page") || "1");

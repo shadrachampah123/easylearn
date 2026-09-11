@@ -61,6 +61,26 @@ export async function POST(
       return errorResponse("This assignment is not accepting submissions");
     }
 
+    // Verify learner is enrolled in the assignment's class (prevent IDOR)
+    const { learnerClasses } = await import("@/db/schema");
+    const [enrollment] = await db
+      .select({ id: learnerClasses.id })
+      .from(learnerClasses)
+      .where(and(eq(learnerClasses.learnerId, payload.userId), eq(learnerClasses.classId, assignment.classId)))
+      .limit(1);
+
+    // If enrollment records exist for this learner at all, enforce enrollment check
+    // If no enrollment records exist at all (legacy data), allow submission to avoid breaking existing functionality
+    const anyEnrollments = await db
+      .select({ id: learnerClasses.id })
+      .from(learnerClasses)
+      .where(eq(learnerClasses.learnerId, payload.userId))
+      .limit(1);
+
+    if (anyEnrollments.length > 0 && !enrollment) {
+      return errorResponse("You are not enrolled in the class for this assignment", 403);
+    }
+
     // Check deadline
     const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
     if (isLate && !assignment.allowLate) {

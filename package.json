@@ -6,7 +6,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts",
+    "test:security": "node tests/security.test.js",
+    "test:real": "npx tsx tests/real-authorization.test.ts",
+    "test:all": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts"
   },
   "dependencies": {
     "@types/bcryptjs": "^2.4.6",

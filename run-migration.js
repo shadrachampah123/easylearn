@@ -88,6 +88,8 @@ async function run() {
           "0008_easyai_grading.sql",
           "0009_file_uploads.sql",
           "0010_object_storage.sql",
+          "0011_attendance_unique_constraint.sql",
+          "0012_login_attempts.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root

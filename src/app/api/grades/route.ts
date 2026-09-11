@@ -4,7 +4,7 @@ import { submissions, assignments, quizAttempts, quizzes, subjects, classes, use
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { eq, and, sql, desc } from "drizzle-orm";
-import { getAccessibleLearnerIds } from "@/lib/report-access";
+import { canAccessLearner } from "@/lib/authorization";
 
 export async function GET(request: NextRequest) {
   try {
@@ -16,20 +16,14 @@ export async function GET(request: NextRequest) {
     const learnerId = request.nextUrl.searchParams.get("learnerId") || payload.userId;
     const subjectId = request.nextUrl.searchParams.get("subjectId");
 
-    // Learners can only view their own grades. Teachers are scoped to the learners
-    // enrolled in their classes or who have used one of their assessments; this also
-    // protects the standalone grades API from cross-teacher data access.
-    if (payload.role === "learner" && learnerId !== payload.userId) {
-      return errorResponse("You can only view your own grades", 403);
-    }
-    if (payload.role === "teacher") {
-      const accessibleLearners = await getAccessibleLearnerIds(payload);
-      if (!accessibleLearners.has(learnerId)) {
-        return errorResponse("You can only view grades for learners in your scope", 403);
-      }
-    }
     if (!["learner", "parent", "super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
       return errorResponse("You are not authorized to view grades", 403);
+    }
+
+    // Verify authorization for the requested learnerId - never trust client-supplied ID alone
+    const authorized = await canAccessLearner(payload, learnerId);
+    if (!authorized) {
+      return errorResponse("You are not authorized to view grades for this learner", 403);
     }
 
     // Get assignment grades

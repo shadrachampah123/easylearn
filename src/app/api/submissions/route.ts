@@ -99,6 +99,24 @@ export async function POST(request: NextRequest) {
       return errorResponse("This assignment is not accepting submissions");
     }
 
+    // Verify learner is enrolled in assignment's class
+    const { learnerClasses } = await import("@/db/schema");
+    const [enrollment] = await db
+      .select({ id: learnerClasses.id })
+      .from(learnerClasses)
+      .where(and(eq(learnerClasses.learnerId, payload.userId), eq(learnerClasses.classId, assignment.classId)))
+      .limit(1);
+
+    const anyEnrollments = await db
+      .select({ id: learnerClasses.id })
+      .from(learnerClasses)
+      .where(eq(learnerClasses.learnerId, payload.userId))
+      .limit(1);
+
+    if (anyEnrollments.length > 0 && !enrollment) {
+      return errorResponse("You are not enrolled in the class for this assignment", 403);
+    }
+
     /* ── File upload gate: the teacher must explicitly enable uploads ── */
     let resolvedAttachments: { fileId: string; name: string; type: string; size: number; url: string }[] = [];
     const submittedFiles = Array.isArray(attachments) ? attachments : [];

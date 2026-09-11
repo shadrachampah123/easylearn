@@ -9,6 +9,8 @@ import {
   pgEnum,
   date,
   jsonb,
+  unique,
+  index,
 } from "drizzle-orm/pg-core";
 
 /* ── Enums ── */
@@ -402,6 +404,34 @@ export const attendance = pgTable("attendance", {
   note: text("note"),
   markedById: uuid("marked_by_id").references(() => users.id),
   createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => ({
+  uniqueLearnerClassDate: unique("attendance_learner_class_date_unique").on(table.learnerId, table.classId, table.date),
+}));
+
+/* ── Login Attempts (for brute-force protection) ── */
+export const loginAttempts = pgTable("login_attempts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  identifier: varchar("identifier", { length: 255 }).notNull(), // email or username normalized
+  ipAddress: varchar("ip_address", { length: 50 }),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => ({
+  identifierIdx: index("login_attempts_identifier_idx").on(table.identifier),
+  createdAtIdx: index("login_attempts_created_at_idx").on(table.createdAt),
+}));
+
+/* ── Attendance Duplicates Backup (for safe migration 0011) ──
+   Preserves duplicate attendance records removed during unique constraint migration */
+export const attendanceDuplicatesBackup = pgTable("attendance_duplicates_backup", {
+  id: uuid("id").primaryKey(),
+  learnerId: uuid("learner_id").notNull(),
+  classId: uuid("class_id").notNull(),
+  date: date("date").notNull(),
+  isPresent: boolean("is_present").notNull(),
+  note: text("note"),
+  markedById: uuid("marked_by_id"),
+  createdAt: timestamp("created_at").notNull(),
+  deletedAt: timestamp("deleted_at").notNull().defaultNow(),
+  deletionReason: text("deletion_reason").default("duplicate_cleanup_0011_migration"),
 });
 
 /* ── Timetable (weekly class schedule) ── */
