@@ -10,8 +10,11 @@ import {
   date,
   jsonb,
   unique,
+  uniqueIndex,
   index,
+  check,
 } from "drizzle-orm/pg-core";
+import { relations, sql } from "drizzle-orm";
 
 /* ── Enums ── */
 export const userRoleEnum = pgEnum("user_role", [
@@ -577,3 +580,98 @@ export const downloads = pgTable("downloads", {
   downloadCount: integer("download_count").default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
+
+/* ── Schools (Phase 2A — multi-school tenant root) ──
+   See docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md (§3, §4).
+   Phase 2A scope: identity + lifecycle only. Contact/branding fields, plan,
+   storage quotas and custom domains arrive in later additive migrations
+   (Phase 2B/2E/2H) per the architecture plan. Nothing in the application
+   reads or writes this table yet — Phase 2B wires membership into auth. */
+export const schools = pgTable("schools", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: varchar("name", { length: 150 }).notNull(),
+  shortName: varchar("short_name", { length: 30 }).notNull(),
+  // URL-safe tenant identifier (future {slug}.easylearn.com routing, plan §8).
+  slug: varchar("slug", { length: 63 }).notNull(),
+  // Lifecycle: provisioned | active | suspended | archived (plan §4.4).
+  // varchar + CHECK (instead of pgEnum) so new lifecycle values are a cheap
+  // additive migration, per plan §4.2.
+  status: varchar("status", { length: 20 }).notNull().default("active"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique("schools_slug_unique").on(table.slug),
+  check(
+    "schools_status_check",
+    sql`${table.status} in ('provisioned', 'active', 'suspended', 'archived')`
+  ),
+  // DNS-label-shaped slug (1–63 chars, lowercase letters/digits/hyphens,
+  // no leading/trailing hyphen) so it is always subdomain-safe.
+  check(
+    "schools_slug_format_check",
+    sql`${table.slug} ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'`
+  ),
+  index("schools_status_idx").on(table.status),
+]);
+
+/* ── School Users (Phase 2A — school membership) ──
+   `users` remains the global identity store; this table records which school a
+   user belongs to and with which school-level role (plan §6). The existing
+   `users.role` system is untouched; Phase 2B will read membership roles from
+   here and issue them into sessions.
+   Note: 'super_admin' is a PLATFORM role (plan §7) — it must never be written
+   into a membership row. That exclusion is enforced by the Phase 2B
+   application layer, not by the database. */
+export const schoolUsers = pgTable("school_users", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  schoolId: uuid("school_id")
+    .notNull()
+    .references(() => schools.id, { onDelete: "cascade" }),
+  userId: uuid("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  // School-level role, reusing the existing `user_role` enum for full
+  // compatibility with the current role model.
+  role: userRoleEnum("role").notNull(),
+  // Membership lifecycle: active | invited | disabled.
+  status: varchar("status", { length: 20 }).notNull().default("active"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  // A user can be added to the same school only once.
+  unique("school_users_school_user_unique").on(table.schoolId, table.userId),
+  check(
+    "school_users_membership_status_check",
+    sql`${table.status} in ('active', 'invited', 'disabled')`
+  ),
+  // Single-school-era guard (plan §6.2): a user holds at most one non-disabled
+  // membership across ALL schools. Replace this index when true multi-school
+  // membership ships in a later phase.
+  uniqueIndex("school_users_one_school_per_user")
+    .on(table.userId)
+    .where(sql`${table.status} <> 'disabled'`),
+  index("school_users_school_role_idx").on(table.schoolId, table.role, table.status),
+  index("school_users_user_idx").on(table.userId),
+]);
+
+/* ── Relations (Phase 2A) ──
+   Drizzle relational definitions for the two new tables. Purely additive —
+   no existing query uses the relational query API yet. */
+export const schoolsRelations = relations(schools, ({ many }) => ({
+  members: many(schoolUsers),
+}));
+
+export const schoolUsersRelations = relations(schoolUsers, ({ one }) => ({
+  school: one(schools, {
+    fields: [schoolUsers.schoolId],
+    references: [schools.id],
+  }),
+  user: one(users, {
+    fields: [schoolUsers.userId],
+    references: [users.id],
+  }),
+}));
+
+export const usersRelations = relations(users, ({ many }) => ({
+  schoolMemberships: many(schoolUsers),
+}));

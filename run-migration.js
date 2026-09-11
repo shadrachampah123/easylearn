@@ -90,6 +90,7 @@ async function run() {
           "0010_object_storage.sql",
           "0011_attendance_unique_constraint.sql",
           "0012_login_attempts.sql",
+          "0013_multi_school_foundation.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root
@@ -112,8 +113,8 @@ async function run() {
 
     // Verify key tables
     const verifyRes = await client.query(`
-      SELECT table_name FROM information_schema.tables 
-      WHERE table_schema='public' AND table_name IN ('timetable_entries','dashboard_card_overrides','activity_logs')
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema='public' AND table_name IN ('timetable_entries','dashboard_card_overrides','activity_logs','schools','school_users')
       ORDER BY table_name;
     `);
     console.log("\n✅ Verification - Key tables:");
