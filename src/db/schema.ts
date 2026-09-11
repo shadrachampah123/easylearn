@@ -419,6 +419,21 @@ export const loginAttempts = pgTable("login_attempts", {
   createdAtIdx: index("login_attempts_created_at_idx").on(table.createdAt),
 }));
 
+/* ── Attendance Duplicates Backup (for safe migration 0011) ──
+   Preserves duplicate attendance records removed during unique constraint migration */
+export const attendanceDuplicatesBackup = pgTable("attendance_duplicates_backup", {
+  id: uuid("id").primaryKey(),
+  learnerId: uuid("learner_id").notNull(),
+  classId: uuid("class_id").notNull(),
+  date: date("date").notNull(),
+  isPresent: boolean("is_present").notNull(),
+  note: text("note"),
+  markedById: uuid("marked_by_id"),
+  createdAt: timestamp("created_at").notNull(),
+  deletedAt: timestamp("deleted_at").notNull().defaultNow(),
+  deletionReason: text("deletion_reason").default("duplicate_cleanup_0011_migration"),
+});
+
 /* ── Timetable (weekly class schedule) ── */
 export const timetableEntries = pgTable("timetable_entries", {
   id: uuid("id").primaryKey().defaultRandom(),

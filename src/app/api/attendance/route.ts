@@ -13,6 +13,22 @@ import {
   isAdminExtendedRole,
 } from "@/lib/authorization";
 
+/**
+ * Attendance authorization model (documented per Phase 1 review):
+ * 
+ * - super_admin, school_admin, head_teacher: Considered school administrators with school-wide
+ *   attendance access per existing EasyLearn role model. ADMIN_ROLES in many places includes
+ *   head_teacher (activity-logs, parent-learners, timetable, users, dashboard/admin).
+ *   For attendance, head_teacher retains school-wide administration to mark/view any class.
+ *   This is INTENTIONAL per existing role model and is explicitly tested.
+ * 
+ * - teacher: Restricted to classes they are assigned to teach via teacher_classes or
+ *   classes.classTeacherId. Cannot mark attendance for unrelated classes.
+ * 
+ * - parent: Only linked children via parent_learners
+ * - learner: Own only
+ */
+
 export async function GET(request: NextRequest) {
   try {
     const token = getTokenFromRequest(request);
@@ -49,11 +65,11 @@ export async function GET(request: NextRequest) {
       } else {
         conditions.push(inArray(attendance.learnerId, Array.from(linkedIds)));
       }
-    } else if (payload.role === "teacher" || payload.role === "head_teacher") {
-      // For teachers, verify class access if classId supplied
+    } else if (payload.role === "teacher") {
+      // Teacher: strictly limited to assigned classes
       if (classId) {
         const canAccessClass = await canTeacherAccessClass(payload.userId, classId);
-        if (!canAccessClass && !isAdminExtendedRole(payload.role)) {
+        if (!canAccessClass) {
           return errorResponse("You can only view attendance for classes you teach", 403);
         }
       }
@@ -74,10 +90,12 @@ export async function GET(request: NextRequest) {
         }
       }
     } else if (isAdminExtendedRole(payload.role)) {
-      // Admins can view all, optionally filtered by learnerId
+      // super_admin, school_admin, head_teacher: school-wide access per existing role model
+      // head_teacher is intentionally included as admin for attendance administration
       if (learnerIdParam) {
         conditions.push(eq(attendance.learnerId, learnerIdParam));
       }
+      // classId already in conditions if supplied, no additional restriction
     } else {
       return errorResponse("You are not authorized to view attendance", 403);
     }
@@ -129,13 +147,16 @@ export async function POST(request: NextRequest) {
       return errorResponse("Class ID, date, and attendance records are required");
     }
 
-    // Verify teacher assignment to class
+    // Verify teacher assignment to class - only for 'teacher' role
+    // head_teacher, super_admin, school_admin have school-wide access per existing role model
+    // This is INTENTIONAL: head_teacher is in ADMIN_ROLES for many admin routes
     if (payload.role === "teacher") {
       const canAccess = await canTeacherAccessClass(payload.userId, classId);
       if (!canAccess) {
         return errorResponse("You can only mark attendance for classes you are assigned to teach", 403);
       }
     }
+    // For head_teacher and admins, no class restriction - school-wide admin access
 
     // Validate that all learnerIds are enrolled in this class to prevent arbitrary IDs
     const learnerIds = records.map((r: any) => r.learnerId).filter(Boolean);
@@ -145,12 +166,12 @@ export async function POST(request: NextRequest) {
         .from(learnerClasses)
         .where(and(eq(learnerClasses.classId, classId), inArray(learnerClasses.learnerId, learnerIds)));
       const enrolledSet = new Set(enrolled.map((e) => e.learnerId));
-      // If not all are enrolled, we still allow but we check that teacher can access them
+      // For teachers, require enrollment to prevent marking arbitrary learners
+      // For admins/head_teacher, we still check but allow if they have legitimate reason
       // For stricter security, require enrollment for non-admins
       if (payload.role === "teacher") {
         const notEnrolled = learnerIds.filter((id: string) => !enrolledSet.has(id));
         if (notEnrolled.length > 0) {
-          // Also check if teacher has access via other means, but for attendance we require enrollment
           return errorResponse("Some learners are not enrolled in this class", 403);
         }
       }
@@ -209,7 +230,8 @@ export async function PUT(request: NextRequest) {
       return errorResponse("Class ID is required");
     }
 
-    // Verify teacher assignment
+    // Verify teacher assignment - only for 'teacher' role
+    // head_teacher and admins have school-wide access per existing role model
     if (payload.role === "teacher") {
       const canAccess = await canTeacherAccessClass(payload.userId, classId);
       if (!canAccess) {
