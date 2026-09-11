@@ -6,7 +6,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node tests/security.test.js",
+    "test:security": "node tests/security.test.js"
   },
   "dependencies": {
     "@types/bcryptjs": "^2.4.6",

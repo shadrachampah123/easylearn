@@ -5,6 +5,12 @@ import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { getDatabaseErrorMessage } from "@/lib/database-errors";
 import { getDatabaseConfigurationProblem, getJwtConfigurationProblem } from "@/lib/env";
 import { eq } from "drizzle-orm";
+import {
+  checkLoginRateLimit,
+  recordFailedLoginAttempt,
+  clearFailedLoginAttempts,
+  getClientIp,
+} from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,6 +44,17 @@ export async function POST(request: NextRequest) {
 
     const { db } = await import("@/db");
 
+    // Rate limiting - DB-backed, works across Vercel instances
+    const identifier = normalizedEmail || normalizedUsername;
+    const clientIp = getClientIp(request);
+    const rateLimit = await checkLoginRateLimit(identifier, clientIp);
+    if (!rateLimit.allowed) {
+      return errorResponse(
+        rateLimit.message || "Too many failed login attempts. Please try again later.",
+        429
+      );
+    }
+
     // Search by email first, then by username. Both reads go through findAuthUser so that a
     // database without drizzle/0006 (users.username) can still sign people in - previously the
     // `select()` picked every schema column and login itself threw.
@@ -59,6 +76,7 @@ export async function POST(request: NextRequest) {
     }
 
     if (!user) {
+      await recordFailedLoginAttempt(identifier, clientIp);
       return errorResponse("Invalid email/username or password", 401);
     }
 
@@ -68,8 +86,12 @@ export async function POST(request: NextRequest) {
 
     const isValid = await verifyPassword(password, user.passwordHash);
     if (!isValid) {
+      await recordFailedLoginAttempt(identifier, clientIp);
       return errorResponse("Invalid email or password", 401);
     }
+
+    // Successful login - clear failed attempts
+    await clearFailedLoginAttempts(identifier);
 
     const token = await createToken({
       userId: user.id,

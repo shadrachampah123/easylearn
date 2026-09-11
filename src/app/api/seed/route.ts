@@ -1,3 +1,4 @@
+import { NextRequest } from "next/server";
 import { db } from "@/db";
 import {
   users,
@@ -14,12 +15,35 @@ import {
   parentLearners,
   timetableEntries,
 } from "@/db/schema";
-import { hashPassword } from "@/lib/auth";
-import { successResponse, errorResponse } from "@/lib/api-helpers";
+import { hashPassword, getTokenFromRequest, verifyToken } from "@/lib/auth";
+import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { sql } from "drizzle-orm";
 
-export async function POST() {
+/**
+ * Database seeding endpoint - PROTECTED
+ * 
+ * In production, this route is disabled entirely to prevent unauthorized database seeding
+ * and exposure of demo credentials.
+ * 
+ * In development, it requires super_admin authentication and only seeds if database is empty.
+ */
+export async function POST(request: NextRequest) {
   try {
+    // In production, disable this endpoint entirely
+    if (process.env.NODE_ENV === "production") {
+      return errorResponse("Not found", 404);
+    }
+
+    // In non-production, require super_admin authentication
+    const token = getTokenFromRequest(request);
+    if (!token) return unauthorizedResponse();
+    const payload = await verifyToken(token);
+    if (!payload) return unauthorizedResponse();
+
+    if (payload.role !== "super_admin") {
+      return errorResponse("Only super administrators can seed the database", 403);
+    }
+
     // Check if already seeded
     const existingUsers = await db.select({ id: users.id }).from(users).limit(1);
     if (existingUsers.length > 0) {

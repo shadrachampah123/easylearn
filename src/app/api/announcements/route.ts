@@ -10,6 +10,34 @@ export async function GET(request: NextRequest) {
   try {
     const isPublic = request.nextUrl.searchParams.get("public") === "true";
 
+    // Public announcements can be accessed without authentication for marketing website
+    if (isPublic) {
+      const results = await db
+        .select({
+          id: announcements.id,
+          title: announcements.title,
+          content: announcements.content,
+          isPinned: announcements.isPinned,
+          isPublic: announcements.isPublic,
+          createdAt: announcements.createdAt,
+          authorFirstName: users.firstName,
+          authorLastName: users.lastName,
+        })
+        .from(announcements)
+        .leftJoin(users, eq(announcements.authorId, users.id))
+        .where(eq(announcements.isPublic, true))
+        .orderBy(desc(announcements.isPinned), desc(announcements.createdAt))
+        .limit(20);
+
+      return successResponse(results);
+    }
+
+    // Non-public announcements require authentication
+    const token = getTokenFromRequest(request);
+    if (!token) return unauthorizedResponse();
+    const payload = await verifyToken(token);
+    if (!payload) return unauthorizedResponse();
+
     const results = await db
       .select({
         id: announcements.id,
@@ -23,7 +51,6 @@ export async function GET(request: NextRequest) {
       })
       .from(announcements)
       .leftJoin(users, eq(announcements.authorId, users.id))
-      .where(isPublic ? eq(announcements.isPublic, true) : undefined)
       .orderBy(desc(announcements.isPinned), desc(announcements.createdAt))
       .limit(20);
 
@@ -42,7 +69,7 @@ export async function POST(request: NextRequest) {
     if (!payload) return unauthorizedResponse();
 
     if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
-      return errorResponse("Forbidden", 403);
+      return errorResponse("Only teachers and administrators can create announcements", 403);
     }
 
     const body = await request.json();

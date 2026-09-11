@@ -4,7 +4,14 @@ import { learnerClasses, users, classes } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, inArray } from "drizzle-orm";
+import {
+  canAccessLearner,
+  canTeacherAccessClass,
+  getAllowedLearnerIdsForEnrollment,
+  getTeacherAccessibleClassIds,
+  isAdminExtendedRole,
+} from "@/lib/authorization";
 
 export async function GET(request: NextRequest) {
   try {
@@ -14,15 +21,68 @@ export async function GET(request: NextRequest) {
     if (!payload) return unauthorizedResponse();
 
     const classId = request.nextUrl.searchParams.get("classId");
-    const learnerId = request.nextUrl.searchParams.get("learnerId");
+    const learnerIdParam = request.nextUrl.searchParams.get("learnerId");
 
-    const conditions = [];
+    const conditions: any[] = [];
+
     if (classId) conditions.push(eq(learnerClasses.classId, classId));
-    if (learnerId) conditions.push(eq(learnerClasses.learnerId, learnerId));
+    if (learnerIdParam) conditions.push(eq(learnerClasses.learnerId, learnerIdParam));
 
-    const whereClause = conditions.length > 0
-      ? conditions.reduce((a, b) => and(a, b)!)
-      : undefined;
+    // Role-based filtering
+    if (isAdminExtendedRole(payload.role)) {
+      // Admins can view all, but if learnerId supplied it's already in conditions
+    } else if (payload.role === "teacher" || payload.role === "head_teacher") {
+      // Teacher: must be assigned to class if classId supplied
+      if (classId) {
+        const canAccessClass = await canTeacherAccessClass(payload.userId, classId);
+        if (!canAccessClass) {
+          return errorResponse("You can only view enrollments for classes you teach", 403);
+        }
+      }
+      if (learnerIdParam) {
+        const canAccess = await canAccessLearner(payload, learnerIdParam);
+        if (!canAccess) {
+          return errorResponse("You can only view enrollments for learners in your scope", 403);
+        }
+      } else {
+        // No learner filter: restrict to teacher's classes
+        const accessibleClassIds = await getTeacherAccessibleClassIds(payload.userId);
+        if (accessibleClassIds.size === 0) {
+          return successResponse([]);
+        }
+        if (classId) {
+          // Already verified class access, no extra filter needed
+        } else {
+          conditions.push(inArray(learnerClasses.classId, Array.from(accessibleClassIds)));
+        }
+      }
+    } else if (payload.role === "parent") {
+      const allowed = await getAllowedLearnerIdsForEnrollment(payload);
+      if (allowed === "all") {
+        // shouldn't happen for parent
+      } else {
+        const allowedSet = allowed as Set<string>;
+        if (allowedSet.size === 0) {
+          return successResponse([]);
+        }
+        if (learnerIdParam) {
+          if (!allowedSet.has(learnerIdParam)) {
+            return errorResponse("You can only view enrollments for your linked children", 403);
+          }
+        } else {
+          conditions.push(inArray(learnerClasses.learnerId, Array.from(allowedSet)));
+        }
+      }
+    } else if (payload.role === "learner") {
+      if (learnerIdParam && learnerIdParam !== payload.userId) {
+        return errorResponse("You can only view your own enrollments", 403);
+      }
+      conditions.push(eq(learnerClasses.learnerId, payload.userId));
+    } else {
+      return errorResponse("You are not authorized to view enrollments", 403);
+    }
+
+    const whereClause = conditions.length > 0 ? conditions.reduce((a, b) => and(a, b)!) : undefined;
 
     const results = await db
       .select({

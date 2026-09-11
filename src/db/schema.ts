@@ -9,6 +9,8 @@ import {
   pgEnum,
   date,
   jsonb,
+  unique,
+  index,
 } from "drizzle-orm/pg-core";
 
 /* ── Enums ── */
@@ -402,7 +404,20 @@ export const attendance = pgTable("attendance", {
   note: text("note"),
   markedById: uuid("marked_by_id").references(() => users.id),
   createdAt: timestamp("created_at").notNull().defaultNow(),
-});
+}, (table) => ({
+  uniqueLearnerClassDate: unique("attendance_learner_class_date_unique").on(table.learnerId, table.classId, table.date),
+}));
+
+/* ── Login Attempts (for brute-force protection) ── */
+export const loginAttempts = pgTable("login_attempts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  identifier: varchar("identifier", { length: 255 }).notNull(), // email or username normalized
+  ipAddress: varchar("ip_address", { length: 50 }),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => ({
+  identifierIdx: index("login_attempts_identifier_idx").on(table.identifier),
+  createdAtIdx: index("login_attempts_created_at_idx").on(table.createdAt),
+}));
 
 /* ── Timetable (weekly class schedule) ── */
 export const timetableEntries = pgTable("timetable_entries", {

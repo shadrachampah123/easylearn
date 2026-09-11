@@ -4,6 +4,7 @@ import { learnerPoints, learnerAchievements, achievements, submissions, quizAtte
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { eq, sql, desc, and } from "drizzle-orm";
+import { canAccessLearner } from "@/lib/authorization";
 
 export async function GET(request: NextRequest) {
   try {
@@ -14,9 +15,13 @@ export async function GET(request: NextRequest) {
 
     const learnerId = request.nextUrl.searchParams.get("learnerId") || payload.userId;
 
-    // Only allow viewing own stats or children's (for parents) or any (for teachers/admin)
-    if (payload.role === "learner" && learnerId !== payload.userId) {
-      return errorResponse("Forbidden", 403);
+    if (!["learner", "parent", "super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+      return errorResponse("You are not authorized to view learner stats", 403);
+    }
+
+    const authorized = await canAccessLearner(payload, learnerId);
+    if (!authorized) {
+      return errorResponse("You are not authorized to view stats for this learner", 403);
     }
 
     // Get total points

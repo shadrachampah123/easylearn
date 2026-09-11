@@ -1,10 +1,17 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { attendance, users, classes, learnerClasses } from "@/db/schema";
+import { attendance, users, classes, learnerClasses, parentLearners } from "@/db/schema";
 import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, inArray } from "drizzle-orm";
+import {
+  canAccessLearner,
+  canTeacherAccessClass,
+  getParentLinkedLearnerIds,
+  getTeacherAccessibleClassIds,
+  isAdminExtendedRole,
+} from "@/lib/authorization";
 
 export async function GET(request: NextRequest) {
   try {
@@ -15,21 +22,67 @@ export async function GET(request: NextRequest) {
 
     const classId = request.nextUrl.searchParams.get("classId");
     const date = request.nextUrl.searchParams.get("date");
-    const learnerId = request.nextUrl.searchParams.get("learnerId");
+    const learnerIdParam = request.nextUrl.searchParams.get("learnerId");
 
-    const conditions = [];
+    const conditions: any[] = [];
 
     if (classId) conditions.push(eq(attendance.classId, classId));
     if (date) conditions.push(eq(attendance.date, date));
-    if (learnerId) conditions.push(eq(attendance.learnerId, learnerId));
 
+    // Role-based authorization
     if (payload.role === "learner") {
+      // Learner can only view own attendance
+      if (learnerIdParam && learnerIdParam !== payload.userId) {
+        return errorResponse("You can only view your own attendance", 403);
+      }
       conditions.push(eq(attendance.learnerId, payload.userId));
+    } else if (payload.role === "parent") {
+      const linkedIds = await getParentLinkedLearnerIds(payload.userId);
+      if (linkedIds.size === 0) {
+        return successResponse([]);
+      }
+      if (learnerIdParam) {
+        if (!linkedIds.has(learnerIdParam)) {
+          return errorResponse("You can only view attendance for your linked children", 403);
+        }
+        conditions.push(eq(attendance.learnerId, learnerIdParam));
+      } else {
+        conditions.push(inArray(attendance.learnerId, Array.from(linkedIds)));
+      }
+    } else if (payload.role === "teacher" || payload.role === "head_teacher") {
+      // For teachers, verify class access if classId supplied
+      if (classId) {
+        const canAccessClass = await canTeacherAccessClass(payload.userId, classId);
+        if (!canAccessClass && !isAdminExtendedRole(payload.role)) {
+          return errorResponse("You can only view attendance for classes you teach", 403);
+        }
+      }
+      if (learnerIdParam) {
+        const authorized = await canAccessLearner(payload, learnerIdParam);
+        if (!authorized) {
+          return errorResponse("You can only view attendance for learners in your scope", 403);
+        }
+        conditions.push(eq(attendance.learnerId, learnerIdParam));
+      } else {
+        // If no learnerId and no classId, restrict to teacher's classes
+        if (!classId) {
+          const accessibleClassIds = await getTeacherAccessibleClassIds(payload.userId);
+          if (accessibleClassIds.size === 0) {
+            return successResponse([]);
+          }
+          conditions.push(inArray(attendance.classId, Array.from(accessibleClassIds)));
+        }
+      }
+    } else if (isAdminExtendedRole(payload.role)) {
+      // Admins can view all, optionally filtered by learnerId
+      if (learnerIdParam) {
+        conditions.push(eq(attendance.learnerId, learnerIdParam));
+      }
+    } else {
+      return errorResponse("You are not authorized to view attendance", 403);
     }
 
-    const whereClause = conditions.length > 0
-      ? conditions.reduce((a, b) => and(a, b)!)
-      : undefined;
+    const whereClause = conditions.length > 0 ? conditions.reduce((a, b) => and(a, b)!) : undefined;
 
     const results = await db
       .select({
@@ -42,6 +95,7 @@ export async function GET(request: NextRequest) {
         learnerLastName: users.lastName,
         learnerId: attendance.learnerId,
         className: classes.name,
+        classId: attendance.classId,
       })
       .from(attendance)
       .leftJoin(users, eq(attendance.learnerId, users.id))
@@ -75,35 +129,62 @@ export async function POST(request: NextRequest) {
       return errorResponse("Class ID, date, and attendance records are required");
     }
 
-    await db
-      .delete(attendance)
-      .where(and(
-        eq(attendance.classId, classId),
-        eq(attendance.date, date)
-      ));
-
-    const attendanceRecords = records.map((r: { learnerId: string; isPresent: boolean; note?: string }) => ({
-      learnerId: r.learnerId,
-      classId,
-      date,
-      isPresent: r.isPresent,
-      note: r.note || null,
-      markedById: payload.userId,
-    }));
-
-    if (attendanceRecords.length > 0) {
-      await db.insert(attendance).values(attendanceRecords);
+    // Verify teacher assignment to class
+    if (payload.role === "teacher") {
+      const canAccess = await canTeacherAccessClass(payload.userId, classId);
+      if (!canAccess) {
+        return errorResponse("You can only mark attendance for classes you are assigned to teach", 403);
+      }
     }
+
+    // Validate that all learnerIds are enrolled in this class to prevent arbitrary IDs
+    const learnerIds = records.map((r: any) => r.learnerId).filter(Boolean);
+    if (learnerIds.length > 0) {
+      const enrolled = await db
+        .select({ learnerId: learnerClasses.learnerId })
+        .from(learnerClasses)
+        .where(and(eq(learnerClasses.classId, classId), inArray(learnerClasses.learnerId, learnerIds)));
+      const enrolledSet = new Set(enrolled.map((e) => e.learnerId));
+      // If not all are enrolled, we still allow but we check that teacher can access them
+      // For stricter security, require enrollment for non-admins
+      if (payload.role === "teacher") {
+        const notEnrolled = learnerIds.filter((id: string) => !enrolledSet.has(id));
+        if (notEnrolled.length > 0) {
+          // Also check if teacher has access via other means, but for attendance we require enrollment
+          return errorResponse("Some learners are not enrolled in this class", 403);
+        }
+      }
+    }
+
+    // Transactional delete + insert to prevent duplicates and ensure integrity
+    await db.transaction(async (tx) => {
+      await tx
+        .delete(attendance)
+        .where(and(eq(attendance.classId, classId), eq(attendance.date, date)));
+
+      const attendanceRecords = records.map((r: { learnerId: string; isPresent: boolean; note?: string }) => ({
+        learnerId: r.learnerId,
+        classId,
+        date,
+        isPresent: r.isPresent,
+        note: r.note || null,
+        markedById: payload.userId,
+      }));
+
+      if (attendanceRecords.length > 0) {
+        await tx.insert(attendance).values(attendanceRecords);
+      }
+    });
 
     await logActivity({
       userId: payload.userId,
       action: "create",
       entityType: "attendance",
-      description: `Marked attendance for class ${classId} on ${date}: ${attendanceRecords.filter((r: any) => r.isPresent).length}/${attendanceRecords.length} present`,
-      details: JSON.stringify({ classId, date, count: attendanceRecords.length }),
+      description: `Marked attendance for class ${classId} on ${date}: ${records.filter((r: any) => r.isPresent).length}/${records.length} present`,
+      details: JSON.stringify({ classId, date, count: records.length }),
     });
 
-    return successResponse({ message: "Attendance saved", count: attendanceRecords.length }, 201);
+    return successResponse({ message: "Attendance saved", count: records.length }, 201);
   } catch (error) {
     console.error("Save attendance error:", error);
     return errorResponse("Internal server error", 500);
@@ -117,11 +198,23 @@ export async function PUT(request: NextRequest) {
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
+    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+      return errorResponse("Only teachers and administrators can view class learners for attendance", 403);
+    }
+
     const body = await request.json();
     const { classId } = body;
 
     if (!classId) {
       return errorResponse("Class ID is required");
+    }
+
+    // Verify teacher assignment
+    if (payload.role === "teacher") {
+      const canAccess = await canTeacherAccessClass(payload.userId, classId);
+      if (!canAccess) {
+        return errorResponse("You can only view learners for classes you are assigned to teach", 403);
+      }
     }
 
     const learners = await db
