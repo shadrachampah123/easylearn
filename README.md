@@ -75,6 +75,7 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 | `0008_easyai_grading.sql` | EasyAI: `assignments.ai_grading_enabled`/`ai_max_marks`, `submissions.graded_by`/`ai_report` |
 | `0009_file_uploads.sql` | Local file uploads: `assignments.allow_file_uploads` (teacher-controlled learner-upload gate) + `uploaded_files` registry |
 | `0010_object_storage.sql` | Cloud object storage: `uploaded_files.storage_backend` (`local` \| `object`) so file bytes can live in S3 / Cloudflare R2 / MinIO |
+| `0013_multi_school_foundation.sql` | Phase 2A multi-school foundation: `schools` (tenant root) + `school_users` (membership). Purely additive — no existing table or data is touched (see `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`) |
 
 Notes:
 
