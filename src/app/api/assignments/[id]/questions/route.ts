@@ -1,8 +1,13 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { assignmentQuestions, assignments } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  hasSchoolStaffRole,
+  sqlAssignmentInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and } from "drizzle-orm";
 
 // GET questions for an assignment
@@ -11,10 +16,9 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const { id } = await params;
 
@@ -22,7 +26,7 @@ export async function GET(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(eq(assignments.id, id))
+      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
@@ -34,7 +38,7 @@ export async function GET(
       .where(eq(assignmentQuestions.assignmentId, id));
 
     // Hide correct answers from learners
-    if (payload.role === "learner") {
+    if (ctx.school.role === "learner") {
       return successResponse(
         questions.map((q) => ({ ...q, correctAnswer: null, explanation: null }))
       );
@@ -53,12 +57,11 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolStaffRole(ctx)) {
       return errorResponse("Only teachers can add questions", 403);
     }
 
@@ -70,12 +73,12 @@ export async function POST(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(eq(assignments.id, id))
+      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
 
-    if (assignment.teacherId !== payload.userId && !["super_admin", "school_admin"].includes(payload.role)) {
+    if (assignment.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only edit your own assignments", 403);
     }
 
@@ -114,12 +117,11 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolStaffRole(ctx)) {
       return errorResponse("Only teachers can delete questions", 403);
     }
 
@@ -140,12 +142,12 @@ export async function DELETE(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(eq(assignments.id, assignmentId))
+      .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
 
-    if (assignment.teacherId !== payload.userId && !["super_admin", "school_admin"].includes(payload.role)) {
+    if (assignment.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only edit your own assignments", 403);
     }
 

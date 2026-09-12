@@ -12,9 +12,16 @@ import {
   quizzes,
   activityLogs,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, desc } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  sqlAssignmentInSchool,
+  sqlClassInSchool,
+  sqlQuizInSchool,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 import { alias } from "drizzle-orm/pg-core";
 import { readOverridesForDashboard, applyOverrides } from "@/lib/dashboard-overrides";
 import {
@@ -26,7 +33,10 @@ import {
   type SchemaWarning,
 } from "@/lib/schema-resilience";
 
-const ADMIN_ROLES = ["super_admin", "school_admin", "head_teacher"];
+/* Phase 1 administrator group. `super_admin` is a PLATFORM role (plan §7): it holds no
+   school membership, so it cannot reach this school dashboard at all in Phase 2C — that is
+   the intended behaviour, not an oversight. */
+const ADMIN_ROLES = ["school_admin", "head_teacher"];
 
 const AREA_LABELS: Record<string, string> = {
   teachers: "Total teachers",
@@ -120,9 +130,11 @@ const FEATURE_MIGRATIONS = {
  * Recent activity, tolerant of migration 0005 not being applied: when the enriched
  * columns are absent we fall back to the base audit trail instead of failing.
  */
-async function loadRecentActivity(add: (w?: SchemaWarning | null) => void): Promise<ActivityRow[]> {
+async function loadRecentActivity(add: (w?: SchemaWarning | null) => void, schoolId: string): Promise<ActivityRow[]> {
   const actorAlias = alias(users, "actor");
 
+  /* Phase 2C: the feed is scoped to actors who are members of the caller's school. Rows
+     logged by a platform account (no membership) are not part of any school's feed. */
   const baseSelect = () =>
     db
       .select({
@@ -136,6 +148,7 @@ async function loadRecentActivity(add: (w?: SchemaWarning | null) => void): Prom
       })
       .from(activityLogs)
       .leftJoin(actorAlias, eq(activityLogs.userId, actorAlias.id))
+      .where(sqlUserInSchool(schoolId, activityLogs.userId))
       .orderBy(desc(activityLogs.createdAt))
       .limit(10);
 
@@ -155,6 +168,7 @@ async function loadRecentActivity(add: (w?: SchemaWarning | null) => void): Prom
       })
       .from(activityLogs)
       .leftJoin(actorAlias, eq(activityLogs.userId, actorAlias.id))
+      .where(sqlUserInSchool(schoolId, activityLogs.userId))
       .orderBy(desc(activityLogs.createdAt))
       .limit(10);
   } catch (error) {
@@ -210,12 +224,11 @@ export async function GET(request: NextRequest) {
   const { add, run, warnings } = collector;
 
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx) || !ADMIN_ROLES.includes(ctx.school.role)) {
       return errorResponse("Forbidden", 403);
     }
 
@@ -252,16 +265,23 @@ export async function GET(request: NextRequest) {
     }
 
     // Live metrics - each count is independent so one missing migration cannot 500 the page.
+    /* Phase 2C: every count is restricted to the caller's school. User counts use the
+       membership predicate; content counts use the attribution predicates.
+       `subjects` is the one exception: `subjects` (like `departments`, `terms` and
+       `academic_years`) carries no user or class anchor, so it cannot be attributed to a
+       school without the Phase 2D `school_id` columns — see
+       docs/PHASE2C_TENANT_AUTHORIZATION.md § Deferred. It is left unchanged on purpose
+       rather than guessed at. */
     const statQueries: Array<[keyof RawStats, () => Promise<number>]> = [
-      ["teachers", () => countFrom(users, eq(users.role, "teacher"))],
-      ["learners", () => countFrom(users, eq(users.role, "learner"))],
-      ["parents", () => countFrom(users, eq(users.role, "parent"))],
-      ["classes", () => countFrom(classes)],
+      ["teachers", () => countFrom(users, sql`${eq(users.role, "teacher")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
+      ["learners", () => countFrom(users, sql`${eq(users.role, "learner")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
+      ["parents", () => countFrom(users, sql`${eq(users.role, "parent")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
+      ["classes", () => countFrom(classes, sqlClassInSchool(ctx.schoolId, classes.id))],
       ["subjects", () => countFrom(subjects)],
-      ["assignments", () => countFrom(assignments)],
-      ["quizzes", () => countFrom(quizzes)],
-      ["resources", () => countFrom(resources)],
-      ["announcements", () => countFrom(announcements)],
+      ["assignments", () => countFrom(assignments, sqlAssignmentInSchool(ctx.schoolId, assignments.id))],
+      ["quizzes", () => countFrom(quizzes, sqlQuizInSchool(ctx.schoolId, quizzes.id))],
+      ["resources", () => countFrom(resources, sqlUserInSchool(ctx.schoolId, resources.teacherId))],
+      ["announcements", () => countFrom(announcements, sqlUserInSchool(ctx.schoolId, announcements.authorId))],
     ];
 
     const statValues = await Promise.all(statQueries.map(([key, task]) => run(key, task, 0)));
@@ -281,6 +301,8 @@ export async function GET(request: NextRequest) {
           })
           .from(attendance)
           .leftJoin(classes, eq(attendance.classId, classes.id))
+          // Phase 2C: only this school's learners.
+          .where(sqlUserInSchool(ctx.schoolId, attendance.learnerId))
           .groupBy(classes.level),
       [] as { level: string | null; total: number; present: number }[]
     );
@@ -305,6 +327,8 @@ export async function GET(request: NextRequest) {
           .from(classes)
           .leftJoin(assignments, eq(assignments.classId, classes.id))
           .leftJoin(submissions, eq(submissions.assignmentId, assignments.id))
+          // Phase 2C: only classes attributable to this school.
+          .where(sqlClassInSchool(ctx.schoolId, classes.id))
           .groupBy(classes.id, classes.name)
           .orderBy(sql`COALESCE(AVG(${submissions.percentage}), 0) DESC`)
           .limit(5),
@@ -318,7 +342,7 @@ export async function GET(request: NextRequest) {
       submissions: Number(c.totalSubmissions),
     }));
 
-    const activityRows = await loadRecentActivity(add);
+    const activityRows = await loadRecentActivity(add, ctx.schoolId);
 
     const activityFeed = activityRows.map((a) => ({
       id: a.id,
@@ -345,7 +369,7 @@ export async function GET(request: NextRequest) {
     };
 
     // Overrides never break the dashboard: unavailable == "show live values".
-    const overrideResult = await readOverridesForDashboard("admin");
+    const overrideResult = await readOverridesForDashboard("admin", [], { schoolId: ctx.schoolId });
     add(overrideResult.warning);
     const mergedStats = applyOverrides(liveData, overrideResult.overrides);
 

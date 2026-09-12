@@ -11,10 +11,10 @@ import {
   subjects,
   users,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { getAccessibleLearnerIds, STAFF_REPORT_ROLES } from "@/lib/report-access";
+import { guardSchoolContext } from "@/lib/tenant";
 
 interface LearnerSummary {
   id: string;
@@ -158,15 +158,18 @@ async function loadLearnerReport(learnerId: string, payload: { userId: string; r
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+    // Phase 1 staff rule, now read from the DB membership role.
+    const payload = { userId: ctx.userId, role: ctx.school.role };
     if (!STAFF_REPORT_ROLES.includes(payload.role as (typeof STAFF_REPORT_ROLES)[number])) return errorResponse("Forbidden", 403);
 
     const learnerId = request.nextUrl.searchParams.get("learnerId");
     const isTeacher = payload.role === "teacher";
-    const allowedLearnerIds = await getAccessibleLearnerIds(payload);
+    /* Phase 2C: the accessible set is intersected with the caller's school, so the
+       administrator branch can no longer report on another school's learners. */
+    const allowedLearnerIds = await getAccessibleLearnerIds(payload, { schoolId: ctx.schoolId });
 
     if (learnerId) {
       if (!allowedLearnerIds.has(learnerId)) {

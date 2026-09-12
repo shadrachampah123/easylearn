@@ -15,32 +15,37 @@ import {
   achievements,
   quizzes,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, desc, and, gte, lte } from "drizzle-orm";
 import { getOverridesForDashboard, applyOverrides } from "@/lib/dashboard-overrides";
+import { guardSchoolContext, isUserInSchool } from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    const learnerId = request.nextUrl.searchParams.get("learnerId") || payload.userId;
+    const learnerId = request.nextUrl.searchParams.get("learnerId") || ctx.userId;
+
+    /* ── TENANT FIRST: the requested learner must belong to the caller's school before any
+       Phase 1 role decision. Another school's learner is reported as missing. ── */
+    if (!(await isUserInSchool(ctx.schoolId, learnerId))) {
+      return errorResponse("Learner not found", 404);
+    }
 
     // Learners can only view own, parents can view their children, teachers/admins can view any
-    if (payload.role === "learner" && learnerId !== payload.userId) {
+    if (ctx.school.role === "learner" && learnerId !== ctx.userId) {
       return errorResponse("Forbidden", 403);
     }
 
-    if (payload.role === "parent") {
+    if (ctx.school.role === "parent") {
       // Check parent-learner link
       const { parentLearners } = await import("@/db/schema");
       const link = await db
         .select()
         .from(parentLearners)
-        .where(and(eq(parentLearners.parentId, payload.userId), eq(parentLearners.learnerId, learnerId)))
+        .where(and(eq(parentLearners.parentId, ctx.userId), eq(parentLearners.learnerId, learnerId)))
         .limit(1);
       if (link.length === 0) {
         return errorResponse("Forbidden - not linked to this learner", 403);

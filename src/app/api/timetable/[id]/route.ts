@@ -1,17 +1,10 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { timetableEntries } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import {
-  successResponse,
-  errorResponse,
-  unauthorizedResponse,
-  notFoundResponse,
-} from "@/lib/api-helpers";
-import { eq } from "drizzle-orm";
+import { guardSchoolContext, hasSchoolAdminExtendedRole, sqlTimetableInSchool } from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import { and, eq } from "drizzle-orm";
 import { TIMETABLE_DAYS } from "../route";
-
-const ADMIN_ROLES = ["super_admin", "school_admin", "head_teacher"];
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -31,12 +24,11 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can manage the timetable", 403);
     }
 
@@ -65,7 +57,7 @@ export async function PUT(
         endTime: timetableEntries.endTime,
       })
       .from(timetableEntries)
-      .where(eq(timetableEntries.id, id))
+      .where(and(eq(timetableEntries.id, id), sqlTimetableInSchool(ctx.schoolId, timetableEntries.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Timetable entry");
@@ -94,7 +86,7 @@ export async function PUT(
         notes: notes !== undefined ? notes?.trim() || null : undefined,
         updatedAt: new Date(),
       })
-      .where(eq(timetableEntries.id, id))
+      .where(and(eq(timetableEntries.id, id), sqlTimetableInSchool(ctx.schoolId, timetableEntries.id)))
       .returning();
 
     return successResponse(updated);
@@ -109,12 +101,11 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can manage the timetable", 403);
     }
 
@@ -125,7 +116,7 @@ export async function DELETE(
         id: timetableEntries.id,
       })
       .from(timetableEntries)
-      .where(eq(timetableEntries.id, id))
+      .where(and(eq(timetableEntries.id, id), sqlTimetableInSchool(ctx.schoolId, timetableEntries.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Timetable entry");

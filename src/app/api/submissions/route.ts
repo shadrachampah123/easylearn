@@ -1,18 +1,23 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { submissions, assignments, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, desc } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  isAssignmentInSchool,
+  sqlSubmissionInSchool,
+} from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+    const schoolRole = ctx.school.role;
 
     const assignmentId = request.nextUrl.searchParams.get("assignmentId");
 
@@ -41,12 +46,24 @@ export async function GET(request: NextRequest) {
       .orderBy(desc(submissions.submittedAt))
       .$dynamic();
 
-    if (payload.role === "learner") {
-      query = query.where(eq(submissions.learnerId, payload.userId));
-    } else if (payload.role === "teacher") {
-      // Teachers only see submissions for assignments they manage.
-      query = query.where(eq(assignments.teacherId, payload.userId));
-    } else if (!["super_admin", "school_admin", "head_teacher"].includes(payload.role)) {
+    /* Phase 2C tenant boundary: a submission is only ever reachable when it belongs to
+       the caller's school — its learner is an active member AND its assignment resolves to
+       that school alone. Applied to every branch, including the supervisory one, which
+       Phase 1 left unscoped. */
+    if (schoolRole === "learner") {
+      query = query.where(and(
+        eq(submissions.learnerId, ctx.userId),
+        sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+      ));
+    } else if (schoolRole === "teacher") {
+      // Teachers only see submissions for assignments they manage, inside their school.
+      query = query.where(and(
+        eq(assignments.teacherId, ctx.userId),
+        sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+      ));
+    } else if (hasSchoolAdminExtendedRole(ctx)) {
+      query = query.where(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
+    } else {
       return errorResponse("You are not authorized to view submissions", 403);
     }
 
@@ -65,12 +82,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (payload.role !== "learner") {
+    if (ctx.school.role !== "learner") {
       return errorResponse("Only learners can submit assignments", 403);
     }
 
@@ -95,25 +111,29 @@ export async function POST(request: NextRequest) {
       return errorResponse("Assignment not found", 404);
     }
 
+    /* Phase 2C: the assignment must belong to the learner's own school before anything else
+       is decided. A foreign (or unattributable) assignment is reported as not found. */
+    if (!(await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
+      return errorResponse("Assignment not found", 404);
+    }
+
     if (assignment.status !== "published") {
       return errorResponse("This assignment is not accepting submissions");
     }
 
-    // Verify learner is enrolled in assignment's class
+    /* Verify the learner is enrolled in the assignment's class.
+       Phase 1 denied only when the learner had at least one enrollment elsewhere and none
+       here — an explicit "if no enrollment found, allow" fallback. Phase 2C removes that
+       permissive fallback (brief §3): the enrollment must exist, otherwise the submission is
+       refused. */
     const { learnerClasses } = await import("@/db/schema");
     const [enrollment] = await db
       .select({ id: learnerClasses.id })
       .from(learnerClasses)
-      .where(and(eq(learnerClasses.learnerId, payload.userId), eq(learnerClasses.classId, assignment.classId)))
+      .where(and(eq(learnerClasses.learnerId, ctx.userId), eq(learnerClasses.classId, assignment.classId)))
       .limit(1);
 
-    const anyEnrollments = await db
-      .select({ id: learnerClasses.id })
-      .from(learnerClasses)
-      .where(eq(learnerClasses.learnerId, payload.userId))
-      .limit(1);
-
-    if (anyEnrollments.length > 0 && !enrollment) {
+    if (!enrollment) {
       return errorResponse("You are not enrolled in the class for this assignment", 403);
     }
 
@@ -128,7 +148,7 @@ export async function POST(request: NextRequest) {
     }
     if (submittedFiles.length > 0) {
       const resolved = await resolveUploadedAttachments(submittedFiles, {
-        uploaderId: payload.userId,
+        uploaderId: ctx.userId,
         purpose: "submission",
         assignmentId,
       });
@@ -144,7 +164,7 @@ export async function POST(request: NextRequest) {
       .from(submissions)
       .where(and(
         eq(submissions.assignmentId, assignmentId),
-        eq(submissions.learnerId, payload.userId)
+        eq(submissions.learnerId, ctx.userId)
       ))
       .limit(1);
 
@@ -179,7 +199,7 @@ export async function POST(request: NextRequest) {
 
     const [newSubmission] = await db.insert(submissions).values({
       assignmentId,
-      learnerId: payload.userId,
+      learnerId: ctx.userId,
       content: content || null,
       attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
       status: isLate ? "late" : "submitted",

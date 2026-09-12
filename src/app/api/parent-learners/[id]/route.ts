@@ -1,30 +1,48 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { parentLearners } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import {
+  getLearnerIdsInSchool,
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  type SchoolAuthContext,
+} from "@/lib/tenant";
 import { logActivity } from "@/lib/activity";
 import { eq } from "drizzle-orm";
 import { RELATIONSHIP_OPTIONS, normalizeRelationship } from "@/lib/relationships";
 import { isMissingRelation, clientSafeErrorMessage } from "@/lib/schema-resilience";
 import { UUID_PATTERN } from "@/lib/dashboard-overrides";
 
-const ADMIN_ROLES = ["super_admin", "school_admin", "head_teacher"];
-
+/**
+ * Phase 2C: every handler needs a DB-backed school context; the membership role (never the
+ * token claim) decides who may change links.
+ */
 async function requireAdmin(request: NextRequest) {
-  const token = getTokenFromRequest(request);
-  if (!token) return { error: unauthorizedResponse() as Response };
-  const payload = await verifyToken(token);
-  if (!payload) return { error: unauthorizedResponse() as Response };
-  if (!ADMIN_ROLES.includes(payload.role)) {
-    return { error: errorResponse("Only administrators can change parent links", 403) as Response };
+  const auth = await guardSchoolContext(request);
+  if (!auth.ok) return { error: auth.response as Response };
+  if (!hasSchoolAdminExtendedRole(auth.context)) {
+    return {
+      error: errorResponse("Only administrators can change parent links", 403) as Response,
+    };
   }
-  return { payload };
+  return { ctx: auth.context };
 }
 
 function parseId(rawId: string): string | null {
   const id = decodeURIComponent(rawId || "").trim();
   return UUID_PATTERN.test(id) ? id : null;
+}
+
+/**
+ * Phase 2C: a link is only readable/changed when BOTH the parent and the learner are active
+ * members of the caller's school. Otherwise it is reported as missing (no existence leak).
+ */
+async function findInSchoolLink(id: string, ctx: SchoolAuthContext) {
+  const link = await findLink(id);
+  if (!link) return null;
+  const members = await getLearnerIdsInSchool(ctx.schoolId, [link.parentId, link.learnerId]);
+  return members.size === 2 ? link : null;
 }
 
 async function findLink(id: string) {
@@ -48,12 +66,13 @@ export async function GET(
   try {
     const auth = await requireAdmin(_request);
     if (auth.error) return auth.error;
+    const ctx = auth.ctx as SchoolAuthContext;
 
     const { id } = await params;
     const linkId = parseId(id);
     if (!linkId) return errorResponse("Link id must be a uuid", 400);
 
-    const link = await findLink(linkId);
+    const link = await findInSchoolLink(linkId, ctx);
     if (!link) return notFoundResponse("Parent link");
 
     return successResponse(link);
@@ -71,7 +90,7 @@ export async function PUT(
   try {
     const auth = await requireAdmin(request);
     if (auth.error) return auth.error;
-    const payload = auth.payload!;
+    const ctx = auth.ctx as SchoolAuthContext;
 
     const { id } = await params;
     const linkId = parseId(id);
@@ -89,7 +108,7 @@ export async function PUT(
       return errorResponse(`relationship must be one of: ${RELATIONSHIP_OPTIONS.join(", ")}`, 400);
     }
 
-    const link = await findLink(linkId);
+    const link = await findInSchoolLink(linkId, ctx);
     if (!link) return notFoundResponse("Parent link");
 
     const [updated] = await db
@@ -99,7 +118,7 @@ export async function PUT(
       .returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "update",
       entityType: "parent_learner",
       entityId: linkId,
@@ -122,19 +141,19 @@ export async function DELETE(
   try {
     const auth = await requireAdmin(request);
     if (auth.error) return auth.error;
-    const payload = auth.payload!;
+    const ctx = auth.ctx as SchoolAuthContext;
 
     const { id } = await params;
     const linkId = parseId(id);
     if (!linkId) return errorResponse("Link id must be a uuid", 400);
 
-    const link = await findLink(linkId);
+    const link = await findInSchoolLink(linkId, ctx);
     if (!link) return notFoundResponse("Parent link");
 
     await db.delete(parentLearners).where(eq(parentLearners.id, linkId));
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "unlink",
       entityType: "parent_learner",
       entityId: linkId,

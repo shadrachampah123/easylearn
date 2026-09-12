@@ -401,18 +401,56 @@ test('Boundary: no API route queries the tenant tables directly', () => {
   }
 });
 
-test('Boundary: only the auth routes use the tenant module so far', () => {
-  const users = [];
-  for (const file of listFiles(path.join(__dirname, '..', 'src', 'app', 'api'), '.ts')) {
-    if (/@\/lib\/tenant/.test(fs.readFileSync(file, 'utf8'))) {
-      users.push(path.relative(path.join(__dirname, '..', 'src', 'app', 'api'), file));
-    }
+test('Boundary: Phase 2C migrated the protected routes onto the central tenant module', () => {
+  // Phase 2B wired only login + me. Phase 2C migrates the school-owned routes onto the same
+  // audited gate — every route listed here must go through src/lib/tenant.ts rather than
+  // running its own token/role preamble.
+  const apiRoot = path.join(__dirname, '..', 'src', 'app', 'api');
+  const mustUseTenant = [
+    'users/route.ts',
+    'users/[id]/route.ts',
+    'enrollments/route.ts',
+    'grades/route.ts',
+    'attendance/route.ts',
+    'announcements/route.ts',
+    'notifications/route.ts',
+    'files/[id]/route.ts',
+    'uploads/route.ts',
+    'uploads/[id]/route.ts',
+    'uploads/presign/route.ts',
+    'submissions/route.ts',
+    'submissions/[id]/route.ts',
+    'submissions/[id]/grade/route.ts',
+    'learner/stats/route.ts',
+    'learner-reports/route.ts',
+    'reports/route.ts',
+    'messages/route.ts',
+    'activity-logs/route.ts',
+    'classes/route.ts',
+    'classes/[id]/route.ts',
+    'dashboard/admin/route.ts',
+    'dashboard/stats/route.ts',
+    'dashboard/teacher/route.ts',
+    'dashboard/parent/route.ts',
+    'dashboard/learner/route.ts',
+  ];
+
+  for (const relative of mustUseTenant) {
+    const file = path.join(apiRoot, relative);
+    assert(fs.existsSync(file), `${relative} is missing`);
+    assert(
+      /@\/lib\/tenant/.test(fs.readFileSync(file, 'utf8')),
+      `${relative} must authorize through src/lib/tenant.ts (Phase 2C)`
+    );
   }
-  assert.deepStrictEqual(
-    users.sort(),
-    ['auth/login/route.ts', 'auth/me/route.ts'],
-    'Phase 2C migrates the remaining routes; 2B wires only login + me'
-  );
+
+  // And nothing outside the tenant module may query the membership tables directly.
+  for (const file of listFiles(apiRoot, '.ts')) {
+    assert(
+      !/\bschoolUsers\b/.test(fs.readFileSync(file, 'utf8')),
+      `${path.relative(process.cwd(), file)} must not touch school_users directly`
+    );
+  }
 });
 
 test('Boundary: Phase 1 authorization helpers stay tenant-free (Phase 2C adds schoolId)', () => {

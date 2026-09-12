@@ -9,8 +9,13 @@ import {
   learnerClasses,
   users,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolStaffRole,
+  isQuizInSchool,
+  sqlQuizInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, sql, desc } from "drizzle-orm";
 
@@ -20,22 +25,26 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (payload.role !== "learner") {
+    if (ctx.school.role !== "learner") {
       return errorResponse("Only learners can take quizzes", 403);
     }
 
     const { id } = await params;
 
+    /* Phase 2C: another school's quiz does not exist for this learner. */
+    if (!(await isQuizInSchool(ctx.schoolId, id))) {
+      return notFoundResponse("Quiz");
+    }
+
     // Get quiz
     const [quiz] = await db
       .select()
       .from(quizzes)
-      .where(eq(quizzes.id, id))
+      .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
       .limit(1);
 
     if (!quiz) return notFoundResponse("Quiz");
@@ -45,7 +54,7 @@ export async function POST(
     const enrolled = await db
       .select({ classId: learnerClasses.classId })
       .from(learnerClasses)
-      .where(eq(learnerClasses.learnerId, payload.userId));
+      .where(eq(learnerClasses.learnerId, ctx.userId));
     if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
       return errorResponse("This quiz was set for a different class", 403);
     }
@@ -56,7 +65,7 @@ export async function POST(
       .from(quizAttempts)
       .where(and(
         eq(quizAttempts.quizId, id),
-        eq(quizAttempts.learnerId, payload.userId)
+        eq(quizAttempts.learnerId, ctx.userId)
       ));
 
     if (quiz.maxAttempts && Number(count) >= quiz.maxAttempts) {
@@ -69,7 +78,7 @@ export async function POST(
       .from(quizAttempts)
       .where(and(
         eq(quizAttempts.quizId, id),
-        eq(quizAttempts.learnerId, payload.userId),
+        eq(quizAttempts.learnerId, ctx.userId),
         sql`${quizAttempts.completedAt} IS NULL`
       ))
       .limit(1);
@@ -84,7 +93,7 @@ export async function POST(
     // Create new attempt
     const [newAttempt] = await db.insert(quizAttempts).values({
       quizId: id,
-      learnerId: payload.userId,
+      learnerId: ctx.userId,
       answers: {},
       startedAt: new Date(),
     }).returning();
@@ -105,12 +114,11 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (payload.role !== "learner") {
+    if (ctx.school.role !== "learner") {
       return errorResponse("Only learners can submit quizzes", 403);
     }
 
@@ -133,7 +141,7 @@ export async function PUT(
       .where(and(
         eq(quizAttempts.id, attemptId),
         eq(quizAttempts.quizId, id),
-        eq(quizAttempts.learnerId, payload.userId)
+        eq(quizAttempts.learnerId, ctx.userId)
       ))
       .limit(1);
 
@@ -144,7 +152,7 @@ export async function PUT(
     const [quiz] = await db
       .select()
       .from(quizzes)
-      .where(eq(quizzes.id, id))
+      .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
       .limit(1);
 
     if (!quiz) return notFoundResponse("Quiz");
@@ -223,7 +231,7 @@ export async function PUT(
 
     // Create notification
     await db.insert(notifications).values({
-      userId: payload.userId,
+      userId: ctx.userId,
       type: "quiz",
       title: "Quiz Completed",
       message: `You scored ${totalScore}/${maxScore} (${percentage}%) on "${quiz.title}"`,
@@ -240,7 +248,7 @@ export async function PUT(
 
     if (points > 0) {
       await db.insert(learnerPoints).values({
-        learnerId: payload.userId,
+        learnerId: ctx.userId,
         points,
         reason: `Scored ${percentage}% on quiz "${quiz.title}"`,
       });
@@ -267,7 +275,7 @@ export async function PUT(
     const bestScorePerLearner = new Map<string, { name: string; score: number; isMe: boolean }>();
     for (const row of leaderboard) {
       const name = `${row.firstName ?? ""} ${row.lastName ?? ""}`.trim() || "Learner";
-      const entry = { name, score: row.score ?? 0, isMe: row.learnerId === payload.userId };
+      const entry = { name, score: row.score ?? 0, isMe: row.learnerId === ctx.userId };
       const existing = bestScorePerLearner.get(row.learnerId);
       if (!existing || entry.score > existing.score) bestScorePerLearner.set(row.learnerId, entry);
     }

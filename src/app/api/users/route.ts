@@ -1,10 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken, hashPassword } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { hashPassword } from "@/lib/auth";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, ilike, or, desc } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
+import {
+  addSchoolMembership,
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  hasSchoolAdminExtendedRole,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 import {
   clientSafeErrorMessage,
   ensureUserIdentityColumns,
@@ -13,16 +20,26 @@ import {
   schemaAwareErrorMessage,
 } from "@/lib/schema-resilience";
 
+/**
+ * Phase 2C — the user directory is a SCHOOL directory.
+ *
+ * `users` stays the global identity store (plan §6), but a row is only listed here when it
+ * holds an ACTIVE `school_users` membership in the caller's own school. The school comes
+ * from the database-backed membership context, never from a client parameter, and the
+ * filter is a SQL predicate so another school's row is never fetched (and therefore never
+ * leaked through a response body or an error path).
+ */
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    await ensureUserIdentityColumns();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    // Only administrators may enumerate users
-    if (!["super_admin", "school_admin", "head_teacher"].includes(payload.role)) {
+    await ensureUserIdentityColumns();
+
+    // Only administrators may enumerate users (Phase 1 rule, now backed by the DB
+    // membership role instead of the JWT `role` claim).
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can view user directory", 403);
     }
 
@@ -32,7 +49,8 @@ export async function GET(request: NextRequest) {
     const limit = parseInt(request.nextUrl.searchParams.get("limit") || "50");
     const offset = (page - 1) * limit;
 
-    const conditions = [];
+    // Tenant boundary first: only members of the caller's school are visible.
+    const conditions = [sqlUserInSchool(ctx.schoolId, users.id)];
     if (role) conditions.push(eq(users.role, role as "teacher" | "parent" | "learner" | "super_admin" | "school_admin" | "head_teacher"));
     if (search && search.trim()) {
       conditions.push(
@@ -44,9 +62,7 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const where = conditions.length > 0
-      ? conditions.reduce((a, b) => sql`${a} AND ${b}`)
-      : undefined;
+    const where = conditions.reduce((a, b) => sql`${a} AND ${b}`);
 
     const baseProjection = {
       id: users.id,
@@ -124,13 +140,13 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    await ensureUserIdentityColumns();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin"].includes(payload.role)) {
+    await ensureUserIdentityColumns();
+
+    if (!hasSchoolAdminRole(ctx)) {
       return errorResponse("Only administrators can create users", 403);
     }
 
@@ -219,8 +235,26 @@ export async function POST(request: NextRequest) {
         isActive: users.isActive,
       });
 
+    /* Phase 2C: the new account is made a member of the CALLER'S school (never a
+       client-supplied one) so membership stays the single source of truth for school
+       context. A failure here rolls the account back rather than leaving a user with an
+       identity and no school — that state would be a silent lockout. */
+    const membership = await addSchoolMembership({
+      schoolId: ctx.schoolId,
+      userId: newUser.id,
+      role,
+    });
+
+    if (!membership) {
+      await db.delete(users).where(eq(users.id, newUser.id));
+      return errorResponse(
+        "The account could not be added to your school. Please retry.",
+        503
+      );
+    }
+
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "create",
       entityType: "user",
       entityId: newUser.id,

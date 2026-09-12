@@ -1,28 +1,34 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { teacherClasses, classes, subjects, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  isClassInSchool,
+  isUserInSchool,
+  sqlTeacherClassInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { eq, and, desc } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const classId = request.nextUrl.searchParams.get("classId");
     const teacherId = request.nextUrl.searchParams.get("teacherId");
 
-    const conditions = [];
+    /* Phase 2C: rows must resolve to the caller's school (teacher + class members). */
+    const conditions = [sqlTeacherClassInSchool(ctx.schoolId, teacherClasses.id)];
     if (classId) conditions.push(eq(teacherClasses.classId, classId));
     if (teacherId) conditions.push(eq(teacherClasses.teacherId, teacherId));
 
     // Teachers can only see their own class assignments, regardless of query parameters.
-    if (payload.role === "teacher") {
-      conditions.push(eq(teacherClasses.teacherId, payload.userId));
+    if (ctx.school.role === "teacher") {
+      conditions.push(eq(teacherClasses.teacherId, ctx.userId));
     }
 
     const whereClause = conditions.length > 0
@@ -51,7 +57,7 @@ export async function GET(request: NextRequest) {
       .where(whereClause)
       .orderBy(desc(teacherClasses.createdAt));
 
-    if (payload.role !== "teacher" || (teacherId && teacherId !== payload.userId)) {
+    if (ctx.school.role !== "teacher" || (teacherId && teacherId !== ctx.userId)) {
       return successResponse(assignments);
     }
 
@@ -69,10 +75,10 @@ export async function GET(request: NextRequest) {
       .where(
         classId
           ? and(
-              eq(classes.classTeacherId, payload.userId),
+              eq(classes.classTeacherId, ctx.userId),
               eq(classes.id, classId)
             )
-          : eq(classes.classTeacherId, payload.userId)
+          : eq(classes.classTeacherId, ctx.userId)
       )
       .orderBy(desc(classes.createdAt));
 
@@ -81,7 +87,7 @@ export async function GET(request: NextRequest) {
       .filter((homeroomClass) => !assignedClassIds.has(homeroomClass.id))
       .map((homeroomClass) => ({
         id: `homeroom-${homeroomClass.id}`,
-        teacherId: payload.userId,
+        teacherId: ctx.userId,
         classId: homeroomClass.id,
         subjectId: null,
         academicYearId: homeroomClass.academicYearId,
@@ -103,12 +109,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher"].includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can assign teachers", 403);
     }
 
@@ -117,6 +122,15 @@ export async function POST(request: NextRequest) {
 
     if (!teacherId || !classId || !subjectId) {
       return errorResponse("Teacher, class, and subject are required");
+    }
+
+    /* Phase 2C: both the teacher and the class must belong to the caller's school. A row
+       can never be created that bridges two schools. */
+    if (!(await isUserInSchool(ctx.schoolId, teacherId))) {
+      return notFoundResponse("Teacher");
+    }
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return notFoundResponse("Class");
     }
 
     // Check for duplicate
@@ -142,7 +156,7 @@ export async function POST(request: NextRequest) {
     }).returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "assign",
       entityType: "teacher_assignment",
       entityId: assignment.id,

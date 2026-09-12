@@ -7,9 +7,12 @@
  */
 import { db } from "@/db";
 import { assignments } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { sqlAssignmentInSchool } from "@/lib/tenant";
 
-const TEACHER_ROLES = new Set(["super_admin", "school_admin", "head_teacher", "teacher"]);
+/** School teaching roles. `super_admin` is a PLATFORM role: it holds no membership, cannot
+ *  pass the Phase 2C school gate, and must never be treated as a school uploader. */
+const TEACHER_ROLES = new Set(["school_admin", "head_teacher", "teacher"]);
 
 export interface UploadAuthorization {
   ok: boolean;
@@ -19,11 +22,14 @@ export interface UploadAuthorization {
 }
 
 export async function authorizeUpload(options: {
+  /** Effective SCHOOL role from the database membership context (never the JWT claim). */
   role: string;
+  /** The caller's verified school. Any referenced assignment must belong to it. */
+  schoolId: string;
   purpose: "assignment" | "submission";
   assignmentId: string | null;
 }): Promise<UploadAuthorization> {
-  const { role, purpose, assignmentId } = options;
+  const { role, purpose, assignmentId, schoolId } = options;
 
   if (purpose === "assignment") {
     if (!TEACHER_ROLES.has(role)) {
@@ -40,6 +46,9 @@ export async function authorizeUpload(options: {
     return { ok: false, error: "Assignment ID is required for submission files" };
   }
 
+  /* TENANT FIRST: the referenced assignment must belong to the uploader's school. The
+     predicate is part of the query, so an assignment of another school is indistinguishable
+     from one that does not exist (fail closed, no existence leak). */
   const [assignment] = await db
     .select({
       id: assignments.id,
@@ -49,7 +58,7 @@ export async function authorizeUpload(options: {
       allowFileUploads: assignments.allowFileUploads,
     })
     .from(assignments)
-    .where(eq(assignments.id, assignmentId))
+    .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(schoolId, assignments.id)))
     .limit(1);
 
   if (!assignment) {

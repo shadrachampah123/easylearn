@@ -11,8 +11,14 @@ import {
   assignmentCorrections,
   learnerClasses,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  hasSchoolAdminRole,
+  sqlAssignmentInSchool,
+} from "@/lib/tenant";
+
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
@@ -23,10 +29,9 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
@@ -61,7 +66,7 @@ export async function GET(
       .leftJoin(classes, eq(assignments.classId, classes.id))
       .leftJoin(subjects, eq(assignments.subjectId, subjects.id))
       .leftJoin(users, eq(assignments.teacherId, users.id))
-      .where(eq(assignments.id, id))
+      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!assignment) {
@@ -70,12 +75,12 @@ export async function GET(
 
     // Teachers may only inspect and grade assignments they manage. Administrators may
     // inspect any assignment in the school.
-    if (payload.role === "teacher" && assignment.teacherId !== payload.userId) {
+    if (ctx.school.role === "teacher" && assignment.teacherId !== ctx.userId) {
       return errorResponse("You can only view your own assignments", 403);
     }
 
     // Get submissions count for teachers
-    if (["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (hasSchoolAdminExtendedRole(ctx) || ctx.school.role === "teacher") {
       const submissionsList = await db
         .select({
           id: submissions.id,
@@ -131,13 +136,13 @@ export async function GET(
     }
 
     // For learners, get their own submission
-    if (payload.role === "learner") {
+    if (ctx.school.role === "learner") {
       const [submission] = await db
         .select()
         .from(submissions)
         .where(and(
           eq(submissions.assignmentId, id),
-          eq(submissions.learnerId, payload.userId)
+          eq(submissions.learnerId, ctx.userId)
         ))
         .limit(1);
 
@@ -201,10 +206,9 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const { id } = await params;
 
@@ -212,12 +216,12 @@ export async function PUT(
     const [existing] = await db
       .select({ teacherId: assignments.teacherId, aiMaxMarks: assignments.aiMaxMarks })
       .from(assignments)
-      .where(eq(assignments.id, id))
+      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Assignment");
 
-    if (existing.teacherId !== payload.userId && !["super_admin", "school_admin"].includes(payload.role)) {
+    if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only edit your own assignments", 403);
     }
 
@@ -228,7 +232,7 @@ export async function PUT(
     let resolvedAttachments = attachments;
     if (attachments !== undefined) {
       const resolved = await resolveUploadedAttachments(attachments, {
-        uploaderId: payload.userId,
+        uploaderId: ctx.userId,
         purpose: "assignment",
       });
       if (!resolved.ok) {
@@ -271,7 +275,7 @@ export async function PUT(
         ...easyAiUpdate,
         updatedAt: new Date(),
       })
-      .where(eq(assignments.id, id))
+      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .returning();
 
     return successResponse(updated);
@@ -289,26 +293,27 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const { id } = await params;
 
     const [existing] = await db
       .select({ teacherId: assignments.teacherId })
       .from(assignments)
-      .where(eq(assignments.id, id))
+      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Assignment");
 
-    if (existing.teacherId !== payload.userId && !["super_admin", "school_admin"].includes(payload.role)) {
+    if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only delete your own assignments", 403);
     }
 
-    await db.delete(assignments).where(eq(assignments.id, id));
+    await db
+      .delete(assignments)
+      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)));
 
     return successResponse({ message: "Assignment deleted" });
   } catch (error) {

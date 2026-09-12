@@ -1,9 +1,14 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { assignmentCorrections, assignmentQuestions, assignments, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq, desc } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  hasSchoolStaffRole,
+  sqlAssignmentInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import { eq, and, desc } from "drizzle-orm";
 
 // GET corrections for an assignment
 export async function GET(
@@ -11,10 +16,9 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const { id } = await params;
 
@@ -48,12 +52,11 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolStaffRole(ctx)) {
       return errorResponse("Only teachers can post corrections", 403);
     }
 
@@ -65,13 +68,13 @@ export async function POST(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(eq(assignments.id, assignmentId))
+      .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
 
     // Only the assignment's teacher (or admin) can post corrections
-    if (assignment.teacherId !== payload.userId && !["super_admin", "school_admin"].includes(payload.role)) {
+    if (assignment.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only post corrections on your own assignments", 403);
     }
 
@@ -99,7 +102,7 @@ export async function POST(
         assignmentId,
         questionId: questionId || null,
         correctionText: correctionText.trim(),
-        postedBy: payload.userId,
+        postedBy: ctx.userId,
       })
       .returning();
 

@@ -1,21 +1,20 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { teacherClasses } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq } from "drizzle-orm";
+import { guardSchoolContext, hasSchoolAdminRole, sqlTeacherClassInSchool } from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import { and, eq } from "drizzle-orm";
 
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin"].includes(payload.role)) {
+    if (!hasSchoolAdminRole(ctx)) {
       return errorResponse("Forbidden", 403);
     }
 
@@ -24,12 +23,14 @@ export async function DELETE(
     const [existing] = await db
       .select({ id: teacherClasses.id })
       .from(teacherClasses)
-      .where(eq(teacherClasses.id, id))
+      .where(and(eq(teacherClasses.id, id), sqlTeacherClassInSchool(ctx.schoolId, teacherClasses.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Assignment");
 
-    await db.delete(teacherClasses).where(eq(teacherClasses.id, id));
+    await db
+      .delete(teacherClasses)
+      .where(and(eq(teacherClasses.id, id), sqlTeacherClassInSchool(ctx.schoolId, teacherClasses.id)));
 
     return successResponse({ message: "Teacher assignment removed" });
   } catch (error) {

@@ -5,23 +5,37 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { db } from "@/db";
 import { assignments, uploadedFiles } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { getObjectStorageConfig, objectDownloadUrl } from "@/lib/object-storage";
 import { uploadStorageDir } from "@/lib/upload-storage";
 import { isInlinePreviewable } from "@/lib/uploads";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  SCHOOL_ADMIN_EXTENDED_ROLES,
+  sqlFileInSchool,
+} from "@/lib/tenant";
 
 export const runtime = "nodejs";
 
-const ADMIN_ROLES = new Set(["super_admin", "school_admin", "head_teacher"]);
+/** School-level administrator roles, taken from the central tenant module. `super_admin` is
+ *  deliberately absent: it is a platform role with no membership, so it cannot reach this
+ *  route at all (Phase 2C). */
+const ADMIN_ROLES = new Set<string>(SCHOOL_ADMIN_EXTENDED_ROLES);
 
 /**
- * Serve an uploaded file with authentication and per-file access control.
+ * Serve an uploaded file with authentication, TENANT and per-file access control.
  *
- *  - Assignment materials: any authenticated user may read them.
+ *  - Phase 2C: the file must belong to the caller's school. Ownership is resolved through
+ *    the relational chain (uploader membership + the assignment it belongs to) inside the
+ *    SQL predicate, so another school's file is "not found" — it is never fetched, never
+ *    counted and never distinguishable from a file that does not exist. A file whose
+ *    ownership cannot be resolved (no membership anywhere) is denied to everyone.
  *  - Submission files: only the learner who uploaded them, the teacher who
  *    owns the assignment, and school administrators may read them.
+ *  - Assignment materials: any authenticated member of the file's school may read them.
+ *    (Phase 1 allowed ANY authenticated user; Phase 2C tightens that to school members —
+ *    see docs/PHASE2C_TENANT_AUTHORIZATION.md.)
  *
  * Video/audio players (and PDF viewers) issue HTTP Range requests, so this
  * endpoint implements byte-range serving (206 Partial Content).
@@ -35,32 +49,28 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    let token = getTokenFromRequest(request);
-    if (!token) {
-      token = request.nextUrl.searchParams.get("token") || "";
+    /* Media elements cannot set an Authorization header, so the Phase 1 `?token=` fallback
+       is preserved. It changes where the token may come from, never what it grants. */
+    const queryToken = request.nextUrl.searchParams.get("token");
+
+    const auth = await guardSchoolContext(request, queryToken);
+    if (!auth.ok) {
+      /* The gate owns the status: 401 for a missing/expired session, 403 for an
+         authenticated account with no active membership. */
+      return auth.response;
     }
-    if (!token) {
-      return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-    const payload = await verifyToken(token);
-    if (!payload) {
-      return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const ctx = auth.context;
 
     const { id } = await params;
 
     await ensureFileUploadSchema();
 
+    /* Tenant predicate INSIDE the query: a file belonging to another school (or to no
+       school that can be established) is simply not found. */
     const [row] = await db
       .select()
       .from(uploadedFiles)
-      .where(eq(uploadedFiles.id, id))
+      .where(and(eq(uploadedFiles.id, id), sqlFileInSchool(ctx.schoolId, uploadedFiles.id)))
       .limit(1);
 
     if (!row) {
@@ -70,9 +80,9 @@ export async function GET(
       });
     }
 
-    /* ── Access control ── */
+    /* ── Phase 1 per-file access control (inside the tenant boundary) ── */
     if (row.purpose === "submission") {
-      const isUploader = row.uploaderId === payload.userId;
+      const isUploader = row.uploaderId === ctx.userId;
       let isAssignmentTeacher = false;
       if (!isUploader && row.assignmentId) {
         const [assignment] = await db
@@ -80,16 +90,17 @@ export async function GET(
           .from(assignments)
           .where(eq(assignments.id, row.assignmentId))
           .limit(1);
-        isAssignmentTeacher = Boolean(assignment && assignment.teacherId === payload.userId);
+        isAssignmentTeacher = Boolean(assignment && assignment.teacherId === ctx.userId);
       }
-      if (!isUploader && !isAssignmentTeacher && !ADMIN_ROLES.has(payload.role)) {
+      if (!isUploader && !isAssignmentTeacher && !ADMIN_ROLES.has(ctx.school.role)) {
         return new Response(JSON.stringify({ success: false, error: "You cannot access this file" }), {
           status: 403,
           headers: { "Content-Type": "application/json" },
         });
       }
     }
-    // Purpose "assignment": any authenticated user may read it.
+    // Purpose "assignment": readable by any authenticated member of the file's school
+    // (the tenant predicate above is what establishes membership).
 
     /* ── Cloud object storage: redirect to a presigned (or public) URL ──
        Media/PDF clients follow the redirect and then issue Range requests

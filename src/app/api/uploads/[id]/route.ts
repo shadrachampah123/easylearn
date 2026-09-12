@@ -3,12 +3,16 @@ import { unlink } from "node:fs/promises";
 import path from "node:path";
 import { db } from "@/db";
 import { uploadedFiles } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { deleteObject, getObjectStorageConfig } from "@/lib/object-storage";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { uploadStorageDir } from "@/lib/upload-storage";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  sqlFileInSchool,
+} from "@/lib/tenant";
 
 export const runtime = "nodejs";
 
@@ -22,31 +26,35 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const { id } = await params;
 
     await ensureFileUploadSchema();
 
+    /* Phase 2C: the file must belong to the caller's school. The predicate is part of the
+       query, so another school's file is "not found" — it is never loaded and never
+       deleted. */
     const [row] = await db
       .select()
       .from(uploadedFiles)
-      .where(eq(uploadedFiles.id, id))
+      .where(and(eq(uploadedFiles.id, id), sqlFileInSchool(ctx.schoolId, uploadedFiles.id)))
       .limit(1);
 
     if (!row) return notFoundResponse("Uploaded file");
 
-    const isAdmin = ["super_admin", "school_admin"].includes(payload.role);
-    if (row.uploaderId !== payload.userId && !isAdmin) {
+    // Phase 1 rule, now backed by the DB membership role: uploader or school administrator.
+    if (row.uploaderId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only delete files you uploaded", 403);
     }
 
     // Remove the database row first so nothing can resolve it mid-delete,
     // then remove the bytes (best effort — a missing object/file is fine).
-    await db.delete(uploadedFiles).where(eq(uploadedFiles.id, id));
+    await db
+      .delete(uploadedFiles)
+      .where(and(eq(uploadedFiles.id, id), sqlFileInSchool(ctx.schoolId, uploadedFiles.id)));
 
     if (row.storageBackend === "object") {
       await deleteObject(getObjectStorageConfig(), row.storedName);

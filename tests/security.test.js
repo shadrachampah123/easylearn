@@ -38,7 +38,17 @@ test('Authentication: users route requires admin role', () => {
 test('Authentication: announcements public vs private', () => {
   const content = readFile('src/app/api/announcements/route.ts');
   assert(content.includes('isPublic'), 'Should handle public param');
-  assert(content.includes('unauthorizedResponse'), 'Should require auth for non-public');
+  // Phase 2C moved the authentication + tenant gate into one audited helper. The property
+  // is unchanged (non-public announcements still require an authenticated session) and the
+  // assertion follows the implementation: the guard IS the 401/403 response.
+  assert(
+    content.includes('guardSchoolContext(request)'),
+    'Should require an authenticated school context for non-public announcements'
+  );
+  assert(
+    content.includes('sqlUserInSchool(ctx.schoolId, announcements.authorId)'),
+    'Phase 2C: only this school\'s announcements may be listed'
+  );
   assert(content.includes('public') && content.includes('true'), 'Should allow public without auth');
 });
 
@@ -135,7 +145,10 @@ test('Enrollments: role-based filtering', () => {
 // 6. Notifications
 test('Notifications: ownership verification', () => {
   const content = readFile('src/app/api/notifications/route.ts');
-  assert(content.includes('eq(notifications.userId, payload.userId)'), 'Should filter by userId');
+  // Phase 2C: the user id now comes from the DB-backed context (never the JWT claim) and
+  // the route additionally requires an active school membership.
+  assert(content.includes('eq(notifications.userId, ctx.userId)'), 'Should filter by userId');
+  assert(content.includes('guardSchoolContext(request)'), 'Phase 2C: require a school context');
   assert(content.includes('inArray'), 'Should use inArray for batch update');
   assert(content.includes('Verify ownership'), 'Should verify ownership comment or logic');
   // Ensure old insecure pattern is removed

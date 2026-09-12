@@ -1,21 +1,30 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { notifications } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, desc, sql, and, inArray } from "drizzle-orm";
+import { guardSchoolContext } from "@/lib/tenant";
 
+/**
+ * Phase 2C — notifications stay strictly per-recipient (Phase 1) and now additionally
+ * require a database-backed school context, so a session without an active membership
+ * cannot read or mutate another school's notification stream.
+ *
+ * Notification rows have no school column in this phase; ownership is the recipient
+ * (`notifications.user_id`) and it is always taken from the verified context — never from a
+ * client-supplied user id. Every query below is scoped by `user_id = ctx.userId`, so a row
+ * belonging to another user (and therefore to another school) is not selected at all.
+ */
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const results = await db
       .select()
       .from(notifications)
-      .where(eq(notifications.userId, payload.userId))
+      .where(eq(notifications.userId, ctx.userId))
       .orderBy(desc(notifications.createdAt))
       .limit(50);
 
@@ -23,12 +32,12 @@ export async function GET(request: NextRequest) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
       .from(notifications)
-      .where(eq(notifications.userId, payload.userId));
+      .where(eq(notifications.userId, ctx.userId));
 
     const [{ unread }] = await db
       .select({ unread: sql<number>`count(*)` })
       .from(notifications)
-      .where(sql`${notifications.userId} = ${payload.userId} AND ${notifications.isRead} = false`);
+      .where(sql`${notifications.userId} = ${ctx.userId} AND ${notifications.isRead} = false`);
 
     return successResponse({
       notifications: results,
@@ -44,10 +53,9 @@ export async function GET(request: NextRequest) {
 // Mark notifications as read - secured to only allow updating own notifications
 export async function PUT(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const body = await request.json();
     const { notificationIds, markAll } = body;
@@ -56,7 +64,7 @@ export async function PUT(request: NextRequest) {
       await db
         .update(notifications)
         .set({ isRead: true })
-        .where(eq(notifications.userId, payload.userId));
+        .where(eq(notifications.userId, ctx.userId));
     } else if (notificationIds && Array.isArray(notificationIds)) {
       if (notificationIds.length === 0) {
         return errorResponse("No notification IDs provided", 400);
@@ -67,7 +75,7 @@ export async function PUT(request: NextRequest) {
         .update(notifications)
         .set({ isRead: true })
         .where(and(
-          eq(notifications.userId, payload.userId),
+          eq(notifications.userId, ctx.userId),
           inArray(notifications.id, notificationIds)
         ));
 
@@ -78,7 +86,7 @@ export async function PUT(request: NextRequest) {
         .select({ id: notifications.id })
         .from(notifications)
         .where(and(
-          eq(notifications.userId, payload.userId),
+          eq(notifications.userId, ctx.userId),
           inArray(notifications.id, notificationIds)
         ));
       const ownedIds = new Set(owned.map((n) => n.id));

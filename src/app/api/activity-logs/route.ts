@@ -1,9 +1,9 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { activityLogs, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { desc, eq, and, sql } from "drizzle-orm";
+import { guardSchoolContext, hasSchoolAdminExtendedRole, sqlUserInSchool } from "@/lib/tenant";
 import { alias } from "drizzle-orm/pg-core";
 import {
   ensureSchemaFeature,
@@ -15,12 +15,11 @@ const ENRICHMENT_MIGRATION = "drizzle/0005_activity_enhancements.sql";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher"].includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only admins can view activity logs", 403);
     }
 
@@ -30,7 +29,10 @@ export async function GET(request: NextRequest) {
     const entityType = url.searchParams.get("entityType");
     const action = url.searchParams.get("action");
 
-    const conditions: any[] = [];
+    /* Phase 2C: the feed used to be every row in `activity_logs`. It is now restricted to
+       events performed by members of the caller's school. Platform events (rows with no
+       school-attributable actor) are not part of any school's feed. */
+    const conditions: any[] = [sqlUserInSchool(ctx.schoolId, activityLogs.userId)];
 
     // entity_type only exists after migration 0005; filtering on it before that throws.
     const enrichment = await ensureSchemaFeature("activity_logs_enrichment");

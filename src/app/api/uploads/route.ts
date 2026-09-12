@@ -4,8 +4,7 @@ import { mkdir, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { db } from "@/db";
 import { uploadedFiles } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { authorizeUpload } from "@/lib/upload-auth";
 import { isObjectStorageEnabled } from "@/lib/object-storage";
@@ -21,6 +20,7 @@ import {
   type StoredAttachment,
 } from "@/lib/uploads";
 import { uploadStorageDir } from "@/lib/upload-storage";
+import { guardSchoolContext } from "@/lib/tenant";
 
 export const runtime = "nodejs";
 
@@ -31,10 +31,8 @@ export const runtime = "nodejs";
  * it posts a multipart form here and the bytes land on local disk.
  */
 export async function GET(request: NextRequest) {
-  const token = getTokenFromRequest(request);
-  if (!token) return unauthorizedResponse();
-  const payload = await verifyToken(token);
-  if (!payload) return unauthorizedResponse();
+  const auth = await guardSchoolContext(request);
+  if (!auth.ok) return auth.response;
 
   return successResponse({
     storage: isObjectStorageEnabled() ? "object" : "local",
@@ -59,10 +57,9 @@ export async function GET(request: NextRequest) {
  */
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     // Reject oversized bodies before buffering anything.
     const contentLength = Number(request.headers.get("content-length") || 0);
@@ -100,7 +97,8 @@ export async function POST(request: NextRequest) {
 
     /* ── Role + purpose authorization (shared with the presign flow) ── */
     const authorization = await authorizeUpload({
-      role: payload.role,
+      role: ctx.school.role,
+      schoolId: ctx.schoolId,
       purpose,
       assignmentId: purpose === "submission" ? assignmentId : null,
     });
@@ -148,7 +146,7 @@ export async function POST(request: NextRequest) {
         const [row] = await db
           .insert(uploadedFiles)
           .values({
-            uploaderId: payload.userId,
+            uploaderId: ctx.userId,
             purpose,
             assignmentId: purpose === "submission" ? assignmentId : null,
             originalName: file.name.slice(0, 255),

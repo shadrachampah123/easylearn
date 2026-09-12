@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { dashboardCardOverrides } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  sqlUserInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, desc, and, or, ilike } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
 import {
@@ -19,9 +23,8 @@ import {
 
 const OVERRIDES_MIGRATION = "drizzle/0004_dashboard_overrides.sql";
 
-function adminRole(payloadRole: string) {
-  return ["super_admin", "school_admin", "head_teacher"].includes(payloadRole);
-}
+/* Phase 1 administrator group. `super_admin` is a platform role with no school membership,
+   so it is deliberately absent: a platform account has no school dashboard to customise. */
 
 /**
  * The overrides list powers the admin "card override" UI. A missing migration 0004 must
@@ -45,10 +48,9 @@ function overridesDisabledResponse(status: { available: boolean; repaired: boole
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const url = request.nextUrl;
     const dashboardRole = url.searchParams.get("dashboardRole");
@@ -72,15 +74,15 @@ export async function GET(request: NextRequest) {
 
     // Only admins can create/change overrides; viewing is open to any signed-in role for
     // transparency about which dashboard cards are overridden.
-    const role = payload.role;
-    const isAdmin = adminRole(role);
+    const isAdmin = hasSchoolAdminExtendedRole(ctx);
 
     const cardKey = url.searchParams.get("cardKey");
     const search = url.searchParams.get("search");
 
     let query = db.select().from(dashboardCardOverrides).$dynamic();
 
-    const conditions: any[] = [];
+    /* Phase 2C: overrides are only visible inside the school of the admin who created them. */
+    const conditions: any[] = [sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)];
 
     if (dashboardRole) {
       conditions.push(eq(dashboardCardOverrides.dashboardRole, dashboardRole as any));
@@ -107,7 +109,7 @@ export async function GET(request: NextRequest) {
         learner: "learner",
         parent: "parent",
       };
-      const allowedRole = roleMap[role] || "global";
+      const allowedRole = roleMap[ctx.school.role] || "global";
       conditions.push(
         or(
           eq(dashboardCardOverrides.dashboardRole, allowedRole as any),
@@ -164,12 +166,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!adminRole(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only admins can create overrides", 403);
     }
 
@@ -208,12 +209,12 @@ export async function POST(request: NextRequest) {
         overridePayload: values.overridePayload ?? null,
         scopeType: values.scopeType ?? "global",
         scopeId: values.scopeId ?? null,
-        createdBy: payload.userId,
+        createdBy: ctx.userId,
       })
       .returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "create",
       entityType: "dashboard_card_override",
       entityId: created?.id,

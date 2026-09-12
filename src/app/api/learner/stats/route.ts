@@ -1,25 +1,31 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { learnerPoints, learnerAchievements, achievements, submissions, quizAttempts, attendance, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, desc, and } from "drizzle-orm";
 import { canAccessLearner } from "@/lib/authorization";
+import { guardSchoolContext, isUserInSchool } from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+    const schoolRole = ctx.school.role;
 
-    const learnerId = request.nextUrl.searchParams.get("learnerId") || payload.userId;
+    const learnerId = request.nextUrl.searchParams.get("learnerId") || ctx.userId;
 
-    if (!["learner", "parent", "super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!["learner", "parent", "school_admin", "head_teacher", "teacher"].includes(schoolRole)) {
       return errorResponse("You are not authorized to view learner stats", 403);
     }
 
-    const authorized = await canAccessLearner(payload, learnerId);
+    /* ── TENANT FIRST: this route both reads statistics and WRITES achievement rows, so the
+       learner must belong to the caller's school before any Phase 1 decision is taken. ── */
+    if (!(await isUserInSchool(ctx.schoolId, learnerId))) {
+      return errorResponse("Learner not found", 404);
+    }
+
+    const authorized = await canAccessLearner({ userId: ctx.userId, role: schoolRole }, learnerId);
     if (!authorized) {
       return errorResponse("You are not authorized to view stats for this learner", 403);
     }

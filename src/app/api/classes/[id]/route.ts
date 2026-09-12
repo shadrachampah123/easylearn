@@ -17,23 +17,35 @@ import {
   teacherClasses,
   timetableEntries,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq, inArray } from "drizzle-orm";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import { and, eq, inArray } from "drizzle-orm";
+import {
+  getClassSchoolIds,
+  guardSchoolContext,
+  isUserInSchool,
+  sqlClassInSchool,
+} from "@/lib/tenant";
 
-const ADMIN_ROLES = ["super_admin", "school_admin"];
+/** Phase 1 admin group. `super_admin` is a platform role with no school membership, so it
+ *  cannot pass the Phase 2C school gate for a school-owned class. */
+const ADMIN_ROLES = ["school_admin"];
+
+/** True only when the class resolves to EXACTLY this school (see `isClassInSchool`). */
+async function hasSchoolClassAccess(schoolId: string, classId: string): Promise<boolean> {
+  const schools = await getClassSchoolIds(classId);
+  return schools.size === 1 && schools.has(schoolId);
+}
 
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!ADMIN_ROLES.includes(ctx.school.role)) {
       return errorResponse("Only administrators can update classes", 403);
     }
 
@@ -45,13 +57,15 @@ export async function PUT(
       return errorResponse("Class name is required");
     }
 
-    const [existing] = await db
-      .select({ id: classes.id })
-      .from(classes)
-      .where(eq(classes.id, id))
-      .limit(1);
+    /* Phase 2C: the target class must belong to the caller's school (fail closed), and a
+       new homeroom teacher must be a member of it too. */
+    if (!(await hasSchoolClassAccess(ctx.schoolId, id))) {
+      return notFoundResponse("Class");
+    }
 
-    if (!existing) return notFoundResponse("Class");
+    if (classTeacherId && !(await isUserInSchool(ctx.schoolId, classTeacherId))) {
+      return errorResponse("Class teacher not found", 404);
+    }
 
     const [updated] = await db
       .update(classes)
@@ -77,20 +91,22 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!ADMIN_ROLES.includes(ctx.school.role)) {
       return errorResponse("Only administrators can delete classes", 403);
     }
 
     const { id } = await params;
+
+    /* Phase 2C: another school's class is "not found" — and the cascade below can therefore
+       never be run against it. */
     const [existing] = await db
       .select({ id: classes.id })
       .from(classes)
-      .where(eq(classes.id, id))
+      .where(and(eq(classes.id, id), sqlClassInSchool(ctx.schoolId, classes.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Class");
@@ -151,7 +167,7 @@ export async function DELETE(
       await tx.delete(learnerClasses).where(eq(learnerClasses.classId, id));
       await tx.delete(teacherClasses).where(eq(teacherClasses.classId, id));
       await tx.delete(timetableEntries).where(eq(timetableEntries.classId, id));
-      await tx.delete(classes).where(eq(classes.id, id));
+      await tx.delete(classes).where(and(eq(classes.id, id), sqlClassInSchool(ctx.schoolId, classes.id)));
     });
 
     return successResponse({ message: "Class deleted" });
