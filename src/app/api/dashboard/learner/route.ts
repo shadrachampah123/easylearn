@@ -231,10 +231,13 @@ export async function GET(request: NextRequest) {
       learner_level: { value: level, label: "Level", icon: "🎓", color: "bg-indigo-100" },
     };
 
+    /* Phase 2C review fix F2: the verified school context is passed so the override read is
+       restricted to overrides created by members of this school. Without it, another
+       school's learner/global-scope card text would be applied to this dashboard. */
     const overrides = await getOverridesForDashboard("learner", [
       { type: "learner", id: learnerId },
       ...(classId ? [{ type: "class", id: classId }] : []),
-    ]);
+    ], { schoolId: ctx.schoolId });
 
     const mergedStats = applyOverrides(liveData, overrides);
 

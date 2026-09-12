@@ -204,6 +204,19 @@ export async function POST(request: NextRequest) {
       return errorResponse("The end time must be after the start time");
     }
 
+    /* ── TENANT FIRST (Phase 2C review fix F1) ──
+       A slot may only reference a class — and a teacher — that belong to the caller's
+       school. Both are resolved through the central relational predicates, so a foreign
+       (or unattributable) id is reported exactly like a missing one and can never create
+       a cross-school timetable row. */
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return notFoundResponse("Class");
+    }
+
+    if (teacherId && !(await isUserInSchool(ctx.schoolId, teacherId))) {
+      return notFoundResponse("Teacher");
+    }
+
     const [newEntry] = await db
       .insert(timetableEntries)
       .values({

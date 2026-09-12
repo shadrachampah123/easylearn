@@ -1031,6 +1031,191 @@ async function main() {
       assertEq(restored.status, 200, "single-school attribution is restored");
     });
 
+    /* ════════════════════ 13. Phase 2C review fixes — F1 (timetable/quiz FK tenancy)
+                            and F2 (learner dashboard override scoping) ════════════════════ */
+
+    /* These four tests are the regression lock for the pre-merge security review of PR #19.
+       F1: `POST /api/timetable`, `PUT /api/timetable/[id]` and `PUT /api/quizzes/[id]`
+       accepted a client-supplied class/teacher id without proving it belonged to the
+       caller's school. F2: `GET /api/dashboard/learner` read card overrides without the
+       school predicate. Every assertion below drives the REAL route handler against the
+       REAL database, and each rejection is additionally asserted at the row level so a
+       "blocked" response that still wrote data cannot pass. */
+
+    let entryA = "";
+
+    await test("Review F1: a timetable slot cannot reference another school's class", async () => {
+      const result = await call("timetable", {
+        token: tokens["admin-a"],
+        body: { classId: classB, dayOfWeek: "monday", startTime: "09:00", endTime: "10:00", room: "R1" },
+      });
+      assertEq(result.status, 404, "School B's class must be rejected");
+      assert(!bodyText(result).includes(classB), "the foreign class id must not be echoed back");
+
+      const rows = await q(`SELECT 1 FROM timetable_entries WHERE class_id = $1`, [classB]);
+      assertEq(rows.length, 0, "no timetable row may be written for another school's class");
+    });
+
+    await test("Review F1: a timetable slot cannot reference another school's teacher", async () => {
+      const result = await call("timetable", {
+        token: tokens["admin-a"],
+        body: {
+          classId: classA,
+          teacherId: ids["teacher-b"],
+          dayOfWeek: "monday",
+          startTime: "09:00",
+          endTime: "10:00",
+        },
+      });
+      assertEq(result.status, 404, "School B's teacher must be rejected");
+
+      const rows = await q(
+        `SELECT 1 FROM timetable_entries WHERE class_id = $1 AND teacher_id = $2`,
+        [classA, ids["teacher-b"]]
+      );
+      assertEq(rows.length, 0, "no cross-school timetable row may be written");
+    });
+
+    await test("Review F1: a membership-less account is not a valid slot teacher either", async () => {
+      const result = await call("timetable", {
+        token: tokens["admin-a"],
+        body: {
+          classId: classA,
+          teacherId: ids["orphan"],
+          dayOfWeek: "friday",
+          startTime: "13:00",
+          endTime: "14:00",
+        },
+      });
+      assertEq(result.status, 404, "a teacher without an active membership must be rejected");
+    });
+
+    await test("Review F1: legitimate same-school timetable creation still works", async () => {
+      const withTeacher = await call("timetable", {
+        token: tokens["admin-a"],
+        body: {
+          classId: classA,
+          teacherId: ids["teacher-a"],
+          subjectId: subject,
+          dayOfWeek: "tuesday",
+          startTime: "09:00",
+          endTime: "10:00",
+          room: "A1",
+        },
+      });
+      assertEq(withTeacher.status, 201, "same-school slot with a teacher");
+      entryA = withTeacher.json.data.id as string;
+      assertEq(withTeacher.json.data.classId, classA, "stored on the caller's own class");
+
+      const withoutTeacher = await call("timetable", {
+        token: tokens["admin-a"],
+        body: { classId: classA, dayOfWeek: "wednesday", startTime: "11:00", endTime: "12:00" },
+      });
+      assertEq(withoutTeacher.status, 201, "a slot without a teacher stays allowed");
+    });
+
+    await test("Review F1: reassigning a slot to another school's teacher is refused", async () => {
+      const result = await call("timetable/[id]", {
+        token: tokens["admin-a"],
+        method: "PUT",
+        params: { id: entryA },
+        body: { teacherId: ids["teacher-b"] },
+      });
+      assertEq(result.status, 404, "foreign teacher reassignment");
+
+      const row = await one(`SELECT teacher_id, room FROM timetable_entries WHERE id = $1`, [entryA]);
+      assertEq(row.teacher_id, ids["teacher-a"], "the stored teacher must be unchanged");
+    });
+
+    await test("Review F1: legitimate same-school slot updates still work", async () => {
+      const result = await call("timetable/[id]", {
+        token: tokens["admin-a"],
+        method: "PUT",
+        params: { id: entryA },
+        body: { teacherId: ids["teacher-a"], room: "A2" },
+      });
+      assertEq(result.status, 200, "same-school reassignment must succeed");
+      assertEq(result.json.data.room, "A2", "the update must be persisted");
+    });
+
+    await test("Review F1: a quiz cannot be moved to another school's class", async () => {
+      const quizA = (
+        await one(
+          `INSERT INTO quizzes (title, class_id, subject_id, teacher_id, is_published)
+           VALUES ('Review Quiz A', $1, $2, $3, false) RETURNING id`,
+          [classA, subject, ids["teacher-a"]]
+        )
+      ).id as string;
+
+      try {
+        const foreign = await call("quizzes/[id]", {
+          token: tokens["teacher-a"],
+          method: "PUT",
+          params: { id: quizA },
+          body: { classId: classB },
+        });
+        assertEq(foreign.status, 404, "School B's class must be rejected");
+
+        const row = await one(`SELECT class_id FROM quizzes WHERE id = $1`, [quizA]);
+        assertEq(row.class_id, classA, "the quiz must stay on its own school's class");
+
+        const legit = await call("quizzes/[id]", {
+          token: tokens["teacher-a"],
+          method: "PUT",
+          params: { id: quizA },
+          body: { classId: classA, title: "Review Quiz A (updated)" },
+        });
+        assertEq(legit.status, 200, "a same-school quiz update must still succeed");
+        assertEq(legit.json.data.classId, classA, "same-school class is persisted");
+      } finally {
+        await q(`DELETE FROM quizzes WHERE id = $1`, [quizA]);
+      }
+    });
+
+    await test("Review F2: a learner never receives another school's dashboard overrides", async () => {
+      const ownOverride = (
+        await one(
+          `INSERT INTO dashboard_card_overrides
+             (card_key, dashboard_role, label, is_visible, is_enabled, scope_type, created_by)
+           VALUES ('phase2c_own_card', 'learner', 'OWN-SCHOOL-CARD', true, true, 'role', $1)
+           RETURNING id`,
+          [ids["admin-a"]]
+        )
+      ).id as string;
+      const foreignOverride = (
+        await one(
+          `INSERT INTO dashboard_card_overrides
+             (card_key, dashboard_role, label, is_visible, is_enabled, scope_type, created_by)
+           VALUES ('phase2c_foreign_card', 'learner', 'FOREIGN-SCHOOL-CARD', true, true, 'role', $1)
+           RETURNING id`,
+          [ids["admin-b"]]
+        )
+      ).id as string;
+
+      try {
+        const result = await call("dashboard/learner", { token: tokens["learner-a"] });
+        assertEq(result.status, 200, "learner dashboard");
+
+        const stats = result.json.data.stats as Record<string, { label?: string }>;
+        assert(stats.phase2c_own_card, "this school's override must still be applied");
+        assertEq(stats.phase2c_own_card.label, "OWN-SCHOOL-CARD", "own override content");
+
+        assert(
+          !stats.phase2c_foreign_card,
+          "another school's override card must not be returned at all"
+        );
+        assert(
+          !bodyText(result).includes("FOREIGN-SCHOOL-CARD"),
+          "another school's override content must never appear in the response"
+        );
+      } finally {
+        await q(`DELETE FROM dashboard_card_overrides WHERE id IN ($1, $2)`, [
+          ownOverride,
+          foreignOverride,
+        ]);
+      }
+    });
+
     /* ════════════════════ Summary ════════════════════ */
 
     console.log(`\n📊 Results: ${passed} passed, ${failed} failed`);

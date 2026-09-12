@@ -13,6 +13,7 @@ import {
   guardSchoolContext,
   hasSchoolAdminRole,
   hasSchoolStaffRole,
+  isClassInSchool,
   sqlQuizInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
@@ -223,6 +224,16 @@ export async function PUT(
     const nextQuestionCount = questionRows ? questionRows.length : Number(questionCount);
     if (nextPublished && nextQuestionCount === 0) {
       return errorResponse("Add at least one question before publishing this quiz to learners");
+    }
+
+    /* ── TENANT FIRST (Phase 2C review fix F1) ──
+       Moving a quiz to another class may only target a class of the caller's school.
+       Without this the update could point the quiz at School B's class, which would make
+       the quiz ambiguous (owned by neither school) instead of safely denied. */
+    if (classId !== undefined && classId !== null && classId !== "") {
+      if (!(await isClassInSchool(ctx.schoolId, classId))) {
+        return notFoundResponse("Class");
+      }
     }
 
     // Only the fields the caller actually sent are written, so a publish toggle can no

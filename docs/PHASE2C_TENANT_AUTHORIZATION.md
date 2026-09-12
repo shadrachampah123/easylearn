@@ -201,3 +201,29 @@ Database provider order, identical to Phases 2A/2B: `TEST_DATABASE_URL` → `emb
    are not part of any school's feed.
 4. Row-level security is still application-level only; a direct database connection bypasses
    these rules. RLS is Phase 2D.
+
+## 8. Post-review hardening (F1/F2)
+
+The pre-merge security review of PR #19 found that four write/read paths accepted a
+client-supplied foreign-school id without proving it against the caller's school. All four
+are fixed in this phase, each with an executable regression test in
+`tests/tenant-authorization-db.test.ts` §13:
+
+| # | Route | Fix |
+|---|-------|-----|
+| F1 | `POST /api/timetable` | `classId` must pass `isClassInSchool(ctx.schoolId, …)` and, when supplied, `teacherId` must pass `isUserInSchool(ctx.schoolId, …)` → otherwise 404 (`Class` / `Teacher`). |
+| F1 | `PUT /api/timetable/[id]` | A reassigned `teacherId` must pass `isUserInSchool(ctx.schoolId, …)` → otherwise 404 (`Teacher`). Clearing the teacher stays allowed. |
+| F1 | `PUT /api/quizzes/[id]` | A new `classId` must pass `isClassInSchool(ctx.schoolId, …)` → otherwise 404 (`Class`), so a quiz can never become cross-school/ambiguous. |
+| F2 | `GET /api/dashboard/learner` | `getOverridesForDashboard("learner", …, { schoolId: ctx.schoolId })` — override text is now limited to overrides created by members of the learner's school, matching the teacher/parent/admin branches. |
+
+The same review surfaced a latent SQL defect in two ownership predicates
+(`sqlSchoolsOfTimetableEntry`, `sqlSchoolsOfTeacherClass`): their injected class lookup used
+an unaliased table, so the inner query bound the outer reference to its own table
+(`"id" = "id"`), returning every row and making Postgres raise *"more than one row returned by
+a subquery used as an expression"* once the table held a second row. Both aliases are fixed
+(`t`, `tc0`) and the fix is covered by the timetable update regression test.
+
+Still open by design (unchanged, deferred): the low findings on `classes/[id]` PUT and
+`submissions` GET noted in the review, the catalog/RLS items of §7, and the unused
+`sqlAnnouncementInSchool` helper, which retains the same unaliased-lookup shape and must be
+aliased before first use.

@@ -614,6 +614,12 @@ function sqlSchoolsOfClass(classRef: SQL | AnyColumn): SQL {
 /**
  * Every school reachable from a teacher↔class row: the teacher, plus the class's own
  * members (so a row that pairs a School A teacher with a School B class is denied).
+ *
+ * NOTE (regression lock): the injected class lookup aliases `teacher_classes` as `tc0`.
+ * Without that alias the outer reference `"teacher_classes"."id"` would bind to the
+ * subquery's own table, degenerating into the tautology `"id" = "id"`, which returns every
+ * row and makes Postgres raise "more than one row returned by a subquery used as an
+ * expression" as soon as the table holds more than one row.
  */
 function sqlSchoolsOfTeacherClass(teacherClassRef: SQL | AnyColumn): SQL {
   return sql`(
@@ -622,13 +628,19 @@ function sqlSchoolsOfTeacherClass(teacherClassRef: SQL | AnyColumn): SQL {
       join "school_users" su on su."user_id" = tc."teacher_id" and su."status" = 'active'
      where tc."id" = ${teacherClassRef}
     union
-    ${sqlSchoolsOfClass(sql`(select "class_id" from "teacher_classes" where "id" = ${teacherClassRef})`)}
+    ${sqlSchoolsOfClass(sql`(select tc0."class_id" from "teacher_classes" tc0 where tc0."id" = ${teacherClassRef})`)}
   )`;
 }
 
 /**
  * Every school reachable from a timetable slot: the teacher, the creator (the admin who
  * scheduled it) and the class's own members.
+ *
+ * NOTE (regression lock): the injected class lookup aliases `timetable_entries` as `t`.
+ * Without that alias the outer reference `"timetable_entries"."id"` would bind to the
+ * subquery's own table, degenerating into the tautology `"id" = "id"`, which returns every
+ * row and makes Postgres raise "more than one row returned by a subquery used as an
+ * expression" as soon as the table holds more than one row.
  */
 function sqlSchoolsOfTimetableEntry(entryRef: SQL | AnyColumn): SQL {
   return sql`(
@@ -642,7 +654,7 @@ function sqlSchoolsOfTimetableEntry(entryRef: SQL | AnyColumn): SQL {
       join "school_users" su on su."user_id" = te."created_by" and su."status" = 'active'
      where te."id" = ${entryRef}
     union
-    ${sqlSchoolsOfClass(sql`(select "class_id" from "timetable_entries" where "id" = ${entryRef})`)}
+    ${sqlSchoolsOfClass(sql`(select t."class_id" from "timetable_entries" t where t."id" = ${entryRef})`)}
   )`;
 }
 
