@@ -195,6 +195,10 @@ export async function POST(request: NextRequest) {
     const [created] = await db
       .insert(dashboardCardOverrides)
       .values({
+        // Phase 2E Step 2: attribute the row to the caller's verified school.
+        // ctx.schoolId comes only from guardSchoolContext() (server-resolved
+        // membership) — client-supplied schoolId/school_id is never read.
+        schoolId: ctx.schoolId,
         cardKey: values.cardKey,
         dashboardRole: values.dashboardRole,
         title: values.title ?? null,

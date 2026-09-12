@@ -12,6 +12,10 @@
  *   d. assignment submission → notifications.school_id   = caller school
  *   e. quiz attempt          → notifications.school_id   = caller school
  *   f. submission grading    → notifications.school_id   = caller school
+ *   f2. dashboard override   → dashboard_card_overrides.school_id = caller school
+ *       (regression: the Step 2 audit found POST /api/dashboard/overrides was the
+ *       last live NULL-school write path; also proves a forged body schoolId is
+ *       ignored and that School B's write stays in School B)
  *   g. constraint error (duplicate academic year) does NOT trigger a NULL-school
  *      fallback insert, and a pre-0016 (column missing) database still gets the narrow
  *      legacy fallback
@@ -479,6 +483,61 @@ async function main() {
         [ids["learner-a"]]
       );
       assertEq(notif?.school_id, schoolA, "notifications.school_id must equal the grader's school");
+    });
+
+    /* ════════════════ f2. dashboard override → dashboard_card_overrides.school_id ════════════════ */
+
+    await test("Override: a dashboard override created by School A is attributed to School A", async () => {
+      // Phase 2E Step 2 regression: POST /api/dashboard/overrides inserted without
+      // schoolId — the last live NULL-school write path found by the read-only audit.
+      const result = await call("dashboard/overrides", {
+        token: tokens["admin-a"],
+        body: {
+          cardKey: "2e-regression-card-a",
+          dashboardRole: "admin",
+          title: "School A card",
+          scopeType: "global",
+        },
+      });
+      assertEq(result.status, 201, `expected 201, body: ${JSON.stringify(result.json)}`);
+      const overrideId = result.json.data?.id as string;
+      assert(overrideId, "response must include the new override id");
+      const row = await one(
+        `SELECT school_id, created_by FROM dashboard_card_overrides WHERE id = $1`,
+        [overrideId]
+      );
+      assertEq(row?.school_id, schoolA, "dashboard_card_overrides.school_id must equal the caller's school");
+      assertEq(row?.created_by, ids["admin-a"], "created_by must be the caller");
+    });
+
+    await test("Override: a forged schoolId is ignored and School B's write stays in School B", async () => {
+      const result = await call("dashboard/overrides", {
+        token: tokens["admin-b"],
+        body: {
+          cardKey: "2e-regression-card-b",
+          dashboardRole: "admin",
+          title: "School B card",
+          scopeType: "global",
+          schoolId: schoolA, // forged: must be ignored (attribution comes from ctx only)
+          school_id: schoolA, // forged snake_case twin: must be ignored too
+        },
+      });
+      assertEq(result.status, 201, `expected 201, body: ${JSON.stringify(result.json)}`);
+      const overrideId = result.json.data?.id as string;
+      assert(overrideId, "response must include the new override id");
+      const row = await one(
+        `SELECT school_id, created_by FROM dashboard_card_overrides WHERE id = $1`,
+        [overrideId]
+      );
+      assertEq(row?.school_id, schoolB, "a forged schoolId must never move a row into another school");
+      assertEq(row?.created_by, ids["admin-b"], "created_by must be the caller");
+
+      // Tenant isolation preserved: School A lists only its own override.
+      const listA = await call("dashboard/overrides", { token: tokens["admin-a"] });
+      assertEq(listA.status, 200, "school A list must succeed");
+      const keysA = ((listA.json.data ?? []) as Array<{ cardKey?: string }>).map((r) => r.cardKey);
+      assert(keysA.includes("2e-regression-card-a"), "school A must see its own override");
+      assert(!keysA.includes("2e-regression-card-b"), "school A must NOT see school B's override");
     });
 
     /* ════════════════ g. errors never trigger a NULL-school fallback ════════════════ */
