@@ -74,6 +74,13 @@ async function run() {
     const client = await pool.connect();
     console.log("✅ Connected to database!");
 
+    // Surface RAISE NOTICE / RAISE WARNING from the migrations (0015 reports the CBISM
+    // backfill counts this way), so a deploy log records what a data migration actually did.
+    client.on("notice", (notice) => {
+      const message = notice && notice.message ? notice.message : String(notice);
+      if (message) console.log(`  ℹ️  ${message}`);
+    });
+
     const files = migrationArg
       ? [migrationArg]
       : [
@@ -92,6 +99,7 @@ async function run() {
           "0012_login_attempts.sql",
           "0013_multi_school_foundation.sql",
           "0014_drop_single_school_guard.sql",
+          "0015_cbism_school_and_membership_backfill.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root
@@ -142,6 +150,43 @@ async function run() {
       "✅ Verification - activity_logs enrichment:",
       activityRes.rows.map(r => r.column_name).join(", ") || "MISSING (0005 not applied)"
     );
+
+    // Phase 2B: confirm the canonical CBISM school + membership backfill landed. Wrapped in
+    // its own try/catch so running a single older file against a pre-0013 database still
+    // succeeds (the rest of this verification is metadata-only and never fails).
+    try {
+      const tenantRes = await client.query(`
+        SELECT
+          (SELECT count(*)::int FROM schools WHERE slug = 'cbism') AS cbism_schools,
+          (SELECT count(*)::int FROM users WHERE role <> 'super_admin') AS eligible_users,
+          (SELECT count(*)::int FROM users WHERE role = 'super_admin') AS excluded_super_admins,
+          (SELECT count(*)::int FROM school_users su
+             JOIN schools s ON s.id = su.school_id
+            WHERE s.slug = 'cbism') AS cbism_memberships,
+          (SELECT count(*)::int FROM school_users su
+             JOIN schools s ON s.id = su.school_id
+            WHERE s.slug = 'cbism' AND su.status = 'active') AS cbism_active_memberships;
+      `);
+      const tenant = tenantRes.rows[0] || {};
+      console.log(
+        "\n✅ Verification - Phase 2B tenant membership:",
+        `cbism schools=${tenant.cbism_schools}`,
+        `eligible users=${tenant.eligible_users}`,
+        `memberships=${tenant.cbism_memberships} (active ${tenant.cbism_active_memberships})`,
+        `super_admins excluded=${tenant.excluded_super_admins}`
+      );
+      if (tenant.cbism_schools > 1) {
+        console.log("   ⚠️  more than one 'cbism' school row - investigate before Phase 2C");
+      } else if (tenant.cbism_schools === 0) {
+        console.log("   ⚠️  no 'cbism' school row (0015 not applied)");
+      } else if (tenant.cbism_memberships < tenant.eligible_users) {
+        console.log(
+          `   ⚠️  ${tenant.eligible_users - tenant.cbism_memberships} eligible user(s) have no CBISM membership`
+        );
+      }
+    } catch (err) {
+      console.log("ℹ️  Verification - Phase 2B tenant membership: skipped (" + (err.message || "").substring(0, 120) + ")");
+    }
 
     client.release();
     await pool.end();

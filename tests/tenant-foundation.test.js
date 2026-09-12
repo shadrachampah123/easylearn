@@ -275,22 +275,33 @@ test('Boundary: no legacy table in schema.ts gained a tenant column', () => {
   });
 });
 
-test('Boundary: no API route uses the new tenant tables yet', () => {
+test('Boundary: no API route queries the tenant tables directly (Phase 2B: via src/lib/tenant.ts)', () => {
+  // Phase 2A asserted that no route touched the tenant tables at all. Phase 2B wires
+  // membership into authentication, but through ONE module: routes must still never import
+  // `schoolUsers`/`schools` from the schema or run their own membership query.
   const routeFiles = listFiles(path.join(__dirname, '..', 'src', 'app', 'api'), '.ts');
   for (const file of routeFiles) {
     const content = fs.readFileSync(file, 'utf8');
     assert(
-      !/schoolUsers|from "@\/db\/schema"[^)]*\bschools\b/.test(content) &&
+      !/\bschoolUsers\b/.test(content) &&
         !/\bimport\s*{[^}]*\bschools\b[^}]*}\s*from\s*"@\/db\/schema"/.test(content),
-      `${path.relative(process.cwd(), file)} must not use tenant tables in Phase 2A`
+      `${path.relative(process.cwd(), file)} must not query tenant tables directly — use src/lib/tenant.ts`
     );
   }
 });
 
-test('Boundary: authentication/JWT unchanged (no schoolId in tokens)', () => {
+test('Boundary: authentication carries school context only as server-derived hints (Phase 2B)', () => {
+  // Phase 2A required auth.ts to stay completely tenant-free. Phase 2B deliberately adds
+  // `ver` + school claims — but they must remain HINTS that are re-validated against
+  // `school_users` on every request, never authorization inputs.
   const auth = readFile('src/lib/auth.ts');
-  assert(!auth.includes('schoolId'), 'auth must not carry school context in Phase 2A');
-  assert(!auth.includes('membershipId'), 'auth must not carry membership context in Phase 2A');
+  assert(auth.includes('schoolIdHint') && auth.includes('membershipIdHint'), 'claims are exposed as hints');
+  assert(!/return\s*{[^}]*\bschoolId:/.test(auth), 'verifyToken must not hand back a bare schoolId');
+  assert(/UNTRUSTED HINTS/.test(auth), 'the hint contract must be documented');
+  assert(fs.existsSync(path.join(__dirname, '..', 'src', 'lib', 'tenant.ts')), 'central membership module must exist');
+  const tenant = readFile('src/lib/tenant.ts');
+  assert(tenant.includes('listActiveSchoolMemberships'), 'membership must be re-derived from the database');
+  assert(!tenant.includes('searchParams'), 'the tenant module must not read client-supplied school ids');
 });
 
 test('Boundary: no tenant filtering added to authorization helpers', () => {

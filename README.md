@@ -76,6 +76,8 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 | `0009_file_uploads.sql` | Local file uploads: `assignments.allow_file_uploads` (teacher-controlled learner-upload gate) + `uploaded_files` registry |
 | `0010_object_storage.sql` | Cloud object storage: `uploaded_files.storage_backend` (`local` \| `object`) so file bytes can live in S3 / Cloudflare R2 / MinIO |
 | `0013_multi_school_foundation.sql` | Phase 2A multi-school foundation: `schools` (tenant root) + `school_users` (membership). Purely additive — no existing table or data is touched (see `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`) |
+| `0014_drop_single_school_guard.sql` | Phase 2A follow-up: replaces the single-school partial unique index with a non-unique placeholder of the same name, so a user can belong to several schools and a full re-run can never resurrect the restriction |
+| `0015_cbism_school_and_membership_backfill.sql` | Phase 2B membership backfill: creates the canonical CBISM `schools` row (`slug = 'cbism'`) if missing and gives every existing non-`super_admin` user a `school_users` membership for it (role preserved, `status` mirrors `users.is_active`). Additive + idempotent — nothing is updated, deleted or re-hashed. The runner prints the affected counts. See `docs/PHASE2B_MEMBERSHIP_AUTH.md` |
 
 Notes:
 
@@ -97,6 +99,29 @@ Notes:
   `column "image_url" of relation "quiz_questions" does not exist` (SQLSTATE 42703) and learners
   saw an empty quiz list. It is registered in the journal now, and the quiz routes also repair it
   on demand through `ensureQuizImageColumn()`.
+
+#### School membership & authentication context (Phase 2B)
+
+CBISM is now a real tenant: `schools` holds one canonical row (`slug = 'cbism'`) and every
+application user has a `school_users` membership for it. Details, the audited auth flow and
+every decision are in **`docs/PHASE2B_MEMBERSHIP_AUTH.md`**; the multi-school architecture is
+in `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`.
+
+- **`src/lib/tenant.ts` is the only place that resolves school context.** It exposes
+  `resolveAuthContext` / `requireSchoolContext` / `resolveSchoolMembership` /
+  `requireActiveSchoolMembership` / `getEffectiveSchoolRole` and reads membership exclusively
+  from `school_users` — a client can never pick a school (no body, query or header is read),
+  and an arbitrary `school_id` resolves to nothing rather than to somebody else's membership.
+- **`super_admin` stays a platform role.** It is excluded from the backfill, `toSchoolRole()`
+  rejects it, and it never grants school-wide access through the tenant module.
+- **Login and `/api/auth/me` now return `school` / `schools`** (server-derived, additive).
+  Sessions carry `ver: 2` plus `schoolId` / `membershipId`, surfaced by `verifyToken()` as
+  `schoolIdHint` / `membershipIdHint` — hints only. Authorization still re-reads the database,
+  so a stale or forged claim cannot widen access, and tokens issued before Phase 2B keep
+  working until they expire (no forced re-login).
+- **Nothing else changed yet**: no tenant filtering, no `school_id` columns, no middleware.
+  Users without a membership still log in (`school: null`), so the backfill cannot lock
+  anybody out. Wiring the central gate into the API routes is Phase 2C.
 
 #### Quizzes and grading
 

@@ -378,11 +378,32 @@ async function main() {
         [schoolB.id, user2.id]
       );
       assert(/^[0-9a-f-]{36}$/i.test(rows[0].id), "user2 joined both schools after the re-run");
-      const { rows: user1Pairs } = await db.query(
-        `SELECT count(*)::int AS n FROM "school_users" WHERE "user_id" = $1`,
+      // Phase 2B update: migration 0015 backfills a CBISM membership for every
+      // non-super_admin user on each full-chain re-run, so user1 now legitimately holds
+      // THREE memberships (School A + School B + CBISM). The property this test guards is
+      // that multi-school membership survives a full re-run — assert it by school, not by
+      // a bare count, so the CBISM backfill is visible rather than silently absorbed.
+      const { rows: user1Memberships } = await db.query(
+        `SELECT s."slug", su."school_id" FROM "school_users" su
+           JOIN "schools" s ON s."id" = su."school_id"
+          WHERE su."user_id" = $1 ORDER BY s."slug"`,
         [user1.id]
       );
-      assertEq(user1Pairs[0].n, 2, "user1's two pre-existing memberships must survive re-runs");
+      assertEq(
+        user1Memberships.map((r) => r.slug).join(","),
+        "cbism,test-school-a,test-school-b",
+        "user1's memberships after the re-run (two pre-existing + the 0015 CBISM backfill)"
+      );
+      assertEq(
+        user1Memberships.filter((r) => r.school_id === schoolA.id).length,
+        1,
+        "user1's pre-existing School A membership must survive re-runs exactly once"
+      );
+      assertEq(
+        user1Memberships.filter((r) => r.school_id === schoolB.id).length,
+        1,
+        "user1's pre-existing School B membership must survive re-runs exactly once"
+      );
     });
 
     /* ── 8. Legacy schema untouched ── */
