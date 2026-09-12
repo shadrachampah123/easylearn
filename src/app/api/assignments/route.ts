@@ -29,7 +29,42 @@ export async function GET(request: NextRequest) {
     const subjectId = request.nextUrl.searchParams.get("subjectId");
     const status = request.nextUrl.searchParams.get("status");
 
-    let query = db
+    // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
+    // Always include schoolId = ctx.schoolId (direct), fallback to relational for pre-0016 DB
+    let useDirect = true;
+    try {
+      await db.execute(sql`select "school_id" from "assignments" limit 0`);
+    } catch {
+      useDirect = false;
+    }
+
+    const conditions: any[] = useDirect
+      ? [eq(assignments.schoolId, ctx.schoolId)]
+      : [sqlAssignmentInSchool(ctx.schoolId, assignments.id)];
+
+    // For teachers, show their own assignments
+    if (ctx.school.role === "teacher") {
+      conditions.push(eq(assignments.teacherId, ctx.userId));
+    }
+
+    // Filter by class
+    if (classId) {
+      conditions.push(eq(assignments.classId, classId));
+    }
+
+    // Filter by subject
+    if (subjectId) {
+      conditions.push(eq(assignments.subjectId, subjectId));
+    }
+
+    // Filter by status
+    if (status) {
+      conditions.push(eq(assignments.status, status as "draft" | "published" | "closed"));
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const results = await db
       .select({
         id: assignments.id,
         title: assignments.title,
@@ -54,37 +89,9 @@ export async function GET(request: NextRequest) {
       .leftJoin(classes, eq(assignments.classId, classes.id))
       .leftJoin(subjects, eq(assignments.subjectId, subjects.id))
       .leftJoin(users, eq(assignments.teacherId, users.id))
+      .where(whereClause)
       .orderBy(desc(assignments.createdAt))
-      .$dynamic();
-
-    /* Phase 2D: direct school_id predicate preferred */
-    try {
-      query = query.where(eq(assignments.schoolId, ctx.schoolId));
-    } catch {
-      query = query.where(sqlAssignmentInSchool(ctx.schoolId, assignments.id));
-    }
-
-    // For teachers, show their own assignments
-    if (ctx.school.role === "teacher") {
-      query = query.where(eq(assignments.teacherId, ctx.userId));
-    }
-
-    // Filter by class
-    if (classId) {
-      query = query.where(eq(assignments.classId, classId));
-    }
-
-    // Filter by subject
-    if (subjectId) {
-      query = query.where(eq(assignments.subjectId, subjectId));
-    }
-
-    // Filter by status
-    if (status) {
-      query = query.where(eq(assignments.status, status as "draft" | "published" | "closed"));
-    }
-
-    const results = await query.limit(50);
+      .limit(50);
 
     // For learners, add submission status
     if (ctx.school.role === "learner") {

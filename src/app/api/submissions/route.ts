@@ -21,7 +21,29 @@ export async function GET(request: NextRequest) {
 
     const assignmentId = request.nextUrl.searchParams.get("assignmentId");
 
-    let query = db
+    // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
+    // Always preserve tenant predicate + role, plus assignmentId filter
+    const conditions: any[] = [];
+
+    if (schoolRole === "learner") {
+      conditions.push(eq(submissions.learnerId, ctx.userId));
+      conditions.push(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
+    } else if (schoolRole === "teacher") {
+      conditions.push(eq(assignments.teacherId, ctx.userId));
+      conditions.push(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
+    } else if (hasSchoolAdminExtendedRole(ctx)) {
+      conditions.push(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
+    } else {
+      return errorResponse("You are not authorized to view submissions", 403);
+    }
+
+    if (assignmentId) {
+      conditions.push(eq(submissions.assignmentId, assignmentId));
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const results = await db
       .select({
         id: submissions.id,
         content: submissions.content,
@@ -43,35 +65,9 @@ export async function GET(request: NextRequest) {
       .from(submissions)
       .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
       .leftJoin(users, eq(submissions.learnerId, users.id))
+      .where(whereClause)
       .orderBy(desc(submissions.submittedAt))
-      .$dynamic();
-
-    /* Phase 2C tenant boundary: a submission is only ever reachable when it belongs to
-       the caller's school — its learner is an active member AND its assignment resolves to
-       that school alone. Applied to every branch, including the supervisory one, which
-       Phase 1 left unscoped. */
-    if (schoolRole === "learner") {
-      query = query.where(and(
-        eq(submissions.learnerId, ctx.userId),
-        sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-      ));
-    } else if (schoolRole === "teacher") {
-      // Teachers only see submissions for assignments they manage, inside their school.
-      query = query.where(and(
-        eq(assignments.teacherId, ctx.userId),
-        sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-      ));
-    } else if (hasSchoolAdminExtendedRole(ctx)) {
-      query = query.where(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
-    } else {
-      return errorResponse("You are not authorized to view submissions", 403);
-    }
-
-    if (assignmentId) {
-      query = query.where(eq(submissions.assignmentId, assignmentId));
-    }
-
-    const results = await query.limit(100);
+      .limit(100);
 
     return successResponse(results);
   } catch (error) {
