@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { resources, classes, subjects, users } from "@/db/schema";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { eq, desc, and, ilike, or } from "drizzle-orm";
+import { eq, desc, and, ilike, or, isNull, sql } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
@@ -23,9 +23,21 @@ export async function GET(request: NextRequest) {
     const type = request.nextUrl.searchParams.get("type");
     const search = request.nextUrl.searchParams.get("search");
 
-    /* Phase 2C: resources are anchored on their uploader; only material of this school's
-       members is listed, whatever the Phase 1 role filter below says. */
-    const conditions = [sqlUserInSchool(ctx.schoolId, resources.teacherId)];
+    /* Phase 2D: prefer direct school_id, fallback to uploader membership for legacy NULL rows */
+    let useDirectRes = true;
+    try {
+      await db.execute(sql`select "school_id" from "resources" limit 0`);
+    } catch {
+      useDirectRes = false;
+    }
+    const conditions = useDirectRes
+      ? [
+          or(
+            eq(resources.schoolId, ctx.schoolId),
+            and(isNull(resources.schoolId), sqlUserInSchool(ctx.schoolId, resources.teacherId))
+          ),
+        ]
+      : [sqlUserInSchool(ctx.schoolId, resources.teacherId)];
 
     if (ctx.school.role === "teacher") {
       conditions.push(eq(resources.teacherId, ctx.userId));
@@ -108,21 +120,41 @@ export async function POST(request: NextRequest) {
 
     const isApproved = hasSchoolAdminExtendedRole(ctx);
 
-    const [newResource] = await db.insert(resources).values({
-      title,
-      description: description || null,
-      type,
-      fileUrl: fileUrl?.trim() || null,
-      fileSize: fileSize || null,
-      subjectId: subjectId || null,
-      classId: classId || null,
-      teacherId: ctx.userId,
-      termId: termId || null,
-      topic: topic || null,
-      week: week || null,
-      isPinned: isPinned || false,
-      isApproved,
-    }).returning();
+    let newResource;
+    try {
+      [newResource] = await db.insert(resources).values({
+        schoolId: ctx.schoolId,
+        title,
+        description: description || null,
+        type,
+        fileUrl: fileUrl?.trim() || null,
+        fileSize: fileSize || null,
+        subjectId: subjectId || null,
+        classId: classId || null,
+        teacherId: ctx.userId,
+        termId: termId || null,
+        topic: topic || null,
+        week: week || null,
+        isPinned: isPinned || false,
+        isApproved,
+      }).returning();
+    } catch {
+      [newResource] = await db.insert(resources).values({
+        title,
+        description: description || null,
+        type,
+        fileUrl: fileUrl?.trim() || null,
+        fileSize: fileSize || null,
+        subjectId: subjectId || null,
+        classId: classId || null,
+        teacherId: ctx.userId,
+        termId: termId || null,
+        topic: topic || null,
+        week: week || null,
+        isPinned: isPinned || false,
+        isApproved,
+      } as any).returning();
+    }
 
     await logActivity({
       userId: ctx.userId,

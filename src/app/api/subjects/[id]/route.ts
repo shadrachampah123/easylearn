@@ -14,30 +14,26 @@ import {
   teacherClasses,
   timetableEntries,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq, inArray } from "drizzle-orm";
-
-const ADMIN_ROLES = ["super_admin", "school_admin"];
-
-async function requireAdmin(request: NextRequest) {
-  const token = getTokenFromRequest(request);
-  if (!token) return unauthorizedResponse();
-  const payload = await verifyToken(token);
-  if (!payload) return unauthorizedResponse();
-  if (!ADMIN_ROLES.includes(payload.role)) {
-    return errorResponse("Only administrators can manage subjects", 403);
-  }
-  return payload;
-}
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import { eq, inArray, and } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  isDepartmentInSchool,
+} from "@/lib/tenant";
 
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await requireAdmin(request);
-    if (auth instanceof Response) return auth;
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+
+    if (!hasSchoolAdminRole(ctx)) {
+      return errorResponse("Only administrators can manage subjects", 403);
+    }
 
     const { id } = await params;
     const body = await request.json();
@@ -47,13 +43,24 @@ export async function PUT(
       return errorResponse("Subject name is required");
     }
 
-    const [existing] = await db
-      .select({ id: subjects.id })
-      .from(subjects)
-      .where(eq(subjects.id, id))
-      .limit(1);
+    // Tenant check: subject must belong to caller's school
+    let existing;
+    try {
+      [existing] = await db
+        .select({ id: subjects.id })
+        .from(subjects)
+        .where(and(eq(subjects.id, id), eq(subjects.schoolId, ctx.schoolId)))
+        .limit(1);
+    } catch {
+      return notFoundResponse("Subject");
+    }
 
     if (!existing) return notFoundResponse("Subject");
+
+    if (departmentId) {
+      const deptOk = await isDepartmentInSchool(ctx.schoolId, departmentId);
+      if (!deptOk) return errorResponse("Department not found", 404);
+    }
 
     const [updated] = await db
       .update(subjects)
@@ -63,7 +70,7 @@ export async function PUT(
         departmentId: departmentId !== undefined ? departmentId || null : undefined,
         description: description !== undefined ? (description?.trim() || null) : undefined,
       })
-      .where(eq(subjects.id, id))
+      .where(and(eq(subjects.id, id), eq(subjects.schoolId, ctx.schoolId)))
       .returning();
 
     return successResponse(updated);
@@ -78,15 +85,26 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await requireAdmin(request);
-    if (auth instanceof Response) return auth;
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+
+    if (!hasSchoolAdminRole(ctx)) {
+      return errorResponse("Only administrators can manage subjects", 403);
+    }
 
     const { id } = await params;
-    const [existing] = await db
-      .select({ id: subjects.id })
-      .from(subjects)
-      .where(eq(subjects.id, id))
-      .limit(1);
+
+    let existing;
+    try {
+      [existing] = await db
+        .select({ id: subjects.id })
+        .from(subjects)
+        .where(and(eq(subjects.id, id), eq(subjects.schoolId, ctx.schoolId)))
+        .limit(1);
+    } catch {
+      return notFoundResponse("Subject");
+    }
 
     if (!existing) return notFoundResponse("Subject");
 
@@ -97,7 +115,7 @@ export async function DELETE(
       const subjectAssignments = await tx
         .select({ id: assignments.id })
         .from(assignments)
-        .where(eq(assignments.subjectId, id));
+        .where(and(eq(assignments.subjectId, id), eq(assignments.schoolId, ctx.schoolId)));
       const assignmentIds = subjectAssignments.map((assignment) => assignment.id);
 
       if (assignmentIds.length > 0) {
@@ -116,8 +134,6 @@ export async function DELETE(
           await tx.delete(assignmentAnswers).where(inArray(assignmentAnswers.submissionId, submissionIds));
         }
         if (assignmentQuestionIds.length > 0) {
-          // Answers reference both submissions and questions. Remove by question
-          // too, so even malformed/partial historical submissions cannot block the delete.
           await tx.delete(assignmentAnswers).where(inArray(assignmentAnswers.questionId, assignmentQuestionIds));
         }
         await tx.delete(assignmentCorrections).where(inArray(assignmentCorrections.assignmentId, assignmentIds));
@@ -131,7 +147,7 @@ export async function DELETE(
       const subjectQuizzes = await tx
         .select({ id: quizzes.id })
         .from(quizzes)
-        .where(eq(quizzes.subjectId, id));
+        .where(and(eq(quizzes.subjectId, id), eq(quizzes.schoolId, ctx.schoolId)));
       const quizIds = subjectQuizzes.map((quiz) => quiz.id);
 
       if (quizIds.length > 0) {
@@ -140,10 +156,29 @@ export async function DELETE(
         await tx.delete(quizzes).where(inArray(quizzes.id, quizIds));
       }
 
-      await tx.delete(teacherClasses).where(eq(teacherClasses.subjectId, id));
-      await tx.update(resources).set({ subjectId: null }).where(eq(resources.subjectId, id));
-      await tx.update(timetableEntries).set({ subjectId: null }).where(eq(timetableEntries.subjectId, id));
-      await tx.delete(subjects).where(eq(subjects.id, id));
+      try {
+        await tx
+          .delete(teacherClasses)
+          .where(and(eq(teacherClasses.subjectId, id), eq(teacherClasses.schoolId, ctx.schoolId)));
+      } catch {
+        await tx.delete(teacherClasses).where(eq(teacherClasses.subjectId, id));
+      }
+
+      try {
+        await tx
+          .update(resources)
+          .set({ subjectId: null })
+          .where(and(eq(resources.subjectId, id), eq(resources.schoolId, ctx.schoolId)));
+        await tx
+          .update(timetableEntries)
+          .set({ subjectId: null })
+          .where(and(eq(timetableEntries.subjectId, id), eq(timetableEntries.schoolId, ctx.schoolId)));
+      } catch {
+        await tx.update(resources).set({ subjectId: null }).where(eq(resources.subjectId, id));
+        await tx.update(timetableEntries).set({ subjectId: null }).where(eq(timetableEntries.subjectId, id));
+      }
+
+      await tx.delete(subjects).where(and(eq(subjects.id, id), eq(subjects.schoolId, ctx.schoolId)));
     });
 
     return successResponse({ message: "Subject deleted" });

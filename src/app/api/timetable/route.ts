@@ -18,7 +18,7 @@ import {
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql, or, isNull } from "drizzle-orm";
 
 export const TIMETABLE_DAYS = [
   "monday",
@@ -64,9 +64,21 @@ export async function GET(request: NextRequest) {
     const day = request.nextUrl.searchParams.get("day");
     const teacherId = request.nextUrl.searchParams.get("teacherId");
 
-    /* Phase 2C: every slot must resolve to the caller's school (class, teacher or creator)
-       before the Phase 1 role filters narrow it further. */
-    const conditions = [sqlTimetableInSchool(ctx.schoolId, timetableEntries.id)];
+    /* Phase 2D: prefer direct school_id, fallback to relational for legacy NULL rows */
+    let useDirectTT = true;
+    try {
+      await db.execute(sql`select "school_id" from "timetable_entries" limit 0`);
+    } catch {
+      useDirectTT = false;
+    }
+    const conditions = useDirectTT
+      ? [
+          or(
+            eq(timetableEntries.schoolId, ctx.schoolId),
+            and(isNull(timetableEntries.schoolId), sqlTimetableInSchool(ctx.schoolId, timetableEntries.id))
+          ),
+        ]
+      : [sqlTimetableInSchool(ctx.schoolId, timetableEntries.id)];
 
     // Everyone only ever sees the timetable of classes they belong to.
     if (ctx.school.role === "teacher") {
@@ -217,23 +229,45 @@ export async function POST(request: NextRequest) {
       return notFoundResponse("Teacher");
     }
 
-    const [newEntry] = await db
-      .insert(timetableEntries)
-      .values({
-        classId,
-        subjectId: subjectId || null,
-        teacherId: teacherId || null,
-        termId: termId || null,
-        academicYearId: academicYearId || null,
-        dayOfWeek,
-        startTime,
-        endTime,
-        room: room?.trim() || null,
-        color: color || null,
-        notes: notes?.trim() || null,
-        createdBy: ctx.userId,
-      })
-      .returning();
+    let newEntry;
+    try {
+      [newEntry] = await db
+        .insert(timetableEntries)
+        .values({
+          schoolId: ctx.schoolId,
+          classId,
+          subjectId: subjectId || null,
+          teacherId: teacherId || null,
+          termId: termId || null,
+          academicYearId: academicYearId || null,
+          dayOfWeek,
+          startTime,
+          endTime,
+          room: room?.trim() || null,
+          color: color || null,
+          notes: notes?.trim() || null,
+          createdBy: ctx.userId,
+        })
+        .returning();
+    } catch {
+      [newEntry] = await db
+        .insert(timetableEntries)
+        .values({
+          classId,
+          subjectId: subjectId || null,
+          teacherId: teacherId || null,
+          termId: termId || null,
+          academicYearId: academicYearId || null,
+          dayOfWeek,
+          startTime,
+          endTime,
+          room: room?.trim() || null,
+          color: color || null,
+          notes: notes?.trim() || null,
+          createdBy: ctx.userId,
+        } as any)
+        .returning();
+    }
 
     return successResponse(newEntry, 201);
   } catch (error) {

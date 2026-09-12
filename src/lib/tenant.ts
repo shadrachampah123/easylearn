@@ -815,87 +815,93 @@ export async function getLearnerIdsInSchool(schoolId: string, learnerIds: string
   return new Set(rows.map((row) => row.userId));
 }
 
-/** Schools a class belongs to (homeroom teacher, assigned teachers, enrolled learners). */
+/** Schools a class belongs to — Phase 2D: direct school_id preferred, relational fallback */
 export async function getClassSchoolIds(classId: string): Promise<Set<string>> {
   if (!isUuid(classId)) return new Set();
+  const direct = await getDirectSchoolId("classes", classId);
+  if (direct) return new Set([direct]);
   return resolveSchoolSet(sqlSchoolsOfClass(sql`${classId}::uuid`));
 }
 
-/** Is this class uniquely attributable to this school? */
+/** Is this class uniquely attributable to this school? — Phase 2D direct check */
 export async function isClassInSchool(schoolId: string, classId: string): Promise<boolean> {
-  const schools = await getClassSchoolIds(classId);
+  const direct = await getDirectSchoolId("classes", classId);
+  if (direct) return direct === schoolId;
+  const schools = await resolveSchoolSet(sqlSchoolsOfClass(sql`${classId}::uuid`));
   return schools.size === 1 && schools.has(schoolId);
 }
 
-/** Schools an assignment belongs to (its teacher, plus its class's members). */
+/** Schools an assignment belongs to — Phase 2D direct check first */
 export async function getAssignmentSchoolIds(assignmentId: string): Promise<Set<string>> {
   if (!isUuid(assignmentId)) return new Set();
+  const direct = await getDirectSchoolId("assignments", assignmentId);
+  if (direct) return new Set([direct]);
   return resolveSchoolSet(sqlSchoolsOfAssignment(sql`${assignmentId}::uuid`));
 }
-
-/** Is this assignment uniquely attributable to this school? */
 export async function isAssignmentInSchool(schoolId: string, assignmentId: string): Promise<boolean> {
-  const schools = await getAssignmentSchoolIds(assignmentId);
+  const direct = await getDirectSchoolId("assignments", assignmentId);
+  if (direct) return direct === schoolId;
+  const schools = await resolveSchoolSet(sqlSchoolsOfAssignment(sql`${assignmentId}::uuid`));
   return schools.size === 1 && schools.has(schoolId);
 }
-
-/** Schools a quiz belongs to (its teacher, plus its class's members). */
 export async function getQuizSchoolIds(quizId: string): Promise<Set<string>> {
   if (!isUuid(quizId)) return new Set();
+  const direct = await getDirectSchoolId("quizzes", quizId);
+  if (direct) return new Set([direct]);
   return resolveSchoolSet(sqlSchoolsOfQuiz(sql`${quizId}::uuid`));
 }
-
-/** Is this quiz uniquely attributable to this school? */
 export async function isQuizInSchool(schoolId: string, quizId: string): Promise<boolean> {
-  const schools = await getQuizSchoolIds(quizId);
+  const direct = await getDirectSchoolId("quizzes", quizId);
+  if (direct) return direct === schoolId;
+  const schools = await resolveSchoolSet(sqlSchoolsOfQuiz(sql`${quizId}::uuid`));
   return schools.size === 1 && schools.has(schoolId);
 }
-
-/** Schools a submission belongs to (its learner, plus its assignment). */
 export async function getSubmissionSchoolIds(submissionId: string): Promise<Set<string>> {
   if (!isUuid(submissionId)) return new Set();
+  const direct = await getDirectSchoolId("submissions", submissionId);
+  if (direct) return new Set([direct]);
   return resolveSchoolSet(sqlSchoolsOfSubmission(sql`${submissionId}::uuid`));
 }
-
-/** Is this submission uniquely attributable to this school? */
 export async function isSubmissionInSchool(schoolId: string, submissionId: string): Promise<boolean> {
-  const schools = await getSubmissionSchoolIds(submissionId);
+  const direct = await getDirectSchoolId("submissions", submissionId);
+  if (direct) return direct === schoolId;
+  const schools = await resolveSchoolSet(sqlSchoolsOfSubmission(sql`${submissionId}::uuid`));
   return schools.size === 1 && schools.has(schoolId);
 }
-
-/** Schools a teacher↔class row belongs to (its teacher, plus its class's members). */
 export async function getTeacherClassSchoolIds(teacherClassId: string): Promise<Set<string>> {
   if (!isUuid(teacherClassId)) return new Set();
+  const direct = await getDirectSchoolId("teacher_classes", teacherClassId);
+  if (direct) return new Set([direct]);
   return resolveSchoolSet(sqlSchoolsOfTeacherClass(sql`${teacherClassId}::uuid`));
 }
-
-/** Is this teacher↔class row uniquely attributable to this school? */
 export async function isTeacherClassInSchool(schoolId: string, teacherClassId: string): Promise<boolean> {
-  const schools = await getTeacherClassSchoolIds(teacherClassId);
+  const direct = await getDirectSchoolId("teacher_classes", teacherClassId);
+  if (direct) return direct === schoolId;
+  const schools = await resolveSchoolSet(sqlSchoolsOfTeacherClass(sql`${teacherClassId}::uuid`));
   return schools.size === 1 && schools.has(schoolId);
 }
-
-/** Schools a timetable slot belongs to (its teacher, its creator, its class). */
 export async function getTimetableSchoolIds(entryId: string): Promise<Set<string>> {
   if (!isUuid(entryId)) return new Set();
+  const direct = await getDirectSchoolId("timetable_entries", entryId);
+  if (direct) return new Set([direct]);
   return resolveSchoolSet(sqlSchoolsOfTimetableEntry(sql`${entryId}::uuid`));
 }
-
-/** Is this timetable slot uniquely attributable to this school? */
 export async function isTimetableInSchool(schoolId: string, entryId: string): Promise<boolean> {
-  const schools = await getTimetableSchoolIds(entryId);
+  const direct = await getDirectSchoolId("timetable_entries", entryId);
+  if (direct) return direct === schoolId;
+  const schools = await resolveSchoolSet(sqlSchoolsOfTimetableEntry(sql`${entryId}::uuid`));
   return schools.size === 1 && schools.has(schoolId);
 }
-
-/** Schools an uploaded file belongs to (its uploader, plus its assignment). */
 export async function getFileSchoolIds(fileId: string): Promise<Set<string>> {
   if (!isUuid(fileId)) return new Set();
+  const direct = await getDirectSchoolId("uploaded_files", fileId);
+  if (direct) return new Set([direct]);
   return resolveSchoolSet(sqlSchoolsOfFile(sql`${fileId}::uuid`));
 }
-
-/** Is this uploaded file uniquely attributable to this school? */
 export async function isFileInSchool(schoolId: string, fileId: string): Promise<boolean> {
-  const schools = await getFileSchoolIds(fileId);
+  const direct = await getDirectSchoolId("uploaded_files", fileId);
+  if (direct) return direct === schoolId;
+  const schools = await resolveSchoolSet(sqlSchoolsOfFile(sql`${fileId}::uuid`));
   return schools.size === 1 && schools.has(schoolId);
 }
 
@@ -910,10 +916,149 @@ export async function sqlAuthorInSchool(schoolId: string, authorRef: SQL | AnyCo
 
 /** Identity predicate: the announcement author is an ACTIVE member of this school. */
 export function sqlAnnouncementInSchool(schoolId: string, announcementRef: SQL | AnyColumn): SQL {
-  return sqlUserInSchool(
-    schoolId,
-    sql`(select "author_id" from "announcements" where "id" = ${announcementRef})`
-  );
+  // Phase 2D: prefer direct school_id column when present, fallback to author membership
+  assertSchoolId(schoolId);
+  return sql`(
+    exists (select 1 from "announcements" a where a."id" = ${announcementRef} and a."school_id" = ${schoolId})
+    or (
+      not exists (select 1 from "announcements" a where a."id" = ${announcementRef} and a."school_id" is not null)
+      and ${sqlUserInSchool(schoolId, sql`(select "author_id" from "announcements" where "id" = ${announcementRef})`)}
+    )
+  )`;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   PHASE 2D — DIRECT school_id TENANT PREDICATES
+   Phase 2C used relational attribution (teacher/class membership joins) because
+   legacy tables had no school_id. Phase 2D adds school_id to all A-class tables
+   (migration 0016) so we can enforce tenancy directly via WHERE school_id = ctx.
+   These helpers are the preferred path; the relational helpers above remain as
+   fallback for databases that have not yet applied 0016, or for rows where
+   school_id is NULL (legacy).
+   ────────────────────────────────────────────────────────────────────────────── */
+
+/** Generic direct school_id predicate: table has school_id = ctx.schoolId */
+function sqlDirectSchoolId(schoolId: string, tableName: string, idRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`exists (select 1 from ${sql.raw(`"${tableName}"`)} t where t."id" = ${idRef} and t."school_id" = ${schoolId})`;
+}
+
+/** Direct school_id check for academic_years */
+export function sqlAcademicYearInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "academic_years", ref);
+}
+export function sqlTermInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "terms", ref);
+}
+export function sqlDepartmentInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "departments", ref);
+}
+export function sqlSubjectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "subjects", ref);
+}
+
+/** Direct school_id for classes — preferred over relational */
+export function sqlClassDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "classes", ref);
+}
+export function sqlTeacherClassDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "teacher_classes", ref);
+}
+export function sqlLearnerClassDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "learner_classes", ref);
+}
+export function sqlParentLearnerDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "parent_learners", ref);
+}
+export function sqlAssignmentDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "assignments", ref);
+}
+export function sqlSubmissionDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "submissions", ref);
+}
+export function sqlFileDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "uploaded_files", ref);
+}
+export function sqlResourceDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "resources", ref);
+}
+export function sqlQuizDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "quizzes", ref);
+}
+export function sqlQuizAttemptDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "quiz_attempts", ref);
+}
+export function sqlAnnouncementDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "announcements", ref);
+}
+export function sqlNotificationDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "notifications", ref);
+}
+export function sqlAttendanceDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "attendance", ref);
+}
+export function sqlTimetableDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "timetable_entries", ref);
+}
+export function sqlMessageDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "messages", ref);
+}
+export function sqlActivityLogDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "activity_logs", ref);
+}
+export function sqlDashboardOverrideDirectInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
+  return sqlDirectSchoolId(schoolId, "dashboard_card_overrides", ref);
+}
+
+/** Direct school_id for list filtering: WHERE table.school_id = ctx.schoolId */
+export function sqlSchoolIdEquals(schoolId: string, columnRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`${columnRef} = ${schoolId}`;
+}
+
+/* ── Direct school_id resolvers (single-record) ── */
+
+async function getDirectSchoolId(tableName: string, id: string): Promise<string | null> {
+  if (!isUuid(id)) return null;
+  try {
+    const result = await db.execute(sql`select "school_id"::text as sid from ${sql.raw(`"${tableName}"`)} where "id" = ${id}::uuid limit 1`);
+    const rows = rowsFromResult(result);
+    const sid = rows[0]?.sid;
+    return typeof sid === "string" && isUuid(sid) ? sid : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function isAcademicYearInSchool(schoolId: string, id: string): Promise<boolean> {
+  const direct = await getDirectSchoolId("academic_years", id);
+  if (direct) return direct === schoolId;
+  // No relational fallback — catalog tables have no anchor, so NULL means not attributable
+  return false;
+}
+export async function isTermInSchool(schoolId: string, id: string): Promise<boolean> {
+  const direct = await getDirectSchoolId("terms", id);
+  return direct ? direct === schoolId : false;
+}
+export async function isDepartmentInSchool(schoolId: string, id: string): Promise<boolean> {
+  const direct = await getDirectSchoolId("departments", id);
+  return direct ? direct === schoolId : false;
+}
+export async function isSubjectInSchool(schoolId: string, id: string): Promise<boolean> {
+  const direct = await getDirectSchoolId("subjects", id);
+  return direct ? direct === schoolId : false;
+}
+
+/** For classes, prefer direct school_id, fallback to relational for transition */
+export async function getClassSchoolIdDirect(classId: string): Promise<string | null> {
+  return getDirectSchoolId("classes", classId);
+}
+
+/** Updated: try direct school_id first, then relational */
+export async function getClassSchoolIdsDirectFirst(classId: string): Promise<Set<string>> {
+  const direct = await getDirectSchoolId("classes", classId);
+  if (direct) return new Set([direct]);
+  return getClassSchoolIds(classId);
 }
 
 /* ── Membership writes (routes never touch `school_users` directly) ── */

@@ -100,6 +100,7 @@ async function run() {
           "0013_multi_school_foundation.sql",
           "0014_drop_single_school_guard.sql",
           "0015_cbism_school_and_membership_backfill.sql",
+          "0016_school_id_columns.sql",
         ];
 
     // Also check drizzle folder for any extra files not in root
