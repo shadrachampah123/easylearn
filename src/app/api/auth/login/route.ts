@@ -93,11 +93,21 @@ export async function POST(request: NextRequest) {
     // Successful login - clear failed attempts
     await clearFailedLoginAttempts(identifier);
 
+    // Phase 2B — school context. Resolved from `school_users` on the server; a client
+    // supplied school id is never read or trusted (see src/lib/tenant.ts). This helper
+    // never throws: a user without a membership (e.g. a platform super_admin) still logs in
+    // with `school: null`, so nobody is locked out by the backfill.
+    const { resolveLoginSchoolContext, toSchoolSummary } = await import("@/lib/tenant");
+    const { memberships, school } = await resolveLoginSchoolContext(user.id);
+
     const token = await createToken({
       userId: user.id,
       email: user.email || undefined,
       username: user.username || undefined,
       role: user.role,
+      // Hints only — authorization re-derives membership from the database.
+      schoolId: school?.schoolId,
+      membershipId: school?.membershipId,
     });
 
     await db
@@ -114,6 +124,10 @@ export async function POST(request: NextRequest) {
         lastName: user.lastName,
         avatarUrl: user.avatarUrl,
       },
+      // Phase 2B additive context. Server-derived and read-only for the client: sending a
+      // `school`/`schoolId` back has no effect anywhere (see src/lib/tenant.ts).
+      school: toSchoolSummary(school),
+      schools: memberships.map((membership) => toSchoolSummary(membership)),
       token,
     });
 

@@ -6,6 +6,26 @@ import { getJwtSecret } from "@/lib/env";
 
 const TOKEN_EXPIRY = "24h";
 
+/**
+ * Token schema version (architecture plan §9.2).
+ *
+ * Phase 2B adds `ver`, `schoolId` and `membershipId` to newly issued tokens. Nothing is
+ * removed or renamed, `JWT_SECRET` is unchanged, and no code branches authorization on
+ * `ver`, so tokens minted before this deploy (no `ver` → treated as 1) keep verifying until
+ * their natural 24 h expiry. The rollout therefore needs no rotation window and forces no
+ * re-login.
+ */
+export const TOKEN_SCHEMA_VERSION = 2;
+
+/** A token without `ver` predates Phase 2B. */
+export const LEGACY_TOKEN_SCHEMA_VERSION = 1;
+
+const UUID_CLAIM_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function uuidClaim(value: unknown): string | undefined {
+  return typeof value === "string" && UUID_CLAIM_PATTERN.test(value) ? value : undefined;
+}
+
 function getJwtKey(): Uint8Array {
   const secret = getJwtSecret();
   if (!secret) {
@@ -30,8 +50,15 @@ export async function createToken(payload: {
   email?: string;
   username?: string;
   role: string;
+  /**
+   * Server-validated school context (Phase 2B). Only ever populated from a `school_users`
+   * row read on the server — never from client input. Carried as a convenience/audit hint;
+   * authorization must re-derive membership from the database (see `src/lib/tenant.ts`).
+   */
+  schoolId?: string;
+  membershipId?: string;
 }): Promise<string> {
-  return new SignJWT(payload)
+  return new SignJWT({ ...payload, ver: TOKEN_SCHEMA_VERSION })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuedAt()
     .setExpirationTime(TOKEN_EXPIRY)
@@ -56,6 +83,21 @@ export async function verifyToken(token: string) {
       email: typeof payload.email === "string" ? payload.email : undefined,
       username: typeof payload.username === "string" ? payload.username : undefined,
       role: payload.role,
+      /** Token schema version; tokens issued before Phase 2B have no claim and read as 1. */
+      ver:
+        typeof payload.ver === "number" && Number.isInteger(payload.ver)
+          ? payload.ver
+          : LEGACY_TOKEN_SCHEMA_VERSION,
+      /**
+       * UNTRUSTED HINTS — do not authorize from these.
+       *
+       * They describe the membership that existed when the token was minted, up to 24 h
+       * ago, and a token is opaque to the database: membership can be removed, disabled or
+       * re-roled without the claim changing. Every authorization path must go through
+       * `src/lib/tenant.ts`, which re-reads `school_users` on each request.
+       */
+      schoolIdHint: uuidClaim(payload.schoolId),
+      membershipIdHint: uuidClaim(payload.membershipId),
     };
   } catch {
     return null;

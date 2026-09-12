@@ -7,12 +7,13 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts && node tests/tenant-foundation.test.js",
+    "test": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts && node tests/tenant-foundation.test.js && node tests/membership-foundation.test.js",
     "test:security": "node tests/security.test.js",
     "test:real": "npx tsx tests/real-authorization.test.ts",
     "test:tenant": "node tests/tenant-foundation.test.js",
-    "test:db": "node tests/tenant-db.test.js",
-    "test:all": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts && node tests/tenant-foundation.test.js"
+    "test:membership": "node tests/membership-foundation.test.js && npx tsx tests/membership-auth-db.test.ts",
+    "test:db": "node tests/tenant-db.test.js && npx tsx tests/membership-auth-db.test.ts",
+    "test:all": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts && node tests/tenant-foundation.test.js && node tests/membership-foundation.test.js && node tests/tenant-db.test.js && npx tsx tests/membership-auth-db.test.ts"
   },
   "dependencies": {
     "@types/bcryptjs": "^2.4.6",
