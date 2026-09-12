@@ -10,24 +10,36 @@ import {
   parentLearners,
   announcements,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, desc, and } from "drizzle-orm";
 import { getOverridesForDashboard, applyOverrides } from "@/lib/dashboard-overrides";
+import {
+  getLearnerIdsInSchool,
+  guardSchoolContext,
+  hasSchoolRole,
+  isUserInSchool,
+} from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["parent", "school_admin", "super_admin"].includes(payload.role)) {
+    if (!hasSchoolRole(ctx, "parent", "school_admin")) {
       return errorResponse("Forbidden", 403);
     }
 
-    const parentId = payload.role === "parent" ? payload.userId : (request.nextUrl.searchParams.get("parentId") || payload.userId);
+    const parentId = ctx.school.role === "parent"
+      ? ctx.userId
+      : (request.nextUrl.searchParams.get("parentId") || ctx.userId);
     const learnerIdParam = request.nextUrl.searchParams.get("learnerId");
+
+    /* Phase 2C: a staff token could previously pass ANY `parentId`. The parameter is only
+       honoured for a member of the caller's school. */
+    if (parentId !== ctx.userId && !(await isUserInSchool(ctx.schoolId, parentId))) {
+      return errorResponse("Parent not found", 404);
+    }
 
     // Get linked children
     const links = await db
@@ -38,7 +50,12 @@ export async function GET(request: NextRequest) {
       .from(parentLearners)
       .where(eq(parentLearners.parentId, parentId));
 
-    const learnerIds = links.map(l => l.learnerId);
+    /* Phase 2C: parent↔learner links have no school column in this phase, so the linked
+       children are intersected with the caller's school's members. A legacy or cross-school
+       link therefore grants nothing. */
+    const linkedIds = links.map(l => l.learnerId);
+    const inSchool = await getLearnerIdsInSchool(ctx.schoolId, linkedIds);
+    const learnerIds = linkedIds.filter(id => inSchool.has(id));
 
     if (learnerIds.length === 0) {
       return successResponse({
@@ -254,7 +271,7 @@ export async function GET(request: NextRequest) {
       { type: "parent", id: parentId },
       { type: "learner", id: targetLearnerId },
       ...(classId ? [{ type: "class", id: classId }] : []),
-    ]);
+    ], { schoolId: ctx.schoolId });
 
     const mergedStats = applyOverrides(liveData, overrides);
 

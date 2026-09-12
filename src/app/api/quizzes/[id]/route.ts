@@ -9,8 +9,14 @@ import {
   users,
   learnerClasses,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  hasSchoolStaffRole,
+  isClassInSchool,
+  sqlQuizInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, asc, and, sql } from "drizzle-orm";
 
@@ -21,10 +27,9 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     // Without quiz_questions.image_url (drizzle/0007) the `select().from(quizQuestions)`
     // below throws 42703 and the quiz page renders "Quiz not found".
@@ -56,7 +61,7 @@ export async function GET(
       .leftJoin(classes, eq(quizzes.classId, classes.id))
       .leftJoin(subjects, eq(quizzes.subjectId, subjects.id))
       .leftJoin(users, eq(quizzes.teacherId, users.id))
-      .where(eq(quizzes.id, id))
+      .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
       .limit(1);
 
     if (!quiz) {
@@ -65,20 +70,20 @@ export async function GET(
 
     // Teachers can only inspect quizzes they manage; administrators can inspect all
     // school quizzes. This also protects the attempt count returned below.
-    if (payload.role === "teacher" && quiz.teacherId !== payload.userId) {
+    if (ctx.school.role === "teacher" && quiz.teacherId !== ctx.userId) {
       return errorResponse("You can only view your own quizzes", 403);
     }
 
-    const isStaff = ["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role);
+    const isStaff = hasSchoolStaffRole(ctx);
 
-    if (payload.role === "learner") {
+    if (ctx.school.role === "learner") {
       if (!quiz.isPublished) {
         return errorResponse("This quiz has not been published by your teacher yet", 403);
       }
       const enrolled = await db
         .select({ classId: learnerClasses.classId })
         .from(learnerClasses)
-        .where(eq(learnerClasses.learnerId, payload.userId));
+        .where(eq(learnerClasses.learnerId, ctx.userId));
       if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
         return errorResponse("This quiz was set for a different class", 403);
       }
@@ -92,7 +97,7 @@ export async function GET(
       .orderBy(asc(quizQuestions.orderIndex));
 
     // For learners taking the quiz, hide correct answers
-    if (payload.role === "learner") {
+    if (ctx.school.role === "learner") {
       questions = questions.map((q) => ({
         ...q,
         correctAnswer: null, // Hide correct answer from learners
@@ -109,14 +114,14 @@ export async function GET(
       .from(quizAttempts)
       .where(and(
         eq(quizAttempts.quizId, id),
-        isStaff ? sql`true` : eq(quizAttempts.learnerId, payload.userId)
+        isStaff ? sql`true` : eq(quizAttempts.learnerId, ctx.userId)
       ));
 
     return successResponse({
       ...quiz,
       questions,
       attemptsUsed: Number(attempts[0]?.count ?? 0),
-      isOwner: quiz.teacherId === payload.userId,
+      isOwner: quiz.teacherId === ctx.userId,
     });
   } catch (error) {
     console.error("Get quiz error:", error);
@@ -132,10 +137,9 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     await ensureQuizImageColumn();
 
@@ -148,12 +152,12 @@ export async function PUT(
         isPublished: quizzes.isPublished,
       })
       .from(quizzes)
-      .where(eq(quizzes.id, id))
+      .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Quiz");
 
-    if (existing.teacherId !== payload.userId && !["super_admin", "school_admin"].includes(payload.role)) {
+    if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only edit your own quizzes", 403);
     }
 
@@ -222,6 +226,16 @@ export async function PUT(
       return errorResponse("Add at least one question before publishing this quiz to learners");
     }
 
+    /* ── TENANT FIRST (Phase 2C review fix F1) ──
+       Moving a quiz to another class may only target a class of the caller's school.
+       Without this the update could point the quiz at School B's class, which would make
+       the quiz ambiguous (owned by neither school) instead of safely denied. */
+    if (classId !== undefined && classId !== null && classId !== "") {
+      if (!(await isClassInSchool(ctx.schoolId, classId))) {
+        return notFoundResponse("Class");
+      }
+    }
+
     // Only the fields the caller actually sent are written, so a publish toggle can no
     // longer wipe the quiz title/description by omitting them.
     const updates: Record<string, unknown> = {};
@@ -242,7 +256,7 @@ export async function PUT(
           await tx
             .update(quizzes)
             .set(updates)
-            .where(eq(quizzes.id, id));
+            .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)));
         }
 
         if (replacesQuestions) {
@@ -272,22 +286,21 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const { id } = await params;
 
     const [existing] = await db
       .select({ teacherId: quizzes.teacherId })
       .from(quizzes)
-      .where(eq(quizzes.id, id))
+      .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Quiz");
 
-    if (existing.teacherId !== payload.userId && !["super_admin", "school_admin"].includes(payload.role)) {
+    if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only delete your own quizzes", 403);
     }
 
@@ -295,7 +308,7 @@ export async function DELETE(
     await db.transaction(async (tx) => {
       await tx.delete(quizAttempts).where(eq(quizAttempts.quizId, id));
       await tx.delete(quizQuestions).where(eq(quizQuestions.quizId, id));
-      await tx.delete(quizzes).where(eq(quizzes.id, id));
+      await tx.delete(quizzes).where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)));
     });
 
     return successResponse({ message: "Quiz deleted" });

@@ -1,6 +1,7 @@
 import { db } from "@/db";
 import { dashboardCardOverrides } from "@/db/schema";
 import { eq, and, or, desc } from "drizzle-orm";
+import { sqlUserInSchool } from "@/lib/tenant";
 import {
   ensureSchemaFeature,
   isSchemaOutOfDate,
@@ -159,9 +160,10 @@ export interface CardOverride {
  */
 export async function getOverridesForDashboard(
   dashboardRole: string,
-  scopes: { type: string; id: string }[] = []
+  scopes: { type: string; id: string }[] = [],
+  options: { schoolId?: string } = {}
 ): Promise<Map<string, CardOverride>> {
-  const result = await readOverridesForDashboard(dashboardRole, scopes);
+  const result = await readOverridesForDashboard(dashboardRole, scopes, options);
   return result.overrides;
 }
 
@@ -180,7 +182,14 @@ export interface OverrideReadResult {
  */
 export async function readOverridesForDashboard(
   dashboardRole: string,
-  scopes: { type: string; id: string }[] = []
+  scopes: { type: string; id: string }[] = [],
+  /**
+   * Phase 2C: when a verified school context is supplied, only overrides created by a
+   * member of that school are returned. Dashboard customisation is school-owned content
+   * whose only anchor is its author, so an override created outside any school is not part
+   * of any school's dashboard.
+   */
+  options: { schoolId?: string } = {}
 ): Promise<OverrideReadResult> {
   const status = await ensureSchemaFeature("dashboard_card_overrides");
 
@@ -206,6 +215,9 @@ export async function readOverridesForDashboard(
         eq(dashboardCardOverrides.dashboardRole, dashboardRole as any),
         eq(dashboardCardOverrides.dashboardRole, "global" as any)
       ),
+      ...(options.schoolId
+        ? [sqlUserInSchool(options.schoolId, dashboardCardOverrides.createdBy)]
+        : []),
     ];
 
     const allOverrides = await db

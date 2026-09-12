@@ -11,23 +11,36 @@ import {
   learnerClasses,
   announcements,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, desc, and } from "drizzle-orm";
 import { getOverridesForDashboard, applyOverrides } from "@/lib/dashboard-overrides";
+import {
+  guardSchoolContext,
+  hasSchoolRole,
+  isUserInSchool,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["teacher", "head_teacher", "school_admin", "super_admin"].includes(payload.role)) {
+    if (!hasSchoolRole(ctx, "teacher", "head_teacher", "school_admin")) {
       return errorResponse("Forbidden", 403);
     }
 
-    const teacherId = payload.role === "teacher" ? payload.userId : (request.nextUrl.searchParams.get("teacherId") || payload.userId);
+    const teacherId = ctx.school.role === "teacher"
+      ? ctx.userId
+      : (request.nextUrl.searchParams.get("teacherId") || ctx.userId);
+
+    /* Phase 2C: a staff token could previously pass ANY `teacherId`. The parameter is
+       honoured only for a user who is an active member of the caller's school; anything
+       else (including a user of another school) is reported as missing. */
+    if (teacherId !== ctx.userId && !(await isUserInSchool(ctx.schoolId, teacherId))) {
+      return errorResponse("Teacher not found", 404);
+    }
 
     // My classes (including homeroom)
     const assigned = await db
@@ -159,7 +172,7 @@ export async function GET(request: NextRequest) {
     const overrides = await getOverridesForDashboard("teacher", [
       { type: "teacher", id: teacherId },
       ...classIdsArray.map(id => ({ type: "class", id })),
-    ]);
+    ], { schoolId: ctx.schoolId });
     const mergedStats = applyOverrides(liveData, overrides);
 
     return successResponse({

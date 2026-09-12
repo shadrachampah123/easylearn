@@ -1,21 +1,31 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { classes } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { desc } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  isUserInSchool,
+  sqlClassInSchool,
+} from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
+    /* Phase 2C: classes have no `school_id` in this phase, so ownership is resolved through
+       the class's people (homeroom teacher, assigned teachers, enrolled learners). A class
+       that is reachable from another school — or from nobody yet — is NOT listed. That is
+       the fail-closed rule of the brief: content that cannot be attributed to the caller's
+       school is denied. Phase 2D adds `classes.school_id` and makes this exact and cheap. */
     const results = await db
       .select()
       .from(classes)
+      .where(sqlClassInSchool(ctx.schoolId, classes.id))
       .orderBy(desc(classes.createdAt));
 
     return successResponse(results);
@@ -27,12 +37,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin"].includes(payload.role)) {
+    if (!hasSchoolAdminRole(ctx)) {
       return errorResponse("Forbidden", 403);
     }
 
@@ -41,6 +50,12 @@ export async function POST(request: NextRequest) {
 
     if (!name || !level) {
       return errorResponse("Name and level are required");
+    }
+
+    /* Phase 2C: the homeroom teacher of a class of this school must be a member of this
+       school. This is also what gives the new class a tenant anchor (see GET above). */
+    if (classTeacherId && !(await isUserInSchool(ctx.schoolId, classTeacherId))) {
+      return errorResponse("Class teacher not found", 404);
     }
 
     const [newClass] = await db.insert(classes).values({
@@ -52,7 +67,7 @@ export async function POST(request: NextRequest) {
     }).returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "create",
       entityType: "class",
       entityId: newClass.id,

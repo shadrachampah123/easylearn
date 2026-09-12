@@ -1,30 +1,37 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { resources, classes, subjects, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { eq, desc, and, ilike, or } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  hasSchoolStaffRole,
+  isClassInSchool,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const classId = request.nextUrl.searchParams.get("classId");
     const subjectId = request.nextUrl.searchParams.get("subjectId");
     const type = request.nextUrl.searchParams.get("type");
     const search = request.nextUrl.searchParams.get("search");
 
-    const conditions = [];
+    /* Phase 2C: resources are anchored on their uploader; only material of this school's
+       members is listed, whatever the Phase 1 role filter below says. */
+    const conditions = [sqlUserInSchool(ctx.schoolId, resources.teacherId)];
 
-    if (payload.role === "teacher") {
-      conditions.push(eq(resources.teacherId, payload.userId));
+    if (ctx.school.role === "teacher") {
+      conditions.push(eq(resources.teacherId, ctx.userId));
     }
 
-    if (payload.role === "learner" || payload.role === "parent") {
+    if (ctx.school.role === "learner" || ctx.school.role === "parent") {
       conditions.push(eq(resources.isApproved, true));
     }
 
@@ -79,12 +86,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolStaffRole(ctx)) {
       return errorResponse("Only teachers can upload resources", 403);
     }
 
@@ -95,7 +101,12 @@ export async function POST(request: NextRequest) {
       return errorResponse("Title and type are required");
     }
 
-    const isApproved = ["super_admin", "school_admin", "head_teacher"].includes(payload.role);
+    /* Phase 2C: a resource may only point at a class of the caller's school. */
+    if (classId && !(await isClassInSchool(ctx.schoolId, classId))) {
+      return notFoundResponse("Class");
+    }
+
+    const isApproved = hasSchoolAdminExtendedRole(ctx);
 
     const [newResource] = await db.insert(resources).values({
       title,
@@ -105,7 +116,7 @@ export async function POST(request: NextRequest) {
       fileSize: fileSize || null,
       subjectId: subjectId || null,
       classId: classId || null,
-      teacherId: payload.userId,
+      teacherId: ctx.userId,
       termId: termId || null,
       topic: topic || null,
       week: week || null,
@@ -114,7 +125,7 @@ export async function POST(request: NextRequest) {
     }).returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "create",
       entityType: "resource",
       entityId: newResource.id,

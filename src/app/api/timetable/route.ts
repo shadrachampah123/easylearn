@@ -9,12 +9,14 @@ import {
   learnerClasses,
   parentLearners,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
 import {
-  successResponse,
-  errorResponse,
-  unauthorizedResponse,
-} from "@/lib/api-helpers";
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  isClassInSchool,
+  isUserInSchool,
+  sqlTimetableInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 
@@ -29,8 +31,6 @@ export const TIMETABLE_DAYS = [
 ] as const;
 
 type TimetableDay = (typeof TIMETABLE_DAYS)[number];
-
-const ADMIN_ROLES = ["super_admin", "school_admin", "head_teacher"];
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -56,30 +56,31 @@ END`;
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const classId = request.nextUrl.searchParams.get("classId");
     const day = request.nextUrl.searchParams.get("day");
     const teacherId = request.nextUrl.searchParams.get("teacherId");
 
-    const conditions = [];
+    /* Phase 2C: every slot must resolve to the caller's school (class, teacher or creator)
+       before the Phase 1 role filters narrow it further. */
+    const conditions = [sqlTimetableInSchool(ctx.schoolId, timetableEntries.id)];
 
     // Everyone only ever sees the timetable of classes they belong to.
-    if (payload.role === "teacher") {
+    if (ctx.school.role === "teacher") {
       const [subjectClasses, homeroomClasses, scheduledClasses] = await Promise.all([
         // Classes the teacher teaches a subject in.
         db
           .select({ classId: teacherClasses.classId })
           .from(teacherClasses)
-          .where(eq(teacherClasses.teacherId, payload.userId)),
+          .where(eq(teacherClasses.teacherId, ctx.userId)),
         // Classes the teacher is the homeroom/class teacher of.
         db
           .select({ classId: classes.id })
           .from(classes)
-          .where(eq(classes.classTeacherId, payload.userId)),
+          .where(eq(classes.classTeacherId, ctx.userId)),
         // Admins can also assign a teacher directly on timetable rows, even when
         // there is no separate teacher_classes record yet. Once a teacher owns at
         // least one published period in a class, they should be able to open the
@@ -87,7 +88,7 @@ export async function GET(request: NextRequest) {
         db
           .select({ classId: timetableEntries.classId })
           .from(timetableEntries)
-          .where(eq(timetableEntries.teacherId, payload.userId)),
+          .where(eq(timetableEntries.teacherId, ctx.userId)),
       ]);
 
       const teacherClassIds = [
@@ -103,14 +104,14 @@ export async function GET(request: NextRequest) {
           ? inArray(timetableEntries.classId, teacherClassIds)
           : sql`false`
       );
-    } else if (payload.role === "learner") {
+    } else if (ctx.school.role === "learner") {
       const ownClasses = db
         .select({ id: learnerClasses.classId })
         .from(learnerClasses)
-        .where(eq(learnerClasses.learnerId, payload.userId));
+        .where(eq(learnerClasses.learnerId, ctx.userId));
 
       conditions.push(inArray(timetableEntries.classId, ownClasses));
-    } else if (payload.role === "parent") {
+    } else if (ctx.school.role === "parent") {
       const childrenClasses = db
         .select({ id: learnerClasses.classId })
         .from(learnerClasses)
@@ -120,7 +121,7 @@ export async function GET(request: NextRequest) {
             db
               .select({ id: parentLearners.learnerId })
               .from(parentLearners)
-              .where(eq(parentLearners.parentId, payload.userId))
+              .where(eq(parentLearners.parentId, ctx.userId))
           )
         );
 
@@ -170,12 +171,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can manage the timetable", 403);
     }
 
@@ -204,6 +204,19 @@ export async function POST(request: NextRequest) {
       return errorResponse("The end time must be after the start time");
     }
 
+    /* ── TENANT FIRST (Phase 2C review fix F1) ──
+       A slot may only reference a class — and a teacher — that belong to the caller's
+       school. Both are resolved through the central relational predicates, so a foreign
+       (or unattributable) id is reported exactly like a missing one and can never create
+       a cross-school timetable row. */
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return notFoundResponse("Class");
+    }
+
+    if (teacherId && !(await isUserInSchool(ctx.schoolId, teacherId))) {
+      return notFoundResponse("Teacher");
+    }
+
     const [newEntry] = await db
       .insert(timetableEntries)
       .values({
@@ -218,7 +231,7 @@ export async function POST(request: NextRequest) {
         room: room?.trim() || null,
         color: color || null,
         notes: notes?.trim() || null,
-        createdBy: payload.userId,
+        createdBy: ctx.userId,
       })
       .returning();
 

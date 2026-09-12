@@ -1,88 +1,110 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { learnerClasses, users, classes } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { eq, and, desc, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   canAccessLearner,
   canTeacherAccessClass,
   getAllowedLearnerIdsForEnrollment,
   getTeacherAccessibleClassIds,
-  isAdminExtendedRole,
 } from "@/lib/authorization";
+import {
+  getLearnerIdsInSchool,
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  isClassInSchool,
+  isUserInSchool,
+  sqlClassInSchool,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 
+/**
+ * Phase 2C — enrollments are the classic cross-school pairing risk.
+ *
+ * Read: every row must satisfy BOTH sides of the tenant boundary as SQL predicates — the
+ * learner is an active member of the caller's school AND the class resolves to that school
+ * alone. Phase 1's role/relationship filters are applied on top, never instead.
+ *
+ * Write: the learner AND the referenced class are verified against the caller's school
+ * before anything is inserted. An enrollment row on its own is never sufficient
+ * authorization (the brief calls this out explicitly).
+ */
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+    const schoolRole = ctx.school.role;
 
     const classId = request.nextUrl.searchParams.get("classId");
     const learnerIdParam = request.nextUrl.searchParams.get("learnerId");
 
-    const conditions: any[] = [];
+    // Tenant boundary — enforced in SQL, so a foreign row is never fetched.
+    const conditions: any[] = [
+      sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId),
+      sqlClassInSchool(ctx.schoolId, learnerClasses.classId),
+    ];
 
     if (classId) conditions.push(eq(learnerClasses.classId, classId));
     if (learnerIdParam) conditions.push(eq(learnerClasses.learnerId, learnerIdParam));
 
-    // Role-based filtering
-    if (isAdminExtendedRole(payload.role)) {
+    const phaseOneActor = { userId: ctx.userId, role: schoolRole };
+
+    // Role-based filtering (Phase 1 rules, now driven by the DB membership role)
+    if (hasSchoolAdminExtendedRole(ctx)) {
       // Admins can view all, but if learnerId supplied it's already in conditions
-    } else if (payload.role === "teacher" || payload.role === "head_teacher") {
+    } else if (schoolRole === "teacher") {
       // Teacher: must be assigned to class if classId supplied
       if (classId) {
-        const canAccessClass = await canTeacherAccessClass(payload.userId, classId);
+        const canAccessClass = await canTeacherAccessClass(ctx.userId, classId);
         if (!canAccessClass) {
           return errorResponse("You can only view enrollments for classes you teach", 403);
         }
       }
       if (learnerIdParam) {
-        const canAccess = await canAccessLearner(payload, learnerIdParam);
+        const canAccess = await canAccessLearner(phaseOneActor, learnerIdParam);
         if (!canAccess) {
           return errorResponse("You can only view enrollments for learners in your scope", 403);
         }
       } else {
         // No learner filter: restrict to teacher's classes
-        const accessibleClassIds = await getTeacherAccessibleClassIds(payload.userId);
+        const accessibleClassIds = await getTeacherAccessibleClassIds(ctx.userId);
         if (accessibleClassIds.size === 0) {
           return successResponse([]);
         }
-        if (classId) {
-          // Already verified class access, no extra filter needed
-        } else {
+        if (!classId) {
           conditions.push(inArray(learnerClasses.classId, Array.from(accessibleClassIds)));
         }
       }
-    } else if (payload.role === "parent") {
-      const allowed = await getAllowedLearnerIdsForEnrollment(payload);
-      if (allowed === "all") {
-        // shouldn't happen for parent
-      } else {
-        const allowedSet = allowed as Set<string>;
-        if (allowedSet.size === 0) {
+    } else if (schoolRole === "parent") {
+      const allowed = await getAllowedLearnerIdsForEnrollment(phaseOneActor);
+      if (allowed !== "all") {
+        /* Phase 1 gave the parent their linked children; Phase 2C intersects that with the
+           school's members so a legacy link to a learner in another school cannot leak. */
+        const inSchool = await getLearnerIdsInSchool(ctx.schoolId, Array.from(allowed));
+        if (inSchool.size === 0) {
           return successResponse([]);
         }
         if (learnerIdParam) {
-          if (!allowedSet.has(learnerIdParam)) {
+          if (!inSchool.has(learnerIdParam)) {
             return errorResponse("You can only view enrollments for your linked children", 403);
           }
         } else {
-          conditions.push(inArray(learnerClasses.learnerId, Array.from(allowedSet)));
+          conditions.push(inArray(learnerClasses.learnerId, Array.from(inSchool)));
         }
       }
-    } else if (payload.role === "learner") {
-      if (learnerIdParam && learnerIdParam !== payload.userId) {
+    } else if (schoolRole === "learner") {
+      if (learnerIdParam && learnerIdParam !== ctx.userId) {
         return errorResponse("You can only view your own enrollments", 403);
       }
-      conditions.push(eq(learnerClasses.learnerId, payload.userId));
+      conditions.push(eq(learnerClasses.learnerId, ctx.userId));
     } else {
       return errorResponse("You are not authorized to view enrollments", 403);
     }
 
-    const whereClause = conditions.length > 0 ? conditions.reduce((a, b) => and(a, b)!) : undefined;
+    const whereClause = conditions.reduce((a, b) => and(a, b)!);
 
     const results = await db
       .select({
@@ -112,12 +134,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher"].includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can enroll learners", 403);
     }
 
@@ -126,6 +147,19 @@ export async function POST(request: NextRequest) {
 
     if (!learnerId || !classId) {
       return errorResponse("Learner and class are required");
+    }
+
+    /* ── Tenant boundary: BOTH sides must belong to the caller's school ──
+       Checked before the duplicate lookup so a foreign class can never be probed for
+       enrollment state. Both failures are reported as 404 so the endpoint cannot be used
+       to enumerate another school's learners or classes. */
+
+    if (!(await isUserInSchool(ctx.schoolId, learnerId))) {
+      return errorResponse("Learner not found", 404);
+    }
+
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return errorResponse("Class not found", 404);
     }
 
     // Check for duplicate
@@ -149,7 +183,7 @@ export async function POST(request: NextRequest) {
     }).returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "enroll",
       entityType: "enrollment",
       entityId: enrollment.id,

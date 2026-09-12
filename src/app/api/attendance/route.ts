@@ -1,80 +1,101 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { attendance, users, classes, learnerClasses, parentLearners } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { eq, and, desc, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import {
   canAccessLearner,
   canTeacherAccessClass,
   getParentLinkedLearnerIds,
   getTeacherAccessibleClassIds,
-  isAdminExtendedRole,
 } from "@/lib/authorization";
+import {
+  getLearnerIdsInSchool,
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  hasSchoolRole,
+  isClassInSchool,
+  isUserInSchool,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 
 /**
- * Attendance authorization model (documented per Phase 1 review):
+ * Attendance authorization model (Phase 1, documented per Phase 1 review) — PRESERVED:
  * 
- * - super_admin, school_admin, head_teacher: Considered school administrators with school-wide
- *   attendance access per existing EasyLearn role model. ADMIN_ROLES in many places includes
- *   head_teacher (activity-logs, parent-learners, timetable, users, dashboard/admin).
- *   For attendance, head_teacher retains school-wide administration to mark/view any class.
- *   This is INTENTIONAL per existing role model and is explicitly tested.
+ * - school_admin, head_teacher: Considered school administrators with school-wide
+ *   attendance access per existing EasyLearn role model. For attendance, head_teacher
+ *   retains school-wide administration to mark/view any class. This is INTENTIONAL per
+ *   existing role model and is explicitly tested. Phase 2C does not weaken it: the
+ *   school-wide branch is now "school-wide WITHIN the caller's own school".
  * 
  * - teacher: Restricted to classes they are assigned to teach via teacher_classes or
  *   classes.classTeacherId. Cannot mark attendance for unrelated classes.
  * 
  * - parent: Only linked children via parent_learners
  * - learner: Own only
+ *
+ * Phase 2C layers TENANT authorization on top of all of it, fail closed:
+ *   * every attendance row must belong to a learner of the caller's school
+ *   * a `classId` / `learnerId` parameter must resolve to the caller's school (404 if not,
+ *     so the endpoint cannot be used to probe another school)
+ *   * writes require the class AND every learner to belong to the caller's school
+ *   * role decisions come from the DB membership role, never the JWT `role` claim
  */
-
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+    const schoolRole = ctx.school.role;
 
     const classId = request.nextUrl.searchParams.get("classId");
     const date = request.nextUrl.searchParams.get("date");
     const learnerIdParam = request.nextUrl.searchParams.get("learnerId");
 
-    const conditions: any[] = [];
+    // Tenant boundary — attendance rows are anchored by their learner.
+    const conditions: any[] = [sqlUserInSchool(ctx.schoolId, attendance.learnerId)];
 
-    if (classId) conditions.push(eq(attendance.classId, classId));
+    if (classId) {
+      // A class of another school is reported as missing, never as forbidden.
+      if (!(await isClassInSchool(ctx.schoolId, classId))) {
+        return errorResponse("Class not found", 404);
+      }
+      conditions.push(eq(attendance.classId, classId));
+    }
     if (date) conditions.push(eq(attendance.date, date));
 
-    // Role-based authorization
-    if (payload.role === "learner") {
+    // Role-based authorization (Phase 1 rules, driven by the DB membership role)
+    if (schoolRole === "learner") {
       // Learner can only view own attendance
-      if (learnerIdParam && learnerIdParam !== payload.userId) {
+      if (learnerIdParam && learnerIdParam !== ctx.userId) {
         return errorResponse("You can only view your own attendance", 403);
       }
-      conditions.push(eq(attendance.learnerId, payload.userId));
-    } else if (payload.role === "parent") {
-      const linkedIds = await getParentLinkedLearnerIds(payload.userId);
-      if (linkedIds.size === 0) {
+      conditions.push(eq(attendance.learnerId, ctx.userId));
+    } else if (schoolRole === "parent") {
+      const linkedIds = await getParentLinkedLearnerIds(ctx.userId);
+      const inSchool = await getLearnerIdsInSchool(ctx.schoolId, Array.from(linkedIds));
+      if (inSchool.size === 0) {
         return successResponse([]);
       }
       if (learnerIdParam) {
-        if (!linkedIds.has(learnerIdParam)) {
+        if (!inSchool.has(learnerIdParam)) {
           return errorResponse("You can only view attendance for your linked children", 403);
         }
         conditions.push(eq(attendance.learnerId, learnerIdParam));
       } else {
-        conditions.push(inArray(attendance.learnerId, Array.from(linkedIds)));
+        conditions.push(inArray(attendance.learnerId, Array.from(inSchool)));
       }
-    } else if (payload.role === "teacher") {
+    } else if (schoolRole === "teacher") {
       // Teacher: strictly limited to assigned classes
       if (classId) {
-        const canAccessClass = await canTeacherAccessClass(payload.userId, classId);
+        const canAccessClass = await canTeacherAccessClass(ctx.userId, classId);
         if (!canAccessClass) {
           return errorResponse("You can only view attendance for classes you teach", 403);
         }
       }
       if (learnerIdParam) {
-        const authorized = await canAccessLearner(payload, learnerIdParam);
+        const authorized = await canAccessLearner({ userId: ctx.userId, role: schoolRole }, learnerIdParam);
         if (!authorized) {
           return errorResponse("You can only view attendance for learners in your scope", 403);
         }
@@ -82,17 +103,20 @@ export async function GET(request: NextRequest) {
       } else {
         // If no learnerId and no classId, restrict to teacher's classes
         if (!classId) {
-          const accessibleClassIds = await getTeacherAccessibleClassIds(payload.userId);
+          const accessibleClassIds = await getTeacherAccessibleClassIds(ctx.userId);
           if (accessibleClassIds.size === 0) {
             return successResponse([]);
           }
           conditions.push(inArray(attendance.classId, Array.from(accessibleClassIds)));
         }
       }
-    } else if (isAdminExtendedRole(payload.role)) {
-      // super_admin, school_admin, head_teacher: school-wide access per existing role model
+    } else if (hasSchoolAdminExtendedRole(ctx)) {
+      // school_admin, head_teacher: school-wide access per existing role model
       // head_teacher is intentionally included as admin for attendance administration
       if (learnerIdParam) {
+        if (!(await isUserInSchool(ctx.schoolId, learnerIdParam))) {
+          return errorResponse("Learner not found", 404);
+        }
         conditions.push(eq(attendance.learnerId, learnerIdParam));
       }
       // classId already in conditions if supplied, no additional restriction
@@ -100,7 +124,7 @@ export async function GET(request: NextRequest) {
       return errorResponse("You are not authorized to view attendance", 403);
     }
 
-    const whereClause = conditions.length > 0 ? conditions.reduce((a, b) => and(a, b)!) : undefined;
+    const whereClause = conditions.reduce((a, b) => and(a, b)!);
 
     const results = await db
       .select({
@@ -131,12 +155,12 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+    const schoolRole = ctx.school.role;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolRole(ctx, "school_admin", "head_teacher", "teacher")) {
       return errorResponse("Only teachers can mark attendance", 403);
     }
 
@@ -147,20 +171,32 @@ export async function POST(request: NextRequest) {
       return errorResponse("Class ID, date, and attendance records are required");
     }
 
+    /* ── TENANT FIRST (brief §5): the class must belong to the caller's school before any
+       Phase 1 role decision is taken. Fail closed — an unattributable class is refused. ── */
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return errorResponse("Class not found", 404);
+    }
+
     // Verify teacher assignment to class - only for 'teacher' role
-    // head_teacher, super_admin, school_admin have school-wide access per existing role model
+    // head_teacher, school_admin have school-wide access per existing role model
     // This is INTENTIONAL: head_teacher is in ADMIN_ROLES for many admin routes
-    if (payload.role === "teacher") {
-      const canAccess = await canTeacherAccessClass(payload.userId, classId);
+    if (schoolRole === "teacher") {
+      const canAccess = await canTeacherAccessClass(ctx.userId, classId);
       if (!canAccess) {
         return errorResponse("You can only mark attendance for classes you are assigned to teach", 403);
       }
     }
-    // For head_teacher and admins, no class restriction - school-wide admin access
 
     // Validate that all learnerIds are enrolled in this class to prevent arbitrary IDs
     const learnerIds = records.map((r: any) => r.learnerId).filter(Boolean);
     if (learnerIds.length > 0) {
+      // Tenant predicate: every referenced learner must be a member of the caller's school.
+      const inSchool = await getLearnerIdsInSchool(ctx.schoolId, learnerIds);
+      const foreign = learnerIds.filter((id: string) => !inSchool.has(id));
+      if (foreign.length > 0) {
+        return errorResponse("Learner not found", 404);
+      }
+
       const enrolled = await db
         .select({ learnerId: learnerClasses.learnerId })
         .from(learnerClasses)
@@ -168,8 +204,7 @@ export async function POST(request: NextRequest) {
       const enrolledSet = new Set(enrolled.map((e) => e.learnerId));
       // For teachers, require enrollment to prevent marking arbitrary learners
       // For admins/head_teacher, we still check but allow if they have legitimate reason
-      // For stricter security, require enrollment for non-admins
-      if (payload.role === "teacher") {
+      if (schoolRole === "teacher") {
         const notEnrolled = learnerIds.filter((id: string) => !enrolledSet.has(id));
         if (notEnrolled.length > 0) {
           return errorResponse("Some learners are not enrolled in this class", 403);
@@ -189,7 +224,7 @@ export async function POST(request: NextRequest) {
         date,
         isPresent: r.isPresent,
         note: r.note || null,
-        markedById: payload.userId,
+        markedById: ctx.userId,
       }));
 
       if (attendanceRecords.length > 0) {
@@ -198,7 +233,7 @@ export async function POST(request: NextRequest) {
     });
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "create",
       entityType: "attendance",
       description: `Marked attendance for class ${classId} on ${date}: ${records.filter((r: any) => r.isPresent).length}/${records.length} present`,
@@ -214,12 +249,12 @@ export async function POST(request: NextRequest) {
 
 export async function PUT(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+    const schoolRole = ctx.school.role;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolRole(ctx, "school_admin", "head_teacher", "teacher")) {
       return errorResponse("Only teachers and administrators can view class learners for attendance", 403);
     }
 
@@ -230,10 +265,15 @@ export async function PUT(request: NextRequest) {
       return errorResponse("Class ID is required");
     }
 
+    // Tenant first: a class of another school is not visible here.
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return errorResponse("Class not found", 404);
+    }
+
     // Verify teacher assignment - only for 'teacher' role
     // head_teacher and admins have school-wide access per existing role model
-    if (payload.role === "teacher") {
-      const canAccess = await canTeacherAccessClass(payload.userId, classId);
+    if (schoolRole === "teacher") {
+      const canAccess = await canTeacherAccessClass(ctx.userId, classId);
       if (!canAccess) {
         return errorResponse("You can only view learners for classes you are assigned to teach", 403);
       }
@@ -248,7 +288,11 @@ export async function PUT(request: NextRequest) {
       })
       .from(learnerClasses)
       .leftJoin(users, eq(learnerClasses.learnerId, users.id))
-      .where(eq(learnerClasses.classId, classId));
+      .where(and(
+        eq(learnerClasses.classId, classId),
+        // Belt and braces: only school members can be listed as the class's learners.
+        sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId)
+      ));
 
     return successResponse(learners);
   } catch (error) {

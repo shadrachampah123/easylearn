@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { quizzes, quizQuestions, quizAttempts, learnerClasses } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import { guardSchoolContext, isQuizInSchool, sqlQuizInSchool } from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, sql } from "drizzle-orm";
 
@@ -20,18 +20,22 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (payload.role !== "learner") {
+    if (ctx.school.role !== "learner") {
       return errorResponse("Only learners can answer quizzes", 403);
     }
 
     await ensureQuizImageColumn();
 
     const { id: quizId } = await params;
+
+    /* Phase 2C: another school's quiz does not exist for this learner. */
+    if (!(await isQuizInSchool(ctx.schoolId, quizId))) {
+      return notFoundResponse("Quiz");
+    }
     const body = await request.json();
     const { attemptId, questionId, answer, elapsedMs } = body as {
       attemptId?: string;
@@ -53,7 +57,7 @@ export async function POST(
         timeLimitMinutes: quizzes.timeLimitMinutes,
       })
       .from(quizzes)
-      .where(eq(quizzes.id, quizId))
+      .where(and(eq(quizzes.id, quizId), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
       .limit(1);
 
     if (!quiz) return notFoundResponse("Quiz");
@@ -66,7 +70,7 @@ export async function POST(
       .where(and(
         eq(quizAttempts.id, attemptId),
         eq(quizAttempts.quizId, quizId),
-        eq(quizAttempts.learnerId, payload.userId),
+        eq(quizAttempts.learnerId, ctx.userId),
         sql`${quizAttempts.completedAt} IS NULL`
       ))
       .limit(1);
@@ -76,7 +80,7 @@ export async function POST(
     const enrolled = await db
       .select({ classId: learnerClasses.classId })
       .from(learnerClasses)
-      .where(eq(learnerClasses.learnerId, payload.userId));
+      .where(eq(learnerClasses.learnerId, ctx.userId));
     if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
       return errorResponse("This quiz was set for a different class", 403);
     }

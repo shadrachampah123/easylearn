@@ -1,8 +1,13 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { assignments, classes, subjects, users, submissions } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolStaffRole,
+  isClassInSchool,
+  sqlAssignmentInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
@@ -11,10 +16,9 @@ import { eq, desc, and, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
@@ -51,9 +55,14 @@ export async function GET(request: NextRequest) {
       .orderBy(desc(assignments.createdAt))
       .$dynamic();
 
+    /* Phase 2C: every branch is restricted to assignments that resolve to the caller's
+       school BEFORE the Phase 1 filters below. Another school's assignment can never be
+       returned, whatever `classId`/`subjectId`/`status` the caller asks for. */
+    query = query.where(sqlAssignmentInSchool(ctx.schoolId, assignments.id));
+
     // For teachers, show their own assignments
-    if (payload.role === "teacher") {
-      query = query.where(eq(assignments.teacherId, payload.userId));
+    if (ctx.school.role === "teacher") {
+      query = query.where(eq(assignments.teacherId, ctx.userId));
     }
 
     // Filter by class
@@ -74,7 +83,7 @@ export async function GET(request: NextRequest) {
     const results = await query.limit(50);
 
     // For learners, add submission status
-    if (payload.role === "learner") {
+    if (ctx.school.role === "learner") {
       const assignmentsWithStatus = await Promise.all(
         results.map(async (assignment) => {
           const [submission] = await db
@@ -89,7 +98,7 @@ export async function GET(request: NextRequest) {
             .from(submissions)
             .where(and(
               eq(submissions.assignmentId, assignment.id),
-              eq(submissions.learnerId, payload.userId)
+              eq(submissions.learnerId, ctx.userId)
             ))
             .limit(1);
           return { ...assignment, submission: submission || null };
@@ -107,12 +116,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolStaffRole(ctx)) {
       return errorResponse("Only teachers can create assignments", 403);
     }
 
@@ -123,9 +131,14 @@ export async function POST(request: NextRequest) {
       return errorResponse("Title, class, and subject are required");
     }
 
+    /* Phase 2C: an assignment may only be created for a class of the caller's school. */
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return notFoundResponse("Class");
+    }
+
     // Every attached file must be one the teacher actually uploaded.
     const resolved = await resolveUploadedAttachments(attachments, {
-      uploaderId: payload.userId,
+      uploaderId: ctx.userId,
       purpose: "assignment",
     });
     if (!resolved.ok) {
@@ -152,7 +165,7 @@ export async function POST(request: NextRequest) {
       instructions: instructions || null,
       classId,
       subjectId,
-      teacherId: payload.userId,
+      teacherId: ctx.userId,
       termId: termId || null,
       dueDate: dueDate ? new Date(dueDate) : null,
       maxScore: maxScore || 100,
@@ -165,7 +178,7 @@ export async function POST(request: NextRequest) {
     }).returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "create",
       entityType: "assignment",
       entityId: newAssignment.id,

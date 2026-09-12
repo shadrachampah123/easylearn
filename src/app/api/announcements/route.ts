@@ -1,11 +1,30 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { announcements, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { desc, eq } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolRole,
+  isClassInSchool,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 
+/**
+ * Phase 2C — announcements belong to the school of their AUTHOR.
+ *
+ * The authenticated branch filters on `author ∈ caller's school` as a SQL predicate, so a
+ * private announcement of another school can never appear in a response. The `?public=true`
+ * branch is deliberately NOT school-private (see docs/PHASE2C_TENANT_AUTHORIZATION.md):
+ * `is_public` means "published to the public website" in the existing design, that website
+ * is currently platform-wide and single-school, and scoping it per school site is a Phase
+ * 2E/2H (tenant-resolution/branding) concern. It is not extended here and it exposes only
+ * rows the application already publishes unauthenticated.
+ *
+ * Writes require a school context and an authoring role, and a targeted class (when given)
+ * must belong to the caller's school.
+ */
 export async function GET(request: NextRequest) {
   try {
     const isPublic = request.nextUrl.searchParams.get("public") === "true";
@@ -32,11 +51,10 @@ export async function GET(request: NextRequest) {
       return successResponse(results);
     }
 
-    // Non-public announcements require authentication
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    // Non-public announcements require authentication AND a school context.
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const results = await db
       .select({
@@ -51,6 +69,8 @@ export async function GET(request: NextRequest) {
       })
       .from(announcements)
       .leftJoin(users, eq(announcements.authorId, users.id))
+      // Tenant predicate: only announcements authored inside THIS school.
+      .where(sqlUserInSchool(ctx.schoolId, announcements.authorId))
       .orderBy(desc(announcements.isPinned), desc(announcements.createdAt))
       .limit(20);
 
@@ -63,12 +83,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolRole(ctx, "teacher", "head_teacher", "school_admin")) {
       return errorResponse("Only teachers and administrators can create announcements", 403);
     }
 
@@ -79,17 +98,25 @@ export async function POST(request: NextRequest) {
       return errorResponse("Title and content are required");
     }
 
+    /* A class-targeted announcement may only point at a class of the caller's school
+       (fail closed: an unattributable class is refused, never assumed). */
+    if (classId) {
+      if (!(await isClassInSchool(ctx.schoolId, classId))) {
+        return errorResponse("Class not found", 404);
+      }
+    }
+
     const [announcement] = await db.insert(announcements).values({
       title,
       content,
-      authorId: payload.userId,
+      authorId: ctx.userId,
       classId: classId || null,
       isPinned: isPinned || false,
       isPublic: isPublic || false,
     }).returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "create",
       entityType: "announcement",
       entityId: announcement.id,

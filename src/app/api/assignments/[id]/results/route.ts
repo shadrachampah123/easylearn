@@ -4,8 +4,12 @@ import {
   submissions, assignments, assignmentAnswers, assignmentQuestions,
   users, parentLearners,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  sqlAssignmentInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and, desc } from "drizzle-orm";
 
 // GET: View results (role-aware)
@@ -14,10 +18,9 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     const { id: assignmentId } = await params;
     const learnerId = request.nextUrl.searchParams.get("learnerId");
@@ -26,14 +29,14 @@ export async function GET(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(eq(assignments.id, assignmentId))
+      .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
 
     // A teacher can only inspect results for assignments they manage. This check applies
     // to both the summary and learner-specific result views.
-    if (payload.role === "teacher" && assignment.teacherId !== payload.userId) {
+    if (ctx.school.role === "teacher" && assignment.teacherId !== ctx.userId) {
       return errorResponse("You can only view results for your own assignments", 403);
     }
 
@@ -45,13 +48,13 @@ export async function GET(
       .orderBy(assignmentQuestions.orderIndex);
 
     // === LEARNER: View their own results ===
-    if (payload.role === "learner") {
+    if (ctx.school.role === "learner") {
       const [submission] = await db
         .select()
         .from(submissions)
         .where(and(
           eq(submissions.assignmentId, assignmentId),
-          eq(submissions.learnerId, payload.userId)
+          eq(submissions.learnerId, ctx.userId)
         ))
         .limit(1);
 
@@ -94,7 +97,7 @@ export async function GET(
     }
 
     // === TEACHER/ADMIN: View all student results ===
-    if (["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (hasSchoolAdminExtendedRole(ctx) || ctx.school.role === "teacher") {
       // If specific learner requested, show detail
       if (learnerId) {
         const [submission] = await db
@@ -179,7 +182,7 @@ export async function GET(
     }
 
     // === PARENT: View their child's results ===
-    if (payload.role === "parent") {
+    if (ctx.school.role === "parent") {
       if (!learnerId) {
         return errorResponse("Learner ID is required for parent view");
       }
@@ -189,7 +192,7 @@ export async function GET(
         .select()
         .from(parentLearners)
         .where(and(
-          eq(parentLearners.parentId, payload.userId),
+          eq(parentLearners.parentId, ctx.userId),
           eq(parentLearners.learnerId, learnerId)
         ))
         .limit(1);

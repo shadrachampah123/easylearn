@@ -1,8 +1,13 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { quizzes, quizQuestions, classes, subjects, users, quizAttempts, learnerClasses } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  hasSchoolStaffRole,
+  isClassInSchool,
+  sqlQuizInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, desc, and, sql, inArray } from "drizzle-orm";
 
@@ -37,10 +42,9 @@ function toQuestionRows(quizId: string, questions: QuestionInput[]) {
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
     // quiz_questions.image_url is only present from drizzle/0007 onwards; without it the
     // question-count subquery below is fine but every question read 500s, and the learner
@@ -50,27 +54,32 @@ export async function GET(request: NextRequest) {
     const classId = request.nextUrl.searchParams.get("classId");
     const subjectId = request.nextUrl.searchParams.get("subjectId");
 
-    const conditions = [];
+    /* Phase 2C: every branch is restricted to quizzes attributable to the caller's school.
+       A quiz is attributable when its class resolves to exactly one school (see
+       `sqlQuizInSchool`). */
+    const conditions = [sqlQuizInSchool(ctx.schoolId, quizzes.id)];
 
-    if (payload.role === "teacher") {
-      conditions.push(eq(quizzes.teacherId, payload.userId));
+    if (ctx.school.role === "teacher") {
+      conditions.push(eq(quizzes.teacherId, ctx.userId));
     }
 
-    if (payload.role === "learner") {
+    if (ctx.school.role === "learner") {
       // Learners only ever see quizzes their teacher has published...
       conditions.push(eq(quizzes.isPublished, true));
 
-      // ...and that were set for one of the classes they are enrolled in. When a school has
-      // not recorded any enrollments yet we fall back to "all published quizzes" so the
-      // page is never blank just because learner_classes is empty.
+      /* ...AND that were set for one of the classes they are enrolled in. The previous
+         "no enrollments recorded → fall back to every published quiz" default was a
+         fail-open rule (plan §3) and has been removed. */
       const enrolled = await db
         .select({ classId: learnerClasses.classId })
         .from(learnerClasses)
-        .where(eq(learnerClasses.learnerId, payload.userId));
+        .where(eq(learnerClasses.learnerId, ctx.userId));
 
-      if (enrolled.length > 0) {
-        conditions.push(inArray(quizzes.classId, enrolled.map((row) => row.classId)));
-      }
+      conditions.push(
+        enrolled.length > 0
+          ? inArray(quizzes.classId, enrolled.map((row) => row.classId))
+          : sql`false`
+      );
     }
 
     if (classId) conditions.push(eq(quizzes.classId, classId));
@@ -118,13 +127,13 @@ export async function GET(request: NextRequest) {
 
         let attempt = null;
         let attemptsUsed = 0;
-        if (payload.role === "learner") {
+        if (ctx.school.role === "learner") {
           const learnerAttempts = await db
             .select()
             .from(quizAttempts)
             .where(and(
               eq(quizAttempts.quizId, quiz.id),
-              eq(quizAttempts.learnerId, payload.userId)
+              eq(quizAttempts.learnerId, ctx.userId)
             ));
           attemptsUsed = learnerAttempts.length;
           attempt = learnerAttempts[0] || null;
@@ -152,12 +161,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolStaffRole(ctx)) {
       return errorResponse("Only teachers can create quizzes", 403);
     }
 
@@ -186,6 +194,11 @@ export async function POST(request: NextRequest) {
       return errorResponse("Title, class, and subject are required");
     }
 
+    /* Phase 2C: quizzes may only be created for a class of the caller's school. */
+    if (!(await isClassInSchool(ctx.schoolId, classId))) {
+      return notFoundResponse("Class");
+    }
+
     const questionRows = Array.isArray(questions) ? toQuestionRows("", questions) : [];
 
     // A quiz with no questions cannot be answered, so publishing it would just show learners
@@ -203,7 +216,7 @@ export async function POST(request: NextRequest) {
         description: description || null,
         classId,
         subjectId,
-        teacherId: payload.userId,
+        teacherId: ctx.userId,
         termId: termId || null,
         timeLimitMinutes: timeLimitMinutes || null,
         shuffleQuestions: shuffleQuestions || false,

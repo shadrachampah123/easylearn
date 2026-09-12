@@ -1,10 +1,14 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { submissions, assignments, assignmentAnswers, assignmentQuestions } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq } from "drizzle-orm";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import { and, eq } from "drizzle-orm";
 import { clientSafeErrorMessage } from "@/lib/schema-resilience";
+import {
+  hasSchoolRole,
+  guardSchoolContext,
+  sqlSubmissionInSchool,
+} from "@/lib/tenant";
 
 /**
  * Read a single submission with the learner's answers, so the teacher can grade what was
@@ -15,12 +19,11 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolRole(ctx, "school_admin", "head_teacher", "teacher")) {
       return errorResponse("Only teachers can review submissions", 403);
     }
 
@@ -45,12 +48,13 @@ export async function GET(
       })
       .from(submissions)
       .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      .where(eq(submissions.id, id))
+      // Phase 2C tenant predicate: another school's submission is "not found".
+      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
       .limit(1);
 
     if (!submission) return notFoundResponse("Submission");
 
-    if (payload.role === "teacher" && submission.teacherId !== payload.userId) {
+    if (ctx.school.role === "teacher" && submission.teacherId !== ctx.userId) {
       return errorResponse("You can only review submissions for your own assignments", 403);
     }
 

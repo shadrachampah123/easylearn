@@ -1,8 +1,12 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { assignments, submissions, assignmentQuestions, assignmentAnswers, notifications, learnerPoints } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import {
+  guardSchoolContext,
+  isAssignmentInSchool,
+  sqlSubmissionInSchool,
+} from "@/lib/tenant";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import {
@@ -32,16 +36,20 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (payload.role !== "learner") {
+    if (ctx.school.role !== "learner") {
       return errorResponse("Only learners can submit assignments", 403);
     }
 
     const { id: assignmentId } = await params;
+
+    /* Phase 2C: another school's assignment does not exist for this learner. */
+    if (!(await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
+      return notFoundResponse("Assignment");
+    }
     const body = await request.json();
     const { answers, content, attachments } = body; // answers = { [questionId]: answerText }
 
@@ -61,23 +69,16 @@ export async function POST(
       return errorResponse("This assignment is not accepting submissions");
     }
 
-    // Verify learner is enrolled in the assignment's class (prevent IDOR)
+    /* Phase 2C: enrollment is REQUIRED. The previous "this learner has no enrollment rows at
+       all, so allow" fallback was a permissive default (fail open) and has been removed. */
     const { learnerClasses } = await import("@/db/schema");
     const [enrollment] = await db
       .select({ id: learnerClasses.id })
       .from(learnerClasses)
-      .where(and(eq(learnerClasses.learnerId, payload.userId), eq(learnerClasses.classId, assignment.classId)))
+      .where(and(eq(learnerClasses.learnerId, ctx.userId), eq(learnerClasses.classId, assignment.classId)))
       .limit(1);
 
-    // If enrollment records exist for this learner at all, enforce enrollment check
-    // If no enrollment records exist at all (legacy data), allow submission to avoid breaking existing functionality
-    const anyEnrollments = await db
-      .select({ id: learnerClasses.id })
-      .from(learnerClasses)
-      .where(eq(learnerClasses.learnerId, payload.userId))
-      .limit(1);
-
-    if (anyEnrollments.length > 0 && !enrollment) {
+    if (!enrollment) {
       return errorResponse("You are not enrolled in the class for this assignment", 403);
     }
 
@@ -98,7 +99,7 @@ export async function POST(
     }
     if (submittedFiles.length > 0) {
       const resolved = await resolveUploadedAttachments(submittedFiles, {
-        uploaderId: payload.userId,
+        uploaderId: ctx.userId,
         purpose: "submission",
         assignmentId,
       });
@@ -114,7 +115,7 @@ export async function POST(
       .from(submissions)
       .where(and(
         eq(submissions.assignmentId, assignmentId),
-        eq(submissions.learnerId, payload.userId)
+        eq(submissions.learnerId, ctx.userId)
       ))
       .limit(1);
 
@@ -139,7 +140,7 @@ export async function POST(
       .insert(submissions)
       .values({
         assignmentId,
-        learnerId: payload.userId,
+        learnerId: ctx.userId,
         content: content || null,
         attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
         status,
@@ -184,7 +185,7 @@ export async function POST(
         .returning();
 
       await db.insert(notifications).values({
-        userId: payload.userId,
+        userId: ctx.userId,
         type: "grade",
         title: "Assignment Graded by EasyAI",
         message: `EasyAI scored you ${score}/${aiMaxMarks} (${percentage}%) on "${assignment.title}"`,
@@ -194,7 +195,7 @@ export async function POST(
       const points = pointsForPercentage(percentage);
       if (points > 0) {
         await db.insert(learnerPoints).values({
-          learnerId: payload.userId,
+          learnerId: ctx.userId,
           points,
           reason: `Scored ${percentage}% on assignment "${assignment.title}" (EasyAI)`,
         });
@@ -243,7 +244,7 @@ export async function POST(
         await db.insert(assignmentAnswers).values({
           submissionId: submission.id,
           questionId: question.id,
-          learnerId: payload.userId,
+          learnerId: ctx.userId,
           answer: learnerAnswer || null,
           isCorrect,
           pointsAwarded,
@@ -303,7 +304,7 @@ export async function POST(
       await db.insert(assignmentAnswers).values({
         submissionId: submission.id,
         questionId: question.id,
-        learnerId: payload.userId,
+        learnerId: ctx.userId,
         answer: learnerAnswer || null,
         isCorrect,
         pointsAwarded,
@@ -367,7 +368,7 @@ export async function POST(
 
     // Create notification
     await db.insert(notifications).values({
-      userId: payload.userId,
+      userId: ctx.userId,
       type: "grade",
       title: aiEnabled ? "Assignment Graded by EasyAI" : "Assignment Graded",
       message: aiEnabled
@@ -380,7 +381,7 @@ export async function POST(
     const points = pointsForPercentage(percentage);
     if (points > 0) {
       await db.insert(learnerPoints).values({
-        learnerId: payload.userId,
+        learnerId: ctx.userId,
         points,
         reason: `Scored ${percentage}% on assignment "${assignment.title}"${aiEnabled ? " (EasyAI)" : ""}`,
       });

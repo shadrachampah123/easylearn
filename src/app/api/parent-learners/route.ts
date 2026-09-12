@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { parentLearners, users } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
+import {
+  getLearnerIdsInSchool,
+  guardSchoolContext,
+  hasSchoolAdminExtendedRole,
+  sqlUserInSchool,
+} from "@/lib/tenant";
 import { logActivity } from "@/lib/activity";
 import { eq, and, or, ilike, desc, inArray } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -15,8 +20,6 @@ import {
   ensureUserIdentityColumns,
 } from "@/lib/schema-resilience";
 import { UUID_PATTERN } from "@/lib/dashboard-overrides";
-
-const ADMIN_ROLES = ["super_admin", "school_admin", "head_teacher"];
 
 function isUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_PATTERN.test(value.trim());
@@ -38,11 +41,10 @@ function parseRelationship(raw: unknown): { ok: true; value: string } | { ok: fa
  */
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
     await ensureUserIdentityColumns();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const ctx = auth.context;
 
     const url = request.nextUrl;
     const parentId = url.searchParams.get("parentId");
@@ -53,18 +55,24 @@ export async function GET(request: NextRequest) {
     if (parentId && !isUuid(parentId)) return errorResponse("parentId must be a uuid", 400);
     if (learnerId && !isUuid(learnerId)) return errorResponse("learnerId must be a uuid", 400);
 
-    // Parents may only read their own links; admins can read any.
-    const isAdmin = ADMIN_ROLES.includes(payload.role);
-    if (!isAdmin && payload.role !== "parent" && payload.role !== "learner") {
+    // Parents may only read their own links; admins can read any *within their school*.
+    const isAdmin = hasSchoolAdminExtendedRole(ctx);
+    if (!isAdmin && ctx.school.role !== "parent" && ctx.school.role !== "learner") {
       return errorResponse("Forbidden", 403);
     }
 
     const parentAlias = alias(users, "link_parent");
     const learnerAlias = alias(users, "link_learner");
 
-    const conditions = [];
-    if (!isAdmin && payload.role === "parent") conditions.push(eq(parentLearners.parentId, payload.userId));
-    if (!isAdmin && payload.role === "learner") conditions.push(eq(parentLearners.learnerId, payload.userId));
+    /* Phase 2C: a link is only visible when BOTH sides are members of the caller's school.
+       A legacy or cross-school row therefore disappears for everyone instead of being
+       treated as school-owned data. */
+    const conditions = [
+      sqlUserInSchool(ctx.schoolId, parentLearners.parentId),
+      sqlUserInSchool(ctx.schoolId, parentLearners.learnerId),
+    ];
+    if (!isAdmin && ctx.school.role === "parent") conditions.push(eq(parentLearners.parentId, ctx.userId));
+    if (!isAdmin && ctx.school.role === "learner") conditions.push(eq(parentLearners.learnerId, ctx.userId));
     if (parentId) conditions.push(eq(parentLearners.parentId, parentId));
     if (learnerId) conditions.push(eq(parentLearners.learnerId, learnerId));
     if (search) {
@@ -157,13 +165,12 @@ export async function GET(request: NextRequest) {
  */
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
     await ensureUserIdentityColumns();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can link parents", 403);
     }
 
@@ -181,6 +188,12 @@ export async function POST(request: NextRequest) {
     const relationship = parseRelationship((body as Record<string, unknown>).relationship);
     if (!relationship.ok) return errorResponse(relationship.message, 400);
 
+    /* Phase 2C: both sides of the link must be members of the caller's school. */
+    const members = await getLearnerIdsInSchool(ctx.schoolId, [parentId, learnerId]);
+    if (members.size !== 2) {
+      return errorResponse("That parent or learner is not part of this school", 404);
+    }
+
     const accounts = await db
       .select({ id: users.id, role: users.role, firstName: users.firstName, lastName: users.lastName })
       .from(users)
@@ -191,7 +204,9 @@ export async function POST(request: NextRequest) {
 
     if (!parent) return errorResponse("Parent account not found", 404);
     if (!learner) return errorResponse("Learner account not found", 404);
-    if (parent.role !== "parent" && !ADMIN_ROLES.includes(parent.role)) {
+    // The account may be a parent, or a staff account that is also a guardian. Platform
+    // roles are irrelevant here: the membership gate above already scoped the request.
+    if (parent.role !== "parent" && !["school_admin", "head_teacher", "teacher"].includes(parent.role)) {
       return errorResponse("That account is not a parent", 400);
     }
     if (learner.role !== "learner") {
@@ -218,7 +233,7 @@ export async function POST(request: NextRequest) {
       .returning();
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "link",
       entityType: "parent_learner",
       entityId: relation?.id,
@@ -245,13 +260,12 @@ export async function POST(request: NextRequest) {
  */
 export async function DELETE(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
     await ensureUserIdentityColumns();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const ctx = auth.context;
 
-    if (!ADMIN_ROLES.includes(payload.role)) {
+    if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("Only administrators can unlink parents", 403);
     }
 
@@ -260,6 +274,10 @@ export async function DELETE(request: NextRequest) {
     if (!isUuid(parentId) || !isUuid(learnerId)) {
       return errorResponse("parentId and learnerId are both required", 400);
     }
+
+    /* Phase 2C: both sides must be members of the caller's school. */
+    const members = await getLearnerIdsInSchool(ctx.schoolId, [parentId, learnerId]);
+    if (members.size !== 2) return errorResponse("This link does not exist", 404);
 
     const [existing] = await db
       .select({ id: parentLearners.id })
@@ -274,7 +292,7 @@ export async function DELETE(request: NextRequest) {
       .where(and(eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)));
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "unlink",
       entityType: "parent_learner",
       entityId: existing.id,

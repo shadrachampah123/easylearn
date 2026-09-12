@@ -8,11 +8,15 @@ import {
   notifications,
   learnerPoints,
 } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and, inArray } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
 import { clientSafeErrorMessage } from "@/lib/schema-resilience";
+import {
+  guardSchoolContext,
+  hasSchoolRole,
+  sqlSubmissionInSchool,
+} from "@/lib/tenant";
 
 type AnswerGrade = {
   questionId: string;
@@ -35,12 +39,11 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin", "head_teacher", "teacher"].includes(payload.role)) {
+    if (!hasSchoolRole(ctx, "school_admin", "head_teacher", "teacher")) {
       return errorResponse("Only teachers can grade submissions", 403);
     }
 
@@ -66,14 +69,15 @@ export async function POST(
       })
       .from(submissions)
       .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      .where(eq(submissions.id, id))
+      // Phase 2C tenant predicate: grades of another school's submission cannot be written.
+      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
       .limit(1);
 
     if (!submission) {
       return notFoundResponse("Submission");
     }
 
-    if (payload.role === "teacher" && submission.teacherId !== payload.userId) {
+    if (ctx.school.role === "teacher" && submission.teacherId !== ctx.userId) {
       return errorResponse("You can only grade submissions for your own assignments", 403);
     }
 
@@ -159,7 +163,7 @@ export async function POST(
         aiReport: null,
         gradedAt: new Date(),
       })
-      .where(eq(submissions.id, id))
+      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
       .returning();
 
     await db.insert(notifications).values({
@@ -189,7 +193,7 @@ export async function POST(
     }
 
     await logActivity({
-      userId: payload.userId,
+      userId: ctx.userId,
       action: "grade",
       entityType: "submission",
       entityId: id,
