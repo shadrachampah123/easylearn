@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
 import { departments, subjects } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
@@ -95,18 +96,21 @@ export async function POST(request: NextRequest) {
           headId: headId || null,
         })
         .returning();
-    } catch {
-      [newDepartment] = await db
-        .insert(departments)
-        .values({
-          name,
-          description: description || null,
-          headId: headId || null,
-        } as any)
-        .returning();
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [newDepartment] = await legacyInsert(db, "departments", {
+        name,
+        description: description || null,
+        headId: headId || null,
+      }, ["id", "name", "description", "headId", "createdAt"]);
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "department",

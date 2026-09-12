@@ -1,7 +1,7 @@
 /**
  * Phase 2A Tenant Foundation — LIVE DATABASE tests
  *
- * Applies the full migration chain (0000…0013) to a scratch PostgreSQL
+ * Applies the full migration chain (0000…0016) to a scratch PostgreSQL
  * database and verifies the actual database behavior of `schools` and
  * `school_users`:
  *
@@ -13,7 +13,7 @@
  *   6. multi-school membership: the SAME user can belong to School A AND
  *      School B (the single-school guard from 0013 is dropped by 0014)
  *   7. migrations are idempotent (running twice exits 0)
- *   8. no legacy table gained a school_id column
+ *   8. school_id exists on exactly the 25 school-owned tables (0016) + school_users
  *
  * Database providers (first match wins):
  *   - TEST_DATABASE_URL  → any PostgreSQL you point at (needs CREATE DATABASE
@@ -406,14 +406,45 @@ async function main() {
       );
     });
 
-    /* ── 8. Legacy schema untouched ── */
+    /* ── 8. Post-0016 school_id surface ── */
 
-    await test("Boundary: school_id exists ONLY on school_users", async () => {
+    // Phase 2E: migration 0016 (drizzle/0016_school_id_columns.sql) intentionally
+    // added a nullable school_id column to every school-owned table, so tenant
+    // attribution can be done directly via WHERE school_id = $ctx.schoolId.
+    // The boundary is now: school_id exists on EXACTLY those 25 tables plus
+    // school_users (Phase 2D, NOT NULL) — and nowhere else.
+    const SCHOOL_ID_TABLES = [
+      "academic_years", "activity_logs", "announcements", "assignments", "attendance",
+      "classes", "dashboard_card_overrides", "departments", "downloads", "faqs",
+      "gallery_items", "learner_classes", "messages", "news", "notifications",
+      "parent_learners", "quiz_attempts", "quizzes", "resources", "school_users",
+      "subjects", "submissions", "teacher_classes", "terms", "timetable_entries",
+      "uploaded_files",
+    ].sort();
+
+    await test("Boundary: school_id exists on exactly the 25 school-owned tables + school_users", async () => {
       const { rows } = await db.query(
-        `SELECT table_name FROM information_schema.columns
-         WHERE table_schema = 'public' AND column_name = 'school_id'`
+        `SELECT table_name, data_type, is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND column_name = 'school_id'
+         ORDER BY table_name`
       );
-      assertEq(rows.map((r) => r.table_name).sort().join(","), "school_users", "school_id columns");
+      assertEq(
+        rows.map((r) => r.table_name).join(","),
+        SCHOOL_ID_TABLES.join(","),
+        "school_id columns (must be exactly the 0016 school-owned surface + school_users, no more, no less)"
+      );
+      const badType = rows.filter((r) => r.data_type !== "uuid");
+      assertEq(badType.length, 0, `non-uuid school_id columns: ${badType.map((r) => r.table_name).join(", ")}`);
+      // 0016 deliberately leaves its 25 columns nullable (NOT NULL enforcement is a
+      // later Phase 2E step after data validation); school_users.school_id stays NOT NULL.
+      for (const r of rows) {
+        const expectedNullable = r.table_name === "school_users" ? "NO" : "YES";
+        if (r.is_nullable !== expectedNullable) {
+          throw new Error(
+            `school_id nullability drift: ${r.table_name}.school_id is_nullable=${r.is_nullable}, expected ${expectedNullable}`
+          );
+        }
+      }
     });
 
     await test("Boundary: exactly the 35 legacy tables + 2 new tables exist", async () => {

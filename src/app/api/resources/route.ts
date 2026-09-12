@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
 import { resources, classes, subjects, users } from "@/db/schema";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
@@ -138,8 +139,13 @@ export async function POST(request: NextRequest) {
         isPinned: isPinned || false,
         isApproved,
       }).returning();
-    } catch {
-      [newResource] = await db.insert(resources).values({
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [newResource] = await legacyInsert(db, "resources", {
         title,
         description: description || null,
         type,
@@ -153,10 +159,11 @@ export async function POST(request: NextRequest) {
         week: week || null,
         isPinned: isPinned || false,
         isApproved,
-      } as any).returning();
+      }, ["id", "title", "description", "type", "fileUrl", "fileSize", "subjectId", "classId", "teacherId", "termId", "topic", "week", "isPinned", "isApproved", "createdAt"]);
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "resource",

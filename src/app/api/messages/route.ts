@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
 import { messages, users, notifications } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, or, and, desc, sql } from "drizzle-orm";
@@ -148,12 +149,17 @@ export async function POST(request: NextRequest) {
         receiverId,
         content,
       }).returning();
-    } catch {
-      [newMessage] = await db.insert(messages).values({
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [newMessage] = await legacyInsert(db, "messages", {
         senderId: ctx.userId,
         receiverId,
         content,
-      } as any).returning();
+      }, ["id", "senderId", "receiverId", "content", "isRead", "createdAt"]);
     }
 
     // Create notification for receiver
@@ -172,14 +178,22 @@ export async function POST(request: NextRequest) {
         message: `${senderUser.firstName} ${senderUser.lastName} sent you a message`,
         link: `/dashboard/messages?userId=${ctx.userId}`,
       });
-    } catch {
-      await db.insert(notifications).values({
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      // Pre-0016: the notifications table has no school_id column, so a Drizzle insert
+      // (which always renders every schema column) would fail — write only the legacy
+      // columns via the raw-SQL helper.
+      await legacyInsert(db, "notifications", {
         userId: receiverId,
         type: "system",
         title: "New Message",
         message: `${senderUser.firstName} ${senderUser.lastName} sent you a message`,
         link: `/dashboard/messages?userId=${ctx.userId}`,
-      } as any);
+      });
     }
 
     return successResponse(newMessage, 201);

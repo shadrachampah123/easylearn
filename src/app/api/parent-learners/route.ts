@@ -12,13 +12,7 @@ import { logActivity } from "@/lib/activity";
 import { eq, and, or, ilike, desc, inArray } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { RELATIONSHIP_OPTIONS, normalizeRelationship } from "@/lib/relationships";
-import {
-  isMissingColumn,
-  isMissingRelation,
-  isUniqueViolation,
-  schemaAwareErrorMessage,
-  ensureUserIdentityColumns,
-} from "@/lib/schema-resilience";
+import { isMissingColumn, isMissingRelation, isSchemaOutOfDate, isUniqueViolation, schemaAwareErrorMessage, ensureUserIdentityColumns, legacyInsert } from "@/lib/schema-resilience";
 import { UUID_PATTERN } from "@/lib/dashboard-overrides";
 
 function isUuid(value: unknown): value is string {
@@ -239,18 +233,21 @@ export async function POST(request: NextRequest) {
           relationship: relationship.value,
         })
         .returning();
-    } catch {
-      [relation] = await db
-        .insert(parentLearners)
-        .values({
-          parentId,
-          learnerId,
-          relationship: relationship.value,
-        } as any)
-        .returning();
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [relation] = await legacyInsert(db, "parent_learners", {
+        parentId,
+        learnerId,
+        relationship: relationship.value,
+      }, ["id", "parentId", "learnerId", "relationship", "createdAt"]);
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "link",
       entityType: "parent_learner",
@@ -310,6 +307,7 @@ export async function DELETE(request: NextRequest) {
       .where(and(eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)));
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "unlink",
       entityType: "parent_learner",

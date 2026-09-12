@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsertMany } from "@/lib/schema-resilience";
 import { attendance, users, classes, learnerClasses, parentLearners } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
@@ -245,13 +246,19 @@ export async function POST(request: NextRequest) {
           await tx.insert(attendance).values(
             baseRecords.map((r) => ({ ...r, schoolId: ctx.schoolId }))
           );
-        } catch {
-          await tx.insert(attendance).values(baseRecords as any);
+        } catch (error) {
+          // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+          // when this database predates migration 0016 (school_id column/table missing).
+          // Any other error (constraint violation, transient DB failure, bad input) is
+          // rethrown so a row can never be written without a school.
+          if (!isSchemaOutOfDate(error)) throw error;
+          await legacyInsertMany(tx, "attendance", baseRecords);
         }
       }
     });
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "attendance",

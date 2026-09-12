@@ -1,7 +1,7 @@
 /**
  * Phase 2B — User membership + authentication context: LIVE DATABASE tests.
  *
- * Applies the project's real migration chain (0000…0015) to a throwaway PostgreSQL
+ * Applies the project's real migration chain (0000…0016) to a throwaway PostgreSQL
  * database and then exercises the real application modules against it:
  *
  *   MEMBERSHIP
@@ -869,12 +869,43 @@ async function main() {
       );
     });
 
-    await test("Boundary: no legacy table gained a school_id column", async () => {
+    // Phase 2E: migration 0016 (drizzle/0016_school_id_columns.sql) intentionally
+    // added a nullable school_id column to every school-owned table, so tenant
+    // attribution can be done directly via WHERE school_id = $ctx.schoolId.
+    // The assertion validates the intended post-0016 tenant schema: school_id exists
+    // on EXACTLY those 25 tables plus school_users (Phase 2D, NOT NULL) — and
+    // nowhere else, all as uuid.
+    const SCHOOL_ID_TABLES = [
+      "academic_years", "activity_logs", "announcements", "assignments", "attendance",
+      "classes", "dashboard_card_overrides", "departments", "downloads", "faqs",
+      "gallery_items", "learner_classes", "messages", "news", "notifications",
+      "parent_learners", "quiz_attempts", "quizzes", "resources", "school_users",
+      "subjects", "submissions", "teacher_classes", "terms", "timetable_entries",
+      "uploaded_files",
+    ].sort();
+
+    await test("Boundary: school_id exists on exactly the 25 school-owned tables + school_users", async () => {
       const rows = await q(
-        `SELECT table_name FROM information_schema.columns
+        `SELECT table_name, data_type, is_nullable FROM information_schema.columns
           WHERE table_schema = 'public' AND column_name = 'school_id' ORDER BY table_name`
       );
-      assertEq(rows.map((r) => r.table_name).join(","), "school_users", "school_id columns");
+      assertEq(
+        rows.map((r) => r.table_name).join(","),
+        SCHOOL_ID_TABLES.join(","),
+        "school_id columns (must be exactly the 0016 school-owned surface + school_users, no more, no less)"
+      );
+      const badType = rows.filter((r) => r.data_type !== "uuid");
+      assertEq(badType.length, 0, `non-uuid school_id columns: ${badType.map((r) => r.table_name).join(", ")}`);
+      // 0016 deliberately leaves its 25 columns nullable (NOT NULL enforcement is a
+      // later Phase 2E step after data validation); school_users.school_id stays NOT NULL.
+      for (const r of rows) {
+        const expectedNullable = r.table_name === "school_users" ? "NO" : "YES";
+        if (r.is_nullable !== expectedNullable) {
+          throw new Error(
+            `school_id nullability drift: ${r.table_name}.school_id is_nullable=${r.is_nullable}, expected ${expectedNullable}`
+          );
+        }
+      }
     });
 
     const { pool } = await import("@/db");

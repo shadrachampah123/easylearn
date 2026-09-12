@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
 import {
   timetableEntries,
   classes,
@@ -249,24 +250,26 @@ export async function POST(request: NextRequest) {
           createdBy: ctx.userId,
         })
         .returning();
-    } catch {
-      [newEntry] = await db
-        .insert(timetableEntries)
-        .values({
-          classId,
-          subjectId: subjectId || null,
-          teacherId: teacherId || null,
-          termId: termId || null,
-          academicYearId: academicYearId || null,
-          dayOfWeek,
-          startTime,
-          endTime,
-          room: room?.trim() || null,
-          color: color || null,
-          notes: notes?.trim() || null,
-          createdBy: ctx.userId,
-        } as any)
-        .returning();
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [newEntry] = await legacyInsert(db, "timetable_entries", {
+        classId,
+        subjectId: subjectId || null,
+        teacherId: teacherId || null,
+        termId: termId || null,
+        academicYearId: academicYearId || null,
+        dayOfWeek,
+        startTime,
+        endTime,
+        room: room?.trim() || null,
+        color: color || null,
+        notes: notes?.trim() || null,
+        createdBy: ctx.userId,
+      }, ["id", "classId", "subjectId", "teacherId", "termId", "academicYearId", "dayOfWeek", "startTime", "endTime", "room", "color", "notes", "createdBy", "createdAt", "updatedAt"]);
     }
 
     return successResponse(newEntry, 201);

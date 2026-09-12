@@ -119,6 +119,8 @@ export async function POST(request: NextRequest) {
     const [row] = await db
       .insert(uploadedFiles)
       .values({
+        // Phase 2E (Step 1): every uploaded file is tenant-attributed at write time.
+        schoolId: ctx.schoolId,
         uploaderId: ctx.userId,
         purpose,
         assignmentId: purpose === "submission" ? assignmentId : null,

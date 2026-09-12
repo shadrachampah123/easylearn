@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { submissions, assignments, users } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
-import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { ensureFileUploadSchema, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
 import { eq, and, desc } from "drizzle-orm";
 import {
   guardSchoolContext,
@@ -225,18 +225,20 @@ export async function POST(request: NextRequest) {
           submittedAt: new Date(),
         })
         .returning();
-    } catch {
-      [newSubmission] = await db
-        .insert(submissions)
-        .values({
-          assignmentId,
-          learnerId: ctx.userId,
-          content: content || null,
-          attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
-          status: isLate ? "late" : "submitted",
-          submittedAt: new Date(),
-        } as any)
-        .returning();
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [newSubmission] = await legacyInsert(db, "submissions", {
+        assignmentId,
+        learnerId: ctx.userId,
+        content: content || null,
+        attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
+        status: isLate ? "late" : "submitted",
+        submittedAt: new Date(),
+      }, ["id", "assignmentId", "learnerId", "content", "attachments", "status", "score", "maxScore", "percentage", "feedback", "gradedBy", "aiReport", "submittedAt", "gradedAt", "createdAt"]);
     }
 
     return successResponse(newSubmission, 201);
