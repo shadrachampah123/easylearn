@@ -254,6 +254,7 @@ export async function POST(request: NextRequest) {
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "user",

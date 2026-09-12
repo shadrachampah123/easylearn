@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
 import { teacherClasses, classes, subjects, users } from "@/db/schema";
 import {
   guardSchoolContext,
@@ -174,19 +175,22 @@ export async function POST(request: NextRequest) {
           academicYearId: academicYearId || null,
         })
         .returning();
-    } catch {
-      [assignment] = await db
-        .insert(teacherClasses)
-        .values({
-          teacherId,
-          classId,
-          subjectId,
-          academicYearId: academicYearId || null,
-        } as any)
-        .returning();
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [assignment] = await legacyInsert(db, "teacher_classes", {
+        teacherId,
+        classId,
+        subjectId,
+        academicYearId: academicYearId || null,
+      }, ["id", "teacherId", "classId", "subjectId", "academicYearId", "createdAt"]);
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "assign",
       entityType: "teacher_assignment",

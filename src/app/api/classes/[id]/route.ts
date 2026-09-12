@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate } from "@/lib/schema-resilience";
 import {
   announcements,
   assignmentAnswers,
@@ -178,7 +179,12 @@ export async function DELETE(
         await tx.delete(learnerClasses).where(and(eq(learnerClasses.classId, id), eq(learnerClasses.schoolId, ctx.schoolId)));
         await tx.delete(teacherClasses).where(and(eq(teacherClasses.classId, id), eq(teacherClasses.schoolId, ctx.schoolId)));
         await tx.delete(timetableEntries).where(and(eq(timetableEntries.classId, id), eq(timetableEntries.schoolId, ctx.schoolId)));
-      } catch {
+      } catch (error) {
+        // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+        // when this database predates migration 0016 (school_id column/table missing).
+        // Any other error (constraint violation, transient DB failure, bad input) is
+        // rethrown so a row can never be written without a school.
+        if (!isSchemaOutOfDate(error)) throw error;
         await tx.update(announcements).set({ classId: null }).where(eq(announcements.classId, id));
         await tx.update(resources).set({ classId: null }).where(eq(resources.classId, id));
         await tx.delete(attendance).where(eq(attendance.classId, id));

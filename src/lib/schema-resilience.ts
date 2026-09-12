@@ -13,6 +13,7 @@
  *  3. self-heal the three migrations that only add optional objects (0004 card overrides,
  *     0005 activity log columns, 0006 user identity columns) with idempotent DDL.
  */
+import { sql } from "drizzle-orm";
 import { pool } from "@/db";
 import { getDatabaseErrorCode } from "@/lib/database-errors";
 
@@ -549,4 +550,74 @@ export function schemaWarningForFeature(status: FeatureStatus, area: string): Sc
     migration: status.migration,
     repaired: status.repaired,
   };
+}
+
+/* ── Phase 2E (Step 1): legacy fallback inserts ── */
+
+/** Convert a Drizzle camelCase column key to its snake_case database column name. */
+export function camelToSnake(column: string): string {
+  return column.replace(/([A-Z])/g, "_$1").toLowerCase();
+}
+
+function legacyValue(value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value;
+  if (typeof value === "object") return JSON.stringify(value); // jsonb payloads
+  return value;
+}
+
+/**
+ * Phase 2E (Step 1) — raw insert for the pre-0016 compatibility fallbacks.
+ *
+ * Drizzle's `.insert(table).values(...)` always renders EVERY column of the current schema
+ * (missing values become `default`). Migration 0016 added `school_id` to the school-owned
+ * tables, so on a database that predates 0016 even a "legacy" fallback insert that omits
+ * `schoolId` would reference a column that does not exist and fail with 42703.
+ *
+ * This helper inserts ONLY the given (legacy) columns, so the narrow fallback path keeps
+ * working on pre-0016 databases. Returned rows carry camelCase keys (via RETURNING
+ * aliases) — the same shape the Drizzle path would have produced.
+ */
+/**
+ * Bulk version of `legacyInsert` — for multi-row pre-0016 fallbacks (e.g. attendance
+ * marking). All rows must have the same keys.
+ */
+export async function legacyInsertMany(
+  db: { execute(query: import("drizzle-orm").SQL): Promise<unknown> },
+  table: string,
+  rows: Record<string, unknown>[]
+): Promise<void> {
+  if (rows.length === 0) return;
+  const keys = Object.keys(rows[0]);
+  const colList = sql.join(keys.map((k) => sql.identifier(camelToSnake(k))), sql.raw(", "));
+  const rowLists = rows.map((row) =>
+    sql`(${sql.join(keys.map((k) => sql.param(legacyValue(row[k]) as never)), sql.raw(", "))})`
+  );
+  await db.execute(sql`insert into ${sql.identifier(table)} (${colList}) values ${sql.join(rowLists, sql.raw(", "))}`);
+}
+
+export type LegacyInsertRow = { id: string } & Record<string, unknown>;
+
+export async function legacyInsert(
+  db: { execute(query: import("drizzle-orm").SQL): Promise<unknown> },
+  table: string,
+  values: Record<string, unknown>,
+  returning: string[] = ["id"]
+): Promise<LegacyInsertRow[]> {
+  const keys = Object.keys(values);
+  const colList = sql.join(keys.map((k) => sql.identifier(camelToSnake(k))), sql.raw(", "));
+  const valList = sql.join(
+    keys.map((k) => sql.param(legacyValue(values[k]) as never)),
+    sql.raw(", ")
+  );
+  const retList = sql.join(
+    returning.map((r) => sql.raw(`${camelToSnake(r)} as ${JSON.stringify(r)}`)),
+    sql.raw(", ")
+  );
+  const result = await db.execute(
+    sql`insert into ${sql.identifier(table)} (${colList}) values (${valList}) returning ${retList}`
+  );
+  if (Array.isArray(result)) return result as LegacyInsertRow[];
+  const rows = (result as { rows?: unknown })?.rows;
+  return Array.isArray(rows) ? (rows as LegacyInsertRow[]) : [];
 }

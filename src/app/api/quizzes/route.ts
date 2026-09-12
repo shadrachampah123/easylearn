@@ -8,7 +8,7 @@ import {
   sqlQuizInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
-import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { ensureQuizImageColumn, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
 import { eq, desc, and, sql, inArray, or, isNull } from "drizzle-orm";
 
 type QuestionInput = {
@@ -242,22 +242,28 @@ export async function POST(request: NextRequest) {
           maxAttempts: maxAttempts || 1,
         }).returning();
         createdRow = created;
-      } catch {
-        const [created] = await tx.insert(quizzes).values({
-          title,
-          description: description || null,
-          classId,
-          subjectId,
-          teacherId: ctx.userId,
-          termId: termId || null,
-          timeLimitMinutes: timeLimitMinutes || null,
-          shuffleQuestions: shuffleQuestions || false,
-          shuffleAnswers: shuffleAnswers || false,
-          showResults: showResults !== false,
-          isPublished: wantsPublished,
-          maxAttempts: maxAttempts || 1,
-        } as any).returning();
-        createdRow = created;
+      } catch (error) {
+        // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+        // when this database predates migration 0016 (school_id column/table missing).
+        // Any other error (constraint violation, transient DB failure, bad input) is
+        // rethrown so a row can never be written without a school.
+        if (!isSchemaOutOfDate(error)) throw error;
+        const [created] = await legacyInsert(tx, "quizzes", {
+        title,
+        description: description || null,
+        classId,
+        subjectId,
+        teacherId: ctx.userId,
+        termId: termId || null,
+        timeLimitMinutes: timeLimitMinutes || null,
+        shuffleQuestions: shuffleQuestions || false,
+        shuffleAnswers: shuffleAnswers || false,
+        showResults: showResults !== false,
+        isPublished: wantsPublished,
+        maxAttempts: maxAttempts || 1,
+      }, ["id", "title", "description", "classId", "subjectId", "teacherId", "termId", "timeLimitMinutes", "shuffleQuestions", "shuffleAnswers", "showResults", "isPublished", "maxAttempts", "createdAt"]);
+        // Legacy rows carry no school; schoolId is nullable, so this is a faithful row.
+        createdRow = created as typeof quizzes.$inferSelect;
       }
 
       if (questionRows.length > 0) {

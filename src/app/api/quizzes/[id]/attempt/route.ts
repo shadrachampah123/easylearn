@@ -92,6 +92,9 @@ export async function POST(
 
     // Create new attempt
     const [newAttempt] = await db.insert(quizAttempts).values({
+      // Phase 2E (Step 1): the quiz was proven to belong to the caller's school
+      // (isQuizInSchool + sqlQuizInSchool above), so the attempt carries that school.
+      schoolId: ctx.schoolId,
       quizId: id,
       learnerId: ctx.userId,
       answers: {},
@@ -231,6 +234,8 @@ export async function PUT(
 
     // Create notification
     await db.insert(notifications).values({
+      // Phase 2E (Step 1): the notification is tenant-attributed to the caller's school.
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       type: "quiz",
       title: "Quiz Completed",

@@ -167,6 +167,9 @@ export async function POST(
       .returning();
 
     await db.insert(notifications).values({
+      // Phase 2E (Step 1): the submission was proven to belong to the caller's school
+      // (sqlSubmissionInSchool above), so the notification carries that school.
+      schoolId: ctx.schoolId,
       userId: submission.learnerId,
       type: "grade",
       title: wasAlreadyGraded ? "Grade Updated" : "Assignment Graded",
@@ -193,6 +196,7 @@ export async function POST(
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "grade",
       entityType: "submission",

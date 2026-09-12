@@ -139,6 +139,10 @@ export async function POST(
     const [submission] = await db
       .insert(submissions)
       .values({
+        // Phase 2E (Step 1): the assignment was proven to belong to the caller's
+        // school (isAssignmentInSchool + direct check above), so the submission
+        // carries that school.
+        schoolId: ctx.schoolId,
         assignmentId,
         learnerId: ctx.userId,
         content: content || null,
@@ -185,6 +189,8 @@ export async function POST(
         .returning();
 
       await db.insert(notifications).values({
+        // Phase 2E (Step 1): the notification is tenant-attributed to the caller's school.
+        schoolId: ctx.schoolId,
         userId: ctx.userId,
         type: "grade",
         title: "Assignment Graded by EasyAI",
@@ -368,6 +374,8 @@ export async function POST(
 
     // Create notification
     await db.insert(notifications).values({
+      // Phase 2E (Step 1): the notification is tenant-attributed to the caller's school.
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       type: "grade",
       title: aiEnabled ? "Assignment Graded by EasyAI" : "Assignment Graded",

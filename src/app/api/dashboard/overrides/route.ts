@@ -214,6 +214,7 @@ export async function POST(request: NextRequest) {
       .returning();
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "dashboard_card_override",

@@ -124,6 +124,7 @@ export async function PUT(
       .returning();
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "update",
       entityType: "dashboard_card_override",
@@ -169,6 +170,7 @@ export async function DELETE(
       .where(and(eq(dashboardCardOverrides.id, overrideId), sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)));
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "delete",
       entityType: "dashboard_card_override",

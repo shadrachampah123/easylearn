@@ -118,6 +118,7 @@ export async function PUT(
       .returning();
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "update",
       entityType: "parent_learner",
@@ -153,6 +154,7 @@ export async function DELETE(
     await db.delete(parentLearners).where(eq(parentLearners.id, linkId));
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "unlink",
       entityType: "parent_learner",

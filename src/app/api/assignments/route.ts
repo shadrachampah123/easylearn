@@ -13,7 +13,7 @@ import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-help
 import { logActivity } from "@/lib/activity";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
-import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
+import { ensureFileUploadSchema, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
 import { eq, desc, and, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -199,30 +199,33 @@ export async function POST(request: NextRequest) {
           status: status || "draft",
         })
         .returning();
-    } catch {
-      [newAssignment] = await db
-        .insert(assignments)
-        .values({
-          title,
-          description: description || null,
-          instructions: instructions || null,
-          classId,
-          subjectId,
-          teacherId: ctx.userId,
-          termId: termId || null,
-          dueDate: dueDate ? new Date(dueDate) : null,
-          maxScore: maxScore || 100,
-          allowLate: allowLate || false,
-          attachments: resolved.attachments.length > 0 ? resolved.attachments : null,
-          allowFileUploads: allowFileUploads === true,
-          aiGradingEnabled: easyAiEnabled,
-          aiMaxMarks: easyAiMaxMarks,
-          status: status || "draft",
-        } as any)
-        .returning();
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [newAssignment] = await legacyInsert(db, "assignments", {
+        title,
+        description: description || null,
+        instructions: instructions || null,
+        classId,
+        subjectId,
+        teacherId: ctx.userId,
+        termId: termId || null,
+        dueDate: dueDate ? new Date(dueDate) : null,
+        maxScore: maxScore || 100,
+        allowLate: allowLate || false,
+        attachments: resolved.attachments.length > 0 ? resolved.attachments : null,
+        allowFileUploads: allowFileUploads === true,
+        aiGradingEnabled: easyAiEnabled,
+        aiMaxMarks: easyAiMaxMarks,
+        status: status || "draft",
+      }, ["id", "title", "description", "instructions", "classId", "subjectId", "teacherId", "termId", "status", "dueDate", "maxScore", "allowLate", "attachments", "allowFileUploads", "aiGradingEnabled", "aiMaxMarks", "createdAt", "updatedAt"]);
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "assignment",

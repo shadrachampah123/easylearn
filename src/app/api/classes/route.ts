@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
 import { classes } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { desc, eq } from "drizzle-orm";
@@ -82,20 +83,23 @@ export async function POST(request: NextRequest) {
           academicYearId: academicYearId || null,
         })
         .returning();
-    } catch {
-      [newClass] = await db
-        .insert(classes)
-        .values({
-          name,
-          level,
-          capacity: capacity || 40,
-          classTeacherId: classTeacherId || null,
-          academicYearId: academicYearId || null,
-        } as any)
-        .returning();
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
+      [newClass] = await legacyInsert(db, "classes", {
+        name,
+        level,
+        capacity: capacity || 40,
+        classTeacherId: classTeacherId || null,
+        academicYearId: academicYearId || null,
+      }, ["id", "name", "level", "capacity", "classTeacherId", "academicYearId", "createdAt"]);
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "class",

@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate } from "@/lib/schema-resilience";
 import { departments, subjects } from "@/db/schema";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and } from "drizzle-orm";
@@ -101,7 +102,12 @@ export async function DELETE(
           .update(subjects)
           .set({ departmentId: null })
           .where(and(eq(subjects.departmentId, id), eq(subjects.schoolId, ctx.schoolId)));
-      } catch {
+      } catch (error) {
+        // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+        // when this database predates migration 0016 (school_id column/table missing).
+        // Any other error (constraint violation, transient DB failure, bad input) is
+        // rethrown so a row can never be written without a school.
+        if (!isSchemaOutOfDate(error)) throw error;
         await tx.update(subjects).set({ departmentId: null }).where(eq(subjects.departmentId, id));
       }
       await tx.delete(departments).where(and(eq(departments.id, id), eq(departments.schoolId, ctx.schoolId)));

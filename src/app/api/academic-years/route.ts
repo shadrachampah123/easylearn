@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
 import { academicYears } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
@@ -60,7 +61,12 @@ export async function POST(request: NextRequest) {
           .update(academicYears)
           .set({ isCurrent: false })
           .where(eq(academicYears.schoolId, ctx.schoolId));
-      } catch {
+      } catch (error) {
+        // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+        // when this database predates migration 0016 (school_id column/table missing).
+        // Any other error (constraint violation, transient DB failure, bad input) is
+        // rethrown so a row can never be written without a school.
+        if (!isSchemaOutOfDate(error)) throw error;
         // Column missing — fallback to global unset (legacy behavior) but still scoped by creation
         await db.update(academicYears).set({ isCurrent: false });
       }
@@ -78,20 +84,23 @@ export async function POST(request: NextRequest) {
           isCurrent: isCurrent || false,
         })
         .returning();
-    } catch {
+    } catch (error) {
+      // Phase 2E (Step 1) — narrow legacy compatibility ONLY: the fallback below may run
+      // when this database predates migration 0016 (school_id column/table missing).
+      // Any other error (constraint violation, transient DB failure, bad input) is
+      // rethrown so a row can never be written without a school.
+      if (!isSchemaOutOfDate(error)) throw error;
       // Fallback for DB without school_id column
-      [newYear] = await db
-        .insert(academicYears)
-        .values({
-          name,
-          startDate,
-          endDate,
-          isCurrent: isCurrent || false,
-        } as any)
-        .returning();
+      [newYear] = await legacyInsert(db, "academic_years", {
+        name,
+        startDate,
+        endDate,
+        isCurrent: isCurrent || false,
+      }, ["id", "name", "startDate", "endDate", "isCurrent", "createdAt"]);
     }
 
     await logActivity({
+      schoolId: ctx.schoolId,
       userId: ctx.userId,
       action: "create",
       entityType: "academic_year",
