@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { announcements, users } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, or, and, isNull, sql } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolRole,
@@ -56,6 +56,19 @@ export async function GET(request: NextRequest) {
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
 
+    // Phase 2D: prefer direct school_id, fallback to author membership for legacy NULL rows
+    let useDirectAnn = true;
+    try {
+      await db.execute(sql`select "school_id" from "announcements" limit 0`);
+    } catch {
+      useDirectAnn = false;
+    }
+    const whereClause = useDirectAnn
+      ? or(
+          eq(announcements.schoolId, ctx.schoolId),
+          and(isNull(announcements.schoolId), sqlUserInSchool(ctx.schoolId, announcements.authorId))
+        )
+      : sqlUserInSchool(ctx.schoolId, announcements.authorId);
     const results = await db
       .select({
         id: announcements.id,
@@ -69,8 +82,7 @@ export async function GET(request: NextRequest) {
       })
       .from(announcements)
       .leftJoin(users, eq(announcements.authorId, users.id))
-      // Tenant predicate: only announcements authored inside THIS school.
-      .where(sqlUserInSchool(ctx.schoolId, announcements.authorId))
+      .where(whereClause)
       .orderBy(desc(announcements.isPinned), desc(announcements.createdAt))
       .limit(20);
 
@@ -106,14 +118,27 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const [announcement] = await db.insert(announcements).values({
-      title,
-      content,
-      authorId: ctx.userId,
-      classId: classId || null,
-      isPinned: isPinned || false,
-      isPublic: isPublic || false,
-    }).returning();
+    let announcement;
+    try {
+      [announcement] = await db.insert(announcements).values({
+        schoolId: ctx.schoolId,
+        title,
+        content,
+        authorId: ctx.userId,
+        classId: classId || null,
+        isPinned: isPinned || false,
+        isPublic: isPublic || false,
+      }).returning();
+    } catch {
+      [announcement] = await db.insert(announcements).values({
+        title,
+        content,
+        authorId: ctx.userId,
+        classId: classId || null,
+        isPinned: isPinned || false,
+        isPublic: isPublic || false,
+      } as any).returning();
+    }
 
     await logActivity({
       userId: ctx.userId,

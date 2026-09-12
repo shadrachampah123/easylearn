@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { learnerClasses, users, classes } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql, or, isNull } from "drizzle-orm";
 import {
   canAccessLearner,
   canTeacherAccessClass,
@@ -41,11 +41,27 @@ export async function GET(request: NextRequest) {
     const classId = request.nextUrl.searchParams.get("classId");
     const learnerIdParam = request.nextUrl.searchParams.get("learnerId");
 
-    // Tenant boundary — enforced in SQL, so a foreign row is never fetched.
-    const conditions: any[] = [
-      sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId),
-      sqlClassInSchool(ctx.schoolId, learnerClasses.classId),
-    ];
+    // Tenant boundary — Phase 2D direct school_id preferred, relational fallback
+    let useDirect = true;
+    try {
+      await db.execute(sql`select "school_id" from "learner_classes" limit 0`);
+    } catch {
+      useDirect = false;
+    }
+
+    // Phase 2D: prefer direct school_id but allow legacy NULL rows via relational fallback
+    const conditions: any[] = useDirect
+      ? [
+          or(
+            eq(learnerClasses.schoolId, ctx.schoolId),
+            and(
+              isNull(learnerClasses.schoolId),
+              sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId),
+              sqlClassInSchool(ctx.schoolId, learnerClasses.classId)
+            )
+          ),
+        ]
+      : [sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId), sqlClassInSchool(ctx.schoolId, learnerClasses.classId)];
 
     if (classId) conditions.push(eq(learnerClasses.classId, classId));
     if (learnerIdParam) conditions.push(eq(learnerClasses.learnerId, learnerIdParam));
@@ -176,11 +192,27 @@ export async function POST(request: NextRequest) {
       return errorResponse("This learner is already enrolled in this class");
     }
 
-    const [enrollment] = await db.insert(learnerClasses).values({
-      learnerId,
-      classId,
-      academicYearId: academicYearId || null,
-    }).returning();
+    let enrollment;
+    try {
+      [enrollment] = await db
+        .insert(learnerClasses)
+        .values({
+          schoolId: ctx.schoolId,
+          learnerId,
+          classId,
+          academicYearId: academicYearId || null,
+        })
+        .returning();
+    } catch {
+      [enrollment] = await db
+        .insert(learnerClasses)
+        .values({
+          learnerId,
+          classId,
+          academicYearId: academicYearId || null,
+        } as any)
+        .returning();
+    }
 
     await logActivity({
       userId: ctx.userId,

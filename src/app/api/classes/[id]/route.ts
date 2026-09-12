@@ -20,21 +20,12 @@ import {
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { and, eq, inArray } from "drizzle-orm";
 import {
-  getClassSchoolIds,
   guardSchoolContext,
   isUserInSchool,
-  sqlClassInSchool,
+  isAcademicYearInSchool,
 } from "@/lib/tenant";
 
-/** Phase 1 admin group. `super_admin` is a platform role with no school membership, so it
- *  cannot pass the Phase 2C school gate for a school-owned class. */
 const ADMIN_ROLES = ["school_admin"];
-
-/** True only when the class resolves to EXACTLY this school (see `isClassInSchool`). */
-async function hasSchoolClassAccess(schoolId: string, classId: string): Promise<boolean> {
-  const schools = await getClassSchoolIds(classId);
-  return schools.size === 1 && schools.has(schoolId);
-}
 
 export async function PUT(
   request: NextRequest,
@@ -57,14 +48,30 @@ export async function PUT(
       return errorResponse("Class name is required");
     }
 
-    /* Phase 2C: the target class must belong to the caller's school (fail closed), and a
-       new homeroom teacher must be a member of it too. */
-    if (!(await hasSchoolClassAccess(ctx.schoolId, id))) {
-      return notFoundResponse("Class");
+    // Phase 2D: direct school_id check
+    let existing;
+    try {
+      [existing] = await db
+        .select({ id: classes.id })
+        .from(classes)
+        .where(and(eq(classes.id, id), eq(classes.schoolId, ctx.schoolId)))
+        .limit(1);
+    } catch {
+      // Fallback for pre-0016 DB
+      const { isClassInSchool } = await import("@/lib/tenant");
+      if (!(await isClassInSchool(ctx.schoolId, id))) return notFoundResponse("Class");
+      [existing] = await db.select({ id: classes.id }).from(classes).where(eq(classes.id, id)).limit(1);
     }
+
+    if (!existing) return notFoundResponse("Class");
 
     if (classTeacherId && !(await isUserInSchool(ctx.schoolId, classTeacherId))) {
       return errorResponse("Class teacher not found", 404);
+    }
+
+    if (academicYearId) {
+      const yearOk = await isAcademicYearInSchool(ctx.schoolId, academicYearId);
+      if (!yearOk) return errorResponse("Academic year not found", 404);
     }
 
     const [updated] = await db
@@ -76,7 +83,7 @@ export async function PUT(
         classTeacherId: classTeacherId !== undefined ? classTeacherId || null : undefined,
         academicYearId: academicYearId ?? undefined,
       })
-      .where(eq(classes.id, id))
+      .where(and(eq(classes.id, id), eq(classes.schoolId, ctx.schoolId)))
       .returning();
 
     return successResponse(updated);
@@ -101,44 +108,47 @@ export async function DELETE(
 
     const { id } = await params;
 
-    /* Phase 2C: another school's class is "not found" — and the cascade below can therefore
-       never be run against it. */
-    const [existing] = await db
-      .select({ id: classes.id })
-      .from(classes)
-      .where(and(eq(classes.id, id), sqlClassInSchool(ctx.schoolId, classes.id)))
-      .limit(1);
+    let existing;
+    try {
+      [existing] = await db
+        .select({ id: classes.id })
+        .from(classes)
+        .where(and(eq(classes.id, id), eq(classes.schoolId, ctx.schoolId)))
+        .limit(1);
+    } catch {
+      const { sqlClassInSchool } = await import("@/lib/tenant");
+      [existing] = await db
+        .select({ id: classes.id })
+        .from(classes)
+        .where(and(eq(classes.id, id), sqlClassInSchool(ctx.schoolId, classes.id)))
+        .limit(1);
+    }
 
     if (!existing) return notFoundResponse("Class");
 
-    // Several legacy foreign keys use ON DELETE NO ACTION. Clean up the dependent
-    // content explicitly so an administrator can remove a class at any point rather
-    // than receiving a database constraint error halfway through the operation.
     await db.transaction(async (tx) => {
       const classAssignments = await tx
         .select({ id: assignments.id })
         .from(assignments)
-        .where(eq(assignments.classId, id));
-      const assignmentIds = classAssignments.map((assignment) => assignment.id);
+        .where(and(eq(assignments.classId, id), eq(assignments.schoolId, ctx.schoolId)));
+      const assignmentIds = classAssignments.map((a) => a.id);
 
       if (assignmentIds.length > 0) {
         const assignmentSubmissions = await tx
           .select({ id: submissions.id })
           .from(submissions)
           .where(inArray(submissions.assignmentId, assignmentIds));
-        const submissionIds = assignmentSubmissions.map((submission) => submission.id);
+        const submissionIds = assignmentSubmissions.map((s) => s.id);
         const assignmentQuestionRows = await tx
           .select({ id: assignmentQuestions.id })
           .from(assignmentQuestions)
           .where(inArray(assignmentQuestions.assignmentId, assignmentIds));
-        const assignmentQuestionIds = assignmentQuestionRows.map((question) => question.id);
+        const assignmentQuestionIds = assignmentQuestionRows.map((q) => q.id);
 
         if (submissionIds.length > 0) {
           await tx.delete(assignmentAnswers).where(inArray(assignmentAnswers.submissionId, submissionIds));
         }
         if (assignmentQuestionIds.length > 0) {
-          // Answers reference both submissions and questions. Remove by question
-          // too, so even malformed/partial historical submissions cannot block the delete.
           await tx.delete(assignmentAnswers).where(inArray(assignmentAnswers.questionId, assignmentQuestionIds));
         }
         await tx.delete(assignmentCorrections).where(inArray(assignmentCorrections.assignmentId, assignmentIds));
@@ -152,8 +162,8 @@ export async function DELETE(
       const classQuizzes = await tx
         .select({ id: quizzes.id })
         .from(quizzes)
-        .where(eq(quizzes.classId, id));
-      const quizIds = classQuizzes.map((quiz) => quiz.id);
+        .where(and(eq(quizzes.classId, id), eq(quizzes.schoolId, ctx.schoolId)));
+      const quizIds = classQuizzes.map((q) => q.id);
 
       if (quizIds.length > 0) {
         await tx.delete(quizAttempts).where(inArray(quizAttempts.quizId, quizIds));
@@ -161,13 +171,23 @@ export async function DELETE(
         await tx.delete(quizzes).where(inArray(quizzes.id, quizIds));
       }
 
-      await tx.update(announcements).set({ classId: null }).where(eq(announcements.classId, id));
-      await tx.update(resources).set({ classId: null }).where(eq(resources.classId, id));
-      await tx.delete(attendance).where(eq(attendance.classId, id));
-      await tx.delete(learnerClasses).where(eq(learnerClasses.classId, id));
-      await tx.delete(teacherClasses).where(eq(teacherClasses.classId, id));
-      await tx.delete(timetableEntries).where(eq(timetableEntries.classId, id));
-      await tx.delete(classes).where(and(eq(classes.id, id), sqlClassInSchool(ctx.schoolId, classes.id)));
+      try {
+        await tx.update(announcements).set({ classId: null }).where(and(eq(announcements.classId, id), eq(announcements.schoolId, ctx.schoolId)));
+        await tx.update(resources).set({ classId: null }).where(and(eq(resources.classId, id), eq(resources.schoolId, ctx.schoolId)));
+        await tx.delete(attendance).where(and(eq(attendance.classId, id), eq(attendance.schoolId, ctx.schoolId)));
+        await tx.delete(learnerClasses).where(and(eq(learnerClasses.classId, id), eq(learnerClasses.schoolId, ctx.schoolId)));
+        await tx.delete(teacherClasses).where(and(eq(teacherClasses.classId, id), eq(teacherClasses.schoolId, ctx.schoolId)));
+        await tx.delete(timetableEntries).where(and(eq(timetableEntries.classId, id), eq(timetableEntries.schoolId, ctx.schoolId)));
+      } catch {
+        await tx.update(announcements).set({ classId: null }).where(eq(announcements.classId, id));
+        await tx.update(resources).set({ classId: null }).where(eq(resources.classId, id));
+        await tx.delete(attendance).where(eq(attendance.classId, id));
+        await tx.delete(learnerClasses).where(eq(learnerClasses.classId, id));
+        await tx.delete(teacherClasses).where(eq(teacherClasses.classId, id));
+        await tx.delete(timetableEntries).where(eq(timetableEntries.classId, id));
+      }
+
+      await tx.delete(classes).where(and(eq(classes.id, id), eq(classes.schoolId, ctx.schoolId)));
     });
 
     return successResponse({ message: "Class deleted" });

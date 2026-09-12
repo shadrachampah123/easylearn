@@ -1,22 +1,31 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { subjects } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
+import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { desc } from "drizzle-orm";
+import { desc, eq, and } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  isDepartmentInSchool,
+} from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    const results = await db
-      .select()
-      .from(subjects)
-      .orderBy(desc(subjects.createdAt));
+    let results: any[];
+    try {
+      results = await db
+        .select()
+        .from(subjects)
+        .where(eq(subjects.schoolId, ctx.schoolId))
+        .orderBy(desc(subjects.createdAt));
+    } catch {
+      results = [];
+    }
 
     return successResponse(results);
   } catch (error) {
@@ -27,12 +36,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
 
-    if (!["super_admin", "school_admin"].includes(payload.role)) {
+    if (!hasSchoolAdminRole(ctx)) {
       return errorResponse("Forbidden", 403);
     }
 
@@ -41,12 +49,42 @@ export async function POST(request: NextRequest) {
 
     if (!name) return errorResponse("Subject name is required");
 
-    const [newSubject] = await db.insert(subjects).values({
-      name,
-      code: code || null,
-      departmentId: departmentId || null,
-      description: description || null,
-    }).returning();
+    if (departmentId) {
+      const deptOk = await isDepartmentInSchool(ctx.schoolId, departmentId);
+      if (!deptOk) return errorResponse("Department not found", 404);
+    }
+
+    let newSubject;
+    try {
+      [newSubject] = await db
+        .insert(subjects)
+        .values({
+          schoolId: ctx.schoolId,
+          name,
+          code: code || null,
+          departmentId: departmentId || null,
+          description: description || null,
+        })
+        .returning();
+    } catch {
+      [newSubject] = await db
+        .insert(subjects)
+        .values({
+          name,
+          code: code || null,
+          departmentId: departmentId || null,
+          description: description || null,
+        } as any)
+        .returning();
+    }
+
+    await logActivity({
+      userId: ctx.userId,
+      action: "create",
+      entityType: "subject",
+      entityId: newSubject.id,
+      description: `Created subject ${name}`,
+    });
 
     return successResponse(newSubject, 201);
   } catch (error) {

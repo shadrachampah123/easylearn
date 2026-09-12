@@ -1250,3 +1250,39 @@ but ledger-tracked** (they mutate data) — hence the 2A ledger requirement.
 
 *End of Phase 2 architecture plan. No code, schema, data, branches, or PRs were touched —
 this document is the only artifact. Implementation awaits your review and instructions.*
+
+---
+
+## Phase 2D Implementation Status (2026-09-12)
+
+### Completed
+
+- **Migration 0016**: Adds `school_id` to 21 A-class tables with indexes and CBISM backfill (idempotent, additive). Root + drizzle copies identical, registered in `run-migration.js`.
+- **Schema**: `src/db/schema.ts` now has `schoolId` on all listed tables with FK to `schools.id`.
+- **Tenant Module**: `src/lib/tenant.ts` now has direct predicates (`sql*DirectInSchool`) and resolvers that prefer direct `school_id` with relational fallback for legacy NULL rows. `getClassSchoolIds`, `isClassInSchool`, `getAssignmentSchoolIds`, `isAssignmentInSchool`, `getQuizSchoolIds`, `isQuizInSchool`, `getSubmissionSchoolIds`, `isSubmissionInSchool`, `getTeacherClassSchoolIds`, `isTeacherClassInSchool`, `getTimetableSchoolIds`, `isTimetableInSchool`, `getFileSchoolIds`, `isFileInSchool` all prefer direct.
+- **Catalog Routes**: academic-years, terms, departments, subjects, classes all now use `guardSchoolContext`, `WHERE school_id = ctx.schoolId`, `schoolId` from ctx on create, foreign key validation via `is*InSchool`, cross-school PUT/DELETE 404, forged schoolId ignored.
+- **Derived Routes**: teacher-classes, enrollments (learner_classes), parent-learners, assignments, submissions, quizzes, resources, announcements, attendance, timetable, messages now set `schoolId` on insert and prefer direct `school_id` with `or(eq(schoolId), and(isNull(schoolId), relational))` fallback for backward compat.
+- **Tests**: 
+  - Static: 28 security, 15 real-auth, 23 tenant-foundation, 35 membership-foundation = 101 passed
+  - Live DB: 71 tenant-authorization, 17 tenant-catalog = 88 passed
+  - Total: 189 tests passing
+- **Validation**: typecheck passes, build passes with dummy DATABASE_URL, lint shows 36 pre-existing issues (not introduced by Phase 2D).
+- **Docs**: New `PHASE2D_TENANT_DATA_ACCESS.md` with full audit, files changed, issues fixed, deferred findings.
+
+### Remaining for Phase 2E/2F
+
+- Tenant resolution via subdomain (`{slug}.easylearn.com`) + middleware host parsing
+- CBISM migration execution against production snapshot
+- RLS defense-in-depth
+- File storage tenancy (schools/{schoolId}/ prefix, quota enforcement)
+- Branding table, audit_logs table, support_access_sessions
+- Cookie-only auth migration, CSRF hardening
+- Remaining derived routes: notifications, uploads, files, activity-logs, dashboard overrides could use explicit direct school_id filter for defense-in-depth (currently via userId which is already tenant-scoped)
+- Grades, reports, learner stats could add direct school_id for performance
+
+### No Prod DB Changes
+
+- No production database modified directly
+- No migrations run against production
+- No secrets changed
+- All changes are code/tests/migration files only

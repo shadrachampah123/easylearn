@@ -64,13 +64,18 @@ export async function GET(request: NextRequest) {
     const parentAlias = alias(users, "link_parent");
     const learnerAlias = alias(users, "link_learner");
 
-    /* Phase 2C: a link is only visible when BOTH sides are members of the caller's school.
-       A legacy or cross-school row therefore disappears for everyone instead of being
-       treated as school-owned data. */
-    const conditions = [
-      sqlUserInSchool(ctx.schoolId, parentLearners.parentId),
-      sqlUserInSchool(ctx.schoolId, parentLearners.learnerId),
-    ];
+    /* Phase 2D: direct school_id preferred, relational fallback */
+    let useDirect = true;
+    try {
+      const { sql: drizzleSql } = await import("drizzle-orm");
+      await db.execute(drizzleSql`select "school_id" from "parent_learners" limit 0`);
+    } catch {
+      useDirect = false;
+    }
+
+    const conditions = useDirect
+      ? [eq(parentLearners.schoolId, ctx.schoolId)]
+      : [sqlUserInSchool(ctx.schoolId, parentLearners.parentId), sqlUserInSchool(ctx.schoolId, parentLearners.learnerId)];
     if (!isAdmin && ctx.school.role === "parent") conditions.push(eq(parentLearners.parentId, ctx.userId));
     if (!isAdmin && ctx.school.role === "learner") conditions.push(eq(parentLearners.learnerId, ctx.userId));
     if (parentId) conditions.push(eq(parentLearners.parentId, parentId));
@@ -223,14 +228,27 @@ export async function POST(request: NextRequest) {
       return errorResponse("This parent is already linked to that learner", 409);
     }
 
-    const [relation] = await db
-      .insert(parentLearners)
-      .values({
-        parentId,
-        learnerId,
-        relationship: relationship.value,
-      })
-      .returning();
+    let relation;
+    try {
+      [relation] = await db
+        .insert(parentLearners)
+        .values({
+          schoolId: ctx.schoolId,
+          parentId,
+          learnerId,
+          relationship: relationship.value,
+        })
+        .returning();
+    } catch {
+      [relation] = await db
+        .insert(parentLearners)
+        .values({
+          parentId,
+          learnerId,
+          relationship: relationship.value,
+        } as any)
+        .returning();
+    }
 
     await logActivity({
       userId: ctx.userId,

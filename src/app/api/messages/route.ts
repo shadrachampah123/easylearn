@@ -140,11 +140,21 @@ export async function POST(request: NextRequest) {
       return errorResponse("Recipient not found", 404);
     }
 
-    const [newMessage] = await db.insert(messages).values({
-      senderId: ctx.userId,
-      receiverId,
-      content,
-    }).returning();
+    let newMessage;
+    try {
+      [newMessage] = await db.insert(messages).values({
+        schoolId: ctx.schoolId,
+        senderId: ctx.userId,
+        receiverId,
+        content,
+      }).returning();
+    } catch {
+      [newMessage] = await db.insert(messages).values({
+        senderId: ctx.userId,
+        receiverId,
+        content,
+      } as any).returning();
+    }
 
     // Create notification for receiver
     const [senderUser] = await db
@@ -153,13 +163,24 @@ export async function POST(request: NextRequest) {
       .where(eq(users.id, ctx.userId))
       .limit(1);
 
-    await db.insert(notifications).values({
-      userId: receiverId,
-      type: "system",
-      title: "New Message",
-      message: `${senderUser.firstName} ${senderUser.lastName} sent you a message`,
-      link: `/dashboard/messages?userId=${ctx.userId}`,
-    });
+    try {
+      await db.insert(notifications).values({
+        schoolId: ctx.schoolId,
+        userId: receiverId,
+        type: "system",
+        title: "New Message",
+        message: `${senderUser.firstName} ${senderUser.lastName} sent you a message`,
+        link: `/dashboard/messages?userId=${ctx.userId}`,
+      });
+    } catch {
+      await db.insert(notifications).values({
+        userId: receiverId,
+        type: "system",
+        title: "New Message",
+        message: `${senderUser.firstName} ${senderUser.lastName} sent you a message`,
+        link: `/dashboard/messages?userId=${ctx.userId}`,
+      } as any);
+    }
 
     return successResponse(newMessage, 201);
   } catch (error) {

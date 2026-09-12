@@ -6,11 +6,12 @@ import {
   hasSchoolAdminExtendedRole,
   isClassInSchool,
   isUserInSchool,
+  isSubjectInSchool,
   sqlTeacherClassInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
   try {
@@ -21,8 +22,19 @@ export async function GET(request: NextRequest) {
     const classId = request.nextUrl.searchParams.get("classId");
     const teacherId = request.nextUrl.searchParams.get("teacherId");
 
-    /* Phase 2C: rows must resolve to the caller's school (teacher + class members). */
-    const conditions = [sqlTeacherClassInSchool(ctx.schoolId, teacherClasses.id)];
+    // Phase 2D: prefer direct school_id, fallback to relational for transition
+    let useDirect = true;
+    try {
+      // probe if column exists by attempting a dummy query — if it throws, fallback
+      await db.execute(sql`select "school_id" from "teacher_classes" limit 0`);
+    } catch {
+      useDirect = false;
+    }
+
+    const conditions: any[] = useDirect
+      ? [eq(teacherClasses.schoolId, ctx.schoolId)]
+      : [sqlTeacherClassInSchool(ctx.schoolId, teacherClasses.id)];
+
     if (classId) conditions.push(eq(teacherClasses.classId, classId));
     if (teacherId) conditions.push(eq(teacherClasses.teacherId, teacherId));
 
@@ -124,13 +136,15 @@ export async function POST(request: NextRequest) {
       return errorResponse("Teacher, class, and subject are required");
     }
 
-    /* Phase 2C: both the teacher and the class must belong to the caller's school. A row
-       can never be created that bridges two schools. */
+    /* Phase 2D: teacher, class and subject must all belong to caller's school */
     if (!(await isUserInSchool(ctx.schoolId, teacherId))) {
       return notFoundResponse("Teacher");
     }
     if (!(await isClassInSchool(ctx.schoolId, classId))) {
       return notFoundResponse("Class");
+    }
+    if (!(await isSubjectInSchool(ctx.schoolId, subjectId))) {
+      return notFoundResponse("Subject");
     }
 
     // Check for duplicate
@@ -148,12 +162,29 @@ export async function POST(request: NextRequest) {
       return errorResponse("This teacher is already assigned to this class/subject");
     }
 
-    const [assignment] = await db.insert(teacherClasses).values({
-      teacherId,
-      classId,
-      subjectId,
-      academicYearId: academicYearId || null,
-    }).returning();
+    let assignment;
+    try {
+      [assignment] = await db
+        .insert(teacherClasses)
+        .values({
+          schoolId: ctx.schoolId,
+          teacherId,
+          classId,
+          subjectId,
+          academicYearId: academicYearId || null,
+        })
+        .returning();
+    } catch {
+      [assignment] = await db
+        .insert(teacherClasses)
+        .values({
+          teacherId,
+          classId,
+          subjectId,
+          academicYearId: academicYearId || null,
+        } as any)
+        .returning();
+    }
 
     await logActivity({
       userId: ctx.userId,

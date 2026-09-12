@@ -1,30 +1,26 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { departments, subjects } from "@/db/schema";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { successResponse, errorResponse, unauthorizedResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq } from "drizzle-orm";
-
-const ADMIN_ROLES = ["super_admin", "school_admin"];
-
-async function requireAdmin(request: NextRequest) {
-  const token = getTokenFromRequest(request);
-  if (!token) return unauthorizedResponse();
-  const payload = await verifyToken(token);
-  if (!payload) return unauthorizedResponse();
-  if (!ADMIN_ROLES.includes(payload.role)) {
-    return errorResponse("Only administrators can manage departments", 403);
-  }
-  return payload;
-}
+import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
+import { eq, and } from "drizzle-orm";
+import {
+  guardSchoolContext,
+  hasSchoolAdminRole,
+  isUserInSchool,
+} from "@/lib/tenant";
 
 export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await requireAdmin(request);
-    if (auth instanceof Response) return auth;
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+
+    if (!hasSchoolAdminRole(ctx)) {
+      return errorResponse("Only administrators can manage departments", 403);
+    }
 
     const { id } = await params;
     const body = await request.json();
@@ -34,13 +30,23 @@ export async function PUT(
       return errorResponse("Department name is required");
     }
 
-    const [existing] = await db
-      .select({ id: departments.id })
-      .from(departments)
-      .where(eq(departments.id, id))
-      .limit(1);
+    // Tenant check: department must belong to caller's school
+    let existing;
+    try {
+      [existing] = await db
+        .select({ id: departments.id })
+        .from(departments)
+        .where(and(eq(departments.id, id), eq(departments.schoolId, ctx.schoolId)))
+        .limit(1);
+    } catch {
+      return notFoundResponse("Department");
+    }
 
     if (!existing) return notFoundResponse("Department");
+
+    if (headId && !(await isUserInSchool(ctx.schoolId, headId))) {
+      return errorResponse("Department head not found", 404);
+    }
 
     const [updated] = await db
       .update(departments)
@@ -49,7 +55,7 @@ export async function PUT(
         description: description !== undefined ? (description?.trim() || null) : undefined,
         headId: headId !== undefined ? headId || null : undefined,
       })
-      .where(eq(departments.id, id))
+      .where(and(eq(departments.id, id), eq(departments.schoolId, ctx.schoolId)))
       .returning();
 
     return successResponse(updated);
@@ -64,26 +70,41 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await requireAdmin(request);
-    if (auth instanceof Response) return auth;
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    const ctx = auth.context;
+
+    if (!hasSchoolAdminRole(ctx)) {
+      return errorResponse("Only administrators can manage departments", 403);
+    }
 
     const { id } = await params;
-    const [existing] = await db
-      .select({ id: departments.id })
-      .from(departments)
-      .where(eq(departments.id, id))
-      .limit(1);
+
+    let existing;
+    try {
+      [existing] = await db
+        .select({ id: departments.id })
+        .from(departments)
+        .where(and(eq(departments.id, id), eq(departments.schoolId, ctx.schoolId)))
+        .limit(1);
+    } catch {
+      return notFoundResponse("Department");
+    }
 
     if (!existing) return notFoundResponse("Department");
 
     // Subjects may still be useful on their own, so preserve them and clear only
     // the optional department relationship before deleting the department.
     await db.transaction(async (tx) => {
-      await tx
-        .update(subjects)
-        .set({ departmentId: null })
-        .where(eq(subjects.departmentId, id));
-      await tx.delete(departments).where(eq(departments.id, id));
+      try {
+        await tx
+          .update(subjects)
+          .set({ departmentId: null })
+          .where(and(eq(subjects.departmentId, id), eq(subjects.schoolId, ctx.schoolId)));
+      } catch {
+        await tx.update(subjects).set({ departmentId: null }).where(eq(subjects.departmentId, id));
+      }
+      await tx.delete(departments).where(and(eq(departments.id, id), eq(departments.schoolId, ctx.schoolId)));
     });
 
     return successResponse({ message: "Department deleted" });

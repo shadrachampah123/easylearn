@@ -259,20 +259,35 @@ test('Boundary: no school_id column added to any legacy table', () => {
   assert(schoolUsersBlock.includes('"school_id"'), 'membership table owns school_id');
 });
 
-test('Boundary: no legacy table in schema.ts gained a tenant column', () => {
+test('Boundary: Phase 2D adds school_id to school-owned tables (expected)', () => {
   const schema = readFile('src/db/schema.ts');
-  // Split into per-table blocks and require schoolId/school_id only in the two new tables.
-  const blocks = schema.split(/export const \w+ = pgTable\(/);
-  const names = schema.match(/export const \w+ = pgTable\("(\w+)"/g) || [];
-  names.forEach((name, index) => {
-    const tableName = name.match(/pgTable\("(\w+)"/)[1];
-    const block = blocks[index + 1] || '';
-    if (['schools', 'school_users'].includes(tableName)) return;
-    assert(
-      !/\bschool_id\b|\bschoolId\b/.test(block),
-      `legacy table ${tableName} must not gain a school_id column in Phase 2A`
-    );
-  });
+  const expectedWithSchoolId = [
+    'academic_years',
+    'terms',
+    'departments',
+    'classes',
+    'subjects',
+    'teacher_classes',
+    'learner_classes',
+    'parent_learners',
+    'assignments',
+    'submissions',
+    'uploaded_files',
+    'resources',
+    'quizzes',
+    'quiz_attempts',
+    'announcements',
+    'notifications',
+    'attendance',
+    'timetable_entries',
+    'messages',
+    'activity_logs',
+    'dashboard_card_overrides',
+  ];
+  for (const table of expectedWithSchoolId) {
+    const regex = new RegExp('pgTable\\("' + table + '"[\\s\\S]*?schoolId');
+    assert(regex.test(schema), `Phase 2D: ${table} should have schoolId column`);
+  }
 });
 
 test('Boundary: no API route queries the tenant tables directly (Phase 2B: via src/lib/tenant.ts)', () => {

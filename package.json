@@ -12,10 +12,11 @@
     "test:real": "npx tsx tests/real-authorization.test.ts",
     "test:tenant": "node tests/tenant-foundation.test.js",
     "test:membership": "node tests/membership-foundation.test.js && npx tsx tests/membership-auth-db.test.ts",
-    "test:db": "node tests/tenant-db.test.js && npx tsx tests/membership-auth-db.test.ts",
-    "test:tenant-auth": "npx tsx tests/tenant-authorization-db.test.ts",
+    "test:db": "node tests/tenant-db.test.js && npx tsx tests/membership-auth-db.test.ts && npx tsx tests/tenant-catalog-db.test.ts",
+    "test:tenant-auth": "npx tsx tests/tenant-authorization-db.test.ts && npx tsx tests/tenant-catalog-db.test.ts",
     "test:mutation": "npx tsx tests/tenant-authorization-mutation.test.ts",
-    "test:all": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts && node tests/tenant-foundation.test.js && node tests/membership-foundation.test.js && node tests/tenant-db.test.js && npx tsx tests/membership-auth-db.test.ts && npx tsx tests/tenant-authorization-db.test.ts && npx tsx tests/tenant-authorization-mutation.test.ts"
+    "test:catalog": "npx tsx tests/tenant-catalog-db.test.ts",
+    "test:all": "node tests/security.test.js && npx tsx tests/real-authorization.test.ts && node tests/tenant-foundation.test.js && node tests/membership-foundation.test.js && node tests/tenant-db.test.js && npx tsx tests/membership-auth-db.test.ts && npx tsx tests/tenant-authorization-db.test.ts && npx tsx tests/tenant-catalog-db.test.ts && npx tsx tests/tenant-authorization-mutation.test.ts"
   },
   "dependencies": {
     "@types/bcryptjs": "^2.4.6",

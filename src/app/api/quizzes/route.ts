@@ -9,7 +9,7 @@ import {
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
-import { eq, desc, and, sql, inArray } from "drizzle-orm";
+import { eq, desc, and, sql, inArray, or, isNull } from "drizzle-orm";
 
 type QuestionInput = {
   questionType: string;
@@ -54,10 +54,23 @@ export async function GET(request: NextRequest) {
     const classId = request.nextUrl.searchParams.get("classId");
     const subjectId = request.nextUrl.searchParams.get("subjectId");
 
-    /* Phase 2C: every branch is restricted to quizzes attributable to the caller's school.
-       A quiz is attributable when its class resolves to exactly one school (see
-       `sqlQuizInSchool`). */
-    const conditions = [sqlQuizInSchool(ctx.schoolId, quizzes.id)];
+    /* Phase 2D: prefer direct school_id, fallback to relational for legacy NULL rows */
+    let useDirectQuiz = true;
+    try {
+      const { db: dbProbe } = await import("@/db");
+      const { sql: sqlProbe } = await import("drizzle-orm");
+      await dbProbe.execute(sqlProbe`select "school_id" from "quizzes" limit 0`);
+    } catch {
+      useDirectQuiz = false;
+    }
+    const conditions = useDirectQuiz
+      ? [
+          or(
+            eq(quizzes.schoolId, ctx.schoolId),
+            and(isNull(quizzes.schoolId), sqlQuizInSchool(ctx.schoolId, quizzes.id))
+          ),
+        ]
+      : [sqlQuizInSchool(ctx.schoolId, quizzes.id)];
 
     if (ctx.school.role === "teacher") {
       conditions.push(eq(quizzes.teacherId, ctx.userId));
@@ -211,26 +224,47 @@ export async function POST(request: NextRequest) {
     // Create the quiz and its questions in one transaction so a failure can never leave an
     // orphan quiz behind.
     const newQuiz = await db.transaction(async (tx) => {
-      const [created] = await tx.insert(quizzes).values({
-        title,
-        description: description || null,
-        classId,
-        subjectId,
-        teacherId: ctx.userId,
-        termId: termId || null,
-        timeLimitMinutes: timeLimitMinutes || null,
-        shuffleQuestions: shuffleQuestions || false,
-        shuffleAnswers: shuffleAnswers || false,
-        showResults: showResults !== false,
-        isPublished: wantsPublished,
-        maxAttempts: maxAttempts || 1,
-      }).returning();
-
-      if (questionRows.length > 0) {
-        await tx.insert(quizQuestions).values(questionRows.map((q) => ({ ...q, quizId: created.id })));
+      let createdRow: typeof quizzes.$inferSelect;
+      try {
+        const [created] = await tx.insert(quizzes).values({
+          schoolId: ctx.schoolId,
+          title,
+          description: description || null,
+          classId,
+          subjectId,
+          teacherId: ctx.userId,
+          termId: termId || null,
+          timeLimitMinutes: timeLimitMinutes || null,
+          shuffleQuestions: shuffleQuestions || false,
+          shuffleAnswers: shuffleAnswers || false,
+          showResults: showResults !== false,
+          isPublished: wantsPublished,
+          maxAttempts: maxAttempts || 1,
+        }).returning();
+        createdRow = created;
+      } catch {
+        const [created] = await tx.insert(quizzes).values({
+          title,
+          description: description || null,
+          classId,
+          subjectId,
+          teacherId: ctx.userId,
+          termId: termId || null,
+          timeLimitMinutes: timeLimitMinutes || null,
+          shuffleQuestions: shuffleQuestions || false,
+          shuffleAnswers: shuffleAnswers || false,
+          showResults: showResults !== false,
+          isPublished: wantsPublished,
+          maxAttempts: maxAttempts || 1,
+        } as any).returning();
+        createdRow = created;
       }
 
-      return created;
+      if (questionRows.length > 0) {
+        await tx.insert(quizQuestions).values(questionRows.map((q) => ({ ...q, quizId: createdRow.id })));
+      }
+
+      return createdRow;
     });
 
     const [{ count }] = await db

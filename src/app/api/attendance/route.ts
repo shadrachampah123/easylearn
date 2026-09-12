@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { attendance, users, classes, learnerClasses, parentLearners } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, or, isNull, sql } from "drizzle-orm";
 import {
   canAccessLearner,
   canTeacherAccessClass,
@@ -53,8 +53,21 @@ export async function GET(request: NextRequest) {
     const date = request.nextUrl.searchParams.get("date");
     const learnerIdParam = request.nextUrl.searchParams.get("learnerId");
 
-    // Tenant boundary — attendance rows are anchored by their learner.
-    const conditions: any[] = [sqlUserInSchool(ctx.schoolId, attendance.learnerId)];
+    // Tenant boundary — Phase 2D: prefer direct school_id, fallback to learner membership
+    let useDirectAtt = true;
+    try {
+      await db.execute(sql`select "school_id" from "attendance" limit 0`);
+    } catch {
+      useDirectAtt = false;
+    }
+    const conditions: any[] = useDirectAtt
+      ? [
+          or(
+            eq(attendance.schoolId, ctx.schoolId),
+            and(isNull(attendance.schoolId), sqlUserInSchool(ctx.schoolId, attendance.learnerId))
+          ),
+        ]
+      : [sqlUserInSchool(ctx.schoolId, attendance.learnerId)];
 
     if (classId) {
       // A class of another school is reported as missing, never as forbidden.
@@ -218,7 +231,7 @@ export async function POST(request: NextRequest) {
         .delete(attendance)
         .where(and(eq(attendance.classId, classId), eq(attendance.date, date)));
 
-      const attendanceRecords = records.map((r: { learnerId: string; isPresent: boolean; note?: string }) => ({
+      const baseRecords = records.map((r: { learnerId: string; isPresent: boolean; note?: string }) => ({
         learnerId: r.learnerId,
         classId,
         date,
@@ -227,8 +240,14 @@ export async function POST(request: NextRequest) {
         markedById: ctx.userId,
       }));
 
-      if (attendanceRecords.length > 0) {
-        await tx.insert(attendance).values(attendanceRecords);
+      if (baseRecords.length > 0) {
+        try {
+          await tx.insert(attendance).values(
+            baseRecords.map((r) => ({ ...r, schoolId: ctx.schoolId }))
+          );
+        } catch {
+          await tx.insert(attendance).values(baseRecords as any);
+        }
       }
     });
 

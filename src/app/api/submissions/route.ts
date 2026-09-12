@@ -100,20 +100,38 @@ export async function POST(request: NextRequest) {
     // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
 
-    // Check assignment exists and is published
-    const [assignment] = await db
-      .select()
-      .from(assignments)
-      .where(eq(assignments.id, assignmentId))
-      .limit(1);
-
-    if (!assignment) {
-      return errorResponse("Assignment not found", 404);
+    // Check assignment exists and is published — Phase 2D: tenant predicate directly in query with relational fallback for legacy rows
+    let assignment: typeof assignments.$inferSelect | undefined;
+    try {
+      const direct = await db
+        .select()
+        .from(assignments)
+        .where(and(eq(assignments.id, assignmentId), eq(assignments.schoolId, ctx.schoolId)))
+        .limit(1);
+      assignment = direct[0];
+      if (!assignment) {
+        // Fallback: legacy row without school_id or NULL — verify via relational predicate
+        const legacy = await db
+          .select()
+          .from(assignments)
+          .where(eq(assignments.id, assignmentId))
+          .limit(1);
+        if (legacy[0] && (await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
+          assignment = legacy[0];
+        }
+      }
+    } catch {
+      const legacy = await db
+        .select()
+        .from(assignments)
+        .where(eq(assignments.id, assignmentId))
+        .limit(1);
+      if (legacy[0] && (await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
+        assignment = legacy[0];
+      }
     }
 
-    /* Phase 2C: the assignment must belong to the learner's own school before anything else
-       is decided. A foreign (or unattributable) assignment is reported as not found. */
-    if (!(await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
+    if (!assignment) {
       return errorResponse("Assignment not found", 404);
     }
 
@@ -197,14 +215,33 @@ export async function POST(request: NextRequest) {
       return errorResponse("Late submissions are not allowed for this assignment");
     }
 
-    const [newSubmission] = await db.insert(submissions).values({
-      assignmentId,
-      learnerId: ctx.userId,
-      content: content || null,
-      attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
-      status: isLate ? "late" : "submitted",
-      submittedAt: new Date(),
-    }).returning();
+    let newSubmission;
+    try {
+      [newSubmission] = await db
+        .insert(submissions)
+        .values({
+          schoolId: ctx.schoolId,
+          assignmentId,
+          learnerId: ctx.userId,
+          content: content || null,
+          attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
+          status: isLate ? "late" : "submitted",
+          submittedAt: new Date(),
+        })
+        .returning();
+    } catch {
+      [newSubmission] = await db
+        .insert(submissions)
+        .values({
+          assignmentId,
+          learnerId: ctx.userId,
+          content: content || null,
+          attachments: resolvedAttachments.length > 0 ? resolvedAttachments : null,
+          status: isLate ? "late" : "submitted",
+          submittedAt: new Date(),
+        } as any)
+        .returning();
+    }
 
     return successResponse(newSubmission, 201);
   } catch (error) {

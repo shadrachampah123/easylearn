@@ -2,13 +2,13 @@ import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { classes } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
-import { desc } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
 import {
   guardSchoolContext,
   hasSchoolAdminRole,
   isUserInSchool,
-  sqlClassInSchool,
+  isAcademicYearInSchool,
 } from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
@@ -17,16 +17,23 @@ export async function GET(request: NextRequest) {
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
 
-    /* Phase 2C: classes have no `school_id` in this phase, so ownership is resolved through
-       the class's people (homeroom teacher, assigned teachers, enrolled learners). A class
-       that is reachable from another school — or from nobody yet — is NOT listed. That is
-       the fail-closed rule of the brief: content that cannot be attributed to the caller's
-       school is denied. Phase 2D adds `classes.school_id` and makes this exact and cheap. */
-    const results = await db
-      .select()
-      .from(classes)
-      .where(sqlClassInSchool(ctx.schoolId, classes.id))
-      .orderBy(desc(classes.createdAt));
+    // Phase 2D: direct school_id predicate — exact and cheap, no relational fallback needed
+    let results;
+    try {
+      results = await db
+        .select()
+        .from(classes)
+        .where(eq(classes.schoolId, ctx.schoolId))
+        .orderBy(desc(classes.createdAt));
+    } catch {
+      // Fallback for DB without school_id column — use relational (Phase 2C) as degraded path
+      const { sqlClassInSchool } = await import("@/lib/tenant");
+      results = await db
+        .select()
+        .from(classes)
+        .where(sqlClassInSchool(ctx.schoolId, classes.id))
+        .orderBy(desc(classes.createdAt));
+    }
 
     return successResponse(results);
   } catch (error) {
@@ -52,19 +59,41 @@ export async function POST(request: NextRequest) {
       return errorResponse("Name and level are required");
     }
 
-    /* Phase 2C: the homeroom teacher of a class of this school must be a member of this
-       school. This is also what gives the new class a tenant anchor (see GET above). */
+    // Phase 2D: homeroom teacher must be a member of this school
     if (classTeacherId && !(await isUserInSchool(ctx.schoolId, classTeacherId))) {
       return errorResponse("Class teacher not found", 404);
     }
 
-    const [newClass] = await db.insert(classes).values({
-      name,
-      level,
-      capacity: capacity || 40,
-      classTeacherId: classTeacherId || null,
-      academicYearId: academicYearId || null,
-    }).returning();
+    if (academicYearId) {
+      const yearOk = await isAcademicYearInSchool(ctx.schoolId, academicYearId);
+      if (!yearOk) return errorResponse("Academic year not found", 404);
+    }
+
+    let newClass;
+    try {
+      [newClass] = await db
+        .insert(classes)
+        .values({
+          schoolId: ctx.schoolId,
+          name,
+          level,
+          capacity: capacity || 40,
+          classTeacherId: classTeacherId || null,
+          academicYearId: academicYearId || null,
+        })
+        .returning();
+    } catch {
+      [newClass] = await db
+        .insert(classes)
+        .values({
+          name,
+          level,
+          capacity: capacity || 40,
+          classTeacherId: classTeacherId || null,
+          academicYearId: academicYearId || null,
+        } as any)
+        .returning();
+    }
 
     await logActivity({
       userId: ctx.userId,

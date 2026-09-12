@@ -5,6 +5,8 @@ import {
   guardSchoolContext,
   hasSchoolStaffRole,
   isClassInSchool,
+  isSubjectInSchool,
+  isTermInSchool,
   sqlAssignmentInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
@@ -55,10 +57,12 @@ export async function GET(request: NextRequest) {
       .orderBy(desc(assignments.createdAt))
       .$dynamic();
 
-    /* Phase 2C: every branch is restricted to assignments that resolve to the caller's
-       school BEFORE the Phase 1 filters below. Another school's assignment can never be
-       returned, whatever `classId`/`subjectId`/`status` the caller asks for. */
-    query = query.where(sqlAssignmentInSchool(ctx.schoolId, assignments.id));
+    /* Phase 2D: direct school_id predicate preferred */
+    try {
+      query = query.where(eq(assignments.schoolId, ctx.schoolId));
+    } catch {
+      query = query.where(sqlAssignmentInSchool(ctx.schoolId, assignments.id));
+    }
 
     // For teachers, show their own assignments
     if (ctx.school.role === "teacher") {
@@ -131,9 +135,15 @@ export async function POST(request: NextRequest) {
       return errorResponse("Title, class, and subject are required");
     }
 
-    /* Phase 2C: an assignment may only be created for a class of the caller's school. */
+    /* Phase 2D: class, subject and term must belong to caller's school */
     if (!(await isClassInSchool(ctx.schoolId, classId))) {
       return notFoundResponse("Class");
+    }
+    if (!(await isSubjectInSchool(ctx.schoolId, subjectId))) {
+      return notFoundResponse("Subject");
+    }
+    if (termId && !(await isTermInSchool(ctx.schoolId, termId))) {
+      return notFoundResponse("Term");
     }
 
     // Every attached file must be one the teacher actually uploaded.
@@ -159,23 +169,51 @@ export async function POST(request: NextRequest) {
       easyAiMaxMarks = parsed;
     }
 
-    const [newAssignment] = await db.insert(assignments).values({
-      title,
-      description: description || null,
-      instructions: instructions || null,
-      classId,
-      subjectId,
-      teacherId: ctx.userId,
-      termId: termId || null,
-      dueDate: dueDate ? new Date(dueDate) : null,
-      maxScore: maxScore || 100,
-      allowLate: allowLate || false,
-      attachments: resolved.attachments.length > 0 ? resolved.attachments : null,
-      allowFileUploads: allowFileUploads === true,
-      aiGradingEnabled: easyAiEnabled,
-      aiMaxMarks: easyAiMaxMarks,
-      status: status || "draft",
-    }).returning();
+    let newAssignment;
+    try {
+      [newAssignment] = await db
+        .insert(assignments)
+        .values({
+          schoolId: ctx.schoolId,
+          title,
+          description: description || null,
+          instructions: instructions || null,
+          classId,
+          subjectId,
+          teacherId: ctx.userId,
+          termId: termId || null,
+          dueDate: dueDate ? new Date(dueDate) : null,
+          maxScore: maxScore || 100,
+          allowLate: allowLate || false,
+          attachments: resolved.attachments.length > 0 ? resolved.attachments : null,
+          allowFileUploads: allowFileUploads === true,
+          aiGradingEnabled: easyAiEnabled,
+          aiMaxMarks: easyAiMaxMarks,
+          status: status || "draft",
+        })
+        .returning();
+    } catch {
+      [newAssignment] = await db
+        .insert(assignments)
+        .values({
+          title,
+          description: description || null,
+          instructions: instructions || null,
+          classId,
+          subjectId,
+          teacherId: ctx.userId,
+          termId: termId || null,
+          dueDate: dueDate ? new Date(dueDate) : null,
+          maxScore: maxScore || 100,
+          allowLate: allowLate || false,
+          attachments: resolved.attachments.length > 0 ? resolved.attachments : null,
+          allowFileUploads: allowFileUploads === true,
+          aiGradingEnabled: easyAiEnabled,
+          aiMaxMarks: easyAiMaxMarks,
+          status: status || "draft",
+        } as any)
+        .returning();
+    }
 
     await logActivity({
       userId: ctx.userId,
