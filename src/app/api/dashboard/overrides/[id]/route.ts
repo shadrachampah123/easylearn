@@ -6,7 +6,6 @@ import { and, eq } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
-  sqlUserInSchool,
   type SchoolAuthContext,
 } from "@/lib/tenant";
 import { logActivity } from "@/lib/activity";
@@ -18,6 +17,12 @@ import {
 } from "@/lib/schema-resilience";
 
 const OVERRIDES_MIGRATION = "drizzle/0004_dashboard_overrides.sql";
+
+/* Phase 2E (F6): single-record access is scoped by the row's own `school_id`
+   (NOT NULL since migrations 0016/0017). A row owned by another school 404s even
+   when its creator happens to be a member of the caller's school — the old
+   creator-membership predicate let multi-school admins read/modify/delete the other
+   school's overrides. */
 
 function notMigratedResponse(error?: unknown) {
   const warning = error ? toSchemaWarning("overrides", error, "Card overrides") : null;
@@ -63,7 +68,7 @@ export async function GET(
     const [override] = await db
       .select()
       .from(dashboardCardOverrides)
-      .where(and(eq(dashboardCardOverrides.id, overrideId), sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)))
+      .where(and(eq(dashboardCardOverrides.id, overrideId), eq(dashboardCardOverrides.schoolId, ctx.schoolId)))
       .limit(1);
 
     if (!override) return notFoundResponse("Override");
@@ -105,7 +110,7 @@ export async function PUT(
     const [existing] = await db
       .select()
       .from(dashboardCardOverrides)
-      .where(and(eq(dashboardCardOverrides.id, overrideId), sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)))
+      .where(and(eq(dashboardCardOverrides.id, overrideId), eq(dashboardCardOverrides.schoolId, ctx.schoolId)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Override");
@@ -120,7 +125,7 @@ export async function PUT(
     const [updated] = await db
       .update(dashboardCardOverrides)
       .set(updateData as any)
-      .where(and(eq(dashboardCardOverrides.id, overrideId), sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)))
+      .where(and(eq(dashboardCardOverrides.id, overrideId), eq(dashboardCardOverrides.schoolId, ctx.schoolId)))
       .returning();
 
     await logActivity({
@@ -160,14 +165,14 @@ export async function DELETE(
     const [existing] = await db
       .select()
       .from(dashboardCardOverrides)
-      .where(and(eq(dashboardCardOverrides.id, overrideId), sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)))
+      .where(and(eq(dashboardCardOverrides.id, overrideId), eq(dashboardCardOverrides.schoolId, ctx.schoolId)))
       .limit(1);
 
     if (!existing) return notFoundResponse("Override");
 
     await db
       .delete(dashboardCardOverrides)
-      .where(and(eq(dashboardCardOverrides.id, overrideId), sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)));
+      .where(and(eq(dashboardCardOverrides.id, overrideId), eq(dashboardCardOverrides.schoolId, ctx.schoolId)));
 
     await logActivity({
       schoolId: ctx.schoolId,

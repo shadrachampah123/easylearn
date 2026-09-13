@@ -11,6 +11,13 @@
  *   F4  learner reports / stats / dashboards never fold another school's activity into a
  *       multi-school learner's view (`learner-reports`, `learner/stats`,
  *       `dashboard/learner`, `dashboard/parent`)
+ *   F6  dashboard card overrides are scoped by their own direct `school_id`, not by
+ *       creator membership — a multi-school admin's override must not appear on, be
+ *       applied to, or be mutable from the other school (`dashboard/overrides`,
+ *       `dashboard/overrides/[id]`, `dashboard/learner`)
+ *   F7  (audit follow-up) DELETE `assignments/[id]/questions` is anchored to the
+ *       assignment the caller was authorized on — a question id from another school's
+ *       assignment must 404 instead of deleting
  *
  * The F4 fixture deliberately gives one learner ACTIVE memberships in BOTH schools plus
  * activity rows in both, so a query that only filters on `learnerId` would leak — the fix
@@ -53,6 +60,14 @@ function test(name: string, fn: () => void | Promise<void>) {
       console.error(`   ${(error as Error).message}`);
       failed++;
     });
+}
+
+function assertEq(actual: unknown, expected: unknown, message: string) {
+  assert.equal(
+    actual,
+    expected,
+    `${message} — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`
+  );
 }
 
 async function main() {
@@ -153,6 +168,12 @@ async function main() {
       { key: "dual-teacher", role: "teacher", memberships: [
         { schoolId: schoolA, role: "teacher", createdAt: "2025-01-01T00:00:00Z" },
         { schoolId: schoolB, role: "teacher", createdAt: "2025-02-01T00:00:00Z" },
+      ] },
+      // Multi-school administrator (F6): admin in BOTH schools, School A first — the
+      // exact shape that made creator-membership scoping of dashboard overrides unsafe.
+      { key: "dual-admin", role: "school_admin", memberships: [
+        { schoolId: schoolA, role: "school_admin", createdAt: "2025-01-01T00:00:00Z" },
+        { schoolId: schoolB, role: "school_admin", createdAt: "2025-02-01T00:00:00Z" },
       ] },
     ];
 
@@ -422,6 +443,170 @@ async function main() {
       assert.equal(r.json.data.rawStats.totalAttendance, 1, "only School A's attendance row is counted");
       const titles = (r.json.data.announcements as { title: string }[]).map((a) => a.title);
       assert(!titles.includes("Announce B"), "other school's announcement must NOT leak on the parent dashboard");
+    });
+
+    /* ════════════════ F6 — dashboard override school scoping ════════════════
+       Overrides must be scoped by the row's own direct school_id (migrations
+       0016/0017), not by "creator is a member of my school". The creator-membership
+       predicate let an override created by a MULTI-SCHOOL admin (here: dual-admin, who
+       owns School A's context) surface on School B's dashboards and let School B's
+       admins mutate/delete it. Every test below fails against the pre-F6 predicate. */
+
+    let f6OverrideId = "";
+
+    await test("F6: an override created in School A's context is attributed to School A", async () => {
+      const r = await call("dashboard/overrides", {
+        token: tokens["dual-admin"],
+        body: {
+          cardKey: "2e-f6-card",
+          dashboardRole: "learner",
+          scopeType: "global",
+          title: "F6 Card",
+          value: "SCHOOL-A-ONLY",
+        },
+      });
+      assertEq(r.status, 201, `expected 201, body: ${r.text}`);
+      f6OverrideId = r.json.data?.id as string;
+      assert(f6OverrideId, "override must be created");
+      const row = await one(`SELECT school_id, created_by FROM dashboard_card_overrides WHERE id = $1`, [f6OverrideId]);
+      assertEq(row?.school_id, schoolA, "school_id must be the caller's resolved (School A) context");
+    });
+
+    await test("F6: School B's admin list must not include the dual admin's School A override", async () => {
+      const r = await call("dashboard/overrides", { token: tokens["admin-b"] });
+      assert.equal(r.status, 200);
+      const keys = (r.json.data as { cardKey: string }[]).map((o) => o.cardKey);
+      assert(!keys.includes("2e-f6-card"), "creator-membership scoping must not widen School B's list");
+    });
+
+    await test("F6: the override applies on School A's learner dashboard but never on School B's", async () => {
+      const ra = await call("dashboard/learner", { token: tokens["learner-a"] });
+      assert.equal(ra.status, 200);
+      assert(ra.text.includes("SCHOOL-A-ONLY"), "own-school override must still be applied");
+
+      const rb = await call("dashboard/learner", { token: tokens["learner-b"] });
+      assert.equal(rb.status, 200);
+      assert(!rb.text.includes("SCHOOL-A-ONLY"), "School A's override must NOT be applied on School B's dashboard");
+    });
+
+    await test("F6: School B's admin cannot read, modify or delete School A's override row", async () => {
+      const get = await call("dashboard/overrides/[id]", { token: tokens["admin-b"], method: "GET", params: { id: f6OverrideId } });
+      assertEq(get.status, 404, `GET must 404 across schools, got ${get.status}`);
+
+      const put = await call("dashboard/overrides/[id]", {
+        token: tokens["admin-b"], method: "PUT", params: { id: f6OverrideId },
+        body: { value: "TAMPERED-BY-B" },
+      });
+      assertEq(put.status, 404, `PUT must 404 across schools, got ${put.status}`);
+      const afterPut = await one(`SELECT value FROM dashboard_card_overrides WHERE id = $1`, [f6OverrideId]);
+      assertEq(afterPut?.value, "SCHOOL-A-ONLY", "value must be untouched by the cross-school PUT");
+
+      const del = await call("dashboard/overrides/[id]", { token: tokens["admin-b"], method: "DELETE", params: { id: f6OverrideId } });
+      assertEq(del.status, 404, `DELETE must 404 across schools, got ${del.status}`);
+      const still = await one(`SELECT id FROM dashboard_card_overrides WHERE id = $1`, [f6OverrideId]);
+      assert(still, "the row must still exist after the cross-school DELETE attempt");
+    });
+
+    await test("F6: School A's own admin keeps full management of the row", async () => {
+      const put = await call("dashboard/overrides/[id]", {
+        token: tokens["admin-a"], method: "PUT", params: { id: f6OverrideId },
+        body: { value: "MANAGED-BY-A" },
+      });
+      assertEq(put.status, 200, `own-school PUT must succeed, got ${put.status}: ${put.text}`);
+      const row = await one(`SELECT value FROM dashboard_card_overrides WHERE id = $1`, [f6OverrideId]);
+      assertEq(row?.value, "MANAGED-BY-A", "own-school update must persist");
+    });
+
+    await test("F6: an override with a deleted creator stays manageable inside its own school", async () => {
+      // created_by is nullable (ON DELETE set null): the pre-F6 creator-membership
+      // predicate made such rows invisible and unmanageable for everybody.
+      const orphan = await one(
+        `INSERT INTO dashboard_card_overrides (school_id, card_key, dashboard_role, scope_type, value, is_enabled, is_visible, created_by)
+         VALUES ($1, '2e-f6-orphan', 'learner', 'global', 'ORPHAN-IN-A', true, true, NULL) RETURNING id`,
+        [schoolA]
+      );
+      const la = await call("dashboard/learner", { token: tokens["learner-a"] });
+      assert(la.text.includes("ORPHAN-IN-A"), "the owning school must keep seeing (and applying) its own row");
+      const listB = await call("dashboard/overrides", { token: tokens["admin-b"] });
+      const keys = (listB.json.data as { cardKey: string }[]).map((o) => o.cardKey);
+      assert(!keys.includes("2e-f6-orphan"), "the other school must not see the orphan row");
+
+      const del = await call("dashboard/overrides/[id]", { token: tokens["admin-a"], method: "DELETE", params: { id: orphan.id } });
+      assertEq(del.status, 200, "the owning school must be able to delete its own orphaned row");
+    });
+
+    await test("F6: the dual admin's School A context cannot list School B's overrides", async () => {
+      const bCreate = await call("dashboard/overrides", {
+        token: tokens["admin-b"],
+        body: { cardKey: "2e-f6-card-b", dashboardRole: "learner", scopeType: "global", title: "B Card", value: "SCHOOL-B-ONLY" },
+      });
+      assertEq(bCreate.status, 201, `expected 201, body: ${bCreate.text}`);
+
+      const dualList = await call("dashboard/overrides", { token: tokens["dual-admin"] });
+      const keys = (dualList.json.data as { cardKey: string }[]).map((o) => o.cardKey);
+      assert(keys.includes("2e-f6-card"), "dual admin sees their School A row in the School A context");
+      assert(!keys.includes("2e-f6-card-b"), "the School A context must not list School B's row");
+
+      const rb = await call("dashboard/learner", { token: tokens["learner-b"] });
+      assert(rb.text.includes("SCHOOL-B-ONLY"), "School B's own override still applies on School B");
+    });
+
+    /* ════════════════ F7 audit finding — anchored question deletion ════════════════
+       DELETE /api/assignments/[id]/questions validated the ASSIGNMENT (school + owner)
+       but deleted the question by its own client-supplied id, without requiring it to
+       belong to that assignment. Any staff member could thus remove another school's
+       question row given its uuid. The audit fix mirrors the anchor the corrections
+       POST already enforces.
+
+       The fixture uses a clean School B class owned solely by the single-school
+       teacher-b — the multi-school members in Class A/B make the relational
+       "uniquely attributable" predicate (by design) deny their assignments, which
+       would mask the parent-child check this test targets. */
+
+    let questionA1 = "";
+    let questionBD1 = "";
+    let questionBD2 = "";
+
+    const classD = (await one(
+      `INSERT INTO classes (school_id, name, level, class_teacher_id, academic_year_id) VALUES ($1,'Class D','primary',$2,$3) RETURNING id`,
+      [schoolB, ids["teacher-b"], yearB]
+    )).id as string;
+    const assignBD = (await one(
+      `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id, status, max_score) VALUES ($1,'Assignment BD',$2,$3,$4,'published',100) RETURNING id`,
+      [schoolB, classD, subjectB, ids["teacher-b"]]
+    )).id as string;
+
+    await test("F7: question fixtures seed one foreign + two local questions", async () => {
+      questionA1 = (await one(
+        `INSERT INTO assignment_questions (assignment_id, question_text, points) VALUES ($1,'Q A1',5) RETURNING id`, [assignA]
+      )).id as string;
+      questionBD1 = (await one(
+        `INSERT INTO assignment_questions (assignment_id, question_text, points) VALUES ($1,'Q BD1',5) RETURNING id`, [assignBD]
+      )).id as string;
+      questionBD2 = (await one(
+        `INSERT INTO assignment_questions (assignment_id, question_text, points) VALUES ($1,'Q BD2',5) RETURNING id`, [assignBD]
+      )).id as string;
+      assert(questionA1 && questionBD1 && questionBD2, "questions must exist");
+    });
+
+    await test("F7: a School B teacher cannot delete a School A question through their own assignment", async () => {
+      const r = await call("assignments/[id]/questions", {
+        token: tokens["teacher-b"], method: "DELETE", params: { id: assignBD }, query: { questionId: questionA1 },
+      });
+      assertEq(r.status, 404, `cross-school question id must 404, got ${r.status}`);
+      const still = await one(`SELECT id FROM assignment_questions WHERE id = $1`, [questionA1]);
+      assert(still, "the foreign question row must still exist");
+    });
+
+    await test("F7: the same teacher still deletes questions of their OWN assignment", async () => {
+      const r = await call("assignments/[id]/questions", {
+        token: tokens["teacher-b"], method: "DELETE", params: { id: assignBD }, query: { questionId: questionBD1 },
+      });
+      assertEq(r.status, 200, `legitimate delete must succeed, got ${r.status}: ${r.text}`);
+      const gone = await one(`SELECT id FROM assignment_questions WHERE id = $1`, [questionBD1]);
+      assert(!gone, "the question must be deleted");
+      const untouched = await one(`SELECT id FROM assignment_questions WHERE id = $1`, [questionBD2]);
+      assert(untouched, "the sibling question must remain");
     });
 
     console.log(`\n📊 Results: ${passed} passed, ${failed} failed`);
