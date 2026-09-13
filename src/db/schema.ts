@@ -129,7 +129,7 @@ export const users = pgTable("users", {
 /* ── Academic Years ── */
 export const academicYears = pgTable("academic_years", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   name: varchar("name", { length: 50 }).notNull(),
   startDate: date("start_date").notNull(),
   endDate: date("end_date").notNull(),
@@ -143,7 +143,7 @@ export const academicYears = pgTable("academic_years", {
 /* ── Terms ── */
 export const terms = pgTable("terms", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   name: termEnum("name").notNull(),
   academicYearId: uuid("academic_year_id").notNull().references(() => academicYears.id),
   startDate: date("start_date").notNull(),
@@ -157,7 +157,7 @@ export const terms = pgTable("terms", {
 /* ── Departments ── */
 export const departments = pgTable("departments", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   name: varchar("name", { length: 100 }).notNull(),
   description: text("description"),
   headId: uuid("head_id"),
@@ -170,7 +170,7 @@ export const departments = pgTable("departments", {
 /* ── Classes ── */
 export const classes = pgTable("classes", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   name: varchar("name", { length: 100 }).notNull(),
   level: levelEnum("level").notNull(),
   capacity: integer("capacity").default(40),
@@ -184,7 +184,7 @@ export const classes = pgTable("classes", {
 /* ── Subjects ── */
 export const subjects = pgTable("subjects", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   name: varchar("name", { length: 100 }).notNull(),
   code: varchar("code", { length: 20 }),
   departmentId: uuid("department_id").references(() => departments.id),
@@ -197,7 +197,7 @@ export const subjects = pgTable("subjects", {
 /* ── Teacher-Class assignments ── */
 export const teacherClasses = pgTable("teacher_classes", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   teacherId: uuid("teacher_id").notNull().references(() => users.id),
   classId: uuid("class_id").notNull().references(() => classes.id),
   subjectId: uuid("subject_id").notNull().references(() => subjects.id),
@@ -210,7 +210,7 @@ export const teacherClasses = pgTable("teacher_classes", {
 /* ── Learner-Class enrollment ── */
 export const learnerClasses = pgTable("learner_classes", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   learnerId: uuid("learner_id").notNull().references(() => users.id),
   classId: uuid("class_id").notNull().references(() => classes.id),
   academicYearId: uuid("academic_year_id").references(() => academicYears.id),
@@ -222,7 +222,7 @@ export const learnerClasses = pgTable("learner_classes", {
 /* ── Parent-Learner relationship ── */
 export const parentLearners = pgTable("parent_learners", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   parentId: uuid("parent_id").notNull().references(() => users.id),
   learnerId: uuid("learner_id").notNull().references(() => users.id),
   relationship: varchar("relationship", { length: 50 }),
@@ -234,7 +234,7 @@ export const parentLearners = pgTable("parent_learners", {
 /* ── Assignments ── */
 export const assignments = pgTable("assignments", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   title: varchar("title", { length: 255 }).notNull(),
   description: text("description"),
   instructions: text("instructions"),
@@ -265,7 +265,7 @@ export const assignments = pgTable("assignments", {
 /* ── Submissions ── */
 export const submissions = pgTable("submissions", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   assignmentId: uuid("assignment_id").notNull().references(() => assignments.id),
   learnerId: uuid("learner_id").notNull().references(() => users.id),
   content: text("content"),
@@ -293,7 +293,7 @@ export const submissions = pgTable("submissions", {
    live on disk under the upload storage directory (UPLOAD_DIR). */
 export const uploadedFiles = pgTable("uploaded_files", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   uploaderId: uuid("uploader_id").notNull().references(() => users.id),
   purpose: varchar("purpose", { length: 30 }).notNull(), // "assignment" | "submission"
   assignmentId: uuid("assignment_id").references(() => assignments.id),
@@ -349,7 +349,7 @@ export const assignmentCorrections = pgTable("assignment_corrections", {
 /* ── Resources / Study Materials ── */
 export const resources = pgTable("resources", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   title: varchar("title", { length: 255 }).notNull(),
   description: text("description"),
   type: resourceTypeEnum("type").notNull(),
@@ -371,7 +371,7 @@ export const resources = pgTable("resources", {
 /* ── Quizzes ── */
 export const quizzes = pgTable("quizzes", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   title: varchar("title", { length: 255 }).notNull(),
   description: text("description"),
   classId: uuid("class_id").notNull().references(() => classes.id),
@@ -405,7 +405,7 @@ export const quizQuestions = pgTable("quiz_questions", {
 /* ── Quiz Attempts ── */
 export const quizAttempts = pgTable("quiz_attempts", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   quizId: uuid("quiz_id").notNull().references(() => quizzes.id),
   learnerId: uuid("learner_id").notNull().references(() => users.id),
   answers: jsonb("answers"),
@@ -419,7 +419,7 @@ export const quizAttempts = pgTable("quiz_attempts", {
 /* ── Announcements ── */
 export const announcements = pgTable("announcements", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   title: varchar("title", { length: 255 }).notNull(),
   content: text("content").notNull(),
   authorId: uuid("author_id").notNull().references(() => users.id),
@@ -434,7 +434,7 @@ export const announcements = pgTable("announcements", {
 /* ── Notifications ── */
 export const notifications = pgTable("notifications", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   userId: uuid("user_id").notNull().references(() => users.id),
   type: notificationTypeEnum("type").notNull(),
   title: varchar("title", { length: 255 }).notNull(),
@@ -449,7 +449,7 @@ export const notifications = pgTable("notifications", {
 /* ── Attendance ── */
 export const attendance = pgTable("attendance", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   learnerId: uuid("learner_id").notNull().references(() => users.id),
   classId: uuid("class_id").notNull().references(() => classes.id),
   date: date("date").notNull(),
@@ -491,7 +491,7 @@ export const attendanceDuplicatesBackup = pgTable("attendance_duplicates_backup"
 /* ── Timetable (weekly class schedule) ── */
 export const timetableEntries = pgTable("timetable_entries", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   classId: uuid("class_id")
     .notNull()
     .references(() => classes.id, { onDelete: "cascade" }),
@@ -523,7 +523,7 @@ export const timetableEntries = pgTable("timetable_entries", {
 /* ── Messages ── */
 export const messages = pgTable("messages", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   senderId: uuid("sender_id").notNull().references(() => users.id),
   receiverId: uuid("receiver_id").notNull().references(() => users.id),
   content: text("content").notNull(),
@@ -536,6 +536,8 @@ export const messages = pgTable("messages", {
 /* ── Activity Logs (Audit) ── */
 export const activityLogs = pgTable("activity_logs", {
   id: uuid("id").primaryKey().defaultRandom(),
+  // Nullable by design (plan §5/§14): NULL = platform event. Migration 0017
+  // deliberately does NOT enforce NOT NULL on this column.
   schoolId: uuid("school_id").references(() => schools.id),
   userId: uuid("user_id").references(() => users.id),
   action: varchar("action", { length: 100 }).notNull(),
@@ -552,7 +554,7 @@ export const activityLogs = pgTable("activity_logs", {
 /* ── Dashboard Card Overrides ── */
 export const dashboardCardOverrides = pgTable("dashboard_card_overrides", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   cardKey: varchar("card_key", { length: 150 }).notNull(),
   dashboardRole: dashboardRoleEnum("dashboard_role").notNull().default("global"),
   title: varchar("title", { length: 255 }),
@@ -603,7 +605,7 @@ export const learnerPoints = pgTable("learner_points", {
 /* ── Gallery ── */
 export const galleryItems = pgTable("gallery_items", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   title: varchar("title", { length: 255 }).notNull(),
   description: text("description"),
   imageUrl: text("image_url").notNull(),
@@ -617,7 +619,7 @@ export const galleryItems = pgTable("gallery_items", {
 /* ── News / Events ── */
 export const news = pgTable("news", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   title: varchar("title", { length: 255 }).notNull(),
   content: text("content").notNull(),
   imageUrl: text("image_url"),
@@ -633,7 +635,7 @@ export const news = pgTable("news", {
 /* ── FAQ ── */
 export const faqs = pgTable("faqs", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   question: text("question").notNull(),
   answer: text("answer").notNull(),
   orderIndex: integer("order_index").default(0),
@@ -645,7 +647,7 @@ export const faqs = pgTable("faqs", {
 /* ── Downloads ── */
 export const downloads = pgTable("downloads", {
   id: uuid("id").primaryKey().defaultRandom(),
-  schoolId: uuid("school_id").references(() => schools.id),
+  schoolId: uuid("school_id").notNull().references(() => schools.id),
   title: varchar("title", { length: 255 }).notNull(),
   description: text("description"),
   fileUrl: text("file_url").notNull(),

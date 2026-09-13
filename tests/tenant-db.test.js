@@ -1,7 +1,7 @@
 /**
  * Phase 2A Tenant Foundation — LIVE DATABASE tests
  *
- * Applies the full migration chain (0000…0016) to a scratch PostgreSQL
+ * Applies the full migration chain (0000…0017) to a scratch PostgreSQL
  * database and verifies the actual database behavior of `schools` and
  * `school_users`:
  *
@@ -408,11 +408,11 @@ async function main() {
 
     /* ── 8. Post-0016 school_id surface ── */
 
-    // Phase 2E: migration 0016 (drizzle/0016_school_id_columns.sql) intentionally
-    // added a nullable school_id column to every school-owned table, so tenant
-    // attribution can be done directly via WHERE school_id = $ctx.schoolId.
-    // The boundary is now: school_id exists on EXACTLY those 25 tables plus
-    // school_users (Phase 2D, NOT NULL) — and nowhere else.
+    // Phase 2E: migration 0016 added school_id to every school-owned table;
+    // migration 0017 enforces NOT NULL on all of them except activity_logs
+    // (nullable forever — platform events). school_users was already NOT NULL (0013).
+    // The boundary is: school_id exists on EXACTLY those 25 tables plus
+    // school_users — and nowhere else.
     const SCHOOL_ID_TABLES = [
       "academic_years", "activity_logs", "announcements", "assignments", "attendance",
       "classes", "dashboard_card_overrides", "departments", "downloads", "faqs",
@@ -421,6 +421,8 @@ async function main() {
       "subjects", "submissions", "teacher_classes", "terms", "timetable_entries",
       "uploaded_files",
     ].sort();
+    // Only activity_logs stays nullable after 0017.
+    const NULLABLE_SCHOOL_ID_TABLES = new Set(["activity_logs"]);
 
     await test("Boundary: school_id exists on exactly the 25 school-owned tables + school_users", async () => {
       const { rows } = await db.query(
@@ -431,20 +433,75 @@ async function main() {
       assertEq(
         rows.map((r) => r.table_name).join(","),
         SCHOOL_ID_TABLES.join(","),
-        "school_id columns (must be exactly the 0016 school-owned surface + school_users, no more, no less)"
+        "school_id columns (must be exactly the 0016/0017 school-owned surface + school_users, no more, no less)"
       );
       const badType = rows.filter((r) => r.data_type !== "uuid");
       assertEq(badType.length, 0, `non-uuid school_id columns: ${badType.map((r) => r.table_name).join(", ")}`);
-      // 0016 deliberately leaves its 25 columns nullable (NOT NULL enforcement is a
-      // later Phase 2E step after data validation); school_users.school_id stays NOT NULL.
+      // 0017: NOT NULL on every school-owned table except activity_logs (platform events).
       for (const r of rows) {
-        const expectedNullable = r.table_name === "school_users" ? "NO" : "YES";
+        const expectedNullable = NULLABLE_SCHOOL_ID_TABLES.has(r.table_name) ? "YES" : "NO";
         if (r.is_nullable !== expectedNullable) {
           throw new Error(
             `school_id nullability drift: ${r.table_name}.school_id is_nullable=${r.is_nullable}, expected ${expectedNullable}`
           );
         }
       }
+    });
+
+    await test("0017: UNIQUE (school_id, id) targets exist on A-class tables", async () => {
+      const expected = [
+        "academic_years_school_id_id_unique",
+        "terms_school_id_id_unique",
+        "departments_school_id_id_unique",
+        "classes_school_id_id_unique",
+        "subjects_school_id_id_unique",
+        "teacher_classes_school_id_id_unique",
+        "learner_classes_school_id_id_unique",
+        "parent_learners_school_id_id_unique",
+        "assignments_school_id_id_unique",
+        "submissions_school_id_id_unique",
+        "uploaded_files_school_id_id_unique",
+        "resources_school_id_id_unique",
+        "quizzes_school_id_id_unique",
+        "quiz_attempts_school_id_id_unique",
+        "announcements_school_id_id_unique",
+        "notifications_school_id_id_unique",
+        "attendance_school_id_id_unique",
+        "timetable_entries_school_id_id_unique",
+        "messages_school_id_id_unique",
+        "dashboard_card_overrides_school_id_id_unique",
+        "gallery_items_school_id_id_unique",
+        "news_school_id_id_unique",
+        "faqs_school_id_id_unique",
+        "downloads_school_id_id_unique",
+      ];
+      const { rows } = await db.query(
+        `SELECT indexname FROM pg_indexes
+          WHERE schemaname = 'public' AND indexname = ANY($1::text[])
+          ORDER BY indexname`,
+        [expected]
+      );
+      assertEq(
+        rows.map((r) => r.indexname).sort().join(","),
+        expected.slice().sort().join(","),
+        "0017 UNIQUE (school_id, id) targets"
+      );
+    });
+
+    await test("0017: NOT NULL rejects unattributed inserts on a required A-table", async () => {
+      await expectError(
+        `INSERT INTO "academic_years" ("name", "start_date", "end_date") VALUES ('no-school', '2026-01-01', '2026-12-31')`,
+        [],
+        "23502",
+        "NULL school_id insert must fail after 0017"
+      );
+    });
+
+    await test("0017: activity_logs still accepts NULL school_id (platform events)", async () => {
+      const { rows } = await db.query(
+        `INSERT INTO "activity_logs" ("action", "description") VALUES ('login', 'platform event') RETURNING school_id`
+      );
+      assertEq(rows[0].school_id, null, "platform activity_logs row may have NULL school_id");
     });
 
     await test("Boundary: exactly the 35 legacy tables + 2 new tables exist", async () => {
