@@ -46,7 +46,7 @@ export async function GET(request: NextRequest) {
       })
       .from(assignments)
       .where(isTeacher
-        ? eq(assignments.teacherId, payload.userId)
+        ? and(eq(assignments.teacherId, payload.userId), eq(assignments.schoolId, ctx.schoolId))
         : sqlAssignmentInSchool(ctx.schoolId, assignments.id));
 
     const [submissionTotals] = await db
@@ -57,7 +57,7 @@ export async function GET(request: NextRequest) {
       .from(submissions)
       .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
       .where(isTeacher
-        ? eq(assignments.teacherId, payload.userId)
+        ? and(eq(assignments.teacherId, payload.userId), eq(assignments.schoolId, ctx.schoolId))
         : sqlAssignmentInSchool(ctx.schoolId, assignments.id));
 
     const [quizTotals] = await db
@@ -68,20 +68,23 @@ export async function GET(request: NextRequest) {
       .from(quizAttempts)
       .innerJoin(quizzes, eq(quizAttempts.quizId, quizzes.id))
       .where(isTeacher
-        ? eq(quizzes.teacherId, payload.userId)
+        ? and(eq(quizzes.teacherId, payload.userId), eq(quizzes.schoolId, ctx.schoolId))
         : sqlQuizInSchool(ctx.schoolId, quizzes.id));
 
+    /* Phase 2E: a teacher's class list is also restricted to the resolved school — the
+       teacherId parameter alone can span schools when the teacher holds several
+       memberships. */
     let teacherClassIds: string[] = [];
     if (isTeacher) {
       const [assignedClasses, homeroomClasses] = await Promise.all([
         db
           .select({ classId: teacherClasses.classId })
           .from(teacherClasses)
-          .where(eq(teacherClasses.teacherId, payload.userId)),
+          .where(and(eq(teacherClasses.teacherId, payload.userId), eq(teacherClasses.schoolId, ctx.schoolId))),
         db
           .select({ classId: classes.id })
           .from(classes)
-          .where(eq(classes.classTeacherId, payload.userId)),
+          .where(and(eq(classes.classTeacherId, payload.userId), eq(classes.schoolId, ctx.schoolId))),
       ]);
       teacherClassIds = [...new Set([
         ...assignedClasses.map((row) => row.classId),
@@ -100,7 +103,7 @@ export async function GET(request: NextRequest) {
        Every row is now restricted to the caller's school (its learner is a member). */
     const attendanceStats = isTeacher
       ? teacherClassIds.length > 0
-        ? await attendanceQuery.where(inArray(attendance.classId, teacherClassIds))
+        ? await attendanceQuery.where(and(eq(attendance.schoolId, ctx.schoolId), inArray(attendance.classId, teacherClassIds)))
         : await attendanceQuery.where(sql`false`)
       : await attendanceQuery.where(sqlUserInSchool(ctx.schoolId, attendance.learnerId));
     const [{ totalAttendance, presentAttendance }] = attendanceStats;
@@ -128,7 +131,7 @@ export async function GET(request: NextRequest) {
     const classDistribution = isTeacher
       ? teacherClassIds.length > 0
         ? await classDistributionQuery
-          .where(inArray(classes.id, teacherClassIds))
+          .where(and(eq(classes.schoolId, ctx.schoolId), inArray(classes.id, teacherClassIds)))
           .groupBy(classes.id)
           .orderBy(asc(classes.name))
         : []

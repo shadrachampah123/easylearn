@@ -42,6 +42,11 @@ export async function GET(request: NextRequest) {
       return errorResponse("Teacher not found", 404);
     }
 
+    /* Phase 2E: class selection and every downstream aggregate are additionally restricted
+       to `ctx.schoolId`. A teacher may hold memberships in several schools, so `teacherId`
+       alone can widen this dashboard across tenants — the direct `school_id` predicate
+       (NOT NULL since migration 0017) keeps it within the resolved school context. */
+
     // My classes (including homeroom)
     const assigned = await db
       .select({
@@ -51,7 +56,7 @@ export async function GET(request: NextRequest) {
       })
       .from(teacherClasses)
       .leftJoin(classes, eq(teacherClasses.classId, classes.id))
-      .where(eq(teacherClasses.teacherId, teacherId));
+      .where(and(eq(teacherClasses.teacherId, teacherId), eq(teacherClasses.schoolId, ctx.schoolId)));
 
     const homeroom = await db
       .select({
@@ -59,7 +64,7 @@ export async function GET(request: NextRequest) {
         className: classes.name,
       })
       .from(classes)
-      .where(eq(classes.classTeacherId, teacherId));
+      .where(and(eq(classes.classTeacherId, teacherId), eq(classes.schoolId, ctx.schoolId)));
 
     const allClassIds = new Set<string>();
     assigned.forEach(a => { if (a.classId) allClassIds.add(a.classId); });
@@ -71,19 +76,22 @@ export async function GET(request: NextRequest) {
     const [myAssignments] = await db
       .select({ count: sql<number>`count(*)` })
       .from(assignments)
-      .where(eq(assignments.teacherId, teacherId));
+      .where(and(eq(assignments.teacherId, teacherId), eq(assignments.schoolId, ctx.schoolId)));
 
     const [myResources] = await db
       .select({ count: sql<number>`count(*)` })
       .from(resources)
-      .where(eq(resources.teacherId, teacherId));
+      .where(and(eq(resources.teacherId, teacherId), eq(resources.schoolId, ctx.schoolId)));
 
     let totalStudents = 0;
     if (classIdsArray.length > 0) {
       const [students] = await db
         .select({ count: sql<number>`count(DISTINCT ${learnerClasses.learnerId})` })
         .from(learnerClasses)
-        .where(sql`${learnerClasses.classId} IN (${sql.join(classIdsArray.map(id => sql`${id}`), sql`, `)})`);
+        .where(and(
+          eq(learnerClasses.schoolId, ctx.schoolId),
+          sql`${learnerClasses.classId} IN (${sql.join(classIdsArray.map(id => sql`${id}`), sql`, `)})`
+        ));
       totalStudents = Number(students.count);
     }
 
@@ -97,6 +105,7 @@ export async function GET(request: NextRequest) {
         .where(
           and(
             eq(assignments.teacherId, teacherId),
+            eq(assignments.schoolId, ctx.schoolId),
             eq(submissions.status, "submitted" as any)
           )
         );
@@ -113,7 +122,7 @@ export async function GET(request: NextRequest) {
         })
         .from(assignments)
         .leftJoin(submissions, eq(submissions.assignmentId, assignments.id))
-        .where(eq(assignments.classId, classId));
+        .where(and(eq(assignments.classId, classId), eq(assignments.schoolId, ctx.schoolId)));
 
       const classInfo = await db.select({ name: classes.name }).from(classes).where(eq(classes.id, classId)).limit(1);
       const topStudent = await db
@@ -125,7 +134,7 @@ export async function GET(request: NextRequest) {
         .from(submissions)
         .leftJoin(users, eq(submissions.learnerId, users.id))
         .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-        .where(eq(assignments.classId, classId))
+        .where(and(eq(assignments.classId, classId), eq(assignments.schoolId, ctx.schoolId)))
         .groupBy(users.id, users.firstName, users.lastName)
         .orderBy(sql`AVG(${submissions.percentage}) DESC`)
         .limit(1);
@@ -152,6 +161,7 @@ export async function GET(request: NextRequest) {
         .from(attendance)
         .where(
           and(
+            eq(attendance.schoolId, ctx.schoolId),
             sql`${attendance.classId} IN (${sql.join(classIdsArray.map(id => sql`${id}`), sql`, `)})`,
             eq(attendance.date, today)
           )

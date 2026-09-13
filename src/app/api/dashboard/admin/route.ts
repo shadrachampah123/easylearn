@@ -267,17 +267,16 @@ export async function GET(request: NextRequest) {
     // Live metrics - each count is independent so one missing migration cannot 500 the page.
     /* Phase 2C: every count is restricted to the caller's school. User counts use the
        membership predicate; content counts use the attribution predicates.
-       `subjects` is the one exception: `subjects` (like `departments`, `terms` and
-       `academic_years`) carries no user or class anchor, so it cannot be attributed to a
-       school without the Phase 2D `school_id` columns — see
-       docs/PHASE2C_TENANT_AUTHORIZATION.md § Deferred. It is left unchanged on purpose
-       rather than guessed at. */
+       `subjects` (like `departments`, `terms` and `academic_years`) now carries its own
+       `school_id` column (migrations 0016/0017), so it is counted with a direct school
+       predicate exactly like every other catalog/content table — no longer an unattributed
+       exception. */
     const statQueries: Array<[keyof RawStats, () => Promise<number>]> = [
       ["teachers", () => countFrom(users, sql`${eq(users.role, "teacher")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
       ["learners", () => countFrom(users, sql`${eq(users.role, "learner")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
       ["parents", () => countFrom(users, sql`${eq(users.role, "parent")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
       ["classes", () => countFrom(classes, sqlClassInSchool(ctx.schoolId, classes.id))],
-      ["subjects", () => countFrom(subjects)],
+      ["subjects", () => countFrom(subjects, eq(subjects.schoolId, ctx.schoolId))],
       ["assignments", () => countFrom(assignments, sqlAssignmentInSchool(ctx.schoolId, assignments.id))],
       ["quizzes", () => countFrom(quizzes, sqlQuizInSchool(ctx.schoolId, quizzes.id))],
       ["resources", () => countFrom(resources, sqlUserInSchool(ctx.schoolId, resources.teacherId))],

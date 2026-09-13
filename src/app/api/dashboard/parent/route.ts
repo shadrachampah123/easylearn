@@ -92,7 +92,7 @@ export async function GET(request: NextRequest) {
       })
       .from(learnerClasses)
       .leftJoin(classes, eq(learnerClasses.classId, classes.id))
-      .where(eq(learnerClasses.learnerId, targetLearnerId))
+      .where(and(eq(learnerClasses.learnerId, targetLearnerId), eq(learnerClasses.schoolId, ctx.schoolId)))
       .orderBy(desc(learnerClasses.createdAt))
       .limit(1);
 
@@ -105,7 +105,11 @@ export async function GET(request: NextRequest) {
         subjectId: sql<string>`(SELECT subject_id FROM assignments WHERE id = ${submissions.assignmentId})`,
       })
       .from(submissions)
-      .where(and(eq(submissions.learnerId, targetLearnerId), eq(submissions.status, "graded" as any)));
+      .where(and(
+        eq(submissions.learnerId, targetLearnerId),
+        eq(submissions.schoolId, ctx.schoolId),
+        eq(submissions.status, "graded" as any)
+      ));
 
     const avgGrade =
       learnerSubmissions.length > 0
@@ -135,7 +139,11 @@ export async function GET(request: NextRequest) {
         avg: sql<number>`AVG(${submissions.percentage})`,
       })
       .from(submissions)
-      .where(and(eq(submissions.learnerId, targetLearnerId), eq(submissions.status, "graded" as any)))
+      .where(and(
+        eq(submissions.learnerId, targetLearnerId),
+        eq(submissions.schoolId, ctx.schoolId),
+        eq(submissions.status, "graded" as any)
+      ))
       .groupBy(sql`(SELECT name FROM subjects WHERE id = (SELECT subject_id FROM assignments WHERE id = ${submissions.assignmentId}))`);
 
     // Attendance
@@ -144,7 +152,7 @@ export async function GET(request: NextRequest) {
         isPresent: attendance.isPresent,
       })
       .from(attendance)
-      .where(eq(attendance.learnerId, targetLearnerId));
+      .where(and(eq(attendance.learnerId, targetLearnerId), eq(attendance.schoolId, ctx.schoolId)));
 
     const present = attendanceRecords.filter(r => r.isPresent).length;
     const totalAttendance = attendanceRecords.length;
@@ -156,12 +164,16 @@ export async function GET(request: NextRequest) {
       const allAssignments = await db
         .select({ id: assignments.id })
         .from(assignments)
-        .where(and(eq(assignments.classId, classId), eq(assignments.status, "published" as any)));
+        .where(and(
+          eq(assignments.classId, classId),
+          eq(assignments.schoolId, ctx.schoolId),
+          eq(assignments.status, "published" as any)
+        ));
 
       const subs = await db
         .select({ assignmentId: submissions.assignmentId })
         .from(submissions)
-        .where(eq(submissions.learnerId, targetLearnerId));
+        .where(and(eq(submissions.learnerId, targetLearnerId), eq(submissions.schoolId, ctx.schoolId)));
 
       const subSet = new Set(subs.map(s => s.assignmentId));
       pendingCount = allAssignments.filter(a => !subSet.has(a.id)).length;
@@ -173,14 +185,18 @@ export async function GET(request: NextRequest) {
       const classmates = await db
         .select({ learnerId: learnerClasses.learnerId })
         .from(learnerClasses)
-        .where(eq(learnerClasses.classId, classId));
+        .where(and(eq(learnerClasses.classId, classId), eq(learnerClasses.schoolId, ctx.schoolId)));
 
       const ranks = await Promise.all(
         classmates.map(async (c) => {
           const subs = await db
             .select({ percentage: submissions.percentage })
             .from(submissions)
-            .where(and(eq(submissions.learnerId, c.learnerId), eq(submissions.status, "graded" as any)));
+            .where(and(
+              eq(submissions.learnerId, c.learnerId),
+              eq(submissions.schoolId, ctx.schoolId),
+              eq(submissions.status, "graded" as any)
+            ));
           const avg = subs.length > 0 ? subs.reduce((sum, s) => sum + (s.percentage || 0), 0) / subs.length : 0;
           return { learnerId: c.learnerId, avg };
         })
@@ -199,7 +215,11 @@ export async function GET(request: NextRequest) {
             dueDate: assignments.dueDate,
           })
           .from(assignments)
-          .where(and(eq(assignments.classId, classId), eq(assignments.status, "published" as any)))
+          .where(and(
+            eq(assignments.classId, classId),
+            eq(assignments.schoolId, ctx.schoolId),
+            eq(assignments.status, "published" as any)
+          ))
           .orderBy(assignments.dueDate)
           .limit(5)
       : [];
@@ -209,7 +229,11 @@ export async function GET(request: NextRequest) {
       const sub = await db
         .select()
         .from(submissions)
-        .where(and(eq(submissions.learnerId, targetLearnerId), eq(submissions.assignmentId, hw.id)))
+        .where(and(
+          eq(submissions.learnerId, targetLearnerId),
+          eq(submissions.schoolId, ctx.schoolId),
+          eq(submissions.assignmentId, hw.id)
+        ))
         .limit(1);
       filteredHomework.push({
         id: hw.id,
@@ -228,14 +252,22 @@ export async function GET(request: NextRequest) {
             createdAt: quizzes.createdAt,
           })
           .from(quizzes)
-          .where(and(eq(quizzes.classId, classId), eq(quizzes.isPublished, true)))
+          .where(and(
+            eq(quizzes.classId, classId),
+            eq(quizzes.schoolId, ctx.schoolId),
+            eq(quizzes.isPublished, true)
+          ))
           .limit(5)
       : [];
 
     const parentQuizAttempts = await db
       .select({ quizId: quizAttempts.quizId })
       .from(quizAttempts)
-      .where(and(eq(quizAttempts.learnerId, targetLearnerId), sql`${quizAttempts.completedAt} IS NOT NULL`));
+      .where(and(
+        eq(quizAttempts.learnerId, targetLearnerId),
+        eq(quizAttempts.schoolId, ctx.schoolId),
+        sql`${quizAttempts.completedAt} IS NOT NULL`
+      ));
     const completedParentQuizIds = new Set(parentQuizAttempts.map(a => a.quizId));
 
     for (const q of parentQuizzes) {
@@ -249,7 +281,9 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Announcements
+    // Announcements — Phase 2E: scoped to the caller's school, mirroring the authenticated
+    // branch of /api/announcements (direct school_id predicate). Ordering and limit are
+    // unchanged.
     const recentAnnouncements = await db
       .select({
         id: announcements.id,
@@ -257,6 +291,7 @@ export async function GET(request: NextRequest) {
         createdAt: announcements.createdAt,
       })
       .from(announcements)
+      .where(eq(announcements.schoolId, ctx.schoolId))
       .orderBy(desc(announcements.createdAt))
       .limit(3);
 

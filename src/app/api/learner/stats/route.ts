@@ -59,6 +59,10 @@ export async function GET(request: NextRequest) {
     // Get all achievements (to show locked ones)
     const allAchievements = await db.select().from(achievements);
 
+    /* Phase 2E: each activity row is additionally attributed to the caller's school, so a
+       learner who belongs to several schools never folds another school's activity into
+       these statistics. Gamification tables stay platform-global by design (see below). */
+
     // Assignment stats
     const [submissionStats] = await db
       .select({
@@ -66,7 +70,10 @@ export async function GET(request: NextRequest) {
         graded: sql<number>`count(*) FILTER (WHERE ${submissions.status} = 'graded')`,
       })
       .from(submissions)
-      .where(eq(submissions.learnerId, learnerId));
+      .where(and(
+        eq(submissions.learnerId, learnerId),
+        eq(submissions.schoolId, ctx.schoolId)
+      ));
 
     // Quiz stats
     const [quizStats] = await db
@@ -77,6 +84,7 @@ export async function GET(request: NextRequest) {
       .from(quizAttempts)
       .where(and(
         eq(quizAttempts.learnerId, learnerId),
+        eq(quizAttempts.schoolId, ctx.schoolId),
         sql`${quizAttempts.completedAt} IS NOT NULL`
       ));
 
@@ -89,6 +97,7 @@ export async function GET(request: NextRequest) {
       .from(attendance)
       .where(and(
         eq(attendance.learnerId, learnerId),
+        eq(attendance.schoolId, ctx.schoolId),
         sql`${attendance.date} >= CURRENT_DATE - INTERVAL '30 days'`
       ));
 

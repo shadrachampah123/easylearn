@@ -28,7 +28,11 @@ interface LearnerSummary {
   average: number;
 }
 
-async function loadLearnerReport(learnerId: string, payload: { userId: string; role: string }) {
+async function loadLearnerReport(
+  learnerId: string,
+  payload: { userId: string; role: string },
+  schoolId: string
+) {
   const isTeacher = payload.role === "teacher";
   const [learner] = await db
     .select({
@@ -70,6 +74,9 @@ async function loadLearnerReport(learnerId: string, payload: { userId: string; r
     .leftJoin(subjects, eq(assignments.subjectId, subjects.id))
     .where(and(
       eq(submissions.learnerId, learnerId),
+      // Phase 2E: a learner may belong to several schools, so the submission row must be
+      // attributed to the caller's school directly (school_id is NOT NULL since 0017).
+      eq(submissions.schoolId, schoolId),
       isTeacher ? eq(assignments.teacherId, payload.userId) : undefined
     ))
     .orderBy(desc(submissions.submittedAt));
@@ -93,6 +100,8 @@ async function loadLearnerReport(learnerId: string, payload: { userId: string; r
     .leftJoin(subjects, eq(quizzes.subjectId, subjects.id))
     .where(and(
       eq(quizAttempts.learnerId, learnerId),
+      // Phase 2E: scope the attempt to the caller's school (multi-school learner).
+      eq(quizAttempts.schoolId, schoolId),
       isTeacher ? eq(quizzes.teacherId, payload.userId) : undefined
     ))
     .orderBy(desc(quizAttempts.startedAt));
@@ -175,7 +184,7 @@ export async function GET(request: NextRequest) {
       if (!allowedLearnerIds.has(learnerId)) {
         return errorResponse("You can only view learners in your scope", 403);
       }
-      const report = await loadLearnerReport(learnerId, payload);
+      const report = await loadLearnerReport(learnerId, payload, ctx.schoolId);
       if (!report) return errorResponse("Learner not found", 404);
       return successResponse({ learners: [], report });
     }
@@ -202,6 +211,7 @@ export async function GET(request: NextRequest) {
           .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
           .where(and(
             eq(submissions.learnerId, learner.id),
+            eq(submissions.schoolId, ctx.schoolId),
             isTeacher ? eq(assignments.teacherId, payload.userId) : undefined
           ));
         const [{ quizAttemptCount }] = await db
@@ -210,6 +220,7 @@ export async function GET(request: NextRequest) {
           .innerJoin(quizzes, eq(quizAttempts.quizId, quizzes.id))
           .where(and(
             eq(quizAttempts.learnerId, learner.id),
+            eq(quizAttempts.schoolId, ctx.schoolId),
             isTeacher ? eq(quizzes.teacherId, payload.userId) : undefined
           ));
         const [{ completedQuizCount }] = await db
@@ -218,6 +229,7 @@ export async function GET(request: NextRequest) {
           .innerJoin(quizzes, eq(quizAttempts.quizId, quizzes.id))
           .where(and(
             eq(quizAttempts.learnerId, learner.id),
+            eq(quizAttempts.schoolId, ctx.schoolId),
             sql`${quizAttempts.completedAt} IS NOT NULL`,
             isTeacher ? eq(quizzes.teacherId, payload.userId) : undefined
           ));
@@ -227,6 +239,7 @@ export async function GET(request: NextRequest) {
           .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
           .where(and(
             eq(submissions.learnerId, learner.id),
+            eq(submissions.schoolId, ctx.schoolId),
             eq(submissions.status, "graded"),
             isTeacher ? eq(assignments.teacherId, payload.userId) : undefined
           ));
@@ -239,6 +252,7 @@ export async function GET(request: NextRequest) {
           .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
           .where(and(
             eq(submissions.learnerId, learner.id),
+            eq(submissions.schoolId, ctx.schoolId),
             eq(submissions.status, "graded"),
             isTeacher ? eq(assignments.teacherId, payload.userId) : undefined
           ));
@@ -251,6 +265,7 @@ export async function GET(request: NextRequest) {
           .innerJoin(quizzes, eq(quizAttempts.quizId, quizzes.id))
           .where(and(
             eq(quizAttempts.learnerId, learner.id),
+            eq(quizAttempts.schoolId, ctx.schoolId),
             sql`${quizAttempts.completedAt} IS NOT NULL`,
             isTeacher ? eq(quizzes.teacherId, payload.userId) : undefined
           ));
