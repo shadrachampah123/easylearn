@@ -151,7 +151,15 @@ export async function DELETE(
       return errorResponse("You can only edit your own assignments", 403);
     }
 
-    await db.delete(assignmentQuestions).where(eq(assignmentQuestions.id, questionId));
+    /* Phase 2E (F7 audit): the question must belong to the assignment the caller was
+       authorized on — the same anchor the corrections POST enforces. Without it, the
+       ownership checks above apply to `assignmentId` while the delete below would happily
+       remove a question of ANOTHER assignment (another school's, given its uuid). */
+    if (question.assignmentId !== assignmentId) return notFoundResponse("Question");
+
+    await db
+      .delete(assignmentQuestions)
+      .where(and(eq(assignmentQuestions.id, questionId), eq(assignmentQuestions.assignmentId, assignmentId)));
 
     return successResponse({ message: "Question deleted" });
   } catch (error) {

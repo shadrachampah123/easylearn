@@ -1,11 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { dashboardCardOverrides } from "@/db/schema";
-import {
-  guardSchoolContext,
-  hasSchoolAdminExtendedRole,
-  sqlUserInSchool,
-} from "@/lib/tenant";
+import { guardSchoolContext, hasSchoolAdminExtendedRole } from "@/lib/tenant";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, desc, and, or, ilike } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
@@ -81,8 +77,11 @@ export async function GET(request: NextRequest) {
 
     let query = db.select().from(dashboardCardOverrides).$dynamic();
 
-    /* Phase 2C: overrides are only visible inside the school of the admin who created them. */
-    const conditions: any[] = [sqlUserInSchool(ctx.schoolId, dashboardCardOverrides.createdBy)];
+    /* Phase 2E (F6): overrides are listed by their own direct `school_id` attribution
+       (migrations 0016/0017), not by creator membership. Creator scoping let an override
+       created by a multi-school admin surface in — and be mutable from — every school the
+       admin belongs to. */
+    const conditions: any[] = [eq(dashboardCardOverrides.schoolId, ctx.schoolId)];
 
     if (dashboardRole) {
       conditions.push(eq(dashboardCardOverrides.dashboardRole, dashboardRole as any));

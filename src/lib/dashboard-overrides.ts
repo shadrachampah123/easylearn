@@ -1,7 +1,6 @@
 import { db } from "@/db";
 import { dashboardCardOverrides } from "@/db/schema";
 import { eq, and, or, desc } from "drizzle-orm";
-import { sqlUserInSchool } from "@/lib/tenant";
 import {
   ensureSchemaFeature,
   isSchemaOutOfDate,
@@ -184,10 +183,13 @@ export async function readOverridesForDashboard(
   dashboardRole: string,
   scopes: { type: string; id: string }[] = [],
   /**
-   * Phase 2C: when a verified school context is supplied, only overrides created by a
-   * member of that school are returned. Dashboard customisation is school-owned content
-   * whose only anchor is its author, so an override created outside any school is not part
-   * of any school's dashboard.
+   * Phase 2E (F6): every override row carries a NOT NULL `school_id` (migrations
+   * 0016/0017), so the read is scoped DIRECTLY by it — the authoritative tenant
+   * predicate. The pre-0016 "creator is a member of the school" scoping is unsafe for
+   * multi-school members: an override created in School A by an admin who also belongs
+   * to School B would surface on (and could be mutated from) School B's dashboards.
+   * Fail closed: without a verified school context no override is applied at all, so a
+   * caller can never fall back to an unscoped read.
    */
   options: { schoolId?: string } = {}
 ): Promise<OverrideReadResult> {
@@ -206,6 +208,11 @@ export async function readOverridesForDashboard(
     };
   }
 
+  // Fail closed on a missing/invalid school context: the dashboard simply shows live data.
+  if (!options.schoolId || !UUID_PATTERN.test(options.schoolId)) {
+    return { overrides: new Map(), available: true, repaired: status.repaired };
+  }
+
   try {
     // Build conditions for relevant overrides
     // Always include global scope and role-specific scope
@@ -215,9 +222,7 @@ export async function readOverridesForDashboard(
         eq(dashboardCardOverrides.dashboardRole, dashboardRole as any),
         eq(dashboardCardOverrides.dashboardRole, "global" as any)
       ),
-      ...(options.schoolId
-        ? [sqlUserInSchool(options.schoolId, dashboardCardOverrides.createdBy)]
-        : []),
+      eq(dashboardCardOverrides.schoolId, options.schoolId),
     ];
 
     const allOverrides = await db
