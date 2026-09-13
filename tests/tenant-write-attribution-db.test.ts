@@ -3,7 +3,7 @@
  *
  * Phase 2D made tenant READS safe; Phase 2E Step 1 stops the NULL school_id bleed on the
  * WRITE side. This suite proves, against a real PostgreSQL with the full migration chain
- * (0000…0016) and two real schools, that every school-scoped write path attributes the
+ * (0000…0017) and two real schools, that every school-scoped write path attributes the
  * row to the CALLER's verified school:
  *
  *   a. local upload          → uploaded_files.school_id  = caller school
@@ -576,8 +576,10 @@ async function main() {
         // academic_years row is NULL again after the re-add — all rows created in
         // this test belong to school A (school B's year is created later, with the
         // column in place).
+        // Restore the post-0017 shape: column present, attributed, NOT NULL.
         await q(`ALTER TABLE academic_years ADD COLUMN IF NOT EXISTS school_id uuid`);
         await q(`UPDATE academic_years SET school_id = $1 WHERE school_id IS NULL`, [schoolA]);
+        await q(`ALTER TABLE academic_years ALTER COLUMN school_id SET NOT NULL`);
       }
       assertEq(
         await nullCount("academic_years"),
@@ -609,11 +611,26 @@ async function main() {
     console.log(`\n📊 Phase 2E Step 1 results: ${passed} passed, ${failed} failed\n`);
   } finally {
     // The scratch client is CONNECTED to the scratch database — it cannot drop it.
-    // Use the admin client (connected to the `postgres` database) instead.
-    await db.end();
-    await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`);
-    await admin.end();
-    if (stopServer) await stopServer();
+    // The app pool (imported via @/db during the suite) also holds sessions against it.
+    // End both before DROP, and FORCE remaining backends so cleanup never fails the suite.
+    try {
+      const { pool } = await import("@/db");
+      await pool.end().catch(() => {});
+    } catch {
+      /* pool may not have been imported if migrations failed early */
+    }
+    await db.end().catch(() => {});
+    try {
+      await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}" WITH (FORCE)`);
+    } catch {
+      try {
+        await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`);
+      } catch {
+        /* best effort */
+      }
+    }
+    await admin.end().catch(() => {});
+    if (stopServer) await stopServer().catch(() => {});
   }
 
   process.exit(failed > 0 ? 1 : 0);
