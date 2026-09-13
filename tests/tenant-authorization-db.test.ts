@@ -209,120 +209,127 @@ async function main() {
       }
     }
 
-    const academicYear = (await one(
-      `INSERT INTO academic_years (name, start_date, end_date, is_current)
-       VALUES ('2025/2026', '2025-09-01', '2026-07-01', true) RETURNING id`
+    const yearA = (await one(
+      `INSERT INTO academic_years (school_id, name, start_date, end_date, is_current)
+       VALUES ($1, '2025/2026', '2025-09-01', '2026-07-01', true) RETURNING id`,
+      [schoolA]
+    )).id as string;
+    const yearB = (await one(
+      `INSERT INTO academic_years (school_id, name, start_date, end_date, is_current)
+       VALUES ($1, '2025/2026', '2025-09-01', '2026-07-01', true) RETURNING id`,
+      [schoolB]
     )).id as string;
 
-    const subject = (await one(`INSERT INTO subjects (name, code) VALUES ('Maths', 'MTH') RETURNING id`)).id as string;
+    const subjectA = (await one(`INSERT INTO subjects (school_id, name, code) VALUES ($1, 'Maths', 'MTH') RETURNING id`, [schoolA])).id as string;
+    const subjectB = (await one(`INSERT INTO subjects (school_id, name, code) VALUES ($1, 'Maths', 'MTH') RETURNING id`, [schoolB])).id as string;
 
     const classA = (await one(
-      `INSERT INTO classes (name, level, class_teacher_id, academic_year_id)
-       VALUES ('Class A', 'primary', $1, $2) RETURNING id`,
-      [ids["teacher-a"], academicYear]
+      `INSERT INTO classes (school_id, name, level, class_teacher_id, academic_year_id)
+       VALUES ($1, 'Class A', 'primary', $2, $3) RETURNING id`,
+      [schoolA, ids["teacher-a"], yearA]
     )).id as string;
     const classB = (await one(
-      `INSERT INTO classes (name, level, class_teacher_id, academic_year_id)
-       VALUES ('Class B', 'primary', $1, $2) RETURNING id`,
-      [ids["teacher-b"], academicYear]
+      `INSERT INTO classes (school_id, name, level, class_teacher_id, academic_year_id)
+       VALUES ($1, 'Class B', 'primary', $2, $3) RETURNING id`,
+      [schoolB, ids["teacher-b"], yearB]
     )).id as string;
 
-    await q(`INSERT INTO teacher_classes (teacher_id, class_id, subject_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
-      ids["teacher-a"], classA, subject, academicYear,
+    await q(`INSERT INTO teacher_classes (school_id, teacher_id, class_id, subject_id, academic_year_id) VALUES ($1,$2,$3,$4,$5)`, [
+      schoolA, ids["teacher-a"], classA, subjectA, yearA,
     ]);
-    await q(`INSERT INTO teacher_classes (teacher_id, class_id, subject_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
-      ids["teacher-b"], classB, subject, academicYear,
-    ]);
-
-    await q(`INSERT INTO learner_classes (learner_id, class_id, academic_year_id) VALUES ($1,$2,$3)`, [
-      ids["learner-a"], classA, academicYear,
-    ]);
-    await q(`INSERT INTO learner_classes (learner_id, class_id, academic_year_id) VALUES ($1,$2,$3)`, [
-      ids["learner-b"], classB, academicYear,
+    await q(`INSERT INTO teacher_classes (school_id, teacher_id, class_id, subject_id, academic_year_id) VALUES ($1,$2,$3,$4,$5)`, [
+      schoolB, ids["teacher-b"], classB, subjectB, yearB,
     ]);
 
-    await q(`INSERT INTO parent_learners (parent_id, learner_id, relationship) VALUES ($1,$2,'guardian')`, [
-      ids["parent-a"], ids["learner-a"],
+    await q(`INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
+      schoolA, ids["learner-a"], classA, yearA,
+    ]);
+    await q(`INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
+      schoolB, ids["learner-b"], classB, yearB,
+    ]);
+
+    await q(`INSERT INTO parent_learners (school_id, parent_id, learner_id, relationship) VALUES ($1,$2,$3,'guardian')`, [
+      schoolA, ids["parent-a"], ids["learner-a"],
     ]);
     // A cross-school link, to prove the parent branch intersects with the school's members.
-    await q(`INSERT INTO parent_learners (parent_id, learner_id, relationship) VALUES ($1,$2,'guardian')`, [
-      ids["parent-a"], ids["learner-b"],
+    await q(`INSERT INTO parent_learners (school_id, parent_id, learner_id, relationship) VALUES ($1,$2,$3,'guardian')`, [
+      schoolB, ids["parent-a"], ids["learner-b"],
     ]);
-    await q(`INSERT INTO parent_learners (parent_id, learner_id, relationship) VALUES ($1,$2,'guardian')`, [
-      ids["parent-b"], ids["learner-b"],
+    await q(`INSERT INTO parent_learners (school_id, parent_id, learner_id, relationship) VALUES ($1,$2,$3,'guardian')`, [
+      schoolB, ids["parent-b"], ids["learner-b"],
     ]);
 
     const assignA = (await one(
-      `INSERT INTO assignments (title, class_id, subject_id, teacher_id, status, max_score, allow_file_uploads)
-       VALUES ('Assignment A', $1, $2, $3, 'published', 100, true) RETURNING id`,
-      [classA, subject, ids["teacher-a"]]
+      `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id, status, max_score, allow_file_uploads)
+       VALUES ($1, 'Assignment A', $2, $3, $4, 'published', 100, true) RETURNING id`,
+      [schoolA, classA, subjectA, ids["teacher-a"]]
     )).id as string;
     const assignB = (await one(
-      `INSERT INTO assignments (title, class_id, subject_id, teacher_id, status, max_score, allow_file_uploads)
-       VALUES ('Assignment B', $1, $2, $3, 'published', 100, true) RETURNING id`,
-      [classB, subject, ids["teacher-b"]]
+      `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id, status, max_score, allow_file_uploads)
+       VALUES ($1, 'Assignment B', $2, $3, $4, 'published', 100, true) RETURNING id`,
+      [schoolB, classB, subjectB, ids["teacher-b"]]
     )).id as string;
 
     const subA = (await one(
-      `INSERT INTO submissions (assignment_id, learner_id, status, score, max_score, percentage, graded_at)
-       VALUES ($1, $2, 'graded', 80, 100, 80, now()) RETURNING id`,
-      [assignA, ids["learner-a"]]
+      `INSERT INTO submissions (school_id, assignment_id, learner_id, status, score, max_score, percentage, graded_at)
+       VALUES ($1, $2, $3, 'graded', 80, 100, 80, now()) RETURNING id`,
+      [schoolA, assignA, ids["learner-a"]]
     )).id as string;
     const subB = (await one(
-      `INSERT INTO submissions (assignment_id, learner_id, status, score, max_score, percentage, graded_at)
-       VALUES ($1, $2, 'graded', 90, 100, 90, now()) RETURNING id`,
-      [assignB, ids["learner-b"]]
+      `INSERT INTO submissions (school_id, assignment_id, learner_id, status, score, max_score, percentage, graded_at)
+       VALUES ($1, $2, $3, 'graded', 90, 100, 90, now()) RETURNING id`,
+      [schoolB, assignB, ids["learner-b"]]
     )).id as string;
 
-    await q(`INSERT INTO attendance (learner_id, class_id, date, is_present, marked_by_id) VALUES ($1,$2,CURRENT_DATE,true,$3)`, [
-      ids["learner-a"], classA, ids["teacher-a"],
+    await q(`INSERT INTO attendance (school_id, learner_id, class_id, date, is_present, marked_by_id) VALUES ($1,$2,$3,CURRENT_DATE,true,$4)`, [
+      schoolA, ids["learner-a"], classA, ids["teacher-a"],
     ]);
-    await q(`INSERT INTO attendance (learner_id, class_id, date, is_present, marked_by_id) VALUES ($1,$2,CURRENT_DATE,false,$3)`, [
-      ids["learner-b"], classB, ids["teacher-b"],
+    await q(`INSERT INTO attendance (school_id, learner_id, class_id, date, is_present, marked_by_id) VALUES ($1,$2,$3,CURRENT_DATE,false,$4)`, [
+      schoolB, ids["learner-b"], classB, ids["teacher-b"],
     ]);
 
     const announcePrivateA = (await one(
-      `INSERT INTO announcements (title, content, author_id, is_public, is_pinned) VALUES ('Private A', 'secret a', $1, false, false) RETURNING id`,
-      [ids["teacher-a"]]
+      `INSERT INTO announcements (school_id, title, content, author_id, is_public, is_pinned) VALUES ($1, 'Private A', 'secret a', $2, false, false) RETURNING id`,
+      [schoolA, ids["teacher-a"]]
     )).id as string;
     const announcePrivateB = (await one(
-      `INSERT INTO announcements (title, content, author_id, is_public, is_pinned) VALUES ('Private B', 'secret b', $1, false, false) RETURNING id`,
-      [ids["teacher-b"]]
+      `INSERT INTO announcements (school_id, title, content, author_id, is_public, is_pinned) VALUES ($1, 'Private B', 'secret b', $2, false, false) RETURNING id`,
+      [schoolB, ids["teacher-b"]]
     )).id as string;
     const announcePublic = (await one(
-      `INSERT INTO announcements (title, content, author_id, is_public, is_pinned) VALUES ('Public A', 'public a', $1, true, false) RETURNING id`,
-      [ids["teacher-a"]]
+      `INSERT INTO announcements (school_id, title, content, author_id, is_public, is_pinned) VALUES ($1, 'Public A', 'public a', $2, true, false) RETURNING id`,
+      [schoolA, ids["teacher-a"]]
     )).id as string;
 
     const notifA = (await one(
-      `INSERT INTO notifications (user_id, type, title, message, is_read) VALUES ($1, 'system', 'N-A', 'for a', false) RETURNING id`,
-      [ids["learner-a"]]
+      `INSERT INTO notifications (school_id, user_id, type, title, message, is_read) VALUES ($1, $2, 'system', 'N-A', 'for a', false) RETURNING id`,
+      [schoolA, ids["learner-a"]]
     )).id as string;
     const notifB = (await one(
-      `INSERT INTO notifications (user_id, type, title, message, is_read) VALUES ($1, 'system', 'N-B', 'for b', false) RETURNING id`,
-      [ids["learner-b"]]
+      `INSERT INTO notifications (school_id, user_id, type, title, message, is_read) VALUES ($1, $2, 'system', 'N-B', 'for b', false) RETURNING id`,
+      [schoolB, ids["learner-b"]]
     )).id as string;
 
     const fileA = (await one(
-      `INSERT INTO uploaded_files (uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
-       VALUES ($1, 'assignment', $2, 'a.pdf', 'stored-a.pdf', 'application/pdf', 'document', 5) RETURNING id`,
-      [ids["teacher-a"], assignA]
+      `INSERT INTO uploaded_files (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
+       VALUES ($1, $2, 'assignment', $3, 'a.pdf', 'stored-a.pdf', 'application/pdf', 'document', 5) RETURNING id`,
+      [schoolA, ids["teacher-a"], assignA]
     )).id as string;
     const fileB = (await one(
-      `INSERT INTO uploaded_files (uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
-       VALUES ($1, 'assignment', $2, 'b.pdf', 'stored-b.pdf', 'application/pdf', 'document', 5) RETURNING id`,
-      [ids["teacher-b"], assignB]
+      `INSERT INTO uploaded_files (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
+       VALUES ($1, $2, 'assignment', $3, 'b.pdf', 'stored-b.pdf', 'application/pdf', 'document', 5) RETURNING id`,
+      [schoolB, ids["teacher-b"], assignB]
     )).id as string;
     const submissionFileB = (await one(
-      `INSERT INTO uploaded_files (uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
-       VALUES ($1, 'submission', $2, 'work-b.pdf', 'stored-work-b.pdf', 'application/pdf', 'document', 5) RETURNING id`,
-      [ids["learner-b"], assignB]
+      `INSERT INTO uploaded_files (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
+       VALUES ($1, $2, 'submission', $3, 'work-b.pdf', 'stored-work-b.pdf', 'application/pdf', 'document', 5) RETURNING id`,
+      [schoolB, ids["learner-b"], assignB]
     )).id as string;
     // The uploader is a platform account with no membership → ownership cannot be resolved.
     const orphanFile = (await one(
-      `INSERT INTO uploaded_files (uploader_id, purpose, original_name, stored_name, mime_type, category, size_bytes)
-       VALUES ($1, 'assignment', 'orphan.pdf', 'stored-orphan.pdf', 'application/pdf', 'document', 5) RETURNING id`,
-      [ids["platform"]]
+      `INSERT INTO uploaded_files (school_id, uploader_id, purpose, original_name, stored_name, mime_type, category, size_bytes)
+       VALUES ($1, $2, 'assignment', 'orphan.pdf', 'stored-orphan.pdf', 'application/pdf', 'document', 5) RETURNING id`,
+      [schoolA, ids["platform"]]
     )).id as string;
 
     // Real bytes for the files a legitimately-authorized caller should be able to download.
@@ -576,7 +583,7 @@ async function main() {
     await test("Enrollments: School A cannot enroll its learner into School B's class", async () => {
       const result = await call("enrollments", {
         token: tokens["admin-a"],
-        body: { learnerId: ids["learner-a2"], classId: classB, academicYearId: academicYear },
+        body: { learnerId: ids["learner-a2"], classId: classB, academicYearId: yearA },
       });
       assertEq(result.status, 404, "cross-school class must not be enrollable");
       const rows = await q(`SELECT 1 FROM learner_classes WHERE learner_id = $1 AND class_id = $2`, [
@@ -944,7 +951,7 @@ async function main() {
     await test("Legitimate: School A's admin can enroll a School A learner into a School A class", async () => {
       const result = await call("enrollments", {
         token: tokens["admin-a"],
-        body: { learnerId: ids["learner-a2"], classId: classA, academicYearId: academicYear },
+        body: { learnerId: ids["learner-a2"], classId: classA, academicYearId: yearA },
       });
       assertEq(result.status, 201, "same-school enrollment");
       await q(`DELETE FROM learner_classes WHERE learner_id = $1 AND class_id = $2`, [ids["learner-a2"], classA]);
@@ -969,11 +976,13 @@ async function main() {
 
     /* ════════════════════ 12. Fail closed when attribution is ambiguous ════════════════════ */
 
-    await test("Fail closed: content reachable from TWO schools belongs to neither", async () => {
-      /* A dual-membership learner (teacher/parent accounts can legitimately belong to more
-         than one school) enrols in School A's class. The class is now reachable from School B
-         as well, so `sqlClassInSchool` must deny it to BOTH schools until the cross-school
-         row is gone — "reachable from my school" alone is not ownership. */
+    await test("Fail closed: direct school_id keeps a class attributable even with a dual-membership learner", async () => {
+      /* Phase 2D/0017: classes carry a NOT NULL school_id, so a class is attributed by its
+         OWN school_id rather than by which schools can "reach" it through memberships. A
+         dual-membership learner enrolling in School A's class therefore no longer makes the
+         class belong to neither school: School A keeps it (direct school_id) and School B is
+         still denied. The relational "reachable from two schools → deny both" rule still
+         applies to routes that attribute via membership (e.g. files), asserted below. */
       const dual = (
         await one(
           `INSERT INTO users (email, username, password_hash, role, first_name, last_name, is_active)
@@ -990,25 +999,27 @@ async function main() {
         dual,
       ]);
       const dualToken = await auth.createToken({ userId: dual, role: "learner", email: "dual@example.test" });
-      await q(`INSERT INTO learner_classes (learner_id, class_id, academic_year_id) VALUES ($1,$2,$3)`, [
+      await q(`INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
+        schoolA,
         dual,
         classA,
-        academicYear,
+        yearA,
       ]);
 
       try {
-        for (const token of [tokens["admin-a"], tokens["admin-b"]]) {
-          const result = await call("attendance", { token, query: { classId: classA } });
-          assertEq(result.status, 404, "a class two schools can reach must be denied to both");
-        }
+        /* Direct school_id is authoritative: the class remains School A's. */
+        const ownSchool = await call("attendance", { token: tokens["admin-a"], query: { classId: classA } });
+        assertEq(ownSchool.status, 200, "School A still owns its class via direct school_id");
+        const foreignSchool = await call("attendance", { token: tokens["admin-b"], query: { classId: classA } });
+        assertEq(foreignSchool.status, 404, "School B must still be denied the class");
 
         /* A file that is reachable from School A (its assignment) and from School B (its
-           uploader) is likewise unattributable. */
+           uploader) is still unattributable under the relational file predicate. */
         const dualFile = (
           await one(
-            `INSERT INTO uploaded_files (uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
-             VALUES ($1, 'assignment', $2, 'dual.pdf', 'stored-dual.pdf', 'application/pdf', 'document', 5) RETURNING id`,
-            [dual, assignA]
+            `INSERT INTO uploaded_files (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
+             VALUES ($1, $2, 'assignment', $3, 'dual.pdf', 'stored-dual.pdf', 'application/pdf', 'document', 5) RETURNING id`,
+            [schoolA, dual, assignA]
           )
         ).id as string;
         fs.writeFileSync(path.join(UPLOAD_DIR, "stored-dual.pdf"), "%PDF-1.4 dual");
@@ -1026,9 +1037,9 @@ async function main() {
         fs.rmSync(path.join(UPLOAD_DIR, "stored-dual.pdf"), { force: true });
       }
 
-      /* Once the ambiguous row is gone the class resolves to School A alone again. */
+      /* The class resolves to School A regardless of the dual enrollment. */
       const restored = await call("attendance", { token: tokens["admin-a"], query: { classId: classA } });
-      assertEq(restored.status, 200, "single-school attribution is restored");
+      assertEq(restored.status, 200, "School A's class attribution is unchanged");
     });
 
     /* ════════════════════ 13. Phase 2C review fixes — F1 (timetable/quiz FK tenancy)
@@ -1096,7 +1107,7 @@ async function main() {
         body: {
           classId: classA,
           teacherId: ids["teacher-a"],
-          subjectId: subject,
+          subjectId: subjectA,
           dayOfWeek: "tuesday",
           startTime: "09:00",
           endTime: "10:00",
@@ -1141,9 +1152,9 @@ async function main() {
     await test("Review F1: a quiz cannot be moved to another school's class", async () => {
       const quizA = (
         await one(
-          `INSERT INTO quizzes (title, class_id, subject_id, teacher_id, is_published)
-           VALUES ('Review Quiz A', $1, $2, $3, false) RETURNING id`,
-          [classA, subject, ids["teacher-a"]]
+          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+           VALUES ($1, 'Review Quiz A', $2, $3, $4, false) RETURNING id`,
+          [schoolA, classA, subjectA, ids["teacher-a"]]
         )
       ).id as string;
 
@@ -1176,19 +1187,19 @@ async function main() {
       const ownOverride = (
         await one(
           `INSERT INTO dashboard_card_overrides
-             (card_key, dashboard_role, label, is_visible, is_enabled, scope_type, created_by)
-           VALUES ('phase2c_own_card', 'learner', 'OWN-SCHOOL-CARD', true, true, 'role', $1)
+             (school_id, card_key, dashboard_role, label, is_visible, is_enabled, scope_type, created_by)
+           VALUES ($1, 'phase2c_own_card', 'learner', 'OWN-SCHOOL-CARD', true, true, 'role', $2)
            RETURNING id`,
-          [ids["admin-a"]]
+          [schoolA, ids["admin-a"]]
         )
       ).id as string;
       const foreignOverride = (
         await one(
           `INSERT INTO dashboard_card_overrides
-             (card_key, dashboard_role, label, is_visible, is_enabled, scope_type, created_by)
-           VALUES ('phase2c_foreign_card', 'learner', 'FOREIGN-SCHOOL-CARD', true, true, 'role', $1)
+             (school_id, card_key, dashboard_role, label, is_visible, is_enabled, scope_type, created_by)
+           VALUES ($1, 'phase2c_foreign_card', 'learner', 'FOREIGN-SCHOOL-CARD', true, true, 'role', $2)
            RETURNING id`,
-          [ids["admin-b"]]
+          [schoolB, ids["admin-b"]]
         )
       ).id as string;
 

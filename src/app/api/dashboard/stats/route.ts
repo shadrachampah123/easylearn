@@ -20,8 +20,8 @@ export async function GET(request: NextRequest) {
 
     /* Phase 2C: the administrator branch counted every row in the database. Each count is
        now restricted to the caller's school (membership for users, attribution for
-       content). `subjects` has no user/class anchor and is a documented Phase 2D
-       dependency — see docs/PHASE2C_TENANT_AUTHORIZATION.md. */
+       content). `subjects` now carries its own `school_id` (migrations 0016/0017) and is
+       counted with a direct school predicate like every other table. */
     if (hasSchoolAdminRole(ctx)) {
       const [totalTeachers] = await db.select({ count: sql<number>`count(*)` }).from(users)
         .where(sql`${eq(users.role, "teacher")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`);
@@ -31,7 +31,8 @@ export async function GET(request: NextRequest) {
         .where(sql`${eq(users.role, "parent")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`);
       const [totalClasses] = await db.select({ count: sql<number>`count(*)` }).from(classes)
         .where(sqlClassInSchool(ctx.schoolId, classes.id));
-      const [totalSubjects] = await db.select({ count: sql<number>`count(*)` }).from(subjects);
+      const [totalSubjects] = await db.select({ count: sql<number>`count(*)` }).from(subjects)
+        .where(eq(subjects.schoolId, ctx.schoolId));
       const [totalAssignments] = await db.select({ count: sql<number>`count(*)` }).from(assignments)
         .where(sqlAssignmentInSchool(ctx.schoolId, assignments.id));
 
