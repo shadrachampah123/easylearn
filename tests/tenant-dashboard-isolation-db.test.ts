@@ -321,10 +321,13 @@ async function main() {
     const auth = await import("@/lib/auth");
     const tokens: Record<string, string> = {};
     for (const fixture of fixtures) {
+      // Multi-school fixtures use a server-issued School A hint so this suite exercises
+      // school-scoped dashboard isolation without relying on first-row selection.
       tokens[fixture.key] = await auth.createToken({
         userId: ids[fixture.key],
         role: fixture.role,
         email: `${fixture.key}@example.test`,
+        schoolId: fixture.memberships[0]?.schoolId,
       });
     }
 

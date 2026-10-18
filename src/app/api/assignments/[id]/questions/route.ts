@@ -3,12 +3,48 @@ import { db } from "@/db";
 import { assignmentQuestions, assignments } from "@/db/schema";
 import {
   guardSchoolContext,
+  hasSchoolAdminExtendedRole,
   hasSchoolAdminRole,
   hasSchoolStaffRole,
-  sqlAssignmentInSchool,
 } from "@/lib/tenant";
+import {
+  assignmentAccessPredicate,
+  toAssignmentQuestionDto,
+  toStaffAssignmentQuestionDto,
+} from "@/lib/assignment-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and } from "drizzle-orm";
+
+const learnerQuestionSelection = {
+  id: assignmentQuestions.id,
+  questionType: assignmentQuestions.questionType,
+  questionText: assignmentQuestions.questionText,
+  options: assignmentQuestions.options,
+  points: assignmentQuestions.points,
+  orderIndex: assignmentQuestions.orderIndex,
+};
+
+const staffQuestionSelection = {
+  ...learnerQuestionSelection,
+  correctAnswer: assignmentQuestions.correctAnswer,
+  explanation: assignmentQuestions.explanation,
+};
+
+async function loadAssignment(
+  context: Parameters<typeof assignmentAccessPredicate>[0],
+  assignmentId: string,
+  learnerId?: string | null
+) {
+  return db
+    .select({
+      id: assignments.id,
+      status: assignments.status,
+      teacherId: assignments.teacherId,
+    })
+    .from(assignments)
+    .where(and(eq(assignments.id, assignmentId), assignmentAccessPredicate(context, { learnerId })))
+    .limit(1);
+}
 
 // GET questions for an assignment
 export async function GET(
@@ -19,32 +55,30 @@ export async function GET(
     const auth = await guardSchoolContext(request);
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
-
     const { id } = await params;
+    const learnerId = request.nextUrl.searchParams.get("learnerId");
 
-    // Check assignment exists
-    const [assignment] = await db
-      .select()
-      .from(assignments)
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
-      .limit(1);
-
+    // This assignment lookup is the authorization query. Parents must identify a linked
+    // learner; learners are bound to their own enrollment; staff are bound to management or
+    // school oversight before any question row is selected.
+    const [assignment] = await loadAssignment(ctx, id, learnerId);
     if (!assignment) return notFoundResponse("Assignment");
 
-    // Get questions
-    const questions = await db
-      .select()
-      .from(assignmentQuestions)
-      .where(eq(assignmentQuestions.assignmentId, id));
-
-    // Hide correct answers from learners
-    if (ctx.school.role === "learner") {
-      return successResponse(
-        questions.map((q) => ({ ...q, correctAnswer: null, explanation: null }))
-      );
+    if (hasSchoolAdminExtendedRole(ctx) || ctx.school.role === "teacher") {
+      const questions = await db
+        .select(staffQuestionSelection)
+        .from(assignmentQuestions)
+        .where(eq(assignmentQuestions.assignmentId, id))
+        .orderBy(assignmentQuestions.orderIndex);
+      return successResponse(questions.map(toStaffAssignmentQuestionDto));
     }
 
-    return successResponse(questions);
+    const questions = await db
+      .select(learnerQuestionSelection)
+      .from(assignmentQuestions)
+      .where(eq(assignmentQuestions.assignmentId, id))
+      .orderBy(assignmentQuestions.orderIndex);
+    return successResponse(questions.map(toAssignmentQuestionDto));
   } catch (error) {
     console.error("Get assignment questions error:", error);
     return errorResponse("Internal server error", 500);
@@ -69,15 +103,11 @@ export async function POST(
     const body = await request.json();
     const { questionType, questionText, options, correctAnswer, points, orderIndex, explanation } = body;
 
-    // Check assignment exists and belongs to teacher
-    const [assignment] = await db
-      .select()
-      .from(assignments)
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
-      .limit(1);
-
+    const [assignment] = await loadAssignment(ctx, id);
     if (!assignment) return notFoundResponse("Assignment");
 
+    // School admins/head teachers may oversee any assignment. A classroom teacher must own
+    // the assignment; there is no implicit cross-teacher management grant.
     if (assignment.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only edit your own assignments", 403);
     }
@@ -85,10 +115,7 @@ export async function POST(
     if (assignment.status === "published") {
       return errorResponse("Cannot add questions to a published assignment. Close it first.", 400);
     }
-
-    if (!questionText) {
-      return errorResponse("Question text is required");
-    }
+    if (!questionText) return errorResponse("Question text is required");
 
     const [question] = await db
       .insert(assignmentQuestions)
@@ -102,9 +129,9 @@ export async function POST(
         orderIndex: orderIndex || 0,
         explanation: explanation || null,
       })
-      .returning();
+      .returning(staffQuestionSelection);
 
-    return successResponse(question, 201);
+    return successResponse(toStaffAssignmentQuestionDto(question), 201);
   } catch (error) {
     console.error("Add assignment question error:", error);
     return errorResponse("Internal server error", 500);
@@ -126,36 +153,26 @@ export async function DELETE(
     }
 
     const { id: assignmentId } = await params;
-    const url = new URL(request.url);
-    const questionId = url.searchParams.get("questionId");
-
+    const questionId = new URL(request.url).searchParams.get("questionId");
     if (!questionId) return errorResponse("Question ID is required");
 
-    const [question] = await db
-      .select({ assignmentId: assignmentQuestions.assignmentId })
-      .from(assignmentQuestions)
-      .where(eq(assignmentQuestions.id, questionId))
-      .limit(1);
-
-    if (!question) return notFoundResponse("Question");
-
-    const [assignment] = await db
-      .select()
-      .from(assignments)
-      .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
-      .limit(1);
-
+    const [assignment] = await loadAssignment(ctx, assignmentId);
     if (!assignment) return notFoundResponse("Assignment");
-
     if (assignment.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only edit your own assignments", 403);
     }
 
-    /* Phase 2E (F7 audit): the question must belong to the assignment the caller was
-       authorized on — the same anchor the corrections POST enforces. Without it, the
-       ownership checks above apply to `assignmentId` while the delete below would happily
-       remove a question of ANOTHER assignment (another school's, given its uuid). */
-    if (question.assignmentId !== assignmentId) return notFoundResponse("Question");
+    // Anchor both the question and delete to the already-authorized assignment. A question
+    // UUID from another assignment/school is therefore not fetched or deleted.
+    const [question] = await db
+      .select({ id: assignmentQuestions.id })
+      .from(assignmentQuestions)
+      .where(and(
+        eq(assignmentQuestions.id, questionId),
+        eq(assignmentQuestions.assignmentId, assignmentId)
+      ))
+      .limit(1);
+    if (!question) return notFoundResponse("Question");
 
     await db
       .delete(assignmentQuestions)

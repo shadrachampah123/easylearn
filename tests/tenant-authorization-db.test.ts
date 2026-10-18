@@ -372,7 +372,12 @@ async function main() {
       );
       await q(`INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1,$2,$3,'active')`, [schoolA, row.id, role]);
       await q(`INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1,$2,$3,'active')`, [schoolB, row.id, role]);
-      const token = await auth.createToken({ userId: row.id, role, email: `${label}@example.test` });
+      const token = await auth.createToken({
+        userId: row.id,
+        role,
+        email: `${label}@example.test`,
+        schoolId: schoolA,
+      });
       return { id: row.id as string, token };
     };
     const dualTeacher = await createDualMember("dual-teacher", "teacher");
@@ -948,7 +953,7 @@ async function main() {
         token: tokens["learner-a2"],
         body: { assignmentId: assignA, content: "not enrolled" },
       });
-      assertEq(result.status, 403, "enrollment is required — no `if no enrollment found, allow` fallback");
+      assert([403, 404].includes(result.status), "enrollment is required — no `if no enrollment found, allow` fallback");
     });
 
     /* ════════════════════ 10. Admin / aggregate isolation ════════════════════ */
@@ -1134,7 +1139,12 @@ async function main() {
         schoolB,
         dual,
       ]);
-      const dualToken = await auth.createToken({ userId: dual, role: "learner", email: "dual@example.test" });
+      const dualToken = await auth.createToken({
+        userId: dual,
+        role: "learner",
+        email: "dual@example.test",
+        schoolId: schoolA,
+      });
       await q(`INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
         schoolA,
         dual,

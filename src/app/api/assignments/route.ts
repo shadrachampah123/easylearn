@@ -7,14 +7,19 @@ import {
   isClassInSchool,
   isSubjectInSchool,
   isTermInSchool,
-  sqlAssignmentInSchool,
+  sqlUserInSchool,
 } from "@/lib/tenant";
+import {
+  assignmentAccessPredicate,
+  learnerAssignmentListPredicate,
+  parentAssignmentListPredicate,
+} from "@/lib/assignment-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
 import { ensureFileUploadSchema, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
-import { eq, desc, and, sql } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
   try {
@@ -29,40 +34,34 @@ export async function GET(request: NextRequest) {
     const subjectId = request.nextUrl.searchParams.get("subjectId");
     const status = request.nextUrl.searchParams.get("status");
 
-    // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
-    // Always include schoolId = ctx.schoolId (direct), fallback to relational for pre-0016 DB
-    let useDirect = true;
-    try {
-      await db.execute(sql`select "school_id" from "assignments" limit 0`);
-    } catch {
-      useDirect = false;
+    // Authorization is part of the assignment query, not a fetch-then-filter step. Learners
+    // and parents are limited to published content tied to enrollment/parent linkage;
+    // teachers are limited to assignments they own; school administrators and head teachers
+    // receive the full school-scoped management view.
+    const conditions: any[] = [];
+    if (ctx.school.role === "parent") {
+      conditions.push(
+        eq(assignments.schoolId, ctx.schoolId),
+        eq(assignments.status, "published"),
+        parentAssignmentListPredicate(ctx.schoolId, ctx.userId)
+      );
+    } else if (ctx.school.role === "learner") {
+      conditions.push(
+        eq(assignments.schoolId, ctx.schoolId),
+        eq(assignments.status, "published"),
+        learnerAssignmentListPredicate(ctx.schoolId, ctx.userId)
+      );
+    } else {
+      conditions.push(assignmentAccessPredicate(ctx));
     }
 
-    const conditions: any[] = useDirect
-      ? [eq(assignments.schoolId, ctx.schoolId)]
-      : [sqlAssignmentInSchool(ctx.schoolId, assignments.id)];
-
-    // For teachers, show their own assignments
-    if (ctx.school.role === "teacher") {
-      conditions.push(eq(assignments.teacherId, ctx.userId));
-    }
-
-    // Filter by class
-    if (classId) {
-      conditions.push(eq(assignments.classId, classId));
-    }
-
-    // Filter by subject
-    if (subjectId) {
-      conditions.push(eq(assignments.subjectId, subjectId));
-    }
-
-    // Filter by status
+    if (classId) conditions.push(eq(assignments.classId, classId));
+    if (subjectId) conditions.push(eq(assignments.subjectId, subjectId));
     if (status) {
       conditions.push(eq(assignments.status, status as "draft" | "published" | "closed"));
     }
 
-    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+    const whereClause = and(...conditions);
 
     const results = await db
       .select({
@@ -86,9 +85,9 @@ export async function GET(request: NextRequest) {
         teacherLastName: users.lastName,
       })
       .from(assignments)
-      .leftJoin(classes, eq(assignments.classId, classes.id))
-      .leftJoin(subjects, eq(assignments.subjectId, subjects.id))
-      .leftJoin(users, eq(assignments.teacherId, users.id))
+      .leftJoin(classes, and(eq(assignments.classId, classes.id), eq(classes.schoolId, ctx.schoolId)))
+      .leftJoin(subjects, and(eq(assignments.subjectId, subjects.id), eq(subjects.schoolId, ctx.schoolId)))
+      .leftJoin(users, and(eq(assignments.teacherId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
       .where(whereClause)
       .orderBy(desc(assignments.createdAt))
       .limit(50);
@@ -109,6 +108,7 @@ export async function GET(request: NextRequest) {
             .from(submissions)
             .where(and(
               eq(submissions.assignmentId, assignment.id),
+              eq(submissions.schoolId, ctx.schoolId),
               eq(submissions.learnerId, ctx.userId)
             ))
             .limit(1);

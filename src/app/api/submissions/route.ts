@@ -8,9 +8,9 @@ import { eq, and, desc } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
-  isAssignmentInSchool,
   sqlSubmissionInSchool,
 } from "@/lib/tenant";
+import { assignmentAccessPredicate } from "@/lib/assignment-access";
 
 export async function GET(request: NextRequest) {
   try {
@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
 
     // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
     // Always preserve tenant predicate + role, plus assignmentId filter
-    const conditions: any[] = [];
+    const conditions: any[] = [eq(submissions.schoolId, ctx.schoolId)];
 
     if (schoolRole === "learner") {
       conditions.push(eq(submissions.learnerId, ctx.userId));
@@ -63,8 +63,11 @@ export async function GET(request: NextRequest) {
         learnerId: submissions.learnerId,
       })
       .from(submissions)
-      .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      .leftJoin(users, eq(submissions.learnerId, users.id))
+      .leftJoin(assignments, and(
+        eq(submissions.assignmentId, assignments.id),
+        eq(assignments.schoolId, ctx.schoolId)
+      ))
+      .leftJoin(users, and(eq(submissions.learnerId, users.id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
       .where(whereClause)
       .orderBy(desc(submissions.submittedAt))
       .limit(100);
@@ -96,36 +99,14 @@ export async function POST(request: NextRequest) {
     // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
 
-    // Check assignment exists and is published — Phase 2D: tenant predicate directly in query with relational fallback for legacy rows
-    let assignment: typeof assignments.$inferSelect | undefined;
-    try {
-      const direct = await db
-        .select()
-        .from(assignments)
-        .where(and(eq(assignments.id, assignmentId), eq(assignments.schoolId, ctx.schoolId)))
-        .limit(1);
-      assignment = direct[0];
-      if (!assignment) {
-        // Fallback: legacy row without school_id or NULL — verify via relational predicate
-        const legacy = await db
-          .select()
-          .from(assignments)
-          .where(eq(assignments.id, assignmentId))
-          .limit(1);
-        if (legacy[0] && (await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
-          assignment = legacy[0];
-        }
-      }
-    } catch {
-      const legacy = await db
-        .select()
-        .from(assignments)
-        .where(eq(assignments.id, assignmentId))
-        .limit(1);
-      if (legacy[0] && (await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
-        assignment = legacy[0];
-      }
-    }
+    // The assignment lookup is itself the authorization query: it requires the learner's
+    // active enrollment, publication, active school context, and direct school ownership
+    // before any assignment or question data is used.
+    const [assignment] = await db
+      .select()
+      .from(assignments)
+      .where(and(eq(assignments.id, assignmentId), assignmentAccessPredicate(ctx)))
+      .limit(1);
 
     if (!assignment) {
       return errorResponse("Assignment not found", 404);
@@ -144,7 +125,11 @@ export async function POST(request: NextRequest) {
     const [enrollment] = await db
       .select({ id: learnerClasses.id })
       .from(learnerClasses)
-      .where(and(eq(learnerClasses.learnerId, ctx.userId), eq(learnerClasses.classId, assignment.classId)))
+      .where(and(
+        eq(learnerClasses.schoolId, ctx.schoolId),
+        eq(learnerClasses.learnerId, ctx.userId),
+        eq(learnerClasses.classId, assignment.classId)
+      ))
       .limit(1);
 
     if (!enrollment) {
@@ -178,6 +163,7 @@ export async function POST(request: NextRequest) {
       .from(submissions)
       .where(and(
         eq(submissions.assignmentId, assignmentId),
+        eq(submissions.schoolId, ctx.schoolId),
         eq(submissions.learnerId, ctx.userId)
       ))
       .limit(1);

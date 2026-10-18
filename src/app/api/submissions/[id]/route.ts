@@ -47,9 +47,16 @@ export async function GET(
         teacherId: assignments.teacherId,
       })
       .from(submissions)
-      .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      // Phase 2C tenant predicate: another school's submission is "not found".
-      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
+      .leftJoin(assignments, and(
+        eq(submissions.assignmentId, assignments.id),
+        eq(assignments.schoolId, ctx.schoolId)
+      ))
+      // Direct and relational tenant predicates: another school's submission is "not found".
+      .where(and(
+        eq(submissions.id, id),
+        eq(submissions.schoolId, ctx.schoolId),
+        sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+      ))
       .limit(1);
 
     if (!submission) return notFoundResponse("Submission");

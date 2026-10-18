@@ -478,6 +478,7 @@ async function main() {
 
     const loginRoute = await import("@/app/api/auth/login/route");
     const meRoute = await import("@/app/api/auth/me/route");
+    const selectSchoolRoute = await import("@/app/api/auth/select-school/route");
     const changePasswordRoute = await import("@/app/api/auth/change-password/route");
     const logoutRoute = await import("@/app/api/auth/logout/route");
 
@@ -492,6 +493,9 @@ async function main() {
 
     let learnerToken = "";
     let learnerMembershipId = "";
+    let multiSchoolToken = "";
+    let selectedSchoolToken = "";
+    let platformToken = "";
 
     await test("Login: a learner logs in and receives the server-derived CBISM context", async () => {
       const response = await loginRoute.POST(
@@ -555,7 +559,105 @@ async function main() {
       const body: any = await response.json();
       assertEq(body.data.user.role, "teacher", "teacher role");
       assertEq(body.data.schools.length, 2, "teacher belongs to two schools");
-      assertEq(body.data.school.schoolId, cbismSchoolId, "deterministic first membership is CBISM");
+      assertEq(body.data.school, null, "dual-school login must require explicit selection");
+      multiSchoolToken = body.data.token;
+      const claims = await auth.verifyToken(multiSchoolToken);
+      assertEq(claims!.schoolIdHint, undefined, "unselected login has no school hint");
+    });
+
+    await test("School selection: only a server-validated active membership can become session context", async () => {
+      const denied = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: crypto.randomUUID() }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(denied.status, 403, "foreign school selection must be denied");
+
+      const selected = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: schoolBId }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(selected.status, 200, "own active school selection");
+      const selectedBody: any = await selected.json();
+      selectedSchoolToken = selectedBody.data.token;
+      assertEq(selectedBody.data.school.schoolId, schoolBId, "selected school");
+      assertEq(selectedBody.data.school.role, "school_admin", "role comes from School B membership");
+      const selectedClaims = await auth.verifyToken(selectedBody.data.token);
+      assertEq(selectedClaims!.schoolIdHint, schoolBId, "selected token school hint");
+      assertEq(selectedClaims!.membershipIdHint, selectedBody.data.school.membershipId, "selected membership hint");
+
+      const selectedContext = await tenant.resolveAuthContext(
+        new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(selectedBody.data.token) }) as never
+      );
+      assertEq(selectedContext.school?.schoolId, schoolBId, "selected context is revalidated from the database");
+    });
+
+    await test("School lifecycle: only active schools grant context, existing sessions are rechecked, and history remains", async () => {
+      const platformLogin = await loginRoute.POST(
+        postJson("/api/auth/login", {
+          email: `2b-platform-${DB_NAME}@example.test`,
+          password: TEST_PASSWORD,
+        }) as never
+      );
+      assertEq(platformLogin.status, 200, "platform login for lifecycle check");
+      platformToken = (await platformLogin.json()).data.token;
+
+      const beforeMemberships = await one(`SELECT count(*)::int AS n FROM school_users WHERE school_id = $1`, [schoolBId]);
+      const originalStatuses = ["active", "provisioned", "suspended", "archived"];
+      for (const status of originalStatuses) {
+        await q(`UPDATE schools SET status = $1 WHERE id = $2`, [status, schoolBId]);
+        const login = await loginRoute.POST(
+          postJson("/api/auth/login", {
+            username: `2b-teacher-${DB_NAME.slice(-8)}`,
+            password: TEST_PASSWORD,
+          }) as never
+        );
+        assertEq(login.status, 200, `${status} identity login remains available`);
+        const loginBody: any = await login.json();
+        assert(
+          status === "active"
+            ? loginBody.data.schools.some((school: any) => school.schoolId === schoolBId)
+            : !loginBody.data.schools.some((school: any) => school.schoolId === schoolBId),
+          `${status} school is ${status === "active" ? "listed" : "not listed"} in login context`
+        );
+
+        const me = await meRoute.GET(
+          new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(selectedSchoolToken) }) as never
+        );
+        assertEq(me.status, 200, `${status} /api/auth/me remains an authenticated identity response`);
+        const meBody: any = await me.json();
+        assertEq(
+          meBody.data.school?.schoolId ?? null,
+          status === "active" ? schoolBId : null,
+          `${status} /api/auth/me school context`
+        );
+
+        if (status === "archived") {
+          const historical = await tenant.listSchoolMemberships(userIds["teacher"], { includeInactive: true });
+          const archivedMembership = historical.find((membership) => membership.schoolId === schoolBId);
+          assert(archivedMembership, "platform/lifecycle reads retain archived memberships");
+          assertEq(archivedMembership!.schoolStatus, "archived", "historical school status remains visible to inspection");
+        }
+
+        const selectedRequest = new NextRequest("http://localhost:3000/api/notifications", {
+          headers: bearer(selectedSchoolToken),
+        });
+        const guarded = await tenant.guardSchoolContext(selectedRequest as never);
+        assertEq(guarded.ok, status === "active", `${status} ordinary school access`);
+
+        const choose = await selectSchoolRoute.POST(
+          postJson("/api/auth/select-school", { schoolId: schoolBId }, bearer(multiSchoolToken)) as never
+        );
+        assertEq(choose.status, status === "active" ? 200 : 403, `${status} selection gate`);
+      }
+      await q(`UPDATE schools SET status = 'active' WHERE id = $1`, [schoolBId]);
+      assertEq(
+        (await one(`SELECT count(*)::int AS n FROM school_users WHERE school_id = $1`, [schoolBId])).n,
+        beforeMemberships.n,
+        "lifecycle changes do not delete historical membership records"
+      );
+
+      const platform = await tenant.guardPlatformAdmin(
+        new NextRequest("http://localhost:3000/api/users", { headers: bearer(platformToken) }) as never
+      );
+      assertEq(platform.ok, true, "platform administrator global gate remains independent of school lifecycle");
     });
 
     await test("Login: every role can authenticate (admin, head teacher, teacher, parent, learner)", async () => {
@@ -569,7 +671,12 @@ async function main() {
         assertEq(response.status, 200, `${key} login status`);
         const body: any = await response.json();
         assert(body.data.token, `${key} token issued`);
-        assertEq(body.data.school.slug, "cbism", `${key} school context`);
+        if (key === "teacher") {
+          assertEq(body.data.school, null, "dual-school teacher must select a school");
+          assertEq(body.data.schools.length, 2, "dual-school teacher memberships remain visible");
+        } else {
+          assertEq(body.data.school.slug, "cbism", `${key} school context`);
+        }
       }
     });
 
@@ -583,6 +690,7 @@ async function main() {
       assertEq(response.status, 200, "super_admin must NOT be locked out");
       const body: any = await response.json();
       assertEq(body.data.user.role, "super_admin", "role");
+      platformToken = body.data.token;
       assertEq(body.data.school, null, "no school context for a platform account");
       assertEq(body.data.schools.length, 0, "no memberships");
       const claims = await auth.verifyToken(body.data.token);

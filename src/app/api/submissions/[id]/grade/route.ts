@@ -68,9 +68,16 @@ export async function POST(
         teacherId: assignments.teacherId,
       })
       .from(submissions)
-      .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      // Phase 2C tenant predicate: grades of another school's submission cannot be written.
-      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
+      .leftJoin(assignments, and(
+        eq(submissions.assignmentId, assignments.id),
+        eq(assignments.schoolId, ctx.schoolId)
+      ))
+      // Direct and relational tenant predicates: grades of another school's submission cannot be written.
+      .where(and(
+        eq(submissions.id, id),
+        eq(submissions.schoolId, ctx.schoolId),
+        sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+      ))
       .limit(1);
 
     if (!submission) {
@@ -163,7 +170,11 @@ export async function POST(
         aiReport: null,
         gradedAt: new Date(),
       })
-      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
+      .where(and(
+        eq(submissions.id, id),
+        eq(submissions.schoolId, ctx.schoolId),
+        sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+      ))
       .returning();
 
     await db.insert(notifications).values({

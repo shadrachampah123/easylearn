@@ -2,6 +2,10 @@ const { Pool } = require("pg");
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
+const {
+  createPostgresConnectionConfig,
+  getDatabaseUrlFromEnvironment,
+} = require("./src/lib/postgres-tls.js");
 
 // Usage:
 //   node run-migration.js                -> runs all migrations in order (0000 ... 0008)
@@ -11,9 +15,19 @@ const path = require("path");
 // for a real reason, so CI and humans cannot miss a half-applied migration again.
 const migrationArg = process.argv[2];
 
+const databaseUrl = getDatabaseUrlFromEnvironment(process.env);
+if (!databaseUrl) {
+  throw new Error("A PostgreSQL connection string is required to run EasyLearn migrations");
+}
+
+const postgresConfig = createPostgresConnectionConfig(databaseUrl, {
+  // CI/disposable database suites explicitly set this flag. It must never be set for a
+  // production migration invocation; the default is verified certificate + hostname TLS.
+  allowInsecureLocal: process.env.EASY_LEARN_TEST_DATABASE === "true",
+});
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("neon") ? { rejectUnauthorized: false } : undefined,
+  ...postgresConfig,
   connectionTimeoutMillis: 30000,
   idleTimeoutMillis: 30000,
 });
