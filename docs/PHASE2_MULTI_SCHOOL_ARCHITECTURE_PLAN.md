@@ -21,7 +21,7 @@ This current roadmap supersedes the historical architecture audit retained below
 | 8. UI/UX, Mobile, Performance & Reliability | **40%** | Existing UI; hardening ongoing | School branding/switching polish, accessibility/mobile checks, query/index performance and reliability/observability work. |
 | 9. Testing, Production Hardening & Enterprise Readiness | **55%** | Test suites and safeguards improved; production proof incomplete | Restored-production-copy rehearsal, verified live schema/data/behavior evidence, confirm branch protections, production smoke tests, security/operational runbooks and launch acceptance. |
 
-**How to read the percentages:** estimates reflect delivered scope against each phase’s full roadmap, not the share of code merged. The overall 42% is a rounded planning estimate across the nine phases. Merged code and passing disposable-database tests do **not** count as production migration or behavior verification.
+**How to read the percentages:** estimates reflect delivered scope against each phase’s full roadmap, not the share of code merged. The overall 46% is a rounded planning estimate across the nine phases. Merged code and passing disposable-database tests do **not** count as production migration or behavior verification.
 
 ### Confirmed progress since the previous roadmap checkpoint
 
