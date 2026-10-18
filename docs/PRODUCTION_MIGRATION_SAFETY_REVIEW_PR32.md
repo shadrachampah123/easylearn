@@ -85,6 +85,414 @@ production migration, and no production database was contacted at any point. The
 "Lock and duration rehearsal" section of the checkpoint is explicitly a restored-copy
 procedure.
 
+
+---
+
+## Independent re-audit (2026-10-18) — commit `69a6e5b`
+
+A second, independent review of the remediation was performed after `9da7333`. It did **not**
+take the previous report's conclusions on trust: the destructive scenario was re-reproduced
+from scratch on a fresh disposable PostgreSQL, every safeguard was re-exercised, and each
+regression guard was mutation-tested to confirm it actually fails when its protection is
+removed.
+
+**Re-audit verdict: READY FOR FURTHER REVIEW — NOT APPROVED FOR PRODUCTION.**
+
+The schema-sync bypass is genuinely closed: the destructive action was reproduced end to end
+and every route to silently losing or falsely certifying the 26 composite tenant foreign
+keys, the 24 unique targets and the migration ledger is now blocked by an executable check.
+Two defects were found in the remediation's **own regression suite** (one HIGH, one MEDIUM);
+both are fixed in `69a6e5b` and both fixes are re-verified below. No finding in this
+re-audit contradicts the original audit's findings, and the original verdict **NOT READY —
+ACTIONS REQUIRED** still stands for the *production* preflight, which remains BLOCKED.
+
+### Verified repository state
+
+| Item | Value |
+|---|---|
+| Branch | `arena/97987bec-easylearn` (only branch written to) |
+| HEAD at audit start | `9da7333324f6d7140ccde089002325be5160ec60` — **the checkpoint was stale**: the local `.git` had been re-cloned and the branch pointer sat on `8931095c` (main) with the whole remediation uncommitted in the working tree. |
+| Recovery | The working tree was proved byte-identical to `9da7333` (all 257 tracked files compared with `git archive` + `cmp`; zero differences, zero extra files) before `git reset --mixed` was used to restore the branch pointer. **No work was discarded.** |
+| HEAD at audit end | `69a6e5ba43e6bf6e8189eae885fe37c6cdf817cf` |
+| Base `main` | `8931095c5333e4f39f527d4520c0185805bf536f` (unchanged; `main` was not touched) |
+| Working tree | clean at audit end |
+| PR #32 | `state=open`, **`draft=true`**, `mergeable=MERGEABLE`, `mergeState=CLEAN`, `merged=false`, head `69a6e5b` |
+| PR #30 / PR #31 | both `state=open`, `merged=false` — untouched |
+| CI | run `39168493830` on `9da7333` — **SUCCESS**, all 17 steps green; run `39169949326` on `69a6e5b` — see §"Tests run" |
+| Production | never contacted; no production credentials used; no production migration run |
+
+### Findings and evidence
+
+#### BLOCKER-1 — Production preflight evidence is still absent (unchanged, by design)
+
+**Evidence.** No production database, credential, or configuration was read or changed at any
+point in this re-audit. Every measurement below was taken on a disposable local PostgreSQL
+16.14 instance (`@embedded-postgres/linux-x64`), on databases whose names begin
+`audit_` / `easylearn_tci_test_` / `easylearn_2c_test_` and which are dropped afterwards.
+
+**Why it is still a blocker.** The remediation closes the *software* bypass. It cannot supply
+the evidence that only a restored production copy can give: the production engine and
+version, the production schema and ledger state, the 28 relationship mismatch counts, the
+production table sizes, the production child-index coverage, the production TLS chain and
+hostname, and a backup/restore rehearsal.
+
+**Exact next action.** An authorized operator restores a production copy to an isolated host
+and runs, read-only, the two SQL blocks of
+`docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md`, plus the "Lock and duration rehearsal"
+section (a **write** procedure, so on the restored copy only). The output is reviewed by a
+human and attached to this PR. Until then the production migration stays unapproved and
+0018 must not be applied to production.
+
+#### HIGH-1 — The regression guard against re-introducing `drizzle-kit push` was inert *(FIXED in `69a6e5b`)*
+
+**Evidence.** The suite's assertion
+`tests/migration-tenant-constraint-integrity.test.ts` used the pattern
+`/Apply [^`]*`npx drizzle-kit push`|Run `npx drizzle-kit push`/`. In a TypeScript template
+literal the backticks are **escaped in the source text**, so the file contains `` \` `` and not
+`` ` ``. The pattern required a bare backtick immediately after `push`, so it never matched.
+
+* The pattern does **not** match the pre-remediation file:
+  `git show d05c209:src/lib/schema-resilience.ts` → `matches = false`, even though line 207
+  of that file literally reads
+  `` ` Apply ${migration} (or \`npx drizzle-kit push\`), then retry.` ``.
+* The same source with the escapes stripped → `matches = true`. That is the proof that the
+  escape, not the wording, was the reason.
+* **Mutation test:** re-introducing `` (or `npx drizzle-kit push`) `` into
+  `src/lib/schema-resilience.ts` left the suite at **20 passed / 0 failed, exit 0** — the
+  named guard did not notice. (Mutation M5 of the re-audit matrix; the previous session's
+  equivalent mutation had been applied to a different file, which is why it had been seen to
+  fail then.)
+
+**Impact.** `src/lib/schema-resilience.ts` is the file that produced the operator-facing
+"the schema is out of date" message. The guard that exists specifically to stop that
+recommendation coming back was, for that file, a no-op — a future edit could have
+reintroduced the exact bypass this remediation closed, and CI would have stayed green.
+
+**Fix (narrow, in the test file only).** The assertion now (a) normalises the escaped
+backticks before matching, and (b) asserts the stronger property directly: **every** mention
+of `drizzle-kit push` in the three operator-facing files must sit in a line that carries an
+explicit prohibition (`do not run` / `never` / `must not` / `not to`). Re-verified: the
+re-introduction now fails the suite — `19 passed / 1 failed`, exit **1** — and the suite is
+back to `20 / 0` after restoring the file (`git status` clean).
+
+#### MEDIUM-1 — The schema-sync regression suite could silently skip in CI *(FIXED in `69a6e5b`)*
+
+**Evidence.** The suite skipped with **exit 0** when no PostgreSQL was reachable:
+
+```
+$ env -u TEST_DATABASE_URL npx tsx tests/migration-tenant-constraint-integrity.test.ts
+⏭️  SKIP: no TEST_DATABASE_URL and embedded-postgres is not installed.
+EXIT_CODE: 0
+```
+
+CI did set `TEST_DATABASE_URL`, and the "Require disposable PostgreSQL configuration" step
+asserts the variable is non-empty — but nothing tied a *skip* to a *failure*. The sibling
+`tests/postgres-tls-e2e.test.js` already had exactly that mechanism
+(`EASY_LEARN_REQUIRE_TLS_E2E=true`); the new suite did not. A renamed environment variable, a
+changed database URL, or a broken `embedded-postgres` fallback would therefore have disarmed
+the entire schema-sync bypass regression while the CI job still reported **SUCCESS**.
+
+**Fix.** The suite now honours `EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true` and exits **1** on
+a skip; `.github/workflows/ci.yml` sets it on the "Tenant constraint integrity / schema-sync
+bypass regression" step. Re-verified: with the flag, the skip exits **1**; without it, a local
+skip still exits **0**. The normal run path is unaffected — **20 passed / 0 failed**.
+
+#### MEDIUM-2 — The "works on a pre-0016 database" claim is not true for the assignment routes *(NOT fixed — needs a decision)*
+
+**Evidence.** `src/lib/assignment-access.ts:78-82` states that the schema-aware predicate
+keeps "a deployment that has not applied migration 0016 yet … tenant-isolated instead of
+failing open or **failing with a missing-column error**"; `src/lib/assignment-access.ts:60`
+says the synchronous form is the one that "assumes a migrated schema" and the asynchronous one
+"additionally works on a pre-0016 database". The same claim appears at
+`src/app/api/assignments/route.ts:40` and `docs/PR30_PR31_INTEGRATION_RESOLUTION.md:46`.
+
+A pre-0016 database was built (migrations 0000–0015 applied, `assignments.school_id` confirmed
+absent) and both predicates were executed against it:
+
+| Predicate | Used by | Result on a pre-0016 database |
+|---|---|---|
+| `assignmentAccessPredicate` (sync) | `src/app/api/assignments/[id]/submit/route.ts:19,56` | **FAILED** — `column assignments.school_id does not exist` |
+| `resolveAssignmentAccessPredicate` (async, schema-aware) | every other assignment/submission route | **FAILED** — `column lc.school_id does not exist` |
+
+The relational fallback itself is pre-0016 compatible in shape, but
+`learnerEnrollmentPredicate` (`src/lib/assignment-access.ts:166-181`) and
+`parentApprovedContentPredicate` (`src/lib/assignment-access.ts:183-210`) reference
+`learner_classes.school_id`, `parent_learners.school_id` and `school_users.school_id` — all
+added by migration **0016**, not 0013/0015. So the fallback cannot reach a pre-0016 schema.
+
+**Impact.** The behaviour is **fail closed** — a missing column aborts the query, so no
+cross-tenant row can be returned. The consequence is availability, not isolation: a learner
+or parent on a pre-0016 database gets a **500** from the assignment list and from assignment
+detail instead of a clean empty result. The defect is that the *documentation* claims a
+capability the code does not have, which matters for a reviewer deciding whether an
+un-migrated deployment is supported.
+
+**Exact next action (a decision, not a code change).** Either (a) correct the three comments
+and the resolution log to say the schema-aware scope covers the *school-scope* half of the
+predicate while the learner/parent role predicates require 0016, or (b) implement a genuinely
+0013/0015-compatible role predicate. This re-audit did **not** change the code, because either
+option changes a documented support guarantee and is the reviewer's call.
+
+#### MEDIUM-3 — None of the 26 composite tenant foreign keys has a supporting child-side index *(F-22 — recorded, deliberately not fixed)*
+
+See **"The 26 missing child-side indexes"** below. Deliberately **not** fixed on this branch:
+26 new indexes are a schema change with their own lock, replication and disk impact, and the
+task scope for this branch is the migration-safety bypass.
+
+#### LOW-1 — An operator-facing error message is ungrammatical
+
+`src/lib/tenant-constraints.js` builds the problem line as
+`` `constraint ${name} on public.${table} is ${row.problem}` ``, and the SQL emits the problem
+value `"references the wrong parent table"`. The rendered operator message therefore reads
+**"constraint classes_school_academic_year_fk on public.classes is references the wrong parent
+table"**. Observed live. Cosmetic only — the message is unambiguous about which object is
+wrong — but it is the text an operator reads during an incident.
+
+#### LOW-2 — The assignment submit route is the only one using the non-schema-aware predicate
+
+`src/app/api/assignments/[id]/submit/route.ts:19,56` uses the synchronous
+`assignmentAccessPredicate`, while every sibling route uses the asynchronous
+`resolveAssignmentAccessPredicate`. On a fully migrated (0016+) database the two produce
+equivalent isolation, and on a pre-0016 database **both** fail (see MEDIUM-2), so there is no
+practical divergence today. It is an inconsistency that will become one if the fallback is
+ever made genuinely 0013-compatible.
+
+#### LOW-3 — The policy mirror documents a teacher-access rule no route implements
+
+`src/lib/assignment-policy.ts:22,35` grants a teacher `manage-full` on
+`explicitlyAuthorized: true`, and `tests/assignment-authorization.test.ts:24` asserts it.
+There is **no co-teacher concept anywhere in the schema** (`co_teacher` / `coTeacher` /
+`co-teacher`: 0 hits) and **no route ever passes `explicitlyAuthorized`**. The SQL predicate
+implements ownership only (`eq(assignments.teacherId, context.userId)`,
+`src/lib/assignment-access.ts:29`). The divergence is in the safe direction (SQL is stricter
+than the mirror), but a reviewer reading the mirror would conclude a co-teacher is supported
+when such a teacher is in fact denied.
+
+#### LOW-4 — The relational "reachable schools" helpers do not check the school lifecycle
+
+`sqlUserInSchool`, `sqlUserRoleInSchool`, `sqlUserHasRoleInSchool` and `sqlSchoolsOfUser`
+(`src/lib/tenant.ts:625-673`) all join `schools` and require `s."status" = 'active'`. The
+content-ownership helpers — `sqlSchoolsOfClass` (`:677`), `sqlSchoolsOfTeacherClass`,
+`sqlSchoolsOfLearnerClass`, `sqlSchoolsOfAssignment`, `sqlSchoolsOfQuiz`
+(`src/lib/tenant.ts:677-800`) — check only `su."status" = 'active'` and never the school's
+lifecycle status.
+
+**Not exploitable, and here is why.** These helpers feed `sqlOwnedBySchool`
+(`src/lib/tenant.ts:803-810`), which requires the row to be reachable from **exactly** the
+requested school: `exists(school_id = schoolId) and not exists(school_id <> schoolId)`. A
+larger reachable set can only ever make that check *stricter*. And the requested `schoolId`
+can only ever be an active school, because `resolveAuthContext` → `listActiveSchoolMemberships`
+(`src/lib/tenant.ts:187-201`) filters on both `school_users.status = 'active'` **and**
+`schools.status = 'active'`, and `selectSchoolForContext` (`:403-417`) can only choose from
+that filtered list. It is a defence-in-depth inconsistency, not a tenant-isolation hole.
+
+#### Environment observation — the local `.git` was re-cloned between sessions
+
+At the start of this re-audit the local repository reported `HEAD = 8931095c` (main's commit)
+on the session branch, with the entire remediation sitting uncommitted in the working tree and
+a reflog containing only `clone` + `checkout`. The remote still held `9da7333`. The working
+tree was proved byte-identical to `9da7333` before the branch pointer was restored, so no work
+was lost. This is an environment/sandbox artifact, not a repository defect, but it is recorded
+because the checkpoint's "working tree clean" assumption was false and a reviewer must not
+trust a branch pointer without `git rev-parse`.
+
+### The 26 missing child-side indexes
+
+**Measured, not assumed.** For each of the 26 composite foreign keys, the child table was
+searched for an index whose **leading** columns are `(school_id, <referenced column>)` — the
+index PostgreSQL needs to find referencing child rows.
+
+**Result: 0 of 26 have one.** On a fully migrated database (0018 applied, 26/26 constraints
+present and validated):
+
+| Child table | Referenced column | ON DELETE | Supporting child index |
+|---|---|---|---|
+| `terms` | `academic_year_id` | NO ACTION | **(none)** |
+| `classes` | `academic_year_id` | NO ACTION | **(none)** |
+| `subjects` | `department_id` | NO ACTION | **(none)** |
+| `teacher_classes` | `class_id` | NO ACTION | **(none)** |
+| `teacher_classes` | `subject_id` | NO ACTION | **(none)** |
+| `teacher_classes` | `academic_year_id` | NO ACTION | **(none)** |
+| `learner_classes` | `class_id` | NO ACTION | **(none)** |
+| `learner_classes` | `academic_year_id` | NO ACTION | **(none)** |
+| `assignments` | `class_id` | NO ACTION | **(none)** |
+| `assignments` | `subject_id` | NO ACTION | **(none)** |
+| `assignments` | `term_id` | NO ACTION | **(none)** |
+| `submissions` | `assignment_id` | NO ACTION | **(none)** |
+| `uploaded_files` | `assignment_id` | SET NULL | **(none)** |
+| `resources` | `class_id` | NO ACTION | **(none)** |
+| `resources` | `subject_id` | NO ACTION | **(none)** |
+| `resources` | `term_id` | NO ACTION | **(none)** |
+| `quizzes` | `class_id` | NO ACTION | **(none)** |
+| `quizzes` | `subject_id` | NO ACTION | **(none)** |
+| `quizzes` | `term_id` | NO ACTION | **(none)** |
+| `quiz_attempts` | `quiz_id` | NO ACTION | **(none)** |
+| `announcements` | `class_id` | NO ACTION | **(none)** |
+| `attendance` | `class_id` | NO ACTION | **(none)** |
+| `timetable_entries` | `class_id` | CASCADE | **(none)** |
+| `timetable_entries` | `subject_id` | SET NULL | **(none)** |
+| `timetable_entries` | `term_id` | SET NULL | **(none)** |
+| `timetable_entries` | `academic_year_id` | SET NULL | **(none)** |
+
+By delete action: **21 NO ACTION, 4 SET NULL, 1 CASCADE**. The 14 affected child tables are
+`announcements, assignments, attendance, classes, learner_classes, quiz_attempts, quizzes,
+resources, subjects, submissions, teacher_classes, terms, timetable_entries, uploaded_files`.
+
+**Why the existing indexes do not help.** The child tables carry `pkey (id)`,
+`UNIQUE (school_id, id)` and — on some — a plain `(school_id)` index. `UNIQUE (school_id, id)`
+has the wrong second column; the `(school_id)` index narrows to the school but still leaves
+every row of that school to be filtered. Verified on `assignments`:
+`assignments_pkey (id)`, `assignments_school_id_id_unique (school_id, id)`,
+`assignments_school_idx (school_id)`.
+
+**Measured impact.** A faithful reproduction (same index layout, 200 000 child rows over 5
+schools) of the referential-integrity check PostgreSQL runs on a parent row delete —
+`SELECT 1 FROM ONLY child x WHERE $1 = x.school_id AND $2 = x.class_id FOR KEY SHARE OF x`:
+
+| | Plan | Buffers read | Rows filtered out | Execution |
+|---|---|---|---|---|
+| **Current schema** (no `(school_id, class_id)` index) | Bitmap Heap Scan on `rep_child_school_idx` | **1903** (1870 heap blocks ≈ 14.6 MB) | **40 000** | **7.43 ms** |
+| **With** a `(school_id, class_id)` index | Index Scan using `rep_child_fk_idx` | **3** (24 KB) | 0 | **0.042 ms** |
+
+That is ~**177×** faster and ~**630×** fewer buffers read, *per parent-row check*, and it
+scales linearly with table size. The cost is paid **while the parent row's lock is held**,
+which is exactly the window the 0018 preflight is meant to size. The 1 CASCADE and 4 SET NULL
+relationships are the ones where a parent delete actively *writes* to the child table, so they
+are the ones that also generate dead tuples and WAL in that window.
+
+**Operational trade-offs of adding the 26 indexes (why they are not in this branch).**
+
+1. **They are a schema change with their own migration, gate and preflight.** 26
+   `CREATE INDEX` statements take a lock on the child table and need the same
+   reviewed-preflight discipline as 0018.
+2. **`CREATE INDEX` blocks writes; `CREATE INDEX CONCURRENTLY` does not block writes but**
+   **cannot run inside a transaction block**, takes a longer lock, and can leave an
+   `INVALID` index behind on failure that must be dropped and retried. The runner applies
+   each migration file inside a single `BEGIN`/`COMMIT` (`run-migration.js`, `applyMigration`),
+   so a concurrent index build does not fit that model without a change to the runner.
+3. **Replication lag.** 26 index builds on the largest child tables replicate their WAL to
+   standbys, which is the usual cause of a delayed failover.
+4. **Disk and write amplification.** Each index adds storage proportional to the table and
+   adds a small write cost to every insert/update of the indexed columns. One index on the
+   200 000-row reproduction was **1424 kB**; scaled to production sizes the 26 indexes are
+   proportional to the real table sizes, which are **BLOCKED** until the checkpoint is run.
+5. **It is not a correctness fix.** The constraints work without the indexes. This is a
+   duration/lock-window issue, and it must be weighed against the lock window 0018 itself
+   creates.
+
+**Exact next action.** Raise a **separate** migration (e.g. `0019_child_side_indexes.sql`),
+with its own confirmation gate, its own read-only checkpoint block (child-index coverage plus
+the production table sizes) and its own rehearsal. Decide `CONCURRENTLY` vs. transactional
+before writing it, and decide whether it is applied **before** 0018 (so the 0018 validation
+window is short) or after. It must not be folded into this integration branch.
+
+### Tests run and results
+
+All commands were run locally in this sandbox against a **disposable** local PostgreSQL 16.14
+(`@embedded-postgres/linux-x64`, `initdb`+`pg_ctl`, data dir `/home/user/auditpg`).
+**GitHub CI evidence is listed separately and is not the same thing as local evidence.**
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| 1 | `npm ci` | 0 | clean install |
+| 2 | `npm run typecheck` | 0 | 0 errors |
+| 3 | `npm run lint` | 0 | 0 errors, 15 pre-existing warnings (none in changed files) |
+| 4 | `npm run build` (`DATABASE_URL=…:1/testdb JWT_SECRET=ci-…`) | 0 | compiled, 95/95 static pages |
+| 5 | `npm audit --omit=dev` | 0 | **0 vulnerabilities** |
+| 6 | `npm run test:all` | **0** | 18 suites green; tenant-db 30, migration-0017/0018 19, integration-regression 11, **tenant-integrity 20**, TLS e2e 7 |
+| 7 | `npx tsx tests/migration-tenant-constraint-integrity.test.ts` | 0 | **20 passed / 0 failed** |
+| 8 | `env -u TEST_DATABASE_URL npx tsx tests/migration-tenant-constraint-integrity.test.ts` | 0 | skip (expected locally) |
+| 9 | `env -u TEST_DATABASE_URL EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true npx tsx …` | **1** | **skip now fails** (MEDIUM-1 fix verified) |
+| 10 | destructive reproduction: `npx drizzle-kit push --force` on a disposable DB | 0 | **26 → 0** composite FKs, **24 → 7** unique targets, ledger **dropped**, total FKs **111 → 85**, relations **38 → 37** |
+| 11 | `node run-migration.js` on the damaged DB | **1** | *"Existing public tables were found without easylearn_schema_migrations. Refusing to replay migrations."* |
+| 12 | `node run-migration.js --baseline …,0018….sql` on the damaged DB | **1** | *"Baseline refused: … 0 of 26 are present and correct."* |
+| 13 | `node db-schema-sync.js` on the damaged DB | **1** | *"Schema sync refused. The target database is not empty"* |
+| 14 | `node run-migration.js --repair-tenant-integrity` without the token | **1** | refused, no DDL run |
+| 15 | `node run-migration.js --repair-tenant-integrity` with the token | 0 | 17 unique targets restored; false ledger claim removed |
+| 16 | baseline of a verified prefix that stops before 0018 | 0 | accepted (legitimate workflow still works) |
+| 17 | re-apply 0018 under its gate | 0 | **26/26 present, validated and correct** |
+| 18 | runner with 2 of 26 constraints dropped (ledger intact) | **1** | *"… 24 of 26 are present and correct."* |
+| 19 | runner with 8 of 26 constraints dropped by `DROP INDEX … CASCADE` | **1** | *"… 18 of 26 …"* (the CASCADE also removes dependent FKs — the cross-check still catches it) |
+| 20 | constraint `NOT VALID` | **1** | *"constraint classes_school_academic_year_fk on public.classes is not validated"* |
+| 21 | constraint pointing at the wrong parent table | **1** | *"… is references the wrong parent table"* (see LOW-1) |
+| 22 | constraint with the wrong `ON DELETE` action | **1** | *"… is wrong ON DELETE action"* |
+| 23 | constraint with the wrong child column pair | **1** | *"… is wrong child columns"* |
+| 24 | ledger checksum drift for 0018 | **1** | *"Checksum mismatch for applied migration 0018…"* |
+| 25 | unknown row in the ledger | **1** | *"Unrecognized migration recorded in history"* |
+| 26 | re-running 0018 when already applied | 0 | no-op, *"26/26 present, validated and correct"* |
+| 27 | pre-0016 database: sync predicate | — | **FAILED** `column assignments.school_id does not exist` |
+| 28 | pre-0016 database: schema-aware predicate | — | **FAILED** `column lc.school_id does not exist` |
+
+**Mutation matrix — every safeguard removed in turn, suite re-run, code restored:**
+
+| # | Safeguard removed | Exit | Failing assertions |
+|---|---|---|---|
+| M1 | pre-apply **and** post-apply catalog cross-check (`run-migration.js`) | 1 | 2 |
+| M2 | baseline catalog check (`run-migration.js`) | 1 | 2 |
+| M3 | guarded schema-sync refusal (`db-schema-sync.js`) | 1 | 1 |
+| M4 | application given auto-repair DDL (`src/lib/schema-resilience.ts`) | 1 | 1 |
+| M5 | operator-facing push recommendation (`src/lib/schema-resilience.ts`) | **0 (before the fix)** → **1 (after)** | 0 → 1 |
+| M6 | runner no longer fails closed on a ledger/catalog disagreement | 1 | 3 |
+| M7 | repair no longer clears the false ledger claim | 1 | 1 |
+
+Every mutated file was restored and verified byte-identical (`cmp` + `git status` clean) after
+each run, and the suite re-ran **20 / 0** at the end.
+
+**GitHub CI evidence (separate from the local evidence above).**
+
+| Run | Commit | Result |
+|---|---|---|
+| `39168493830` | `9da7333` | **SUCCESS** — 17/17 steps green, including "Tenant constraint integrity / schema-sync bypass regression (PostgreSQL required)" |
+| `39169949326` | `69a6e5b` | see §"Tests run" — the commit that carries the HIGH-1 and MEDIUM-1 fixes |
+
+**Not verified / not claimed.** The production engine and version, the production schema and
+ledger state, the 28 production relationship mismatch counts, the production table sizes, the
+production child-index coverage, the production TLS certificate chain and hostname, and a
+production backup/restore rehearsal. No production system was contacted. The GitHub Actions
+**job logs** could not be downloaded in this sandbox (the log archive redirects to a host that
+is not reachable from here), so the CI evidence above is the run and step **conclusions**, not
+a reading of the raw logs. The `EASY_LEARN_REQUIRE_TLS_E2E` / `EASY_LEARN_REQUIRE_TENANT_INTEGRITY`
+mechanisms are what make those conclusions meaningful: they turn a silent skip into a failure.
+
+### Remaining blockers and the exact next action for each
+
+| ID | Severity | Blocker | Exact next action | Owner |
+|---|---|---|---|---|
+| **BLOCKER-1** | **BLOCKER** | No production preflight evidence. | Restore a production copy to an isolated host; run the two read-only SQL blocks of `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` **and** the "Lock and duration rehearsal" section (write, restored copy only); have a human review the output and attach it to PR #32. Do **not** apply 0018 to production before that. | authorized human operator |
+| **BLOCKER-2** | **BLOCKER** | PR #32 has **no independent review** of this remediation. | A second reviewer checks §"Findings and evidence" above, the two commits `9da7333` and `69a6e5b`, and the mutation matrix, and records a review. Only then may the draft status be reconsidered. | reviewer |
+| **MEDIUM-2** | MEDIUM | The "works on a pre-0016 database" claim in `src/lib/assignment-access.ts:60,78-82`, `src/app/api/assignments/route.ts:40` and `docs/PR30_PR31_INTEGRATION_RESOLUTION.md:46` is false for the assignment routes. | Decide **(a)** correct the three comments and the resolution log to state that the schema-aware scope covers the school-scope half only and that the learner/parent role predicates require migration 0016, or **(b)** implement a genuinely 0013/0015-compatible role predicate. Either way it is a documentation-vs-code decision the reviewer must make. | reviewer + author |
+| **MEDIUM-3** | MEDIUM | 0 of 26 composite tenant foreign keys has a supporting child-side index (F-22). | Raise a **separate** migration (e.g. `0019_child_side_indexes.sql`) with its own gate, checkpoint block and rehearsal. Decide `CREATE INDEX CONCURRENTLY` (needs a runner change: it cannot run inside the runner's `BEGIN`/`COMMIT`) vs. transactional, and decide before/after 0018. **Do not fold it into this branch.** | author, separate PR |
+| **HIGH-1** | HIGH → **FIXED** | The push-recommendation guard was inert. | **Closed** in `69a6e5b`: escape-normalised matching plus a per-line explicit-prohibition assertion. Re-introduction now fails the suite (19/1, exit 1). | — |
+| **MEDIUM-1** | MEDIUM → **FIXED** | The suite could skip in CI with exit 0. | **Closed** in `69a6e5b`: `EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true` turns a skip into exit 1, and CI sets it. | — |
+| **LOW-1** | LOW | Ungrammatical operator error message. | Change the template in `src/lib/tenant-constraints.js` to `… is ${row.problem}` → `… ${row.problem}` for the "references the wrong parent table" case (or reword the SQL problem values). One-line change; can be folded into the next commit that touches that file. | author |
+| **LOW-2** | LOW | The submit route uses the non-schema-aware predicate. | Switch `src/app/api/assignments/[id]/submit/route.ts:19,56` to `resolveAssignmentAccessPredicate` for consistency. No behavioural change on a migrated database. | author |
+| **LOW-3** | LOW | The policy mirror grants a rule no route implements. | Either remove `explicitlyAuthorized` from `src/lib/assignment-policy.ts` and the corresponding assertion in `tests/assignment-authorization.test.ts:24`, or state in the file that it is a reserved future rule. | author |
+| **LOW-4** | LOW | The relational "reachable schools" helpers do not check the school lifecycle. | Add `join schools s on s.id = … and s.status = 'active'` to `sqlSchoolsOfClass` and the other `sqlSchoolsOf*` helpers for defence in depth. Not exploitable today (see the finding). | author |
+| **ENV-1** | LOW | The local `.git` was re-cloned between sessions; the branch pointer had to be restored. | No repository action. Reviewers must verify `git rev-parse HEAD` against the PR's head SHA rather than trusting a checkpoint. | reviewer |
+
+### Final verdict of the re-audit
+
+**READY FOR FURTHER REVIEW** — for the *code* of the schema-sync bypass remediation.
+
+The bypass is closed by executable checks, the destructive scenario is reproduced and
+contained, every failure mode is explicit and fail-closed, the recovery procedure was
+exercised end to end (damage → repair → re-apply → verify), and the regression suite is
+demonstrably non-vacuous (7 mutations, 7 detections after the HIGH-1 fix).
+
+It is **NOT READY for approval of the production migration**, and PR #32 must stay a draft,
+because:
+
+* **BLOCKER-1** — the production preflight evidence does not exist and cannot be produced by
+  any code change; it requires an authorized operator on a restored production copy.
+* **BLOCKER-2** — this remediation has had no independent human review yet.
+* **MEDIUM-2** — one documented support guarantee is inaccurate and needs a reviewer decision.
+* **MEDIUM-3** — the child-side index gap is real and measured, and its remediation is a
+  separate migration with its own gate and preflight.
+
+This re-audit changed only the regression suite and the CI wiring (`69a6e5b`). It did not
+change the migration, the runner, the schema, the application authorization code, the
+production environment, or PR #32's draft status, and it did not merge anything.
+
 ---
 
 ## 0. Method, scope, and constraints
