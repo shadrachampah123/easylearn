@@ -1,3 +1,229 @@
+# EasyLearn — Canonical Nine-Phase Roadmap
+
+**Audit date:** 2026-10-18 · **Repository:** `shadrachampah123/easylearn`
+**Verified application main:** `9a654a9ded904734250149206604193fe7133e5e` (PR #25, merged 2026-09-13).
+
+This current roadmap supersedes the historical architecture audit retained below, including
+its proposed numbering, table counts, future migration numbers and old “remaining” lists.
+Status describes the stated scope, not commercial launch readiness. **Implemented**, **merged**,
+**deployed**, **production DB migrated**, and **production behavior verified** are independent gates.
+“Reported” is documentary evidence, not independent production confirmation. No production
+connections, migrations or deployments were performed for this audit.
+
+## Verified checkpoint and evidence
+
+- GitHub `main` and fetched `origin/main` agree on the SHA above. The supplied checkpoint
+  `c9adf6f41389f768de32417474e9b6f8bcdeecd9` is an ancestor (assignment/submission
+  filter-overwrite fix in [PR #20](https://github.com/shadrachampah123/easylearn/pull/20)), not latest main.
+- [PR #16](https://github.com/shadrachampah123/easylearn/pull/16) merged Phase 1 at `eaed78c`;
+  Production deployment **6402657266** succeeded 2026-09-11 22:16:59 UTC.
+- Phase 2 foundations: [#17](https://github.com/shadrachampah123/easylearn/pull/17) `18d32f8` (2A),
+  [#18](https://github.com/shadrachampah123/easylearn/pull/18) `9d6c6ce` (2B),
+  [#19](https://github.com/shadrachampah123/easylearn/pull/19) `9553b4a` (2C),
+  #20 `86e6a44` (2D). All merged; included in deployed main.
+- Subsequent Phase 2E work is also merged and included in deployed main:
+  [#21](https://github.com/shadrachampah123/easylearn/pull/21) `1fa91b9` (write attribution and narrow legacy fallbacks),
+  [#22](https://github.com/shadrachampah123/easylearn/pull/22) `b22d56f` (override write attribution),
+  [#23](https://github.com/shadrachampah123/easylearn/pull/23) `dbc19ef` (migration 0017),
+  [#24](https://github.com/shadrachampah123/easylearn/pull/24) `1329426` (dashboard/report isolation),
+  [#25](https://github.com/shadrachampah123/easylearn/pull/25) `9a654a9` (direct override scope and question DELETE parent anchoring).
+- [GitHub Production deployment 6417389439](https://api.github.com/repos/shadrachampah123/easylearn/deployments/6417389439/statuses)
+  is tied to the exact main SHA; success recorded 2026-09-13 03:59:23 UTC.
+  [Vercel deployment](https://vercel.com/shadrachampah123s-projects/easylearn/GEDjSsuUKbwrSsW8Q45Gk4dUXRUh).
+  This proves a successful Production deployment record, **not** database execution, custom-domain
+  routing, functional correctness, or that today's production alias still serves that build.
+- Open PRs at audit start: **none**. GitHub Actions runs: **none returned**, no `.github/workflows`.
+  Main's Vercel status is success; main has no check runs. PR #25's preview Vercel context is
+  **ERROR**, last updated 2026-10-13, while Preview Comments succeeded. Its bot comment lists
+  two Vercel projects (`easylearn`, `easylearnn`) with inconsistent preview states. Later
+  September preview deployments are not newer main or Production evidence. Reconcile project/alias
+  ownership and the failed preview before relying on CI as a release gate.
+
+### Migration and production-verification ledger
+
+| Gate | Verified state / evidence | Required closure |
+| --- | --- | --- |
+| Implemented / merged | 0013–0017 SQL, schema and runner registration exist; root/drizzle copies of 0016/0017 match. 0013/14 establish memberships; 0015 backfills CBISM; 0016 adds direct tenancy; 0017 backfills residual NULLs and enforces NOT NULL on 24 tables, leaving platform `activity_logs` nullable. | Do not rebuild these completed artifacts. |
+| Deployed | Exact latest application SHA has successful GitHub Production deployment record above. | Confirm intended project and production alias build identity. |
+| Production DB migrated | **Reported applied, independently unverified.** `PHASE2E_MIGRATION_0017.md` records a live post-0016 audit (26 school-ID tables including memberships, FKs/indexes, one school, residual NULLs). `PHASE2E_HARDENING.md` second pass explicitly says production had 0016+0017 applied; #25 assumes both shipped. #23 itself explicitly did not run production migrations. No attached runner output or timestamped production catalog result establishes execution. | Obtain sanitized read-only production catalog/data proof for 0013–0017, especially 0016/17. Do **not** treat the old “0016 awaiting execution” checkpoint as current fact or blindly re-run it. |
+| Production behavior verified | Historical audit assertions exist; no reproducible post-#25 production smoke/isolation report found. Local DB tests in PRs are not production tests. | Record build identity, authorized role/school smoke tests, isolation denials, dual-membership attribution and regression results, with timestamp and environment. |
+
+`run-migration.js` explicitly runs an ordered list through 0017, splits statements, logs notices,
+and exits nonzero for collected non-idempotent failures. It has **no applied-migration ledger**,
+no whole-chain transaction, broadly treats “duplicate/already exists” as skips, and a missing
+explicit file can be skipped. Partial application must be ruled out by catalog checks.
+Drizzle journals are file metadata, not production execution evidence. `package.json` builds
+with `next build`, **not** the migration runner; no checked-in deployment hook proves automatic
+migration execution. The #23 claim that redeploy applies migrations is therefore insufficient.
+
+### Test evidence (2026-10-18)
+
+- Fresh `npm ci --ignore-scripts --no-audit --no-fund`; no tracked dependency changes.
+- `npm test` initially stopped after security tests because `DATABASE_URL` is required at import.
+  Re-run with an inert loopback port-1 test URL (no production credentials or DB connection):
+  **101 passed** (28 security source checks, 15 pure authorization, 23 tenant foundation,
+  35 membership foundation). `npm run typecheck`: **pass**.
+- `npm run lint`: **fails, 20 errors / 16 warnings**, matching the previously documented baseline;
+  not a new documentation regression, but still a release-quality gap.
+- Latest #25 PR reports 13 suites passing: 28 + 15 + 23 + 35 + 26 + 44 + 71 + 17 + 11 +
+  7 mutation checks + 11 write-attribution + 12 migration + 21 dashboard-isolation checks.
+  These are **author-reported**, not CI-attested. Build/typecheck also reported green there.
+- DB, mutation and migration suites were **not rerun** in this audit (no approved disposable
+  database provisioned); build not rerun. Some DB harnesses explicitly skip with exit 0 when
+  neither `TEST_DATABASE_URL` nor embedded PostgreSQL exists: an exit code alone is not coverage.
+  Future CI must require all DB suites to execute against an ephemeral database, never production.
+
+## Phase status and commercial-launch work
+
+**Gate notation:** I = implemented, M = merged, D = deployment record, DB = production migration,
+V = production behavior verification. “Required” below refers to future work, not authorization
+to execute it. Historical design-only subscopes were never all delivered merely because a
+similarly named PR merged.
+
+### 1. Critical Security & Access Control — **complete** (bounded Phase 1 scope)
+
+- **Evidence/gates:** #16; I/M yes; D yes (above); migration artifacts 0011 attendance uniqueness
+  and 0012 login attempts; DB not independently confirmed; V not independently confirmed.
+  Role/relationship access, protected seed/register, password ownership, file access, rate
+  limiting and security headers exist; current security/pure-auth tests pass.
+- **Acceptance/dependencies:** preserve these controls across all later work and verify live
+  role-denial/rate-limit/attendance behavior. No reimplementation of Phase 1 is queued.
+  Cookie-only auth, CSRF, revocation and enterprise assurance remain explicit later scopes;
+  “complete” here does not certify all security work or a penetration test.
+- **Required:** no new deployment/migration for already merged work; production verification
+  and confirmation of underlying DB prerequisites remain launch gates.
+
+### 2. Multi-School / Multi-Tenant Architecture — **in progress**
+
+| Subphase (actual delivery naming) | Status / evidence / gates | Outstanding scope, dependencies and acceptance | Required |
+| --- | --- | --- | --- |
+| **2A Foundation** | **complete** for schools + school_users, #17, 0013/14; I/M/D yes; DB reported, unverified; V unverified. | Unique school slug, multi-school memberships and lifecycle schema exist. Original proposed branding/support/audit tables and runner ledger did NOT ship; tracked below, not part of delivered foundation. | Verify live foundation; no duplicate implementation. |
+| **2B Membership/auth** | **complete** for delivered membership backfill and DB-derived auth context, #18, 0015; I/M/D yes; DB reported, unverified; V unverified. | Active memberships re-read; token hints not authority. Original session revocation, cookie-only/CSRF scope remains below. Acceptance: existing CBISM users retain correct active memberships without widening access. | Verify production memberships/login; no new migration for delivered scope. |
+| **2C Central authorization** | **complete** for delivered gates and route conversion/security fixes, #19; `src/lib/tenant.ts`; I/M/D yes, V unverified. | Preserve fail-closed role, relationship and tenant checks; rerun real two-school denial tests. No claim of comprehensive independent security certification. | Production verification; DB foundation prerequisite. |
+| **2D Direct tenant data access** | **complete** for delivered 0016/schema/route isolation and filter-overwrite fixes, #20 (`c9adf6f` included); I/M/D yes; DB reported, unverified; V unverified. | Migration surface is **25 school-owned tables plus school_users**, not the historical “21” count. NOT NULL belongs to delivered 2E, not future 2D work. Acceptance: direct attribution/filtering and cross-school read/write denial hold. | Verify 0016 state and behavior; do not blindly execute. |
+| **2E Write/DB/query hardening** | **in progress** overall; delivered slices complete in #21–25: write attribution, 0017, aggregate isolation, override scope, question-parent DELETE; I/M/D yes for those slices. DB reported, unverified; V unverified. | Do not relist fixed dashboard/report/override/question gaps as unfixed. Still missing composite tenant FKs (0017 only supplies unique targets), audited fallback cleanup after schema baseline, migration ledger/runner hardening. Check historical compatibility catches cannot widen operations on supported schemas. Acceptance: no cross-school relational rows, zero required NULLs, constraint and isolation suites executed. | Evidence first; future constraint/runner code requires reviewed migration, deployment and verification. |
+| **2F CBISM production reconciliation** | **blocked** on independent production evidence, not known missing execution. | Reconcile actual catalog, FK validation/indexes, required NULL counts, orphan and cross-school relationships against 0016/17 and intended build. Preserve allowed platform activity NULLs. Require backup/restore rehearsal before any separately approved remediation. | Read-only verification now; controlled migration only if a proven gap is later authorized. |
+| **2G Isolation testing / launch hardening** | **in progress**: extensive DB/mutation suites exist (#19–25), but no automated CI execution evidence. | Wire mandatory non-skipping ephemeral-DB CI; full route/role/two-school matrix, dual membership, forged IDs, public content/files, revocation and aggregate regressions. Finish independent security review and production smoke evidence. | CI/code deployment where changed; no production fixture seeding. |
+| **Tenant selection (original proposed 2E)** | **not started** end-to-end; host-resolution helper is not wired; earliest active membership is selected today (`memberships[0]`). | Implement trusted host/picker/switch flow with server-side membership and host/session cross-check; no client-selected arbitrary school. Dual members currently act in their earliest school: misattribution/correctness risk, not evidence of foreign-school access. | Deployment + staging/production verification; domain/session schema migration if needed. |
+| **DB defense-in-depth** | **not started** for composite FK enforcement / RLS. | Composite FK validation after clean data; prove transaction-scoped RLS safe under Neon pooling or document approved alternative. Never infer RLS from application predicates. | Migrations, pool rehearsal, negative tests and verification; depends on reconciliation. |
+| **Session security** | **not started** for cookie-only/CSRF/revocation completion. | Replace localStorage bearer flow safely, session invalidation/password-change behavior, secure cookie and CSRF tests. Preserve current auth gates. | Deployment, possible session schema migration, production verification. |
+| **Tenant branding/storage/support/audit** | **not started** for complete designed scope; existing file authorization, object storage and activity logs are implemented baselines. | Dynamic branding/public tenant content and metadata; school storage namespace/quotas and lifecycle; immutable school/platform audit attribution; expiring, explicit audited support access instead of implicit platform bypass. Decide global gamification data-sharing policy (currently intentional global totals). | Schema migrations as designed + deployment + isolation/operational verification; branding UI also Phase 3. |
+
+**Numbering reconciliation:** original §21 below proposed 2D constraints / 2E resolution;
+actual PRs used 2D direct access and 2E hardening. The table above is authoritative. Original
+2F/2G acceptance still applies; shipped DB and isolation tests are credited, not queued anew.
+
+### 3. School Management & Administration — **in progress** (legacy baseline; SaaS scope not started)
+
+- **3A Existing school operations — in progress:** users/roles, classes/departments/subjects,
+  academic years/terms, enrollment, parent links and teacher allocations already exist and are
+  tenant-aware (#19/20). I/M/D yes for baseline; DB/V unverified. Do not rebuild them.
+- **3B Commercial school lifecycle — not started:** platform school onboarding/provisioning,
+  invitations and membership administration, suspension/reactivation, per-school settings,
+  branding, import/export and safe offboarding/retention controls. No complete platform admin flow found.
+- **Acceptance/dependencies:** Phase 2 reconciliation/isolation/selection gates before onboarding
+  independent schools; prove two schools can be provisioned and administered independently, with
+  no global identity destruction when removing one membership.
+- **Required:** new workflows need code deployment, school/settings/lifecycle migrations where
+  necessary and verified admin/role E2E tests; legacy baseline needs production verification.
+
+### 4. Academic & Results Management — **in progress**
+
+- **4A Learning delivery — in progress:** assignments/submissions, quizzes, resources, attendance,
+  timetable, teacher grading and EasyAI exist (including #10–15, then tenant hardening #19–25).
+  I/M/D baseline yes; migration artifacts through 0017; DB/V unverified.
+- **4B Complete academic outcomes — not started:** configurable grading/scales and curriculum,
+  assessment weighting, moderated/approved result publication, term/year report cards,
+  promotion/rollover and historical records. Existing grades/reports do not prove this complete.
+- **Acceptance/dependencies:** tenant baseline plus school-specific configuration; deterministic
+  calculations, permissions, result visibility, cross-year history and rollover tested; validate
+  AI privacy/accuracy/human review before commercial reliance.
+- **Required:** deployment, academic schema migrations for new workflows, production verification;
+  retain already implemented learning features rather than list them as missing.
+
+### 5. Communication & Notifications — **in progress**
+
+- **5A In-app communication — in progress:** announcements, direct messages, notifications and
+  parent dashboards exist; tenant/aggregate fixes merged and deployed (#19–25); DB/V unverified.
+- **5B Delivery operations — not started:** reliable queued email/SMS/push as selected by product,
+  preferences/consent, retries, delivery status, provider limits and tenant-safe templates/audience.
+- **Acceptance/dependencies:** prove intended audience only, no cross-school recipients or
+  attachments, idempotent delivery and opt-out handling; depends on tenant selection and privacy policy.
+- **Required:** deployment and delivery/job/preference migrations as needed, provider configuration
+  outside this audit, staging and production delivery verification without unsolicited messages.
+
+### 6. Reports, Documents & Analytics — **in progress**
+
+- **6A Existing reports — in progress:** `/api/reports`, `/api/learner-reports`, grades, dashboard
+  metrics and learner stats exist; #24/25 isolate multi-school aggregates. I/M/D yes; DB/V unverified.
+- **6B Commercial document/analytics suite — not started:** branded validated report-card PDFs,
+  permissioned exports, attendance/academic trend definitions, audit/export history and tenant-safe
+  scheduled generation. Existing on-screen reports are not proof of this scope.
+- **Acceptance/dependencies:** approved academic formulas (Phase 4), branding, accessible documents,
+  reproducible totals and two-school export/scheduled-job denial tests.
+- **Required:** deployment, document/job/schema migrations if introduced, production verification.
+
+### 7. SaaS Billing & Subscriptions — **not started**
+
+- **7A Plans/entitlements — not started:** no subscriptions/billing schema or complete billing API
+  found; school limits, trials, entitlement model and grace/suspension policy need definition.
+- **7B Payments/reconciliation — not started:** provider selection, verified idempotent webhooks,
+  invoices/receipts, renewals/cancellation/refunds, taxes/currency and reconciliation.
+- **Evidence/gates:** no implementation/merge/deployment/DB/production verification evidence for
+  this scope. School records or a role enum are not billing capability.
+- **Acceptance/dependencies:** Phase 3 lifecycle; sandbox payment and replay/failure tests, accurate
+  tenant ledger and enforcement without destructive data loss. No payout/payment actions in audit.
+- **Required:** reviewed migrations, application deployment and separately authorized provider/live verification.
+
+### 8. UI/UX, Mobile, Performance & Reliability — **in progress**
+
+- **8A Baseline — in progress:** role dashboards, responsive UI, PWA assets and resilient schema
+  handling exist (README, `public`, `src/app`); I/M/D baseline yes, V unverified.
+- **8B Commercial UX — not started:** remove CBISM-only identity from shared entrypoints,
+  tenant picker/context visibility and branding, accessibility audit, onboarding, empty/error states,
+  browser/device QA and safe offline/logout behavior (including cache isolation).
+- **8C Performance/reliability qualification — not started:** tenant-sized load budgets, query/index
+  review, connection saturation, job reliability and measurable service objectives; fix lint baseline.
+- **Acceptance/dependencies:** depends on Phase 2 context and Phase 3 branding; measured accessibility,
+  mobile/caching and load results with zero cross-account/school cache leakage.
+- **Required:** deployment + device/load/production verification; performance migrations only after measurement.
+
+### 9. Testing, Production Hardening & Enterprise Readiness — **in progress**
+
+- **9A Automated assurance — in progress:** current 101 non-DB checks/typecheck pass; DB/mutation
+  suites implemented and PR-reported green. Lint fails; no Actions enforcement. Add reproducible
+  build/lint/test/security/dependency checks and browser E2E with actual non-skipped DB coverage.
+- **9B Operations/security readiness — not started** as an evidenced release program: backup and
+  timed restore drills, migration/rollback rehearsals, monitoring/alerts, incident response,
+  audit retention, secret rotation/session revocation procedures and independent penetration review.
+- **9C Enterprise/commercial readiness — not started:** privacy/data-processing terms, school data
+  ownership/export/deletion/retention, support/SLA/runbooks, safeguarding and vendor/data residency
+  review, quotas/abuse response and a controlled two-school pilot sign-off.
+- **Evidence/gates:** code/test baselines merged/deployed; no independent end-to-end production
+  acceptance evidence found. Dependencies are all earlier launch gates; no invented compliance certification.
+- **Acceptance/required:** required CI green including lint, documented DB/build identity and isolation
+  proof, recovery exercises and pilot acceptance before general availability. Deploy operational changes;
+  migrations only for reviewed supporting schema, never as an audit side effect.
+
+## Single next action — reconcile production tenancy evidence before Phase 3
+
+**Request an authorized, read-only production tenancy verification checkpoint for the intended
+Vercel project/alias and migrations 0016/0017.** Capture timestamped sanitized build identity,
+column/nullability/catalog FK/index evidence, required NULL/orphan/cross-school counts and
+post-#25 role/dual-school smoke-test results. Establish whether the reported migrations truly
+landed before planning any execution. If missing/partial, stop and prepare a separately approved,
+backup-rehearsed remediation; do not run the whole ledger-less runner blindly. This resolves
+both a possible schema/code mismatch and the unsupported deployment-to-migration assumption.
+After this gate, finish Phase 2 selection/integrity/CI hardening before independent-school onboarding.
+
+---
+
+# Historical Phase 2 Architecture Audit (2026-09-11)
+
+**Archive, not current status:** the following records the original findings and design rationale.
+Present-tense “no school”, proposed migration numbering and original phase sequence refer to
+that audit date only. Use the current roadmap above for shipped scope and outstanding work.
+
 # PHASE 2 — MULTI-SCHOOL / MULTI-TENANT ARCHITECTURE PLAN
 
 **Repository:** `shadrachampah123/easylearn`
@@ -1252,37 +1478,3 @@ but ledger-tracked** (they mutate data) — hence the 2A ledger requirement.
 this document is the only artifact. Implementation awaits your review and instructions.*
 
 ---
-
-## Phase 2D Implementation Status (2026-09-12)
-
-### Completed
-
-- **Migration 0016**: Adds `school_id` to 21 A-class tables with indexes and CBISM backfill (idempotent, additive). Root + drizzle copies identical, registered in `run-migration.js`.
-- **Schema**: `src/db/schema.ts` now has `schoolId` on all listed tables with FK to `schools.id`.
-- **Tenant Module**: `src/lib/tenant.ts` now has direct predicates (`sql*DirectInSchool`) and resolvers that prefer direct `school_id` with relational fallback for legacy NULL rows. `getClassSchoolIds`, `isClassInSchool`, `getAssignmentSchoolIds`, `isAssignmentInSchool`, `getQuizSchoolIds`, `isQuizInSchool`, `getSubmissionSchoolIds`, `isSubmissionInSchool`, `getTeacherClassSchoolIds`, `isTeacherClassInSchool`, `getTimetableSchoolIds`, `isTimetableInSchool`, `getFileSchoolIds`, `isFileInSchool` all prefer direct.
-- **Catalog Routes**: academic-years, terms, departments, subjects, classes all now use `guardSchoolContext`, `WHERE school_id = ctx.schoolId`, `schoolId` from ctx on create, foreign key validation via `is*InSchool`, cross-school PUT/DELETE 404, forged schoolId ignored.
-- **Derived Routes**: teacher-classes, enrollments (learner_classes), parent-learners, assignments, submissions, quizzes, resources, announcements, attendance, timetable, messages now set `schoolId` on insert and prefer direct `school_id` with `or(eq(schoolId), and(isNull(schoolId), relational))` fallback for backward compat.
-- **Tests**: 
-  - Static: 28 security, 15 real-auth, 23 tenant-foundation, 35 membership-foundation = 101 passed
-  - Live DB: 71 tenant-authorization, 17 tenant-catalog = 88 passed
-  - Total: 189 tests passing
-- **Validation**: typecheck passes, build passes with dummy DATABASE_URL, lint shows 36 pre-existing issues (not introduced by Phase 2D).
-- **Docs**: New `PHASE2D_TENANT_DATA_ACCESS.md` with full audit, files changed, issues fixed, deferred findings.
-
-### Remaining for Phase 2E/2F
-
-- Tenant resolution via subdomain (`{slug}.easylearn.com`) + middleware host parsing
-- CBISM migration execution against production snapshot
-- RLS defense-in-depth
-- File storage tenancy (schools/{schoolId}/ prefix, quota enforcement)
-- Branding table, audit_logs table, support_access_sessions
-- Cookie-only auth migration, CSRF hardening
-- Remaining derived routes: notifications, uploads, files, activity-logs, dashboard overrides could use explicit direct school_id filter for defense-in-depth (currently via userId which is already tenant-scoped)
-- Grades, reports, learner stats could add direct school_id for performance
-
-### No Prod DB Changes
-
-- No production database modified directly
-- No migrations run against production
-- No secrets changed
-- All changes are code/tests/migration files only
