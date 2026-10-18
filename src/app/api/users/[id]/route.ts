@@ -9,6 +9,8 @@ import {
   guardSchoolContext,
   hasSchoolAdminRole,
   hasSchoolAdminExtendedRole,
+  getEffectiveSchoolRole,
+  isUserInSchool,
   sqlUserInSchool,
   updateSchoolMembershipRole,
 } from "@/lib/tenant";
@@ -21,11 +23,9 @@ import {
  * Phase 2C — `/api/users/[id]` is the canonical cross-tenant IDOR and is the reason the
  * brief calls this the highest-risk route.
  *
- * Every method resolves the caller's school from the database membership context and then
- * requires the TARGET user to be an ACTIVE member of that same school. The check is part of
- * the SQL predicate, so another school's row cannot be read, mutated, deactivated or have
- * its role changed — and it is reported as 404, not 403, so the endpoint cannot be used to
- * enumerate users in other schools.
+ * School-scoped reads and membership-role changes target the caller's active school
+ * membership. Global identity fields (profile, active status, password, and the legacy
+ * global role) are platform-only because one identity may be shared across schools.
  *
  * DELETE keeps its pre-Phase-2C rule: it is a PLATFORM operation on the global identity
  * store and requires `super_admin` explicitly (see docs/PHASE2C_TENANT_AUTHORIZATION.md).
@@ -45,14 +45,9 @@ export async function GET(
     const ctx = auth.context;
 
     await ensureUserIdentityColumns();
-
-    if (!hasSchoolAdminExtendedRole(ctx)) {
-      return errorResponse("Forbidden", 403);
-    }
+    if (!hasSchoolAdminExtendedRole(ctx)) return errorResponse("Forbidden", 403);
 
     const { id } = await params;
-
-    // Tenant predicate inside the query: a user of another school is "not found".
     const [user] = await db
       .select()
       .from(users)
@@ -60,17 +55,13 @@ export async function GET(
       .limit(1);
 
     if (!user) return notFoundResponse("User");
-
-    // Never hand a credential out of the API, whatever the row happens to contain.
-    const { passwordHash: _passwordHash, ...safeUser } = user as Record<string, unknown>;
-
-    return successResponse(safeUser);
+    const schoolRole = await getEffectiveSchoolRole(id, { schoolId: ctx.schoolId });
+    if (!schoolRole) return notFoundResponse("User");
+    const { passwordHash: _passwordHash, ...safeUser } = user;
+    return successResponse({ ...safeUser, role: schoolRole });
   } catch (error) {
     console.error("Get user error:", error);
-    return errorResponse(
-      schemaAwareErrorMessage(error, "The user could not be loaded."),
-      503
-    );
+    return errorResponse(schemaAwareErrorMessage(error, "The user could not be loaded."), 503);
   }
 }
 
@@ -79,36 +70,49 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await guardSchoolContext(request);
-    if (!auth.ok) return auth.response;
-    const ctx = auth.context;
-
-    await ensureUserIdentityColumns();
-
-    if (!hasSchoolAdminRole(ctx)) {
-      return errorResponse("Only administrators can update users", 403);
-    }
-
-    const { id } = await params;
+    const schoolAuth = await guardSchoolContext(request);
     const body = await request.json();
     const { firstName, lastName, phone, gender, isActive, role } = body;
+    const { id } = await params;
+    await ensureUserIdentityColumns();
 
     if (role !== undefined && !ASSIGNABLE_ROLES.includes(role)) {
       return errorResponse("Invalid role");
     }
 
-    // Tenant predicate inside the query — another school's user is not updatable here.
-    const [existing] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(and(eq(users.id, id), sqlUserInSchool(ctx.schoolId, users.id)))
-      .limit(1);
+    const hasGlobalFields = [firstName, lastName, phone, gender, isActive].some((value) => value !== undefined);
 
-    if (!existing) return notFoundResponse("User");
+    if (schoolAuth.ok) {
+      const ctx = schoolAuth.context;
+      if (!(await isUserInSchool(ctx.schoolId, id))) return notFoundResponse("User");
+      if (!hasSchoolAdminRole(ctx)) return errorResponse("Only administrators can update users", 403);
+      // A school cannot change fields on the shared identity, even if this request's
+      // target happens to be a member of the current school.
+      if (hasGlobalFields) {
+        return errorResponse("Profile and account status changes require a platform administrator", 403);
+      }
+      if (role === undefined) return errorResponse("No school-scoped user changes provided", 400);
 
-    /* A platform administrator is not a school member and therefore cannot be edited into
-       one: assigning `super_admin` is already rejected above, and a platform account is
-       excluded from the school predicate, so it cannot be targeted here at all. */
+      const updatedRole = await updateSchoolMembershipRole({ schoolId: ctx.schoolId, userId: id, role });
+      if (!updatedRole) return notFoundResponse("User");
+      const [user] = await db.select({
+        id: users.id,
+        email: users.email,
+        firstName: users.firstName,
+        lastName: users.lastName,
+        phone: users.phone,
+        gender: users.gender,
+        isActive: users.isActive,
+      }).from(users).where(eq(users.id, id)).limit(1);
+      return successResponse({ ...user, role: updatedRole });
+    }
+
+    // No school context means the caller must explicitly pass the platform gate before any
+    // mutation to the global identity store (profile/status/legacy role).
+    const platformAuth = await guardPlatformAdmin(request);
+    if (!platformAuth.ok) return platformAuth.response;
+    if (!hasGlobalFields && role === undefined) return errorResponse("No user changes provided", 400);
+
     const [updated] = await db
       .update(users)
       .set({
@@ -120,7 +124,7 @@ export async function PUT(
         role: role ?? undefined,
         updatedAt: new Date(),
       })
-      .where(and(eq(users.id, id), sqlUserInSchool(ctx.schoolId, users.id)))
+      .where(eq(users.id, id))
       .returning({
         id: users.id,
         email: users.email,
@@ -131,21 +135,11 @@ export async function PUT(
         gender: users.gender,
         isActive: users.isActive,
       });
-
-    /* Keep `school_users.role` aligned with the identity role so the DB membership stays
-       authoritative for the next request instead of drifting for up to 24 h. Scoped to the
-       caller's own school, so this can never touch another school's membership. */
-    if (role !== undefined) {
-      await updateSchoolMembershipRole({ schoolId: ctx.schoolId, userId: id, role });
-    }
-
+    if (!updated) return notFoundResponse("User");
     return successResponse(updated);
   } catch (error) {
     console.error("Update user error:", error);
-    return errorResponse(
-      schemaAwareErrorMessage(error, "The account could not be updated."),
-      503
-    );
+    return errorResponse(schemaAwareErrorMessage(error, "The account could not be updated."), 503);
   }
 }
 
@@ -190,46 +184,34 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await guardSchoolContext(request);
-    if (!auth.ok) return auth.response;
-    const ctx = auth.context;
-
-    await ensureUserIdentityColumns();
-
-    if (!hasSchoolAdminRole(ctx)) {
-      return errorResponse("Only administrators can reset passwords", 403);
+    const schoolAuth = await guardSchoolContext(request);
+    if (schoolAuth.ok) {
+      const { id } = await params;
+      if (!(await isUserInSchool(schoolAuth.context.schoolId, id))) return notFoundResponse("User");
+      return errorResponse("Password resets require a platform administrator", 403);
     }
+
+    const auth = await guardPlatformAdmin(request);
+    if (!auth.ok) return auth.response;
+    await ensureUserIdentityColumns();
 
     const { id } = await params;
     const body = await request.json();
     const { password } = body;
-
-    if (!password || password.length < 6) {
+    if (!password || typeof password !== "string" || password.length < 6) {
       return errorResponse("Password must be at least 6 characters");
     }
 
-    // Tenant predicate inside the query: no cross-school password reset.
-    const [existing] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(and(eq(users.id, id), sqlUserInSchool(ctx.schoolId, users.id)))
-      .limit(1);
-
-    if (!existing) return notFoundResponse("User");
-
     const passwordHash = await hashPassword(password);
-
-    await db
+    const [updated] = await db
       .update(users)
       .set({ passwordHash, updatedAt: new Date() })
-      .where(and(eq(users.id, id), sqlUserInSchool(ctx.schoolId, users.id)));
-
+      .where(eq(users.id, id))
+      .returning({ id: users.id });
+    if (!updated) return notFoundResponse("User");
     return successResponse({ message: "Password reset successfully" });
   } catch (error) {
     console.error("Reset password error:", error);
-    return errorResponse(
-      schemaAwareErrorMessage(error, "The password could not be reset."),
-      503
-    );
+    return errorResponse(schemaAwareErrorMessage(error, "The password could not be reset."), 503);
   }
 }

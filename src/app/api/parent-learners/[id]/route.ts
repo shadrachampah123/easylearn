@@ -9,7 +9,7 @@ import {
   type SchoolAuthContext,
 } from "@/lib/tenant";
 import { logActivity } from "@/lib/activity";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { RELATIONSHIP_OPTIONS, normalizeRelationship } from "@/lib/relationships";
 import { isMissingRelation, clientSafeErrorMessage } from "@/lib/schema-resilience";
 import { UUID_PATTERN } from "@/lib/dashboard-overrides";
@@ -39,13 +39,13 @@ function parseId(rawId: string): string | null {
  * members of the caller's school. Otherwise it is reported as missing (no existence leak).
  */
 async function findInSchoolLink(id: string, ctx: SchoolAuthContext) {
-  const link = await findLink(id);
+  const link = await findLink(id, ctx.schoolId);
   if (!link) return null;
   const members = await getLearnerIdsInSchool(ctx.schoolId, [link.parentId, link.learnerId]);
   return members.size === 2 ? link : null;
 }
 
-async function findLink(id: string) {
+async function findLink(id: string, schoolId: string) {
   const [link] = await db
     .select({
       id: parentLearners.id,
@@ -54,7 +54,7 @@ async function findLink(id: string) {
       relationship: parentLearners.relationship,
     })
     .from(parentLearners)
-    .where(eq(parentLearners.id, id))
+    .where(and(eq(parentLearners.id, id), eq(parentLearners.schoolId, schoolId)))
     .limit(1);
   return link ?? null;
 }
@@ -114,7 +114,7 @@ export async function PUT(
     const [updated] = await db
       .update(parentLearners)
       .set({ relationship: normalized })
-      .where(eq(parentLearners.id, linkId))
+      .where(and(eq(parentLearners.id, linkId), eq(parentLearners.schoolId, ctx.schoolId)))
       .returning();
 
     await logActivity({
@@ -151,7 +151,7 @@ export async function DELETE(
     const link = await findInSchoolLink(linkId, ctx);
     if (!link) return notFoundResponse("Parent link");
 
-    await db.delete(parentLearners).where(eq(parentLearners.id, linkId));
+    await db.delete(parentLearners).where(and(eq(parentLearners.id, linkId), eq(parentLearners.schoolId, ctx.schoolId)));
 
     await logActivity({
       schoolId: ctx.schoolId,

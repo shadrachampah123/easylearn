@@ -29,10 +29,13 @@ export async function GET(request: NextRequest) {
     const entityType = url.searchParams.get("entityType");
     const action = url.searchParams.get("action");
 
-    /* Phase 2C: the feed used to be every row in `activity_logs`. It is now restricted to
-       events performed by members of the caller's school. Platform events (rows with no
-       school-attributable actor) are not part of any school's feed. */
-    const conditions: any[] = [sqlUserInSchool(ctx.schoolId, activityLogs.userId)];
+    /* Activity logs are explicitly school-attributed; NULL school_id denotes a platform
+       event and is intentionally excluded from school feeds. Keep actor membership as a
+       second guard, but never infer a log's owner from a shared identity. */
+    const conditions: any[] = [
+      eq(activityLogs.schoolId, ctx.schoolId),
+      sqlUserInSchool(ctx.schoolId, activityLogs.userId),
+    ];
 
     // entity_type only exists after migration 0005; filtering on it before that throws.
     const enrichment = await ensureSchemaFeature("activity_logs_enrichment");

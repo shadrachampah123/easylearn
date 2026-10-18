@@ -30,11 +30,11 @@ export async function GET(request: NextRequest) {
       const [totalParents] = await db.select({ count: sql<number>`count(*)` }).from(users)
         .where(sql`${eq(users.role, "parent")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`);
       const [totalClasses] = await db.select({ count: sql<number>`count(*)` }).from(classes)
-        .where(sqlClassInSchool(ctx.schoolId, classes.id));
+        .where(sql`${eq(classes.schoolId, ctx.schoolId)} AND ${sqlClassInSchool(ctx.schoolId, classes.id)}`);
       const [totalSubjects] = await db.select({ count: sql<number>`count(*)` }).from(subjects)
         .where(eq(subjects.schoolId, ctx.schoolId));
       const [totalAssignments] = await db.select({ count: sql<number>`count(*)` }).from(assignments)
-        .where(sqlAssignmentInSchool(ctx.schoolId, assignments.id));
+        .where(sql`${eq(assignments.schoolId, ctx.schoolId)} AND ${sqlAssignmentInSchool(ctx.schoolId, assignments.id)}`);
 
       return successResponse({
         teachers: Number(totalTeachers.count),
@@ -47,8 +47,10 @@ export async function GET(request: NextRequest) {
     }
 
     if (role === "teacher") {
-      const [myAssignments] = await db.select({ count: sql<number>`count(*)` }).from(assignments).where(eq(assignments.teacherId, ctx.userId));
-      const [myAnnouncements] = await db.select({ count: sql<number>`count(*)` }).from(announcements).where(eq(announcements.authorId, ctx.userId));
+      const [myAssignments] = await db.select({ count: sql<number>`count(*)` }).from(assignments)
+        .where(sql`${eq(assignments.teacherId, ctx.userId)} AND ${eq(assignments.schoolId, ctx.schoolId)}`);
+      const [myAnnouncements] = await db.select({ count: sql<number>`count(*)` }).from(announcements)
+        .where(sql`${eq(announcements.authorId, ctx.userId)} AND ${eq(announcements.schoolId, ctx.schoolId)}`);
 
       return successResponse({
         assignments: Number(myAssignments.count),

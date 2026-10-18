@@ -6,7 +6,6 @@ import {
   getLearnerIdsInSchool,
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
-  sqlUserInSchool,
 } from "@/lib/tenant";
 import { logActivity } from "@/lib/activity";
 import { eq, and, or, ilike, desc, inArray } from "drizzle-orm";
@@ -58,18 +57,9 @@ export async function GET(request: NextRequest) {
     const parentAlias = alias(users, "link_parent");
     const learnerAlias = alias(users, "link_learner");
 
-    /* Phase 2D: direct school_id preferred, relational fallback */
-    let useDirect = true;
-    try {
-      const { sql: drizzleSql } = await import("drizzle-orm");
-      await db.execute(drizzleSql`select "school_id" from "parent_learners" limit 0`);
-    } catch {
-      useDirect = false;
-    }
-
-    const conditions = useDirect
-      ? [eq(parentLearners.schoolId, ctx.schoolId)]
-      : [sqlUserInSchool(ctx.schoolId, parentLearners.parentId), sqlUserInSchool(ctx.schoolId, parentLearners.learnerId)];
+    // The relationship row itself is the tenant-owned resource. Do not infer its owner
+    // only from member users: a shared identity can belong to multiple schools.
+    const conditions = [eq(parentLearners.schoolId, ctx.schoolId)];
     if (!isAdmin && ctx.school.role === "parent") conditions.push(eq(parentLearners.parentId, ctx.userId));
     if (!isAdmin && ctx.school.role === "learner") conditions.push(eq(parentLearners.learnerId, ctx.userId));
     if (parentId) conditions.push(eq(parentLearners.parentId, parentId));
@@ -215,7 +205,7 @@ export async function POST(request: NextRequest) {
     const [existing] = await db
       .select({ id: parentLearners.id })
       .from(parentLearners)
-      .where(and(eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)))
+      .where(and(eq(parentLearners.schoolId, ctx.schoolId), eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)))
       .limit(1);
 
     if (existing) {
@@ -297,14 +287,14 @@ export async function DELETE(request: NextRequest) {
     const [existing] = await db
       .select({ id: parentLearners.id })
       .from(parentLearners)
-      .where(and(eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)))
+      .where(and(eq(parentLearners.schoolId, ctx.schoolId), eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)))
       .limit(1);
 
     if (!existing) return errorResponse("This link does not exist", 404);
 
     await db
       .delete(parentLearners)
-      .where(and(eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)));
+      .where(and(eq(parentLearners.schoolId, ctx.schoolId), eq(parentLearners.parentId, parentId), eq(parentLearners.learnerId, learnerId)));
 
     await logActivity({
       schoolId: ctx.schoolId,

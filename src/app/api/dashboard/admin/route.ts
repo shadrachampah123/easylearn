@@ -13,7 +13,7 @@ import {
   activityLogs,
 } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
-import { eq, sql, desc } from "drizzle-orm";
+import { eq, sql, desc, and } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
@@ -148,7 +148,7 @@ async function loadRecentActivity(add: (w?: SchemaWarning | null) => void, schoo
       })
       .from(activityLogs)
       .leftJoin(actorAlias, eq(activityLogs.userId, actorAlias.id))
-      .where(sqlUserInSchool(schoolId, activityLogs.userId))
+      .where(and(eq(activityLogs.schoolId, schoolId), sqlUserInSchool(schoolId, activityLogs.userId)))
       .orderBy(desc(activityLogs.createdAt))
       .limit(10);
 
@@ -168,7 +168,7 @@ async function loadRecentActivity(add: (w?: SchemaWarning | null) => void, schoo
       })
       .from(activityLogs)
       .leftJoin(actorAlias, eq(activityLogs.userId, actorAlias.id))
-      .where(sqlUserInSchool(schoolId, activityLogs.userId))
+      .where(and(eq(activityLogs.schoolId, schoolId), sqlUserInSchool(schoolId, activityLogs.userId)))
       .orderBy(desc(activityLogs.createdAt))
       .limit(10);
   } catch (error) {
@@ -275,12 +275,12 @@ export async function GET(request: NextRequest) {
       ["teachers", () => countFrom(users, sql`${eq(users.role, "teacher")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
       ["learners", () => countFrom(users, sql`${eq(users.role, "learner")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
       ["parents", () => countFrom(users, sql`${eq(users.role, "parent")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
-      ["classes", () => countFrom(classes, sqlClassInSchool(ctx.schoolId, classes.id))],
+      ["classes", () => countFrom(classes, sql`${eq(classes.schoolId, ctx.schoolId)} AND ${sqlClassInSchool(ctx.schoolId, classes.id)}`)],
       ["subjects", () => countFrom(subjects, eq(subjects.schoolId, ctx.schoolId))],
-      ["assignments", () => countFrom(assignments, sqlAssignmentInSchool(ctx.schoolId, assignments.id))],
-      ["quizzes", () => countFrom(quizzes, sqlQuizInSchool(ctx.schoolId, quizzes.id))],
-      ["resources", () => countFrom(resources, sqlUserInSchool(ctx.schoolId, resources.teacherId))],
-      ["announcements", () => countFrom(announcements, sqlUserInSchool(ctx.schoolId, announcements.authorId))],
+      ["assignments", () => countFrom(assignments, sql`${eq(assignments.schoolId, ctx.schoolId)} AND ${sqlAssignmentInSchool(ctx.schoolId, assignments.id)}`)],
+      ["quizzes", () => countFrom(quizzes, sql`${eq(quizzes.schoolId, ctx.schoolId)} AND ${sqlQuizInSchool(ctx.schoolId, quizzes.id)}`)],
+      ["resources", () => countFrom(resources, sql`${eq(resources.schoolId, ctx.schoolId)} AND ${sqlUserInSchool(ctx.schoolId, resources.teacherId)}`)],
+      ["announcements", () => countFrom(announcements, sql`${eq(announcements.schoolId, ctx.schoolId)} AND ${sqlUserInSchool(ctx.schoolId, announcements.authorId)}`)],
     ];
 
     const statValues = await Promise.all(statQueries.map(([key, task]) => run(key, task, 0)));
@@ -299,9 +299,9 @@ export async function GET(request: NextRequest) {
             present: sql<number>`count(*) FILTER (WHERE ${attendance.isPresent} = true)`,
           })
           .from(attendance)
-          .leftJoin(classes, eq(attendance.classId, classes.id))
+          .leftJoin(classes, and(eq(attendance.classId, classes.id), eq(classes.schoolId, ctx.schoolId)))
           // Phase 2C: only this school's learners.
-          .where(sqlUserInSchool(ctx.schoolId, attendance.learnerId))
+          .where(and(eq(attendance.schoolId, ctx.schoolId), sqlUserInSchool(ctx.schoolId, attendance.learnerId)))
           .groupBy(classes.level),
       [] as { level: string | null; total: number; present: number }[]
     );
@@ -324,10 +324,10 @@ export async function GET(request: NextRequest) {
             totalSubmissions: sql<number>`count(${submissions.id})`,
           })
           .from(classes)
-          .leftJoin(assignments, eq(assignments.classId, classes.id))
-          .leftJoin(submissions, eq(submissions.assignmentId, assignments.id))
+          .leftJoin(assignments, and(eq(assignments.classId, classes.id), eq(assignments.schoolId, ctx.schoolId)))
+          .leftJoin(submissions, and(eq(submissions.assignmentId, assignments.id), eq(submissions.schoolId, ctx.schoolId)))
           // Phase 2C: only classes attributable to this school.
-          .where(sqlClassInSchool(ctx.schoolId, classes.id))
+          .where(and(eq(classes.schoolId, ctx.schoolId), sqlClassInSchool(ctx.schoolId, classes.id)))
           .groupBy(classes.id, classes.name)
           .orderBy(sql`COALESCE(AVG(${submissions.percentage}), 0) DESC`)
           .limit(5),

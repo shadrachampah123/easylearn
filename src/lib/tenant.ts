@@ -1107,7 +1107,7 @@ export async function updateSchoolMembershipRole(params: {
   const [row] = await db
     .update(schoolUsers)
     .set({ role, updatedAt: new Date() })
-    .where(and(eq(schoolUsers.schoolId, params.schoolId), eq(schoolUsers.userId, params.userId)))
+    .where(and(eq(schoolUsers.schoolId, params.schoolId), eq(schoolUsers.userId, params.userId), eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS)))
     .returning({ role: schoolUsers.role });
 
   return row ? (row.role as SchoolRole) : null;

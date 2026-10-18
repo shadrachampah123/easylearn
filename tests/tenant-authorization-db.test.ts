@@ -337,11 +337,11 @@ async function main() {
       fs.writeFileSync(path.join(UPLOAD_DIR, storedName), "%PDF-1.4 phase 2c test file");
     }
 
-    await q(`INSERT INTO activity_logs (user_id, action, entity_type, description) VALUES ($1, 'create', 'class', 'A event')`, [
-      ids["teacher-a"],
+    await q(`INSERT INTO activity_logs (school_id, user_id, action, entity_type, description) VALUES ($1, $2, 'create', 'class', 'A event')`, [
+      schoolA, ids["teacher-a"],
     ]);
-    await q(`INSERT INTO activity_logs (user_id, action, entity_type, description) VALUES ($1, 'create', 'class', 'B event')`, [
-      ids["teacher-b"],
+    await q(`INSERT INTO activity_logs (school_id, user_id, action, entity_type, description) VALUES ($1, $2, 'create', 'class', 'B event')`, [
+      schoolB, ids["teacher-b"],
     ]);
     await q(`INSERT INTO activity_logs (user_id, action, entity_type, description) VALUES ($1, 'login', null, 'orphan event')`, [
       ids["orphan"],
@@ -360,6 +360,25 @@ async function main() {
     }
 
     const route = async (pathName: string) => import(`@/app/api/${pathName}/route`);
+
+    // Real shared identities: each holds an active membership in both tenants. These
+    // records expose cases where membership-derived visibility was incorrectly used in
+    // place of the owning row's school_id.
+    const createDualMember = async (label: string, role: string) => {
+      const row = await one(
+        `INSERT INTO users (email, username, password_hash, role, first_name, last_name, is_active)
+         VALUES ($1, $2, $3, $4, 'Shared', $5, true) RETURNING id`,
+        [`${label}-${DB_NAME}@example.test`, `${label}-${DB_NAME.slice(-8)}`, passwordHash, role, label]
+      );
+      await q(`INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1,$2,$3,'active')`, [schoolA, row.id, role]);
+      await q(`INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1,$2,$3,'active')`, [schoolB, row.id, role]);
+      const token = await auth.createToken({ userId: row.id, role, email: `${label}@example.test` });
+      return { id: row.id as string, token };
+    };
+    const dualTeacher = await createDualMember("dual-teacher", "teacher");
+    const dualPeer = await createDualMember("dual-peer", "teacher");
+    const dualParent = await createDualMember("dual-parent", "parent");
+    const dualLearner = await createDualMember("dual-learner", "learner");
 
     type CallOptions = {
       token?: string | null;
@@ -772,6 +791,68 @@ async function main() {
       assertEq(foreign.is_read, false, "foreign notification untouched");
     });
 
+    await test("Notifications: dual-member views and updates only the current school's rows", async () => {
+      const own = (await one(`INSERT INTO notifications (school_id, user_id, type, title, message, is_read) VALUES ($1,$2,'system','DUAL-A','A notification',false) RETURNING id`, [schoolA, dualTeacher.id])).id as string;
+      const foreign = (await one(`INSERT INTO notifications (school_id, user_id, type, title, message, is_read) VALUES ($1,$2,'system','DUAL-B','B notification',false) RETURNING id`, [schoolB, dualTeacher.id])).id as string;
+      try {
+        const list = await call("notifications", { token: dualTeacher.token });
+        assertEq(list.status, 200, "dual member notification list");
+        assert(bodyText(list).includes(own), "School A notification remains visible");
+        assert(!bodyText(list).includes(foreign), "School B notification is not exposed");
+        await call("notifications", { token: dualTeacher.token, method: "PUT", body: { notificationIds: [foreign] } });
+        let state = await one(`SELECT is_read FROM notifications WHERE id=$1`, [foreign]);
+        assertEq(state.is_read, false, "single-item update cannot mark School B read");
+        await call("notifications", { token: dualTeacher.token, method: "PUT", body: { markAll: true } });
+        state = await one(`SELECT is_read FROM notifications WHERE id=$1`, [foreign]);
+        const ownState = await one(`SELECT is_read FROM notifications WHERE id=$1`, [own]);
+        assertEq(state.is_read, false, "bulk update cannot mark School B read");
+        assertEq(ownState.is_read, true, "bulk update still marks School A notification read");
+      } finally {
+        await q(`DELETE FROM notifications WHERE id IN ($1,$2)`, [own, foreign]);
+      }
+    });
+
+    await test("Messages: dual participant sees and marks read only the current school's conversation", async () => {
+      const a = (await one(`INSERT INTO messages (school_id,sender_id,receiver_id,content,is_read) VALUES ($1,$2,$3,'A-only-content',false) RETURNING id`, [schoolA, dualPeer.id, dualTeacher.id])).id as string;
+      const b = (await one(`INSERT INTO messages (school_id,sender_id,receiver_id,content,is_read) VALUES ($1,$2,$3,'B-secret-content',false) RETURNING id`, [schoolB, dualPeer.id, dualTeacher.id])).id as string;
+      try {
+        const result = await call("messages", { token: dualTeacher.token, query: { userId: dualPeer.id } });
+        assertEq(result.status, 200, "same-school participant can view conversation");
+        assert(bodyText(result).includes("A-only-content"), "School A message remains accessible");
+        assert(!bodyText(result).includes("B-secret-content"), "School B message is not exposed");
+        const aState = await one(`SELECT is_read FROM messages WHERE id=$1`, [a]);
+        const bState = await one(`SELECT is_read FROM messages WHERE id=$1`, [b]);
+        assertEq(aState.is_read, true, "School A incoming message is marked read");
+        assertEq(bState.is_read, false, "School B incoming message remains unread");
+        const list = await call("messages", { token: dualTeacher.token });
+        assert(!bodyText(list).includes("B-secret-content"), "conversation list also excludes School B content");
+      } finally {
+        await q(`DELETE FROM messages WHERE id IN ($1,$2)`, [a, b]);
+      }
+    });
+
+    await test("Parent links: owner school_id protects id reads, updates, collection reads and deletes", async () => {
+      const link = (await one(`INSERT INTO parent_learners (school_id,parent_id,learner_id,relationship) VALUES ($1,$2,$3,'guardian') RETURNING id`, [schoolB, dualParent.id, dualLearner.id])).id as string;
+      try {
+        const collection = await call("parent-learners", { token: tokens["admin-a"] });
+        assert(!bodyText(collection).includes(link), "School A collection omits School B link despite dual memberships");
+        const foreignRead = await call("parent-learners/[id]", { token: tokens["admin-a"], params: { id: link } });
+        assertEq(foreignRead.status, 404, "foreign link id read is hidden");
+        const foreignUpdate = await call("parent-learners/[id]", { token: tokens["admin-a"], method: "PUT", params: { id: link }, body: { relationship: "mother" } });
+        assertEq(foreignUpdate.status, 404, "foreign link id update is hidden");
+        const collectionDelete = await call("parent-learners", { token: tokens["admin-a"], method: "DELETE", query: { parentId: dualParent.id, learnerId: dualLearner.id } });
+        assertEq(collectionDelete.status, 404, "collection delete requires link ownership, not just shared membership");
+        const state = await one(`SELECT relationship FROM parent_learners WHERE id=$1`, [link]);
+        assertEq(state.relationship, "guardian", "foreign relationship remains unchanged");
+        assertEq((await call("parent-learners/[id]", { token: tokens["admin-b"], params: { id: link } })).status, 200, "School B retains legitimate link read");
+        assertEq((await call("parent-learners/[id]", { token: tokens["admin-b"], method: "PUT", params: { id: link }, body: { relationship: "mother" } })).status, 200, "School B retains legitimate update");
+        assertEq((await call("parent-learners", { token: tokens["admin-b"], method: "DELETE", query: { parentId: dualParent.id, learnerId: dualLearner.id } })).status, 200, "School B retains legitimate collection delete");
+        assertEq((await one(`SELECT id FROM parent_learners WHERE id=$1`, [link])), undefined, "School B deletion removes only its owned link");
+      } finally {
+        await q(`DELETE FROM parent_learners WHERE id=$1`, [link]);
+      }
+    });
+
     /* ════════════════════ 8. File isolation ════════════════════ */
 
     await test("Files: downloading another school's file is 404 (not 403 — no enumeration)", async () => {
@@ -872,6 +953,30 @@ async function main() {
 
     /* ════════════════════ 10. Admin / aggregate isolation ════════════════════ */
 
+    await test("Admin aggregates and feeds use row school_id for a dual-member actor", async () => {
+      await q(`INSERT INTO resources (school_id,title,type,teacher_id) VALUES ($1,'Dual A Resource','pdf',$2),($3,'Dual B Resource','pdf',$2)`, [schoolA, dualTeacher.id, schoolB]);
+      await q(`INSERT INTO announcements (school_id,title,content,author_id,is_public) VALUES ($1,'Dual A Announcement','A',$2,false),($3,'DUAL-B-ANNOUNCEMENT-SECRET','B',$2,false)`, [schoolA, dualTeacher.id, schoolB]);
+      await q(`INSERT INTO activity_logs (school_id,user_id,action,entity_type,description) VALUES ($1,$2,'create','resource','DUAL A ACTIVITY'),($3,$2,'create','resource','DUAL B ACTIVITY SECRET')`, [schoolA, dualTeacher.id, schoolB]);
+      try {
+        const admin = await call("dashboard/admin", { token: tokens["admin-a"] });
+        assertEq(admin.status, 200, "admin dashboard");
+        assertEq(admin.json.data.rawStats.resources, 1, "resource count only includes School A row");
+        assertEq(admin.json.data.rawStats.announcements, 3, "announcement metric only includes School A rows");
+        assert(bodyText(admin).includes("DUAL A ACTIVITY"), "School A activity remains visible");
+        assert(!bodyText(admin).includes("DUAL B ACTIVITY SECRET"), "School B activity not exposed in dashboard feed");
+        const feed = await call("activity-logs", { token: tokens["admin-a"] });
+        assert(bodyText(feed).includes("DUAL A ACTIVITY"), "School A activity feed includes own activity");
+        assert(!bodyText(feed).includes("DUAL B ACTIVITY SECRET"), "activity endpoint excludes the same actor's School B event");
+        const stats = await call("dashboard/stats", { token: tokens["admin-a"] });
+        assertEq(stats.status, 200, "admin stats");
+        assertEq(stats.json.data.teachers, 3, "all three teacher identities with School A memberships are counted");
+      } finally {
+        await q(`DELETE FROM resources WHERE title LIKE 'Dual % Resource'`);
+        await q(`DELETE FROM announcements WHERE title LIKE 'Dual % Announcement' OR title='DUAL-B-ANNOUNCEMENT-SECRET'`);
+        await q(`DELETE FROM activity_logs WHERE description LIKE 'DUAL % ACTIVITY%'`);
+      }
+    });
+
     await test("Admin: the activity feed is scoped to the caller's school", async () => {
       const result = await call("activity-logs", { token: tokens["admin-a"] });
       assertEq(result.status, 200, "activity feed");
@@ -883,8 +988,8 @@ async function main() {
     await test("Admin: the admin dashboard counts only this school", async () => {
       const result = await call("dashboard/admin", { token: tokens["admin-a"] });
       assertEq(result.status, 200, "dashboard status");
-      assertEq(result.json.data.rawStats.teachers, 1, "only School A's teacher is counted");
-      assertEq(result.json.data.rawStats.learners, 2, "only School A's learners are counted");
+      assertEq(result.json.data.rawStats.teachers, 3, "only School A member teachers are counted, including shared identities");
+      assertEq(result.json.data.rawStats.learners, 3, "only School A member learners are counted, including shared identities");
       assert(!bodyText(result).includes("B event"), "School B's activity must not appear");
     });
 
@@ -914,6 +1019,37 @@ async function main() {
     });
 
     /* ════════════════════ 11. Legitimate access (nothing broke) ════════════════════ */
+
+    await test("Users: school administration changes only its membership role, not shared identity", async () => {
+      const globalBefore = await one(`SELECT role, first_name, is_active FROM users WHERE id=$1`, [dualTeacher.id]);
+      const a = await call("users/[id]", { token: tokens["admin-a"], method: "PUT", params: { id: dualTeacher.id }, body: { role: "head_teacher" } });
+      assertEq(a.status, 200, "same-school membership role update allowed");
+      const memberships = await q(`SELECT school_id,role FROM school_users WHERE user_id=$1 ORDER BY school_id`, [dualTeacher.id]);
+      assertEq(memberships.find((m: any) => m.school_id === schoolA)?.role, "head_teacher", "School A membership role updated");
+      assertEq(memberships.find((m: any) => m.school_id === schoolB)?.role, "teacher", "School B role preserved");
+      const globalAfter = await one(`SELECT role, first_name, is_active FROM users WHERE id=$1`, [dualTeacher.id]);
+      assertEq(globalAfter.role, globalBefore.role, "global role is unchanged");
+      assertEq(globalAfter.first_name, globalBefore.first_name, "global profile is unchanged");
+      assertEq(globalAfter.is_active, globalBefore.is_active, "global active status is unchanged");
+      const profile = await call("users/[id]", { token: tokens["admin-a"], method: "PUT", params: { id: dualTeacher.id }, body: { firstName: "Unauthorized" } });
+      assertEq(profile.status, 403, "school admin cannot edit globally shared profile");
+      const deactivate = await call("users/[id]", { token: tokens["admin-a"], method: "PUT", params: { id: dualTeacher.id }, body: { isActive: false } });
+      assertEq(deactivate.status, 403, "school admin cannot deactivate shared identity");
+      const foreignPassword = await call("users/[id]", { token: tokens["admin-a"], method: "PATCH", params: { id: ids["teacher-b"] }, body: { password: "NewPass123" } });
+      assertEq(foreignPassword.status, 404, "school admin cannot target another school's account");
+      const sharedPassword = await call("users/[id]", { token: tokens["admin-a"], method: "PATCH", params: { id: dualTeacher.id }, body: { password: "NewPass123" } });
+      assertEq(sharedPassword.status, 403, "school admin cannot reset a shared identity's global password");
+      const stillActive = await one(`SELECT is_active FROM users WHERE id=$1`, [dualTeacher.id]);
+      assertEq(stillActive.is_active, true, "identity remains active");
+
+      const platformProfile = await call("users/[id]", { token: tokens["platform"], method: "PUT", params: { id: ids["teacher-b"] }, body: { firstName: "Platform Managed" } });
+      assertEq(platformProfile.status, 200, "platform administrator retains global profile administration");
+      const platformPassword = await call("users/[id]", { token: tokens["platform"], method: "PATCH", params: { id: ids["teacher-b"] }, body: { password: "PlatformPass123" } });
+      assertEq(platformPassword.status, 200, "platform administrator retains global password administration");
+      const changed = await one(`SELECT password_hash, first_name FROM users WHERE id=$1`, [ids["teacher-b"]]);
+      assertEq(changed.first_name, "Platform Managed", "platform profile update is persisted");
+      assert(await bcrypt.compare("PlatformPass123", changed.password_hash), "platform password reset is persisted");
+    });
 
     await test("Legitimate: School A's admin can read a School A user in full", async () => {
       const result = await call("users/[id]", { token: tokens["admin-a"], params: { id: ids["learner-a"] } });

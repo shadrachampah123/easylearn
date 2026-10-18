@@ -10,10 +10,8 @@ import { guardSchoolContext } from "@/lib/tenant";
  * require a database-backed school context, so a session without an active membership
  * cannot read or mutate another school's notification stream.
  *
- * Notification rows have no school column in this phase; ownership is the recipient
- * (`notifications.user_id`) and it is always taken from the verified context — never from a
- * client-supplied user id. Every query below is scoped by `user_id = ctx.userId`, so a row
- * belonging to another user (and therefore to another school) is not selected at all.
+ * Notifications are tenant-owned even when their recipient has memberships in multiple
+ * schools. Every read and mutation is scoped by both the verified recipient and school.
  */
 export async function GET(request: NextRequest) {
   try {
@@ -24,7 +22,7 @@ export async function GET(request: NextRequest) {
     const results = await db
       .select()
       .from(notifications)
-      .where(eq(notifications.userId, ctx.userId))
+      .where(and(eq(notifications.userId, ctx.userId), eq(notifications.schoolId, ctx.schoolId)))
       .orderBy(desc(notifications.createdAt))
       .limit(50);
 
@@ -32,12 +30,12 @@ export async function GET(request: NextRequest) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
       .from(notifications)
-      .where(eq(notifications.userId, ctx.userId));
+      .where(and(eq(notifications.userId, ctx.userId), eq(notifications.schoolId, ctx.schoolId)));
 
     const [{ unread }] = await db
       .select({ unread: sql<number>`count(*)` })
       .from(notifications)
-      .where(sql`${notifications.userId} = ${ctx.userId} AND ${notifications.isRead} = false`);
+      .where(sql`${notifications.userId} = ${ctx.userId} AND ${notifications.schoolId} = ${ctx.schoolId} AND ${notifications.isRead} = false`);
 
     return successResponse({
       notifications: results,
@@ -64,7 +62,7 @@ export async function PUT(request: NextRequest) {
       await db
         .update(notifications)
         .set({ isRead: true })
-        .where(eq(notifications.userId, ctx.userId));
+        .where(and(eq(notifications.userId, ctx.userId), eq(notifications.schoolId, ctx.schoolId)));
     } else if (notificationIds && Array.isArray(notificationIds)) {
       if (notificationIds.length === 0) {
         return errorResponse("No notification IDs provided", 400);
@@ -76,6 +74,7 @@ export async function PUT(request: NextRequest) {
         .set({ isRead: true })
         .where(and(
           eq(notifications.userId, ctx.userId),
+          eq(notifications.schoolId, ctx.schoolId),
           inArray(notifications.id, notificationIds)
         ));
 
@@ -87,6 +86,7 @@ export async function PUT(request: NextRequest) {
         .from(notifications)
         .where(and(
           eq(notifications.userId, ctx.userId),
+          eq(notifications.schoolId, ctx.schoolId),
           inArray(notifications.id, notificationIds)
         ));
       const ownedIds = new Set(owned.map((n) => n.id));
