@@ -1,9 +1,44 @@
 # EasyLearn — Canonical Nine-Phase Roadmap
 
-**Audit date:** 2026-10-18 · **Repository:** `shadrachampah123/easylearn`
-**Latest repository main verified after this follow-up:** `8931095c5333e4f39f527d4520c0185805bf536f` (PR #29, merged 2026-10-18).
-**Latest application-code checkpoint:** `0adb2052841055b994b266618c56ba7ba2d9df40` includes the focused tenant-isolation repair (PR #28, merged 2026-10-18); PR #29 updates roadmap documentation only.
-**Next action — pending:** obtain an independent review of the merged PR #28 tenant-isolation repair (GitHub currently shows no submitted reviews), then obtain an authorized, read-only production tenancy checkpoint confirming deployed identity, migrations 0013–0017, schema/data integrity, and post-repair behavior. This branch also contains unmerged explicit school-selection/CI follow-up plus repository-only migration-runner hardening and migration 0018. Do not run migrations, deploy, or begin Phase 3 until independent review and production evidence gates are satisfied.
+**Roadmap updated:** 2026-10-18 · **Repository:** `shadrachampah123/easylearn`
+**Verified `main`:** `851156cac0403f1b9e268c0c3584543852399c48` (PR #33 merged).
+**Latest application/security checkpoint:** PR #32 merged at `90ec04363cbec3222232c6f912fcad69ab038dba`; PR #33 follow-up merged at `851156cac0403f1b9e268c0c3584543852399c48`.
+**Overall roadmap estimate: 46% complete.** This is a planning estimate across the nine product phases, not a test score or production-readiness certification. Phase 2 code hardening has advanced substantially, but production database state and safe migration gates remain unresolved.
+
+This current roadmap supersedes the historical architecture audit retained below, including its proposed numbering, table counts, future migration numbers and old “remaining” lists. Status distinguishes **implemented**, **merged**, **deployed**, **production DB migrated**, and **production behavior verified** as independent gates. No production connections, migrations, deployments, secrets, or settings were accessed or changed for this roadmap update.
+
+## Current progress dashboard — 2026-10-18
+
+| Phase | Estimated completion | Status | Main work still outstanding |
+| --- | ---: | --- | --- |
+| 1. Critical Security & Access Control | **100%** | Complete for bounded Phase 1 scope | Verify live role-denial, rate-limit and DB prerequisites; broader session/CSRF security is later scope. |
+| 2. Multi-School / Multi-Tenant Architecture | **78%** | Code hardening merged; production gate blocked | Read-only production evidence for migrations 0013–0017 and tenant behavior; safely rehearse migration 0018 against a restored production copy; plan and validate 26 missing child-side FK indexes; separately authorize any production change. |
+| 3. School Management & Administration | **25%** | Legacy LMS baseline exists; SaaS workflows not started | Platform school onboarding/provisioning, invitations, membership administration, school lifecycle/settings, safe offboarding and independent-school E2E. |
+| 4. Academic & Results Management | **45%** | Core teaching workflows exist | Configurable grading/scales, moderation and result publication, report cards, promotion/rollover, historical-year handling and school-specific configuration. |
+| 5. Communication & Notifications | **40%** | Core features exist | Complete tenant-aware verification and production checks; richer school communication workflows and operational acceptance. |
+| 6. Reports, Documents & Analytics | **35%** | Existing reports/dashboards; isolation fixes merged | Verify live isolation; complete document/report lifecycle, exports and scalable analytics as product scope requires. |
+| 7. SaaS Billing & Subscriptions | **0%** | Not started | Plans, entitlements, subscription lifecycle, payments, invoices, retries, cancellations and billing administration. |
+| 8. UI/UX, Mobile, Performance & Reliability | **40%** | Existing UI; hardening ongoing | School branding/switching polish, accessibility/mobile checks, query/index performance and reliability/observability work. |
+| 9. Testing, Production Hardening & Enterprise Readiness | **55%** | Test suites and safeguards improved; production proof incomplete | Restored-production-copy rehearsal, verified live schema/data/behavior evidence, confirm branch protections, production smoke tests, security/operational runbooks and launch acceptance. |
+
+**How to read the percentages:** estimates reflect delivered scope against each phase’s full roadmap, not the share of code merged. The overall 46% is a rounded planning estimate across the nine phases. Merged code and passing disposable-database tests do **not** count as production migration or behavior verification.
+
+### Confirmed progress since the previous roadmap checkpoint
+
+- **PR #32 merged** at `90ec04363cbec3222232c6f912fcad69ab038dba`. It integrated the migration-runner/schema-resilience safeguards and the migration-0018 composite-FK work, plus regression evidence. It did not apply migration 0018 to production.
+- **PR #33 merged** at `851156cac0403f1b9e268c0c3584543852399c48`. CI succeeded; scratch database teardown is now shared and asserted, and the LOW-1/2/3 findings were addressed. LOW-4 was deliberately not changed because the proposed change weakened fail-closed authorization.
+- The scratch-database leak was reproduced before the fix (four databases left behind by the worst suites); the PR reports repeated suite runs and the complete CI sequence leaving zero scratch databases.
+- **Still not confirmed:** production execution of migrations 0013–0017, current production schema/data integrity, intended deployed build identity, and post-change live tenant-isolation behavior.
+- **Still outstanding:** 26 child-side FK indexes identified as a performance/locking risk. They require a separate reviewed and gated migration; PR #32/#33 did not add them.
+- No production connection, migration, data/settings change, manual deployment, or branch-protection change was performed as part of these merges or this roadmap update.
+
+## Immediate remaining work (ordered)
+
+1. **Read-only production checkpoint:** an authorized operator verifies the intended Vercel project/alias and production build identity, then captures sanitized catalog/data evidence for migrations 0013–0017, required NULLs, orphan/cross-school rows, FK validation and indexes, and post-repair role/dual-school behavior. Do not expose secrets.
+2. **Restored-copy rehearsal for migration 0018:** use a restored copy of production only. Check PostgreSQL version (migration syntax requires PostgreSQL 15+), row/table sizes, preflight results, lock duration and rollback behavior. Record results and review them before any production application.
+3. **Index plan and separate migration:** enumerate the 26 missing child-side FK indexes, inspect query plans and table sizes, design a low-lock/concurrent-index approach compatible with the migration runner, and test it on the restored copy. Do not bundle this into an unreviewed production action.
+4. **Decision gate:** reconcile the evidence. If production is already at the expected state, do not rerun migrations. If there is a gap, prepare a narrowly scoped remediation plan for explicit authorization, with backup/recovery and post-checks.
+5. **Only after Phase 2 gates:** complete independent-school onboarding/lifecycle workflows and proceed with the remaining Phase 3–9 product scope. Phase 3 is not launch-ready while the tenancy production gate is unresolved.
 
 This current roadmap supersedes the historical architecture audit retained below, including
 its proposed numbering, table counts, future migration numbers and old “remaining” lists.
@@ -115,9 +150,9 @@ section below. Build and database suites used no production database.
 until a reviewer other than the implementation pass reviews this repair and the production
 verification gate is separately satisfied.
 
-## Current branch continuation — explicit school selection, CI, and database defenses (2026-10-18)
+## Historical implementation continuation — explicit school selection, CI, and database defenses (2026-10-18; later merged through PR #32)
 
-The working branch `arena/dc9adcab-easylearn` is based on main `8931095c5333e4f39f527d4520c0185805bf536f`; PR #30 remains open. Its current source changes include the school-selection/authentication tranche, required CI, the 0018 relational-tenant migration, and migration-runner history hardening. This is repository-only implementation: not merged, independently reviewed, deployed, or production-verified.
+The working branch `arena/dc9adcab-easylearn` was based on main `8931095c5333e4f39f527d4520c0185805bf536f`. The school-selection/authentication tranche, required CI, migration 0018 and migration-runner history hardening were subsequently integrated through PR #32, merged at `90ec04363cbec3222232c6f912fcad69ab038dba`. PR #33 then merged test-database cleanup and LOW-1/2/3 follow-up at `851156cac0403f1b9e268c0c3584543852399c48`. These are repository/code and disposable-test results only: production migration and production behavior remain unverified.
 
 ### PR #30 self-review record
 
@@ -276,16 +311,16 @@ actual PRs used 2D direct access and 2E hardening. The table above is authoritat
   proof, recovery exercises and pilot acceptance before general availability. Deploy operational changes;
   migrations only for reviewed supporting schema, never as an audit side effect.
 
-## Single next action — reconcile production tenancy evidence before Phase 3
+## Single next action — read-only production tenancy checkpoint before migration rehearsal
 
-**Request an authorized, read-only production tenancy verification checkpoint for the intended
-Vercel project/alias and migrations 0016/0017.** Capture timestamped sanitized build identity,
+**Request an authorized, read-only production tenancy verification checkpoint** for the intended
+Vercel project/alias and migrations 0013–0017. Capture timestamped sanitized build identity,
 column/nullability/catalog FK/index evidence, required NULL/orphan/cross-school counts and
-post-#25 role/dual-school smoke-test results. Establish whether the reported migrations truly
-landed before planning any execution. If missing/partial, stop and prepare a separately approved,
-backup-rehearsed remediation; do not run the whole ledger-less runner blindly. This resolves
-both a possible schema/code mismatch and the unsupported deployment-to-migration assumption.
-After this gate, finish Phase 2 selection/integrity/CI hardening before independent-school onboarding.
+post-repair role/dual-school smoke-test results. Establish the actual production state before
+planning any execution. Then rehearse migration 0018 and the separate child-side-index plan on a
+restored production copy. If production is missing/partial, stop and prepare a separately approved,
+backup-rehearsed remediation; do not blindly rerun migrations. No production migration or deploy
+is authorized by this roadmap update.
 
 ---
 
