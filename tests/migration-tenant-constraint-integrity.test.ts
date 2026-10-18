@@ -32,6 +32,8 @@
  *      recovered through the documented repair procedure.
  *
  * Providers: TEST_DATABASE_URL → embedded-postgres → SKIP (exit 0).
+ * Set `EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true` to turn a skip into a failure — CI
+ * does exactly that, so the job proves these assertions really ran.
  * Every database used here is disposable. No production database is ever contacted.
  */
 
@@ -63,6 +65,7 @@ const GATE = GATED_MIGRATIONS[GATE_FILE];
 
 let passed = 0;
 let failed = 0;
+let skipped = false;
 
 function test(name: string, fn: () => void | Promise<void>) {
   return Promise.resolve()
@@ -145,15 +148,34 @@ async function main() {
   let stopServer: (() => Promise<void>) | null = null;
   let adminUrl = process.env.TEST_DATABASE_URL;
 
+  /* Locally the suite skips gracefully when no PostgreSQL is available. In CI
+     (EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true) a skip is a FAILURE: the CI job must
+     actually execute the schema-sync bypass regression, not quietly pass without it.
+     Without this, a renamed environment variable or a broken database fallback would
+     disarm the whole suite while the job still reported success. */
+  const requireExecution = process.env.EASY_LEARN_REQUIRE_TENANT_INTEGRITY === "true";
+  const skip = (message: string) => {
+    console.log(message);
+    skipped = true;
+    if (requireExecution) {
+      console.error(
+        "❌ FAIL: EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true — the tenant constraint " +
+          "integrity suite must run, not skip."
+      );
+    }
+  };
+
   if (!adminUrl) {
     let EmbeddedPostgres: any = null;
     try {
       EmbeddedPostgres = requireFromRepo("embedded-postgres");
       EmbeddedPostgres = EmbeddedPostgres.default ?? EmbeddedPostgres;
     } catch {
-      console.log("⏭️  SKIP: no TEST_DATABASE_URL and embedded-postgres is not installed.");
+      skip("⏭️  SKIP: no TEST_DATABASE_URL and embedded-postgres is not installed.");
       console.log("   Install with `npm i --no-save embedded-postgres` and re-run.");
-      return;
+      /* Nothing has been opened yet, so exiting here is safe. Locally a skip is
+         acceptable; in CI it is a failure. */
+      process.exit(skipped && requireExecution ? 1 : 0);
     }
     const port = 55929 + (crypto.randomBytes(2).readUInt16BE(0) % 1000);
     const pg = new EmbeddedPostgres({
@@ -292,11 +314,29 @@ async function main() {
       ];
       for (const file of files) {
         const source = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
+        /* A TypeScript template literal escapes its backticks, so the source text
+           contains  \`  and not  `.  A pattern that expects a bare backtick therefore
+           never matches the very file that used to carry the recommendation
+           (src/lib/schema-resilience.ts).  Normalise the escapes first. */
+        const normalised = source.replace(/\\`/g, "`");
         const recommendation = /Apply [^`]*`npx drizzle-kit push`|Run `npx drizzle-kit push`/;
         assert(
-          !recommendation.test(source),
+          !recommendation.test(normalised),
           `${file} must not recommend \`drizzle-kit push\` to an operator`
         );
+
+        /* The pattern above only catches two phrasings.  Assert the stronger
+           property directly: every remaining mention of \`drizzle-kit push\` in these
+           operator-facing files must be part of an explicit prohibition.  This is
+           what makes the guard effective against a re-introduction in any wording. */
+        for (const rawLine of normalised.split("\n")) {
+          const line = rawLine.trim();
+          if (!line.includes("drizzle-kit push")) continue;
+          assert(
+            /do not run|never|must not|not to/i.test(line),
+            `${file} mentions "drizzle-kit push" without an explicit prohibition: ${line}`
+          );
+        }
       }
     });
 
@@ -718,7 +758,10 @@ async function main() {
     if (stopServer) await stopServer().catch(() => {});
   }
 
-  process.exit(failed > 0 ? 1 : 0);
+  /* A skip is only acceptable outside CI.  In CI the suite must have executed, so a
+     skip is a failure — otherwise the job would report success on a suite that never
+     ran a single assertion. */
+  process.exit(failed > 0 || (skipped && requireExecution) ? 1 : 0);
 }
 
 /** Convenience: read a single boolean from a disposable client. */

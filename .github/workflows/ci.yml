@@ -62,6 +62,9 @@ jobs:
       - name: PR integration regression suite (PostgreSQL required)
         run: npm run test:integration
       - name: Tenant constraint integrity / schema-sync bypass regression (PostgreSQL required)
+        env:
+          # A skip must fail this job: the schema-sync bypass regression has to actually run.
+          EASY_LEARN_REQUIRE_TENANT_INTEGRITY: "true"
         run: npm run test:tenant-integrity
       - name: Typecheck
         run: npm run typecheck
