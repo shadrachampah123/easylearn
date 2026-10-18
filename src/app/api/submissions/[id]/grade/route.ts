@@ -15,9 +15,8 @@ import { clientSafeErrorMessage } from "@/lib/schema-resilience";
 import {
   guardSchoolContext,
   hasSchoolRole,
-  sqlAssignmentInSchool,
-  sqlSchoolRowInSchool,
-  sqlSubmissionInSchool,
+  sqlAssignmentScope,
+  sqlSubmissionScope,
   sqlUserInSchool,
 } from "@/lib/tenant";
 
@@ -51,12 +50,8 @@ export async function POST(
     }
 
     const { id } = await params;
-    const submissionScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-    );
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
+    const assignmentScope = await sqlAssignmentScope(ctx.schoolId, assignments.id);
     const body = await request.json();
     const { score, maxScore, feedback, answers } = body as {
       score?: number;
@@ -91,11 +86,9 @@ export async function POST(
 
     // In an UPDATE statement there is no assignments table in the outer FROM clause, so
     // anchor the parent-scope check to the assignment id just read from this submission.
-    const updateAssignmentScope = await sqlSchoolRowInSchool(
+    const updateAssignmentScope = await sqlAssignmentScope(
       ctx.schoolId,
-      "assignments",
-      sql`${submission.assignmentId}::uuid`,
-      sqlAssignmentInSchool(ctx.schoolId, sql`${submission.assignmentId}::uuid`)
+      sql`${submission.assignmentId}::uuid`
     );
 
     if (ctx.school.role === "teacher" && submission.teacherId !== ctx.userId) {

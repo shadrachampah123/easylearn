@@ -1,4 +1,13 @@
 "use client";
+/**
+ * Login + explicit school selection.
+ *
+ * Merged behaviour: PR #30 supplies the complete session hand-off (username OR email,
+ * `mustChangePassword` redirect, the school-scoped `el_user` session object) and PR #31
+ * supplies the "that school is no longer available" wording for a selection that the server
+ * refuses. The school list itself is server-validated — the client only ever asks for a
+ * school the server already listed as one of the caller's active memberships.
+ */
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -118,7 +127,7 @@ export default function LoginPage() {
       });
       const data = await res.json();
       if (!res.ok || !data?.success) {
-        setError(data?.error || "That school could not be selected. Please sign in again.");
+        setError(data?.error || "That school is no longer available. Please sign in again.");
         return;
       }
       continueToApp(pendingUser, data.data.school, data.data.token, data.data.schools);

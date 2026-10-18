@@ -8,12 +8,13 @@ import { eq, and, desc } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
-  sqlAssignmentInSchool,
+  sqlAssignmentScope,
   sqlLearnerClassInSchool,
   sqlSchoolRowInSchool,
-  sqlSubmissionInSchool,
+  sqlSubmissionScope,
   sqlUserInSchool,
 } from "@/lib/tenant";
+import { resolveAssignmentAccessPredicate } from "@/lib/assignment-access";
 
 export async function GET(request: NextRequest) {
   try {
@@ -23,16 +24,20 @@ export async function GET(request: NextRequest) {
     const schoolRole = ctx.school.role;
 
     const assignmentId = request.nextUrl.searchParams.get("assignmentId");
-    const submissionScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-    );
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
+
+    // The submission and assignment scopes are resolved schema-aware: the direct
+    // `school_id` column on a migrated database, the relational ownership set on a
+    // pre-0016 one. Both are deny-by-default.
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
+    const assignmentScope = await sqlAssignmentScope(ctx.schoolId, assignments.id);
 
     // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
     // Always preserve tenant predicate + role, plus assignmentId filter
-    const conditions: any[] = [];
+    const conditions: any[] = [
+      submissionScope,
+      assignmentScope,
+      sqlUserInSchool(ctx.schoolId, submissions.learnerId),
+    ];
 
     if (schoolRole === "learner") {
       conditions.push(eq(submissions.learnerId, ctx.userId));
@@ -41,7 +46,6 @@ export async function GET(request: NextRequest) {
     } else if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("You are not authorized to view submissions", 403);
     }
-    conditions.push(submissionScope, assignmentScope, sqlUserInSchool(ctx.schoolId, submissions.learnerId));
 
     if (assignmentId) {
       conditions.push(eq(submissions.assignmentId, assignmentId));
@@ -102,19 +106,13 @@ export async function POST(request: NextRequest) {
     // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
 
-    // The explicit row school_id is authoritative on migrated schemas. Relational fallback
-    // is used only if the school_id column is genuinely absent (pre-0016), never when a
-    // direct row belongs to a different school.
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
-    const submissionScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-    );
+    // The assignment lookup is itself the authorization query: it requires the learner's
+    // active enrollment, publication, active school context, and direct school ownership
+    // before any assignment or question data is used.
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(and(eq(assignments.id, assignmentId), assignmentScope))
+      .where(and(eq(assignments.id, assignmentId), await resolveAssignmentAccessPredicate(ctx)))
       .limit(1);
 
     if (!assignment) {
@@ -169,22 +167,23 @@ export async function POST(request: NextRequest) {
       resolvedAttachments = resolved.attachments;
     }
 
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
+
     // Check for existing submission
     const [existing] = await db
       .select({ id: submissions.id })
       .from(submissions)
       .where(and(
         eq(submissions.assignmentId, assignmentId),
-        eq(submissions.learnerId, ctx.userId),
         submissionScope,
-        sqlUserInSchool(ctx.schoolId, submissions.learnerId)
+        eq(submissions.learnerId, ctx.userId)
       ))
       .limit(1);
 
     if (existing) {
       // Update existing submission
       const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
-      
+
       if (isLate && !assignment.allowLate) {
         return errorResponse("Late submissions are not allowed for this assignment");
       }
@@ -205,7 +204,7 @@ export async function POST(request: NextRequest) {
 
     // Create new submission
     const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
-    
+
     if (isLate && !assignment.allowLate) {
       return errorResponse("Late submissions are not allowed for this assignment");
     }

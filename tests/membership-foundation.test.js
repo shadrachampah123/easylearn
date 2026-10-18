@@ -485,6 +485,9 @@ test('Boundary: no middleware / hostname tenant resolution (Phase 2E)', () => {
 
 test('Boundary: explicit membership-validated school switching exists; unrelated phases remain deferred', () => {
   assert(fs.existsSync(path.join(__dirname, '..', 'src', 'app', 'api', 'auth', 'select-school', 'route.ts')), 'school switcher route exists');
+  const selectionRoute = readFile('src/app/api/auth/select-school/route.ts');
+  assert(selectionRoute.includes('selectSchoolForContext'), 'school selection must narrow verified memberships');
+  assert(selectionRoute.includes('resolveAuthContext'), 'school selection must revalidate the authenticated context');
   assert(!fs.existsSync(path.join(__dirname, '..', 'src', 'app', 'api', 'platform')), 'no platform routes yet');
   assert(!/schoolBranding|school_branding/.test(readFile('src/db/schema.ts')), 'no branding table');
   assert(!/ROW LEVEL SECURITY/i.test(migrationSql), 'no RLS');

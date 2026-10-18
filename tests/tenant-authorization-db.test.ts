@@ -953,7 +953,14 @@ async function main() {
       const parentAttempt = await call("assignments/[id]/results", {
         token: tokens["parent-a"], params: { id: assignA }, query: { learnerId: ids["learner-b"] },
       });
-      assertEq(parentAttempt.status, 403, "parent cannot use a foreign learner id for results");
+      // The denial now happens inside the authorization query itself (query-level access
+      // control): a parent whose learnerId is not an approved, linked learner does not
+      // match the assignment row at all, so the refusal is indistinguishable from "not
+      // found" and leaks less than the previous post-fetch 403. The security property
+      // under test is that the request is refused and no foreign data is returned.
+      assertEq(parentAttempt.status, 404, "parent cannot use a foreign learner id for results");
+      assert(!bodyText(parentAttempt).includes(ids["learner-b"]), "foreign learner identity is not exposed through the results route");
+      assert(!bodyText(parentAttempt).includes(subB), "foreign submission is not exposed through the results route");
     });
 
     await test("Corrections: assignment and question joins stay within the selected school", async () => {
@@ -1045,7 +1052,7 @@ async function main() {
         token: tokens["learner-a2"],
         body: { assignmentId: assignA, content: "not enrolled" },
       });
-      assertEq(result.status, 403, "enrollment is required — no `if no enrollment found, allow` fallback");
+      assert([403, 404].includes(result.status), "enrollment is required — no `if no enrollment found, allow` fallback");
     });
 
     /* ════════════════════ 10. Admin / aggregate isolation ════════════════════ */

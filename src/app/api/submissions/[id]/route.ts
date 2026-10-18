@@ -7,9 +7,8 @@ import { clientSafeErrorMessage } from "@/lib/schema-resilience";
 import {
   hasSchoolRole,
   guardSchoolContext,
-  sqlAssignmentInSchool,
-  sqlSchoolRowInSchool,
-  sqlSubmissionInSchool,
+  sqlAssignmentScope,
+  sqlSubmissionScope,
   sqlUserInSchool,
 } from "@/lib/tenant";
 
@@ -31,12 +30,8 @@ export async function GET(
     }
 
     const { id } = await params;
-    const submissionScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-    );
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
+    const assignmentScope = await sqlAssignmentScope(ctx.schoolId, assignments.id);
 
     const [submission] = await db
       .select({

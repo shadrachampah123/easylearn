@@ -7,17 +7,17 @@ import {
   isClassInSchool,
   isSubjectInSchool,
   isTermInSchool,
-  sqlAssignmentInSchool,
   sqlClassInSchool,
   sqlSchoolRowInSchool,
-  sqlSubmissionInSchool,
+  sqlSubmissionScope,
   sqlUserInSchool,
 } from "@/lib/tenant";
+import { resolveAssignmentListPredicate } from "@/lib/assignment-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
-import { ensureFileUploadSchema, isMissingColumn, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
+import { ensureFileUploadSchema, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
 import { eq, desc, and, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -33,41 +33,20 @@ export async function GET(request: NextRequest) {
     const subjectId = request.nextUrl.searchParams.get("subjectId");
     const status = request.nextUrl.searchParams.get("status");
 
-    // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
-    // Always include schoolId = ctx.schoolId (direct), fallback to relational for pre-0016 DB
-    let useDirect = true;
-    try {
-      await db.execute(sql`select "school_id" from "assignments" limit 0`);
-    } catch (error) {
-      if (!isMissingColumn(error)) throw error;
-      useDirect = false;
-    }
+    // Authorization is part of the assignment query, not a fetch-then-filter step. Learners
+    // and parents are limited to published content tied to enrollment/parent linkage;
+    // teachers are limited to assignments they own; school administrators and head teachers
+    // receive the full school-scoped management view. The school scope is resolved
+    // schema-aware, so a database that predates migration 0016 is isolated as well.
+    const conditions: any[] = [await resolveAssignmentListPredicate(ctx)];
 
-    const conditions: any[] = useDirect
-      ? [eq(assignments.schoolId, ctx.schoolId)]
-      : [sqlAssignmentInSchool(ctx.schoolId, assignments.id)];
-
-    // For teachers, show their own assignments
-    if (ctx.school.role === "teacher") {
-      conditions.push(eq(assignments.teacherId, ctx.userId));
-    }
-
-    // Filter by class
-    if (classId) {
-      conditions.push(eq(assignments.classId, classId));
-    }
-
-    // Filter by subject
-    if (subjectId) {
-      conditions.push(eq(assignments.subjectId, subjectId));
-    }
-
-    // Filter by status
+    if (classId) conditions.push(eq(assignments.classId, classId));
+    if (subjectId) conditions.push(eq(assignments.subjectId, subjectId));
     if (status) {
       conditions.push(eq(assignments.status, status as "draft" | "published" | "closed"));
     }
 
-    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+    const whereClause = and(...conditions);
     const classScope = await sqlSchoolRowInSchool(
       ctx.schoolId, "classes", classes.id, sqlClassInSchool(ctx.schoolId, classes.id)
     );
@@ -104,9 +83,7 @@ export async function GET(request: NextRequest) {
 
     // For learners, add submission status without following a foreign-school child row.
     if (ctx.school.role === "learner") {
-      const submissionScope = await sqlSchoolRowInSchool(
-        ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-      );
+      const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
       const assignmentsWithStatus = await Promise.all(
         results.map(async (assignment) => {
           const [submission] = await db

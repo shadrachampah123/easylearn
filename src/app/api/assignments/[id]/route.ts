@@ -15,19 +15,84 @@ import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
   hasSchoolAdminRole,
-  sqlAssignmentInSchool,
   sqlClassInSchool,
   sqlLearnerClassInSchool,
   sqlSchoolRowInSchool,
-  sqlSubmissionInSchool,
+  sqlSubmissionScope,
   sqlUserInSchool,
 } from "@/lib/tenant";
-
+import {
+  resolveAssignmentAccessPredicate,
+  toAssignmentQuestionDto,
+  toLearnerAnswerDto,
+  toStaffAssignmentQuestionDto,
+} from "@/lib/assignment-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, desc, sql } from "drizzle-orm";
+
+const learnerQuestionSelection = {
+  id: assignmentQuestions.id,
+  questionType: assignmentQuestions.questionType,
+  questionText: assignmentQuestions.questionText,
+  options: assignmentQuestions.options,
+  points: assignmentQuestions.points,
+  orderIndex: assignmentQuestions.orderIndex,
+};
+
+const staffQuestionSelection = {
+  ...learnerQuestionSelection,
+  correctAnswer: assignmentQuestions.correctAnswer,
+  explanation: assignmentQuestions.explanation,
+};
+
+const learnerSubmissionSelection = {
+  id: submissions.id,
+  content: submissions.content,
+  attachments: submissions.attachments,
+  status: submissions.status,
+  score: submissions.score,
+  maxScore: submissions.maxScore,
+  percentage: submissions.percentage,
+  feedback: submissions.feedback,
+  submittedAt: submissions.submittedAt,
+  gradedAt: submissions.gradedAt,
+};
+
+const staffSubmissionSelection = {
+  ...learnerSubmissionSelection,
+  learnerId: submissions.learnerId,
+  gradedBy: submissions.gradedBy,
+  learnerFirstName: users.firstName,
+  learnerLastName: users.lastName,
+};
+
+function learnerAssignmentDto(assignment: Record<string, unknown>) {
+  return {
+    id: assignment.id,
+    title: assignment.title,
+    description: assignment.description,
+    instructions: assignment.instructions,
+    status: assignment.status,
+    dueDate: assignment.dueDate,
+    maxScore: assignment.maxScore,
+    allowLate: assignment.allowLate,
+    allowFileUploads: assignment.allowFileUploads,
+    aiGradingEnabled: assignment.aiGradingEnabled,
+    aiMaxMarks: assignment.aiMaxMarks,
+    attachments: assignment.attachments,
+    createdAt: assignment.createdAt,
+    classId: assignment.classId,
+    subjectId: assignment.subjectId,
+    className: assignment.className,
+    classLevel: assignment.classLevel,
+    subjectName: assignment.subjectName,
+    teacherFirstName: assignment.teacherFirstName,
+    teacherLastName: assignment.teacherLastName,
+  };
+}
 
 export async function GET(
   request: NextRequest,
@@ -37,14 +102,16 @@ export async function GET(
     const auth = await guardSchoolContext(request);
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
-
-    // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
 
     const { id } = await params;
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
+    const learnerId = request.nextUrl.searchParams.get("learnerId");
+
+    // The class/subject joins and the child-row queries are scoped to this school. The
+    // scopes are resolved schema-aware: a migrated database uses the direct `school_id`
+    // column, a pre-0016 database uses the relational ownership set. A row that cannot be
+    // attributed to exactly this school is never joined in, so no foreign name, learner or
+    // submission can ride along on a legitimate assignment.
     const classScope = await sqlSchoolRowInSchool(
       ctx.schoolId, "classes", classes.id, sqlClassInSchool(ctx.schoolId, classes.id)
     );
@@ -53,13 +120,13 @@ export async function GET(
     const subjectScope = await sqlSchoolRowInSchool(
       ctx.schoolId, "subjects", subjects.id, sql`false`
     );
-    const submissionScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
-    );
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
     const learnerClassScope = await sqlSchoolRowInSchool(
       ctx.schoolId, "learner_classes", learnerClasses.id, sqlLearnerClassInSchool(ctx.schoolId, learnerClasses.id)
     );
 
+    // The assignment lookup itself is the authorization boundary: the query-level predicate
+    // decides ownership/oversight, publication and enrollment before any row is fetched.
     const [assignment] = await db
       .select({
         id: assignments.id,
@@ -88,40 +155,16 @@ export async function GET(
       .leftJoin(classes, and(eq(assignments.classId, classes.id), classScope))
       .leftJoin(subjects, and(eq(assignments.subjectId, subjects.id), subjectScope))
       .leftJoin(users, and(eq(assignments.teacherId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
-      .where(and(eq(assignments.id, id), assignmentScope))
+      .where(and(eq(assignments.id, id), await resolveAssignmentAccessPredicate(ctx, { learnerId })))
       .limit(1);
 
-    if (!assignment) {
-      return notFoundResponse("Assignment");
-    }
+    if (!assignment) return notFoundResponse("Assignment");
 
-    // Teachers may only inspect and grade assignments they manage. Administrators may
-    // inspect any assignment in the school.
-    if (ctx.school.role === "teacher" && assignment.teacherId !== ctx.userId) {
-      return errorResponse("You can only view your own assignments", 403);
-    }
-
-    // Get submissions count for teachers
+    // Staff responses may include keys only after the query-level ownership/oversight rule
+    // above has succeeded. Every selected field remains explicit.
     if (hasSchoolAdminExtendedRole(ctx) || ctx.school.role === "teacher") {
       const submissionsList = await db
-        .select({
-          id: submissions.id,
-          status: submissions.status,
-          score: submissions.score,
-          maxScore: submissions.maxScore,
-          percentage: submissions.percentage,
-          feedback: submissions.feedback,
-          gradedBy: submissions.gradedBy,
-          // The teacher needs to read what the learner actually wrote before grading it.
-          content: submissions.content,
-          // Files the learner uploaded with their submission.
-          attachments: submissions.attachments,
-          submittedAt: submissions.submittedAt,
-          gradedAt: submissions.gradedAt,
-          learnerFirstName: users.firstName,
-          learnerLastName: users.lastName,
-          learnerId: submissions.learnerId,
-        })
+        .select(staffSubmissionSelection)
         .from(submissions)
         .leftJoin(users, and(eq(submissions.learnerId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
         .where(and(
@@ -131,14 +174,12 @@ export async function GET(
         ))
         .orderBy(desc(submissions.submittedAt));
 
-      // Get questions with correct answers for teacher view
       const questions = await db
-        .select()
+        .select(staffQuestionSelection)
         .from(assignmentQuestions)
         .where(eq(assignmentQuestions.assignmentId, id))
         .orderBy(assignmentQuestions.orderIndex);
 
-      // Learners enrolled in the class who have not handed anything in yet.
       const enrolledLearners = await db
         .select({
           learnerId: learnerClasses.learnerId,
@@ -153,77 +194,88 @@ export async function GET(
           sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId)
         ));
 
-      const submittedIds = new Set(submissionsList.map((s) => s.learnerId));
-      const missing = enrolledLearners.filter((row) => !submittedIds.has(row.learnerId));
-
+      const submittedIds = new Set(submissionsList.map((row) => row.learnerId));
       return successResponse({
         ...assignment,
         submissions: submissionsList,
-        questions,
-        pendingLearners: missing,
-        awaitingGrading: submissionsList.filter((s) => s.status === "submitted" || s.status === "late").length,
+        questions: questions.map(toStaffAssignmentQuestionDto),
+        pendingLearners: enrolledLearners.filter((row) => !submittedIds.has(row.learnerId)),
+        awaitingGrading: submissionsList.filter((row) => row.status === "submitted" || row.status === "late").length,
       });
     }
 
-    // For learners, get their own submission
-    if (ctx.school.role === "learner") {
-      const [submission] = await db
-        .select()
-        .from(submissions)
-        .where(and(
-          eq(submissions.assignmentId, id),
-          eq(submissions.learnerId, ctx.userId),
-          submissionScope,
-          sqlUserInSchool(ctx.schoolId, submissions.learnerId)
-        ))
-        .limit(1);
+    // Learner and parent content is an allowlisted DTO. Neither role receives a correct
+    // answer or explanation, even after submission or grading.
+    const requestedLearnerId = ctx.school.role === "parent" ? learnerId : ctx.userId;
+    if (!requestedLearnerId) return notFoundResponse("Assignment");
 
-      // Get questions (hide correct answers unless graded)
-      const questions = await db
-        .select()
-        .from(assignmentQuestions)
-        .where(eq(assignmentQuestions.assignmentId, id));
+    const [submission] = await db
+      .select(learnerSubmissionSelection)
+      .from(submissions)
+      .where(and(
+        eq(submissions.assignmentId, id),
+        submissionScope,
+        eq(submissions.learnerId, requestedLearnerId)
+      ))
+      .limit(1);
 
-      const showAnswers = submission && (submission.status === "graded" || submission.status === "submitted");
+    const questions = await db
+      .select(learnerQuestionSelection)
+      .from(assignmentQuestions)
+      .where(eq(assignmentQuestions.assignmentId, id))
+      .orderBy(assignmentQuestions.orderIndex);
 
-      // Get answers for this submission
-      let answers: any[] = [];
-      if (submission) {
-        answers = await db
-          .select()
+    const answers = submission
+      ? await db
+          .select({
+            questionId: assignmentAnswers.questionId,
+            questionText: assignmentQuestions.questionText,
+            questionType: assignmentQuestions.questionType,
+            options: assignmentQuestions.options,
+            answer: assignmentAnswers.answer,
+            isCorrect: assignmentAnswers.isCorrect,
+            pointsAwarded: assignmentAnswers.pointsAwarded,
+            pointsPossible: assignmentAnswers.pointsPossible,
+          })
           .from(assignmentAnswers)
-          .where(eq(assignmentAnswers.submissionId, submission.id));
-      }
+          .innerJoin(
+            assignmentQuestions,
+            and(
+              eq(assignmentAnswers.questionId, assignmentQuestions.id),
+              eq(assignmentQuestions.assignmentId, id)
+            )
+          )
+          .where(eq(assignmentAnswers.submissionId, submission.id))
+      : [];
 
-      // Get corrections
-      const corrections = await db
-        .select({
-          id: assignmentCorrections.id,
-          questionId: assignmentCorrections.questionId,
-          correctionText: assignmentCorrections.correctionText,
-          postedAt: assignmentCorrections.postedAt,
-          teacherName: users.firstName,
-          teacherLastName: users.lastName,
-        })
-        .from(assignmentCorrections)
-        .leftJoin(users, eq(assignmentCorrections.postedBy, users.id))
-        .where(eq(assignmentCorrections.assignmentId, id))
-        .orderBy(desc(assignmentCorrections.postedAt));
+    const corrections = await db
+      .select({
+        id: assignmentCorrections.id,
+        questionId: assignmentCorrections.questionId,
+        correctionText: assignmentCorrections.correctionText,
+        postedAt: assignmentCorrections.postedAt,
+        teacherName: users.firstName,
+        teacherLastName: users.lastName,
+      })
+      .from(assignmentCorrections)
+      .leftJoin(
+        assignmentQuestions,
+        and(
+          eq(assignmentCorrections.questionId, assignmentQuestions.id),
+          eq(assignmentQuestions.assignmentId, id)
+        )
+      )
+      .leftJoin(users, and(eq(assignmentCorrections.postedBy, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
+      .where(eq(assignmentCorrections.assignmentId, id))
+      .orderBy(desc(assignmentCorrections.postedAt));
 
-      const sanitizedQuestions = showAnswers
-        ? questions
-        : questions.map((q) => ({ ...q, correctAnswer: null, explanation: null }));
-
-      return successResponse({
-        ...assignment,
-        mySubmission: submission || null,
-        questions: sanitizedQuestions,
-        myAnswers: answers,
-        corrections,
-      });
-    }
-
-    return successResponse(assignment);
+    return successResponse({
+      ...learnerAssignmentDto(assignment),
+      mySubmission: submission || null,
+      questions: questions.map(toAssignmentQuestionDto),
+      myAnswers: answers.map(toLearnerAnswerDto),
+      corrections,
+    });
   } catch (error) {
     console.error("Get assignment error:", error);
     return errorResponse(
@@ -241,19 +293,13 @@ export async function PUT(
     const auth = await guardSchoolContext(request);
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
-
     const { id } = await params;
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
 
-    // Check ownership
     const [existing] = await db
       .select({ teacherId: assignments.teacherId, aiMaxMarks: assignments.aiMaxMarks })
       .from(assignments)
-      .where(and(eq(assignments.id, id), assignmentScope))
+      .where(and(eq(assignments.id, id), await resolveAssignmentAccessPredicate(ctx)))
       .limit(1);
-
     if (!existing) return notFoundResponse("Assignment");
 
     if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
@@ -263,30 +309,23 @@ export async function PUT(
     const body = await request.json();
     const { title, description, instructions, dueDate, maxScore, allowLate, attachments, allowFileUploads, status, aiGradingEnabled, aiMaxMarks } = body;
 
-    // Every attached file must be one the teacher actually uploaded.
     let resolvedAttachments = attachments;
     if (attachments !== undefined) {
       const resolved = await resolveUploadedAttachments(attachments, {
         uploaderId: ctx.userId,
         purpose: "assignment",
       });
-      if (!resolved.ok) {
-        return errorResponse(resolved.error || "The attached files could not be verified");
-      }
+      if (!resolved.ok) return errorResponse(resolved.error || "The attached files could not be verified");
       resolvedAttachments = resolved.attachments.length > 0 ? resolved.attachments : null;
     }
 
-    // EasyAI configuration is only touched when the caller sends it, so partial
-    // updates (e.g. the publish/close toggle) never wipe the AI settings.
     const easyAiUpdate: { aiGradingEnabled?: boolean; aiMaxMarks?: number | null } = {};
     if (aiGradingEnabled !== undefined) {
       const enabled = aiGradingEnabled === true;
       if (enabled) {
         const parsed = Number(aiMaxMarks ?? existing.aiMaxMarks ?? maxScore ?? 100);
         if (!Number.isInteger(parsed) || parsed < EASYAI_MAX_MARKS_MIN || parsed > EASYAI_MAX_MARKS_MAX) {
-          return errorResponse(
-            `EasyAI total marks must be a whole number between ${EASYAI_MAX_MARKS_MIN} and ${EASYAI_MAX_MARKS_MAX}`
-          );
+          return errorResponse(`EasyAI total marks must be a whole number between ${EASYAI_MAX_MARKS_MIN} and ${EASYAI_MAX_MARKS_MAX}`);
         }
         easyAiUpdate.aiMaxMarks = parsed;
       } else {
@@ -310,8 +349,23 @@ export async function PUT(
         ...easyAiUpdate,
         updatedAt: new Date(),
       })
-      .where(and(eq(assignments.id, id), assignmentScope))
-      .returning();
+      .where(and(eq(assignments.id, id), await resolveAssignmentAccessPredicate(ctx)))
+      .returning({
+        id: assignments.id,
+        title: assignments.title,
+        description: assignments.description,
+        instructions: assignments.instructions,
+        status: assignments.status,
+        dueDate: assignments.dueDate,
+        maxScore: assignments.maxScore,
+        allowLate: assignments.allowLate,
+        allowFileUploads: assignments.allowFileUploads,
+        aiGradingEnabled: assignments.aiGradingEnabled,
+        aiMaxMarks: assignments.aiMaxMarks,
+        attachments: assignments.attachments,
+        createdAt: assignments.createdAt,
+        updatedAt: assignments.updatedAt,
+      });
 
     return successResponse(updated);
   } catch (error) {
@@ -331,28 +385,21 @@ export async function DELETE(
     const auth = await guardSchoolContext(request);
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
-
     const { id } = await params;
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
 
     const [existing] = await db
       .select({ teacherId: assignments.teacherId })
       .from(assignments)
-      .where(and(eq(assignments.id, id), assignmentScope))
+      .where(and(eq(assignments.id, id), await resolveAssignmentAccessPredicate(ctx)))
       .limit(1);
-
     if (!existing) return notFoundResponse("Assignment");
-
     if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only delete your own assignments", 403);
     }
 
     await db
       .delete(assignments)
-      .where(and(eq(assignments.id, id), assignmentScope));
-
+      .where(and(eq(assignments.id, id), await resolveAssignmentAccessPredicate(ctx)));
     return successResponse({ message: "Assignment deleted" });
   } catch (error) {
     console.error("Delete assignment error:", error);

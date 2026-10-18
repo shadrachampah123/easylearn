@@ -3,6 +3,10 @@ require("dotenv").config();
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const {
+  createPostgresConnectionConfig,
+  getDatabaseUrlFromEnvironment,
+} = require("./src/lib/postgres-tls.js");
 
 const MIGRATIONS = [
   "0000_wet_legion.sql",
@@ -35,6 +39,24 @@ const HISTORY_SQL = `
   )
 `;
 const BASELINE_CONFIRMATION = "I_HAVE_VERIFIED_THESE_MIGRATIONS";
+
+// Every PostgreSQL connection made by the migration runner goes through the same verified
+// TLS policy as the application pool: certificate AND hostname validation, with the
+// `pg-connection-string` sslmode downgrade neutralized. The only escape hatch is the
+// explicit disposable-test opt-in, which is never set for a production invocation.
+const databaseUrl = getDatabaseUrlFromEnvironment(process.env);
+
+function buildPoolConfig() {
+  if (!databaseUrl) {
+    throw new Error("A PostgreSQL connection string is required to run EasyLearn migrations");
+  }
+
+  return createPostgresConnectionConfig(databaseUrl, {
+    // CI/disposable database suites explicitly set this flag. It must never be set for a
+    // production migration invocation; the default is verified certificate + hostname TLS.
+    allowInsecureLocal: process.env.EASY_LEARN_TEST_DATABASE === "true",
+  });
+}
 
 function usage() {
   console.log(`Usage:
@@ -281,15 +303,14 @@ async function main() {
     return;
   }
 
-  if (!process.env.DATABASE_URL) {
+  if (!databaseUrl) {
     console.error("❌ DATABASE_URL is required");
     process.exitCode = 1;
     return;
   }
 
   const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_URL.includes("neon") ? { rejectUnauthorized: false } : undefined,
+    ...buildPoolConfig(),
     connectionTimeoutMillis: 30000,
     idleTimeoutMillis: 30000,
     max: 1,

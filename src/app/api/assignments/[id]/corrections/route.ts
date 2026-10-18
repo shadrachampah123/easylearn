@@ -5,14 +5,14 @@ import {
   guardSchoolContext,
   hasSchoolAdminRole,
   hasSchoolStaffRole,
-  sqlAssignmentInSchool,
-  sqlSchoolRowInSchool,
   sqlUserInSchool,
 } from "@/lib/tenant";
+import { resolveAssignmentAccessPredicate } from "@/lib/assignment-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and, desc } from "drizzle-orm";
 
-// GET corrections for an assignment
+// GET corrections for an assignment. The assignment query is also the content authorization:
+// parent/learner reads require approved published content and the proper learner relationship.
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -21,20 +21,15 @@ export async function GET(
     const auth = await guardSchoolContext(request);
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
-
     const { id } = await params;
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
+    const learnerId = request.nextUrl.searchParams.get("learnerId");
+
     const [assignment] = await db
-      .select({ teacherId: assignments.teacherId })
+      .select({ id: assignments.id })
       .from(assignments)
-      .where(and(eq(assignments.id, id), assignmentScope))
+      .where(and(eq(assignments.id, id), await resolveAssignmentAccessPredicate(ctx, { learnerId })))
       .limit(1);
     if (!assignment) return notFoundResponse("Assignment");
-    if (ctx.school.role === "teacher" && assignment.teacherId !== ctx.userId) {
-      return errorResponse("You can only view corrections for your own assignments", 403);
-    }
 
     const corrections = await db
       .select({
@@ -48,12 +43,21 @@ export async function GET(
         questionText: assignmentQuestions.questionText,
       })
       .from(assignmentCorrections)
-      .leftJoin(assignmentQuestions, and(
-        eq(assignmentCorrections.questionId, assignmentQuestions.id),
-        eq(assignmentQuestions.assignmentId, id)
+      .leftJoin(
+        assignmentQuestions,
+        and(
+          eq(assignmentCorrections.questionId, assignmentQuestions.id),
+          eq(assignmentQuestions.assignmentId, id)
+        )
+      )
+      .leftJoin(
+        users,
+        and(eq(assignmentCorrections.postedBy, users.id), sqlUserInSchool(ctx.schoolId, users.id))
+      )
+      .where(and(
+        eq(assignmentCorrections.assignmentId, id),
+        eq(assignmentCorrections.assignmentId, assignment.id)
       ))
-      .leftJoin(users, and(eq(assignmentCorrections.postedBy, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
-      .where(eq(assignmentCorrections.assignmentId, id))
       .orderBy(desc(assignmentCorrections.postedAt));
 
     return successResponse(corrections);
@@ -78,38 +82,30 @@ export async function POST(
     }
 
     const { id: assignmentId } = await params;
-    const assignmentScope = await sqlSchoolRowInSchool(
-      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
-    );
     const body = await request.json();
     const { questionId, correctionText } = body;
 
-    // Check assignment exists
     const [assignment] = await db
-      .select()
+      .select({ id: assignments.id, teacherId: assignments.teacherId })
       .from(assignments)
-      .where(and(eq(assignments.id, assignmentId), assignmentScope))
+      .where(and(eq(assignments.id, assignmentId), await resolveAssignmentAccessPredicate(ctx)))
       .limit(1);
-
     if (!assignment) return notFoundResponse("Assignment");
 
-    // Only the assignment's teacher (or admin) can post corrections
     if (assignment.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only post corrections on your own assignments", 403);
     }
 
-    // If a questionId is provided, verify it belongs to this assignment
     if (questionId) {
       const [question] = await db
-        .select()
+        .select({ id: assignmentQuestions.id })
         .from(assignmentQuestions)
-        .where(eq(assignmentQuestions.id, questionId))
+        .where(and(
+          eq(assignmentQuestions.id, questionId),
+          eq(assignmentQuestions.assignmentId, assignmentId)
+        ))
         .limit(1);
-
       if (!question) return notFoundResponse("Question");
-      if (question.assignmentId !== assignmentId) {
-        return errorResponse("Question does not belong to this assignment");
-      }
     }
 
     if (!correctionText || !correctionText.trim()) {
@@ -124,7 +120,14 @@ export async function POST(
         correctionText: correctionText.trim(),
         postedBy: ctx.userId,
       })
-      .returning();
+      .returning({
+        id: assignmentCorrections.id,
+        assignmentId: assignmentCorrections.assignmentId,
+        questionId: assignmentCorrections.questionId,
+        correctionText: assignmentCorrections.correctionText,
+        postedBy: assignmentCorrections.postedBy,
+        postedAt: assignmentCorrections.postedAt,
+      });
 
     return successResponse(correction, 201);
   } catch (error) {

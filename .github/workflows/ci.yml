@@ -54,6 +54,8 @@ jobs:
         run: npm run test:tenant-auth
       - name: Tenant negative mutation tests
         run: npm run test:mutation
+      - name: PR integration regression suite (PostgreSQL required)
+        run: npm run test:integration
       - name: Typecheck
         run: npm run typecheck
       - name: Production build
