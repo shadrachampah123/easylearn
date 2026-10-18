@@ -286,6 +286,17 @@ can only ever be an active school, because `resolveAuthContext` → `listActiveS
 `schools.status = 'active'`, and `selectSchoolForContext` (`:403-417`) can only choose from
 that filtered list. It is a defence-in-depth inconsistency, not a tenant-isolation hole.
 
+#### LOW-5 — The database test suites leave their scratch databases behind
+
+After a full `npm run test:all` run, the **admin** database still contained 13 scratch
+databases: `easylearn_2c_test_*` (6), `easylearn_2d_test_*`, `easylearn_2d_reg_*`,
+`easylearn_2e_dash_*`, `easylearn_integration_*` and `audit_repro`. The tenant-constraint
+integrity suite does clean up after itself (it drops its four databases in a `finally`
+block); the older tenant suites do not. On a CI runner this is invisible — the service
+container is destroyed with the job — but on a long-lived developer or self-hosted CI
+database the scratch databases accumulate. No correctness or isolation impact; housekeeping
+only.
+
 #### Environment observation — the local `.git` was re-cloned between sessions
 
 At the start of this re-audit the local repository reported `HEAD = 8931095c` (main's commit)
@@ -445,6 +456,7 @@ each run, and the suite re-ran **20 / 0** at the end.
 | `39168493830` | `9da7333` | **SUCCESS** — 17/17 steps green, including "Tenant constraint integrity / schema-sync bypass regression (PostgreSQL required)" |
 | `39169949326` | `69a6e5b` | **SUCCESS** — the commit that carries the HIGH-1 and MEDIUM-1 fixes |
 | `39170082202` | `0c40ff5` | **SUCCESS** — 22/22 steps green, including the new fail-on-skip mechanism |
+| `39170297840` | `ae0deeb` | **SUCCESS** — the head commit of the re-audit |
 
 **Not verified / not claimed.** The production engine and version, the production schema and
 ledger state, the 28 production relationship mismatch counts, the production table sizes, the
@@ -469,6 +481,8 @@ mechanisms are what make those conclusions meaningful: they turn a silent skip i
 | **LOW-2** | LOW | The submit route uses the non-schema-aware predicate. | Switch `src/app/api/assignments/[id]/submit/route.ts:19,56` to `resolveAssignmentAccessPredicate` for consistency. No behavioural change on a migrated database. | author |
 | **LOW-3** | LOW | The policy mirror grants a rule no route implements. | Either remove `explicitlyAuthorized` from `src/lib/assignment-policy.ts` and the corresponding assertion in `tests/assignment-authorization.test.ts:24`, or state in the file that it is a reserved future rule. | author |
 | **LOW-4** | LOW | The relational "reachable schools" helpers do not check the school lifecycle. | Add `join schools s on s.id = … and s.status = 'active'` to `sqlSchoolsOfClass` and the other `sqlSchoolsOf*` helpers for defence in depth. Not exploitable today (see the finding). | author |
+| **LOW-5** | LOW | The database test suites leave their scratch databases on the admin database. |
+| Add a `finally`-block cleanup (as the tenant-constraint suite already does) to the tenant suites that create scratch databases. Housekeeping only. | author |
 | **ENV-1** | LOW | The local `.git` was re-cloned between sessions; the branch pointer had to be restored. | No repository action. Reviewers must verify `git rev-parse HEAD` against the PR's head SHA rather than trusting a checkpoint. | reviewer |
 
 ### Final verdict of the re-audit
