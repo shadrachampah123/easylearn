@@ -40,6 +40,32 @@ const HISTORY_SQL = `
 `;
 const BASELINE_CONFIRMATION = "I_HAVE_VERIFIED_THESE_MIGRATIONS";
 
+/* ── Gated migrations ──
+   Some migrations must never be applied as part of an ordinary "apply everything" run.
+   They change the database in a way that requires an independent, reviewed preflight
+   against a restored copy of the target database first, and they abort atomically
+   rather than repairing data.
+
+   A gated migration is applied ONLY when the operator
+     1. names that file explicitly on the command line, and
+     2. supplies the confirmation token for that file.
+   A default run skips it and says so loudly. It never fails the run, because that would
+   pressure operators into setting the token to unblock an unrelated deployment. */
+const GATED_MIGRATIONS = {
+  "0018_composite_school_foreign_keys.sql": {
+    env: "CONFIRM_MIGRATION_0018",
+    token: "I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS",
+    reason:
+      "0018 adds 26 composite tenant foreign keys between school-owned records. It aborts " +
+      "atomically on any legacy cross-school or orphan reference and never repairs, " +
+      "reassigns or deletes rows. The selective column-list SET NULL syntax requires " +
+      "PostgreSQL 15+. Before applying it, run the read-only preflight in " +
+      "docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md against a restored copy of the " +
+      "target database, confirm the PostgreSQL version and the table/lock impact, and " +
+      "review the result.",
+  },
+};
+
 // Every PostgreSQL connection made by the migration runner goes through the same verified
 // TLS policy as the application pool: certificate AND hostname validation, with the
 // `pg-connection-string` sslmode downgrade neutralized. The only escape hatch is the
@@ -67,7 +93,16 @@ Normal runs apply only unapplied migrations in order, recording their SHA-256 ch
 A database with existing public tables but no history is never migrated automatically.
 For an existing database, baseline only a verified, sequential prefix using --baseline and
 CONFIRM_MIGRATION_BASELINE=${BASELINE_CONFIRMATION}. Baseline records operator-provided
-history; it does not inspect or prove that those migrations were applied.`);
+history; it does not inspect or prove that those migrations were applied.
+
+Gated migrations are never applied by a default run. They need an explicit file name and
+their own confirmation token:
+${Object.entries(GATED_MIGRATIONS)
+  .map(
+    ([fileName, gate]) =>
+      `  ${fileName}\n    ${gate.env}=${gate.token} node run-migration.js ${fileName}`
+  )
+  .join("\n")}`);
 }
 
 function migrationPath(fileName) {
@@ -91,16 +126,17 @@ function loadMigration(fileName) {
 }
 
 function parseArgs(args) {
-  if (args.length === 0) return { mode: "run", files: MIGRATIONS };
-  if (args[0] === "--help" || args[0] === "-h") return { mode: "help", files: [] };
+  if (args.length === 0) return { mode: "run", files: MIGRATIONS, explicit: false };
+  if (args[0] === "--help" || args[0] === "-h") return { mode: "help", files: [], explicit: false };
   if (args[0] === "--baseline") {
     if (args.length !== 2 || !args[1]) {
       throw new Error("--baseline requires a comma-separated migration prefix");
     }
-    return { mode: "baseline", files: args[1].split(",") };
+    return { mode: "baseline", files: args[1].split(","), explicit: false };
   }
   if (args.length !== 1) throw new Error("Pass one migration filename, or use --baseline");
-  return { mode: "run", files: [args[0]] };
+  /* A single, explicitly named file. Only this form may apply a gated migration. */
+  return { mode: "run", files: [args[0]], explicit: true };
 }
 
 function assertSequentialPrefix(files) {
@@ -168,6 +204,21 @@ async function baseline(client, files) {
   assertSequentialPrefix(files);
   if (process.env.CONFIRM_MIGRATION_BASELINE !== BASELINE_CONFIRMATION) {
     throw new Error(`Baseline refused: set CONFIRM_MIGRATION_BASELINE=${BASELINE_CONFIRMATION} only after independently verifying the database migration history`);
+  }
+  /* A baseline records an operator-asserted history. It must not be usable to record a
+     GATED migration as applied without the same explicit confirmation that the gated
+     path requires — otherwise the ledger would claim a migration ran that never did. */
+  for (const fileName of files) {
+    const gate = GATED_MIGRATIONS[fileName];
+    if (!gate) continue;
+    if (process.env[gate.env] !== gate.token) {
+      throw new Error(
+        `Baseline refused: the prefix includes the gated migration ${fileName}.\n` +
+          `   ${gate.reason}\n` +
+          `   Set ${gate.env}=${gate.token} to confirm that the preflight has been reviewed ` +
+          "and that the migration really was applied to this database."
+      );
+    }
   }
   if (await historyExists(client)) {
     throw new Error(`Baseline refused: public.${HISTORY_TABLE} already exists`);
@@ -344,13 +395,59 @@ async function main() {
 
     const selected = options.files;
     const pending = selected.filter((fileName) => !history.has(fileName));
+
+    /* Split the pending set: ordinary migrations, and gated ones that need an explicit
+       name plus a confirmation token before they may touch the database. */
+    const toApply = [];
+    const skippedGated = [];
+    for (const fileName of pending) {
+      const gate = GATED_MIGRATIONS[fileName];
+      if (!gate) {
+        toApply.push(fileName);
+        continue;
+      }
+      if (!options.explicit) {
+        skippedGated.push(fileName);
+        continue;
+      }
+      if (process.env[gate.env] !== gate.token) {
+        throw new Error(
+          `Refusing to apply ${fileName}.\n` +
+            `   ${gate.reason}\n` +
+            `   Set ${gate.env}=${gate.token} to confirm that the preflight has been reviewed.`
+        );
+      }
+      toApply.push(fileName);
+    }
+
+    /* The order must stay exact: nothing may be applied after a gated migration that was
+       skipped, because the skipped migration may change the shape of the later ones. */
+    if (skippedGated.length > 0) {
+      const skippedIndex = Math.min(...skippedGated.map((fileName) => MIGRATIONS.indexOf(fileName)));
+      const afterSkipped = toApply.filter((fileName) => MIGRATIONS.indexOf(fileName) > skippedIndex);
+      if (afterSkipped.length > 0) {
+        throw new Error(
+          `Cannot apply ${afterSkipped[0]} because the gated migration ${skippedGated[0]} was skipped; ` +
+            "apply the gated migration first, in order."
+        );
+      }
+    }
+
     if (pending.length === 0) {
       console.log("✅ All requested migrations are already recorded with matching checksums.");
     } else {
-      const firstIndex = MIGRATIONS.indexOf(pending[0]);
+      const firstIndex = MIGRATIONS.indexOf(toApply[0] ?? pending[0]);
       const priorMissing = MIGRATIONS.slice(0, firstIndex).find((fileName) => !history.has(fileName));
-      if (priorMissing) throw new Error(`Cannot apply ${pending[0]} before ${priorMissing}`);
-      for (const fileName of pending) await applyMigration(client, fileName);
+      if (priorMissing) throw new Error(`Cannot apply ${toApply[0] ?? pending[0]} before ${priorMissing}`);
+      for (const fileName of toApply) await applyMigration(client, fileName);
+    }
+
+    for (const fileName of skippedGated) {
+      const gate = GATED_MIGRATIONS[fileName];
+      console.log(`\n⚠️  GATED MIGRATION NOT APPLIED: ${fileName}`);
+      console.log(`   ${gate.reason}`);
+      console.log("   It was skipped on purpose. To apply it after the preflight has been reviewed:");
+      console.log(`     ${gate.env}=${gate.token} node run-migration.js ${fileName}`);
     }
 
     await verify(client);
@@ -367,4 +464,15 @@ async function main() {
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+/* Exported for the disposable test suites and for operator tooling. The metadata is
+   static; requiring this module does NOT run a migration. */
+module.exports = {
+  BASELINE_CONFIRMATION,
+  GATED_MIGRATIONS,
+  HISTORY_TABLE,
+  MIGRATIONS,
+};

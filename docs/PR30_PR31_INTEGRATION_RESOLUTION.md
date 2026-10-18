@@ -1,6 +1,6 @@
 > Integration artifact: this file records how the conflicts between PR #30 and PR #31 were
-> resolved on the `arena/97987bec-easylearn` integration branch. It is a review aid, not
-> an application document.
+> resolved on the `arena/97987bec-easylearn` integration branch, and how the follow-up
+> risks R1–R5 were addressed. It is a review aid, not an application document.
 
 # EasyLearn — PR #30 / #31 integration conflict-resolution log
 
@@ -140,3 +140,146 @@ covered by `tests/postgres-tls.test.js` (10 assertions, including real `tls` han
 against a self-signed certificate with the trusted / untrusted / hostname-mismatch cases),
 but an end-to-end `sslmode=verify-full` connection to a TLS-enabled PostgreSQL 16 is still
 outstanding.
+
+---
+
+# Follow-up: R1–R5 addressed (draft PR #32)
+
+All five risks recorded above were worked on the same integration branch
+(`arena/97987bec-easylearn`), in a follow-up commit on top of `a6488bf`.
+
+## R2 — `pg-connection-string` is now a direct production dependency — RESOLVED
+
+`pg` parses every connection string with `pg-connection-string` at runtime
+(`node_modules/pg/lib/connection-parameters.js`). The TLS policy is built on that parser:
+it is what turns `sslmode=require` into `rejectUnauthorized: false`, and it is exactly what
+`src/lib/postgres-tls.js` neutralises. The package was therefore **load-bearing in
+production** while only being a transitive dependency.
+
+* `pg-connection-string@2.14.0` is now declared in `dependencies` and **pinned exactly**
+  (not a caret range), matching the pinning style used for `pg` and `next`.
+* `package-lock.json` records it as a direct dependency; `pg` resolves to the same
+  instance (`deduped`), so there is no second copy in the tree.
+* `npm ci` from a clean `node_modules` succeeds (410 packages) and does not further modify
+  the lockfile. `npm audit --omit=dev` reports **0 vulnerabilities**.
+* A new regression test in `tests/postgres-tls.test.js` asserts that the package is
+  declared in `dependencies` (not `devDependencies`), that the version is exact, and that
+  the locked version matches the declared one.
+
+## R4 — a genuine end-to-end PostgreSQL TLS test — RESOLVED
+
+The earlier limitation was real: the only PostgreSQL build available in the test
+environment (the `pgserver` wheel) is compiled **without OpenSSL**, so it cannot serve
+TLS. Rather than leave the claim unproven, a TLS-capable PostgreSQL 16 was obtained.
+
+* `@embedded-postgres/linux-x64@16.14.0-beta.17` (and the `darwin-x64` twin) are added as
+  **optionalDependencies**. That package ships **PostgreSQL 16.14 linked against
+  `libssl`/`libcrypto`**. Because they are optional and carry `os`/`cpu` fields, npm
+  installs them on linux-x64 and darwin-x64 and silently skips them elsewhere.
+* New suite `tests/postgres-tls-e2e.test.js` boots a **real PostgreSQL 16 cluster with
+  `ssl = on`**, generates a CA and a server certificate with `openssl`, and connects with
+  the real `pg` driver through `createPostgresConnectionConfig`. Seven assertions:
+  1. a **trusted** certificate connects and the server confirms `pg_stat_ssl.ssl = true`
+     with a real TLS version and cipher;
+  2. an **untrusted** certificate (a CA the server was not issued by) is rejected;
+  3. a **hostname mismatch** (a trusted certificate issued for another host) is rejected
+     with `ERR_TLS_CERT_ALTNAME_INVALID`;
+  4. `sslmode=require` is **upgraded**, not downgraded: a trusted CA connects, an
+     untrusted one still fails — proving the `pg-connection-string` downgrade is
+     neutralised end to end;
+  5. `sslmode=disable` and `sslmode=verify-ca` are refused before any connection;
+  6. the disposable-test escape hatch (`allowInsecureLocal`) cannot weaken an explicit
+     TLS request, even for a `127.0.0.1` URL;
+  7. the refusal happens during the handshake, not later.
+* The suite **skips honestly** (exit 0, explicit `⏭️ SKIP` message) when no TLS-capable
+  PostgreSQL 16 can be found — it never reports a skip as a pass. Both skip paths were
+  exercised: "build without OpenSSL" and "no binary at all".
+* Wired into `npm run test:all`, exposed as `npm run test:tls-e2e`, and added as its own
+  CI step. On the CI runner (linux-x64) it will **run**, not skip.
+
+## R3 — the 403/404 contract — DOCUMENTED AND TESTED
+
+New document `docs/API_TENANT_ERROR_SEMANTICS.md` states the contract:
+
+* **403** is a statement about *the caller*: no active membership, no explicit school
+  selection, the selected school is not `active`, a platform-scoped route, a role that may
+  not perform the verb, or ownership of a row that is already visible inside the caller's
+  own tenant.
+* **404** is a statement about *the resource*: the tenant-scoped, authorization-aware query
+  matched nothing. The three cases — the resource does not exist, it exists in another
+  tenant, it exists in the caller's tenant but is hidden from their role — are
+  **byte-identical**. That is the anti-enumeration guarantee.
+* The document contains the full endpoint matrix for every route changed by the
+  integration, the reasons the one behaviour change (parent results 403 → 404) is correct,
+  and four rules for future changes.
+
+Four new regression tests in `tests/tenant-integration-regression.test.ts` (11 total in
+that suite) pin the contract against a real database and the real handlers:
+
+1. a cross-tenant read and a read of a **non-existent** id return the same status **and the
+   same body**;
+2. a cross-tenant submission read is a 404 and leaks neither content nor id;
+3. a same-tenant role denial is a 403 that names the rule and discloses no resource;
+4. a multi-school session with no selection is refused with 403.
+
+Non-vacuity was verified: removing the query-level access predicate from the assignment
+lookup makes the anti-enumeration test fail.
+
+## R1 / R5 — migration 0018 is gated; TLS requirements and fail-closed behaviour documented — RESOLVED
+
+**The gap was real.** `0018_composite_school_foreign_keys.sql` was registered in the
+migration list, and the README documented `node run-migration.js` as the ordinary operator
+command — so a default run **would** have applied 0018 to production with no preflight
+gate at all.
+
+`run-migration.js` now supports **gated migrations**:
+
+* a gated migration is applied **only** when the file is named explicitly on the command
+  line **and** its confirmation token is supplied;
+* an ordinary run **skips** it, prints a prominent `⚠️ GATED MIGRATION NOT APPLIED` block
+  naming the token, and still exits 0 (the gate must not block unrelated deployments);
+* an explicit run without the token is **refused** with a non-zero exit and the reason;
+* the gate is data, not a special case: `GATED_MIGRATIONS` in `run-migration.js`.
+* 0018 is registered as gated with
+  `CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS`.
+
+A new regression test in `tests/migration-0017-school-id-not-null.test.ts` (19 tests in
+that suite) proves all three behaviours against a real database, and its non-vacuity was
+verified by removing the gate.
+
+The disposable test suites now apply the chain the way an operator must: the ordinary run
+first, then each gated migration explicitly with its token. The gated list is read from
+`run-migration.js` itself (`tests/helpers/migrations.js`), so a future gated migration
+cannot be forgotten there.
+
+**No production connection was made and no production migration was run.** The gate and
+the checkpoint procedure were exercised only against disposable PostgreSQL databases.
+
+New document `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md` records:
+
+* the certificate requirements (verified chain **and** hostname match, how to supply the
+  CA, why `verify-ca` is refused and `require` is upgraded rather than downgraded);
+* the single test-only escape hatch and its strict limits;
+* a fail-closed table covering missing/untrusted/mismatched certificates, a missing
+  ledger, checksum drift, ledger gaps, unknown files, missing files, per-file rollback,
+  the advisory lock, and the gated-migration skip;
+* the 0018 preconditions (PostgreSQL 15+, the read-only checkpoint against a restored
+  copy, lock impact, backup and rollback);
+* an operator runbook.
+
+The README now documents the gate, the TLS requirements, and links to the runbook.
+
+## Still open (needs an owner with production access — deliberately NOT done here)
+
+**R1-production — applying 0018 to production.** The *code* now prevents an accidental or
+unreviewed application. The remaining step is an operational one and is out of scope for
+this branch: run the read-only checkpoint in
+`docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` against a restored copy of production,
+review the report, and then apply 0018 with the confirmation token. **This branch does not
+authorise, perform or schedule that action**, and the production gate remains
+*unverified* until an authorized operator does it.
+
+**R5-deployment — a TLS-enabled production connection has not been exercised.** The policy
+and the handshake are now proven end to end against a real TLS-enabled PostgreSQL 16
+(R4), but no connection to a production database was made — that remains an operator step
+against the real provider's certificate chain.

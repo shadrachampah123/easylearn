@@ -25,6 +25,7 @@ import fs from "fs";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
+const { runMigrations: runMigrationChain, GATED_MIGRATIONS } = requireFromRepo("./tests/helpers/migrations.js");
 const DB_NAME = `easylearn_0017_test_${crypto.randomBytes(4).toString("hex")}`;
 
 let passed = 0;
@@ -123,12 +124,7 @@ async function main() {
   const db = new Client({ connectionString: scratchUrl });
   await db.connect();
 
-  const runMigrations = () =>
-    spawnSync(process.execPath, ["run-migration.js"], {
-      cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: scratchUrl },
-      encoding: "utf8",
-    });
+  const runMigrations = () => runMigrationChain({ databaseUrl: scratchUrl });
 
   // Re-execute 0017's SQL directly only inside this disposable test database. The migration
   // runner now consults its history ledger and correctly skips already-recorded migrations.
@@ -489,9 +485,30 @@ async function main() {
       assert(`${invalidPrefix.stdout || ""}${invalidPrefix.stderr || ""}`.includes("sequential prefix"), "invalid baseline should explain required ordering");
 
       const tableCountBefore = Number((await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`)).count);
-      const confirmed = spawnSync(process.execPath, ["run-migration.js", "--baseline", prefix.join(",")], {
+      /* A baseline must not be usable to record a GATED migration as applied without the
+         same explicit confirmation the gated path requires. */
+      const gatedPrefix = prefix[prefix.length - 1];
+      const gatedGate = GATED_MIGRATIONS[gatedPrefix];
+      assert(gatedGate, "the last migration of the prefix is expected to be gated");
+      const gatedBaseline = spawnSync(process.execPath, ["run-migration.js", "--baseline", prefix.join(",")], {
         cwd: REPO_ROOT,
         env: { ...baselineEnv, CONFIRM_MIGRATION_BASELINE: "I_HAVE_VERIFIED_THESE_MIGRATIONS" },
+        encoding: "utf8",
+      });
+      const gatedBaselineOutput = `${gatedBaseline.stdout || ""}${gatedBaseline.stderr || ""}`;
+      assert(gatedBaseline.status !== 0, "a baseline that includes a gated migration must be refused without its confirmation");
+      assert(
+        gatedBaselineOutput.includes("Baseline refused") && gatedBaselineOutput.includes(gatedPrefix),
+        "the baseline refusal must name the gated migration"
+      );
+
+      const confirmed = spawnSync(process.execPath, ["run-migration.js", "--baseline", prefix.join(",")], {
+        cwd: REPO_ROOT,
+        env: {
+          ...baselineEnv,
+          CONFIRM_MIGRATION_BASELINE: "I_HAVE_VERIFIED_THESE_MIGRATIONS",
+          [gatedGate.env]: gatedGate.token,
+        },
         encoding: "utf8",
       });
       assertEq(confirmed.status, 0, `explicit baseline should succeed in this disposable test DB: ${(confirmed.stdout || "") + (confirmed.stderr || "")}`);
@@ -499,6 +516,100 @@ async function main() {
       const tableCountAfter = Number((await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`)).count);
       assertEq(tableCountAfter, tableCountBefore + 1, "baseline should add only the migration ledger table");
       assertEq(Number((await one(`SELECT count(*)::int AS count FROM easylearn_schema_migrations`)).count), prefix.length, "baseline records only the supplied sequential prefix");
+    });
+
+    await test("A gated migration is never applied automatically and needs an explicit confirmation", async () => {
+      /* 0018 adds 26 composite tenant foreign keys. It is gated: the standard
+         "apply everything" run must NOT apply it, and an explicit run must be refused
+         until the operator confirms that the read-only preflight has been reviewed. */
+      const gateFile = "0018_composite_school_foreign_keys.sql";
+      const gate = GATED_MIGRATIONS[gateFile];
+      assert(gate, "0018 must be registered as a gated migration");
+
+      const gateDbName = `${DB_NAME}_gate`;
+      await admin.query(`DROP DATABASE IF EXISTS "${gateDbName}" WITH (FORCE)`);
+      await admin.query(`CREATE DATABASE "${gateDbName}"`);
+      const gateUrl = (() => {
+        const url = new URL(scratchUrl);
+        url.pathname = `/${gateDbName}`;
+        return url.toString();
+      })();
+      const gateDb = new Client({ connectionString: gateUrl });
+      await gateDb.connect();
+      const gateOne = async (sql: string, values: unknown[] = []) =>
+        (await gateDb.query(sql, values)).rows[0];
+
+      /* The composite tenant foreign keys are exactly the foreign keys whose key list
+         starts with (school_id, ...). The single-column school_id FKs added by 0016
+         reference schools(id) and must NOT be counted here. */
+      const constraintCount = async () =>
+        Number(
+          (
+            await gateOne(
+              `SELECT count(*)::int AS count FROM pg_constraint
+                WHERE contype = 'f' AND pg_get_constraintdef(oid) LIKE '%(school_id,%'`
+            )
+          ).count
+        );
+
+      try {
+        /* 1. The ordinary run applies everything else and SKIPS the gated migration. */
+        const ordinary = spawnSync(process.execPath, ["run-migration.js"], {
+          cwd: REPO_ROOT,
+          env: { ...process.env, DATABASE_URL: gateUrl },
+          encoding: "utf8",
+        });
+        const ordinaryOutput = `${ordinary.stdout || ""}${ordinary.stderr || ""}`;
+        assertEq(ordinary.status, 0, `the ordinary run must still succeed: ${ordinaryOutput.slice(-2000)}`);
+        assert(
+          ordinaryOutput.includes("GATED MIGRATION NOT APPLIED"),
+          "the ordinary run must announce that the gated migration was skipped"
+        );
+        assert(ordinaryOutput.includes(gate.env), "the skip notice must name the confirmation variable");
+        const recorded = await gateOne(
+          `SELECT count(*)::int AS count FROM easylearn_schema_migrations WHERE filename = $1`,
+          [gateFile]
+        );
+        assertEq(recorded.count, 0, "the gated migration must not be recorded as applied");
+        assertEq(await constraintCount(), 0, "the gated migration's constraints must not exist");
+
+        /* 2. An explicit run without the confirmation token is REFUSED. */
+        const unconfirmed = spawnSync(process.execPath, ["run-migration.js", gateFile], {
+          cwd: REPO_ROOT,
+          env: { ...process.env, DATABASE_URL: gateUrl },
+          encoding: "utf8",
+        });
+        const unconfirmedOutput = `${unconfirmed.stdout || ""}${unconfirmed.stderr || ""}`;
+        assert(unconfirmed.status !== 0, "an unconfirmed gated migration must fail");
+        assert(
+          unconfirmedOutput.includes("Refusing to apply"),
+          "the refusal must be explicit and must explain the preflight requirement"
+        );
+        const stillUnrecorded = await gateOne(
+          `SELECT count(*)::int AS count FROM easylearn_schema_migrations WHERE filename = $1`,
+          [gateFile]
+        );
+        assertEq(stillUnrecorded.count, 0, "a refused gated migration must not be recorded");
+        assertEq(await constraintCount(), 0, "a refused gated migration must not change the schema");
+
+        /* 3. With the confirmation token the migration is applied. */
+        const confirmed = spawnSync(process.execPath, ["run-migration.js", gateFile], {
+          cwd: REPO_ROOT,
+          env: { ...process.env, DATABASE_URL: gateUrl, [gate.env]: gate.token },
+          encoding: "utf8",
+        });
+        const confirmedOutput = `${confirmed.stdout || ""}${confirmed.stderr || ""}`;
+        assertEq(confirmed.status, 0, `the confirmed gated migration must succeed: ${confirmedOutput.slice(-2000)}`);
+        const nowRecorded = await gateOne(
+          `SELECT count(*)::int AS count FROM easylearn_schema_migrations WHERE filename = $1`,
+          [gateFile]
+        );
+        assertEq(nowRecorded.count, 1, "the confirmed gated migration must be recorded");
+        assertEq(await constraintCount(), 26, "the confirmed gated migration must add its 26 constraints");
+      } finally {
+        await gateDb.end().catch(() => undefined);
+        await admin.query(`DROP DATABASE IF EXISTS "${gateDbName}" WITH (FORCE)`).catch(() => undefined);
+      }
     });
 
     await test("Runner fails closed on an existing schema without migration history", async () => {

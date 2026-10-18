@@ -36,6 +36,7 @@ import { NextRequest } from "next/server";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
+const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
 
 const DB_NAME = `easylearn_integration_${crypto.randomBytes(4).toString("hex")}`;
 const JWT_SECRET = "integration-regression-test-secret-0123456789";
@@ -121,11 +122,7 @@ async function main() {
       (await db.query(sql, values)).rows;
     const one = async (sql: string, values: unknown[] = []) => (await q(sql, values))[0];
 
-    const migrationRun = spawnSync(process.execPath, ["run-migration.js"], {
-      cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: scratchUrl, JWT_SECRET },
-      encoding: "utf8",
-    });
+    const migrationRun = runMigrationChain({ databaseUrl: scratchUrl, env: { JWT_SECRET } });
     if (migrationRun.status !== 0) {
       throw new Error(
         `run-migration.js exited ${migrationRun.status}:\n${((migrationRun.stdout || "") + (migrationRun.stderr || "")).slice(-4000)}`
@@ -213,6 +210,34 @@ async function main() {
        VALUES ($1,'Integration Other Teacher Assignment',$2,$3,$4,'published') RETURNING id`,
       [schoolA, classA, subjectA, otherTeacher.id]
     )).id as string;
+
+    /* School B content, used to prove the anti-enumeration guarantee: a cross-tenant read
+       must be indistinguishable from a read of an id that does not exist at all. */
+    const yearB = (await one(
+      `INSERT INTO academic_years (school_id, name, start_date, end_date, is_current)
+       VALUES ($1,'2026/27','2026-01-01','2026-12-31',true) RETURNING id`,
+      [schoolB]
+    )).id as string;
+    const subjectB = (await one(
+      `INSERT INTO subjects (school_id, name, code) VALUES ($1,'Integration Subject B','INT-SUB-B') RETURNING id`,
+      [schoolB]
+    )).id as string;
+    const classB = (await one(
+      `INSERT INTO classes (school_id, name, level, class_teacher_id, academic_year_id)
+       VALUES ($1,'Integration Class B','junior_high',$2,$3) RETURNING id`,
+      [schoolB, teacher.id, yearB]
+    )).id as string;
+    const foreignAssignment = (await one(
+      `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id, status)
+       VALUES ($1,'INTEGRATION-FOREIGN-ASSIGNMENT',$2,$3,$4,'published') RETURNING id`,
+      [schoolB, classB, subjectB, teacher.id]
+    )).id as string;
+    const foreignSubmission = (await one(
+      `INSERT INTO submissions (school_id, assignment_id, learner_id, status, content)
+       VALUES ($1,$2,$3,'submitted','INTEGRATION-FOREIGN-SUBMISSION') RETURNING id`,
+      [schoolB, foreignAssignment, learner.id]
+    )).id as string;
+    const missingId = crypto.randomUUID();
 
     const { auth, tenant } = {
       auth: await import("@/lib/auth"),
@@ -459,6 +484,134 @@ async function main() {
       assertEq(published.status, 200, "a learner can read a published, enrolled assignment");
       assert(!published.bodyText.includes("SECRET-ANSWER"), "the answer key never reaches a learner");
       assert(!published.bodyText.includes("SECRET-EXPLANATION"), "the explanation never reaches a learner");
+    });
+
+    /* ── 6. R3 — the 403/404 contract and the anti-enumeration guarantee ── */
+
+    await test("A cross-tenant read is indistinguishable from a read of a missing id", async () => {
+      /* The guarantee: a caller must not be able to tell "this exists in another school"
+         from "this does not exist". Both answers must be byte-identical. */
+      const selectedToken = await auth.createToken({
+        userId: teacher.id,
+        role: "teacher",
+        email: "dual-teacher@example.test",
+        schoolId: schoolA,
+        membershipId: teacher.memberships[schoolA],
+      });
+
+      const foreign = await call("assignments/[id]", {
+        token: selectedToken,
+        params: { id: foreignAssignment },
+      });
+      const missing = await call("assignments/[id]", {
+        token: selectedToken,
+        params: { id: missingId },
+      });
+
+      assertEq(foreign.status, 404, "a cross-tenant assignment is not found");
+      assertEq(missing.status, 404, "a missing assignment is not found");
+      assertEq(
+        foreign.bodyText,
+        missing.bodyText,
+        "a cross-tenant resource and a missing resource must be byte-identical"
+      );
+      assert(
+        !foreign.bodyText.includes("INTEGRATION-FOREIGN-ASSIGNMENT"),
+        "no foreign assignment title leaks"
+      );
+      assert(
+        !foreign.bodyText.includes(foreignAssignment),
+        "no foreign assignment id leaks"
+      );
+    });
+
+    await test("A cross-tenant submission read is a 404 and leaks nothing", async () => {
+      const selectedToken = await auth.createToken({
+        userId: teacher.id,
+        role: "teacher",
+        email: "dual-teacher@example.test",
+        schoolId: schoolA,
+        membershipId: teacher.memberships[schoolA],
+      });
+
+      const foreign = await call("submissions/[id]", {
+        token: selectedToken,
+        params: { id: foreignSubmission },
+      });
+      const missing = await call("submissions/[id]", {
+        token: selectedToken,
+        params: { id: missingId },
+      });
+
+      assertEq(foreign.status, 404, "a cross-tenant submission is not found");
+      assertEq(
+        foreign.bodyText,
+        missing.bodyText,
+        "a cross-tenant submission and a missing submission must be byte-identical"
+      );
+      assert(
+        !foreign.bodyText.includes("INTEGRATION-FOREIGN-SUBMISSION"),
+        "no foreign submission content leaks"
+      );
+      assert(!foreign.bodyText.includes(foreignSubmission), "no foreign submission id leaks");
+    });
+
+    await test("A same-tenant role denial is a 403 and names the rule", async () => {
+      /* A learner may not create assignments. This is a statement about the CALLER, not
+         about a resource, so it is a 403 — and it must not mention any other tenant. */
+      const learnerToken = await auth.createToken({
+        userId: learner.id,
+        role: "learner",
+        email: "learner@example.test",
+        schoolId: schoolA,
+        membershipId: learner.memberships[schoolA],
+      });
+
+      const response = await call("assignments", {
+        token: learnerToken,
+        method: "POST",
+        body: {
+          title: "Learner Attempt",
+          classId: classA,
+          subjectId: subjectA,
+          description: "should never be created",
+        },
+      });
+
+      assertEq(response.status, 403, "a learner cannot create assignments");
+      assert(
+        /only teachers/i.test(response.bodyText),
+        `the 403 names the role rule (got ${response.bodyText})`
+      );
+      assert(
+        !response.bodyText.includes("INTEGRATION-FOREIGN"),
+        "the 403 discloses no foreign resource"
+      );
+    });
+
+    await test("A multi-school session with no selection is refused with 403", async () => {
+      /* The teacher holds two active memberships, so the session is deliberately left
+         unselected: the caller must not silently inherit a tenant. */
+      const unselectedToken = await auth.createToken({
+        userId: teacher.id,
+        role: "teacher",
+        email: "dual-teacher@example.test",
+      });
+
+      const response = await call("assignments/[id]", {
+        token: unselectedToken,
+        params: { id: teacherAssignment },
+      });
+
+      assertEq(response.status, 403, "an unselected multi-school session is refused");
+      assert(
+        /select one of your schools/i.test(response.bodyText),
+        `the 403 asks for an explicit selection (got ${response.bodyText})`
+      );
+      assert(
+        !response.bodyText.includes("Integration Teacher Assignment"),
+        "the refusal discloses no assignment content"
+      );
     });
   } finally {
     await db.end().catch(() => undefined);

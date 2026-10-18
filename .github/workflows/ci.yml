@@ -48,6 +48,8 @@ jobs:
         run: test -n "$TEST_DATABASE_URL"
       - name: Unit and source-security tests
         run: npm test
+      - name: End-to-end PostgreSQL TLS tests (TLS-enabled PostgreSQL 16 required)
+        run: npm run test:tls-e2e
       - name: Database, migration, and membership suites (PostgreSQL required)
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)

@@ -114,6 +114,41 @@ test("the pg parser downgrade is neutralized before the Pool receives the URL", 
   assert(!config.connectionString.includes("sslmode=require"));
 });
 
+test("pg-connection-string is a declared production dependency, not a transitive one", () => {
+  /* `pg` parses every connection string with pg-connection-string at runtime
+     (node_modules/pg/lib/connection-parameters.js). The TLS policy above depends on
+     that parser: it is what turns `sslmode=require` into `rejectUnauthorized: false`,
+     and it is what EasyLearn neutralises by removing the query option before `pg` ever
+     sees the URL. If the package were only a transitive dependency, a `pg` upgrade could
+     silently change the parse behaviour that the whole TLS policy is built on — or drop
+     it entirely and break the connection layer. It must therefore be pinned directly. */
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8")
+  );
+
+  const declared = packageJson.dependencies && packageJson.dependencies["pg-connection-string"];
+  assert.ok(declared, "pg-connection-string must be declared in package.json dependencies");
+  assert.ok(
+    !/[\^~*]/.test(declared),
+    `pg-connection-string must be pinned to an exact version (found "${declared}"), because the TLS policy depends on its exact parse behaviour`
+  );
+
+  const devOnly = packageJson.devDependencies && packageJson.devDependencies["pg-connection-string"];
+  assert.ok(!devOnly, "pg-connection-string must not be a devDependency: it is required at runtime by pg");
+
+  /* The lockfile must resolve it to the same instance `pg` uses (no duplicated copy). */
+  const lock = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "package-lock.json"), "utf8")
+  );
+  const resolved = lock.packages && lock.packages["node_modules/pg-connection-string"];
+  assert.ok(resolved, "package-lock.json must contain a pg-connection-string entry");
+  assert.strictEqual(
+    resolved.version,
+    declared,
+    "the locked pg-connection-string version must match the declared dependency"
+  );
+});
+
 test("application and migration paths use the same verified config and only explicit test opt-in permits local plaintext", () => {
   const appConfig = createPostgresConnectionConfig("postgres://u:p@db.example.test/app?sslmode=require");
   const migrationConfig = createPostgresConnectionConfig("postgres://u:p@db.example.test/app?sslmode=require");

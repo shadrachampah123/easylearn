@@ -27,6 +27,7 @@ const assert = require("assert");
 const { spawnSync } = require("child_process");
 const path = require("path");
 const crypto = require("crypto");
+const { runMigrations: runMigrationChain } = require("./helpers/migrations.js");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const DB_NAME = `easylearn_2a_test_${crypto.randomBytes(4).toString("hex")}`;
@@ -107,12 +108,7 @@ async function main() {
     await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`);
     await admin.query(`CREATE DATABASE "${DB_NAME}"`);
 
-    const runMigrations = (fileName) =>
-      spawnSync(process.execPath, fileName ? ["run-migration.js", fileName] : ["run-migration.js"], {
-        cwd: REPO_ROOT,
-        env: { ...process.env, DATABASE_URL: scratchUrl },
-        encoding: "utf8",
-      });
+    const runMigrations = (fileName) => runMigrationChain({ databaseUrl: scratchUrl, fileName });
 
     let result = runMigrations();
     await test("Migration runner applies 0000…0018 successfully", () => {

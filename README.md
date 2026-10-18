@@ -66,6 +66,29 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js
 DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_identity_columns.sql
 ```
 
+**Gated migrations:** a migration marked as gated is never applied by the ordinary run
+above. It is applied only when the file is named explicitly **and** its confirmation
+token is supplied, so an unreviewed schema change cannot ride along with a deployment.
+`0018_composite_school_foreign_keys.sql` is gated:
+
+```bash
+# Refused (exit 1) until the preflight has been reviewed:
+DATABASE_URL="your-neon-connection-string" node run-migration.js 0018_composite_school_foreign_keys.sql
+
+# Applied, after the reviewed preflight:
+CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS \
+  DATABASE_URL="your-neon-connection-string" node run-migration.js 0018_composite_school_foreign_keys.sql
+```
+
+**PostgreSQL TLS:** the application pool and the migration runner both require a verified
+TLS connection — a trusted certificate chain **and** a matching hostname. `sslmode=disable`,
+`allow`, `prefer` and `verify-ca` are refused; `sslmode=require` is upgraded to full
+verification rather than downgraded. Supply the certificate authority with
+`DATABASE_CA_CERT` (or `PGSSLROOTCERT`, or a `sslrootcert=` query parameter). A missing,
+untrusted or mismatched certificate fails the connection instead of falling back to an
+unverified one. The full certificate requirements, the fail-closed behaviour and the
+operator runbook are in `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md`.
+
 **Existing databases:** if public tables exist without the new history ledger, the normal runner
 refuses to replay them. First establish the applied migration prefix from independently verified
 catalog/data evidence. Only then may an authorized operator use `--baseline` to record that

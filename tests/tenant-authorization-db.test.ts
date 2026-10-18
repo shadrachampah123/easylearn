@@ -45,6 +45,7 @@ import { NextRequest } from "next/server";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
+const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
 
 const DB_NAME = `easylearn_2c_test_${crypto.randomBytes(4).toString("hex")}`;
 const JWT_SECRET = "phase-2c-integration-test-secret-0123456789";
@@ -128,12 +129,7 @@ async function main() {
     process.env.UPLOAD_DIR = UPLOAD_DIR;
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-    const runMigrations = () =>
-      spawnSync(process.execPath, ["run-migration.js"], {
-        cwd: REPO_ROOT,
-        env: { ...process.env, DATABASE_URL: scratchUrl, JWT_SECRET },
-        encoding: "utf8",
-      });
+    const runMigrations = () => runMigrationChain({ databaseUrl: scratchUrl, env: { JWT_SECRET } });
 
     const q = async (sql: string, values: unknown[] = []): Promise<any[]> =>
       (await db.query(sql, values)).rows;

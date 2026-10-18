@@ -43,6 +43,7 @@ import { NextRequest } from "next/server";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
+const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
 
 const DB_NAME = `easylearn_2b_test_${crypto.randomBytes(4).toString("hex")}`;
 const TEST_PASSWORD = "Phase2b-Test-Password!";
@@ -132,12 +133,7 @@ async function main() {
     process.env.DATABASE_URL = scratchUrl;
     process.env.JWT_SECRET = JWT_SECRET;
 
-    const runMigrations = () =>
-      spawnSync(process.execPath, ["run-migration.js"], {
-        cwd: REPO_ROOT,
-        env: { ...process.env, DATABASE_URL: scratchUrl, JWT_SECRET },
-        encoding: "utf8",
-      });
+    const runMigrations = () => runMigrationChain({ databaseUrl: scratchUrl, env: { JWT_SECRET } });
 
     // Migration SQL is replayed directly only in this disposable DB to test its idempotent
     // data-backfill behavior. The production runner itself must skip files recorded in its ledger.

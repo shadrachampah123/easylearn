@@ -17,6 +17,7 @@ import { NextRequest } from "next/server";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
+const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
 const DB_NAME = `easylearn_assignment_auth_${crypto.randomBytes(4).toString("hex")}`;
 const PASSWORD = "Assignment-Auth-Test-Password!";
 const JWT_SECRET = "assignment-auth-test-secret-0123456789";
@@ -94,10 +95,9 @@ async function main() {
     process.env.DATABASE_URL = scratchUrl;
     process.env.JWT_SECRET = JWT_SECRET;
 
-    const migration = spawnSync(process.execPath, ["run-migration.js"], {
-      cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: scratchUrl, JWT_SECRET, EASY_LEARN_TEST_DATABASE: "true" },
-      encoding: "utf8",
+    const migration = runMigrationChain({
+      databaseUrl: scratchUrl,
+      env: { JWT_SECRET, EASY_LEARN_TEST_DATABASE: "true" },
     });
     if (migration.status !== 0) {
       throw new Error(`migration failed:\n${((migration.stdout || "") + (migration.stderr || "")).slice(-6000)}`);
