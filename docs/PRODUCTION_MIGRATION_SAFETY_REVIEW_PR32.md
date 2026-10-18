@@ -443,7 +443,8 @@ each run, and the suite re-ran **20 / 0** at the end.
 | Run | Commit | Result |
 |---|---|---|
 | `39168493830` | `9da7333` | **SUCCESS** — 17/17 steps green, including "Tenant constraint integrity / schema-sync bypass regression (PostgreSQL required)" |
-| `39169949326` | `69a6e5b` | see §"Tests run" — the commit that carries the HIGH-1 and MEDIUM-1 fixes |
+| `39169949326` | `69a6e5b` | **SUCCESS** — the commit that carries the HIGH-1 and MEDIUM-1 fixes |
+| `39170082202` | `0c40ff5` | **SUCCESS** — 22/22 steps green, including the new fail-on-skip mechanism |
 
 **Not verified / not claimed.** The production engine and version, the production schema and
 ledger state, the 28 production relationship mismatch counts, the production table sizes, the
