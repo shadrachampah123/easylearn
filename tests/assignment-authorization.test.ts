@@ -18,11 +18,14 @@ function test(name: string, fn: () => void) {
 
 console.log("📝 Assignment-question authorization policy tests\n");
 
-test("teachers receive full content only for ownership or explicit management authorization", () => {
+test("teachers receive full content only for ownership, and the reserved explicit-authorization flag is not honoured", () => {
   assert.strictEqual(assignmentPolicyDecision({ role: "teacher", ownsAssignment: true }), "manage-full");
+  /* `explicitlyAuthorized` is a RESERVED rule: no route and no schema column populates
+     it, and `assignment-access.ts` grants a teacher access by ownership only. The mirror
+     must not hand out access the routes do not grant. */
   assert.strictEqual(
     assignmentPolicyDecision({ role: "teacher", explicitlyAuthorized: true }),
-    "manage-full"
+    "denied"
   );
   assert.strictEqual(assignmentPolicyDecision({ role: "teacher" }), "denied");
   assert.strictEqual(

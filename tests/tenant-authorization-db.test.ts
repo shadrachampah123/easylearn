@@ -46,6 +46,9 @@ import { NextRequest } from "next/server";
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
 const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
+const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
+  "./tests/helpers/scratch-db.js"
+);
 
 const DB_NAME = `easylearn_2c_test_${crypto.randomBytes(4).toString("hex")}`;
 const JWT_SECRET = "phase-2c-integration-test-secret-0123456789";
@@ -116,11 +119,17 @@ async function main() {
 
   const admin = new Client({ connectionString: adminUrl });
   await admin.connect();
-  await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`);
-  await admin.query(`CREATE DATABASE "${DB_NAME}"`);
-  const db = new Client({ connectionString: scratchUrl });
-  await db.connect();
+  /* The scratch database is created and removed by the shared helper, so it is dropped
+     even when a setup step or an assertion fails. See tests/helpers/scratch-db.js. */
+  const scratch = await createScratchDatabase({
+    admin,
+    adminUrl: adminUrl as string,
+    dbName: DB_NAME,
+    label: "tenant-authorization-db",
+  });
+  const db = scratch.db;
 
+  let primaryError: any = null;
   try {
     /* The application modules must see the scratch database. Set BEFORE the first `@/db`
        import — the pool is created at import time. */
@@ -1502,6 +1511,10 @@ async function main() {
     /* ════════════════════ Summary ════════════════════ */
 
     console.log(`\n📊 Results: ${passed} passed, ${failed} failed`);
+  } catch (error) {
+    /* Remember the original failure: the teardown must never replace it. */
+    primaryError = error;
+    throw error;
   } finally {
     try {
       const { pool } = await import("@/db");
@@ -1509,10 +1522,11 @@ async function main() {
     } catch {
       /* ignore */
     }
-    await db.end().catch(() => undefined);
+    const cleanup = await scratch.dispose();
     await admin.end().catch(() => undefined);
     if (stopServer) await stopServer().catch(() => undefined);
     fs.rmSync(UPLOAD_DIR, { recursive: true, force: true });
+    assertCleanupSucceeded(cleanup, primaryError);
   }
 
   /* Exit explicitly: the embedded-postgres shutdown hook must not turn a red suite green. */

@@ -18,6 +18,9 @@ import { NextRequest } from "next/server";
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
 const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
+const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
+  "./tests/helpers/scratch-db.js"
+);
 const DB_NAME = `easylearn_assignment_auth_${crypto.randomBytes(4).toString("hex")}`;
 const PASSWORD = "Assignment-Auth-Test-Password!";
 const JWT_SECRET = "assignment-auth-test-secret-0123456789";
@@ -86,11 +89,17 @@ async function main() {
   })();
   const admin = new Client({ connectionString: adminUrl });
   await admin.connect();
-  await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`);
-  await admin.query(`CREATE DATABASE "${DB_NAME}"`);
-  const db = new Client({ connectionString: scratchUrl });
-  await db.connect();
+  /* The scratch database is created and removed by the shared helper, so it is dropped
+     even when a setup step or an assertion fails. See tests/helpers/scratch-db.js. */
+  const scratch = await createScratchDatabase({
+    admin,
+    adminUrl: adminUrl as string,
+    dbName: DB_NAME,
+    label: "assignment-access-db",
+  });
+  const db = scratch.db;
 
+  let primaryError: any = null;
   try {
     process.env.DATABASE_URL = scratchUrl;
     process.env.JWT_SECRET = JWT_SECRET;
@@ -369,16 +378,16 @@ async function main() {
       assertStatus(result, 200, "learner submission");
       assertNoAnswerKey(result.json, "submission response");
     });
+  } catch (error) {
+    /* Remember the original failure: the teardown must never replace it. */
+    primaryError = error;
+    throw error;
   } finally {
-    await db.end().catch(() => undefined);
     await (await import("@/db")).pool.end().catch(() => undefined);
-    await admin.query(
-      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-      [DB_NAME]
-    ).catch(() => undefined);
-    await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`).catch(() => undefined);
+    const cleanup = await scratch.dispose();
     await admin.end().catch(() => undefined);
     if (stopServer) await stopServer().catch(() => undefined);
+    assertCleanupSucceeded(cleanup, primaryError);
   }
 
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed`);
