@@ -37,7 +37,11 @@ export async function GET(request: NextRequest) {
     // and parents are limited to published content tied to enrollment/parent linkage;
     // teachers are limited to assignments they own; school administrators and head teachers
     // receive the full school-scoped management view. The school scope is resolved
-    // schema-aware, so a database that predates migration 0016 is isolated as well.
+    // schema-aware, so the teacher and school-administrator roles also work on a database
+    // that predates migration 0016. The learner and parent roles require migration 0016
+    // (their predicates read `learner_classes.school_id` / `parent_learners.school_id`); on a
+    // pre-0016 schema they fail closed with a missing-column error rather than returning
+    // rows. See `src/lib/assignment-access.ts`.
     const conditions: any[] = [await resolveAssignmentListPredicate(ctx)];
 
     if (classId) conditions.push(eq(assignments.classId, classId));

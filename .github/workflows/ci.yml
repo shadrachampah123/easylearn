@@ -54,6 +54,10 @@ jobs:
           EASY_LEARN_REQUIRE_TLS_E2E: "true"
         run: npm run test:tls-e2e
       - name: Database, migration, and membership suites (PostgreSQL required)
+        env:
+          # A skip must fail this job: the assignment schema-prerequisite assertions have to
+          # actually run.
+          EASY_LEARN_REQUIRE_ASSIGNMENT_PREREQ: "true"
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth

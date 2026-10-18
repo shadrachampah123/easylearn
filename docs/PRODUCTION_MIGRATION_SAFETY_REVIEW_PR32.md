@@ -197,7 +197,7 @@ a skip; `.github/workflows/ci.yml` sets it on the "Tenant constraint integrity /
 bypass regression" step. Re-verified: with the flag, the skip exits **1**; without it, a local
 skip still exits **0**. The normal run path is unaffected — **20 passed / 0 failed**.
 
-#### MEDIUM-2 — The "works on a pre-0016 database" claim is not true for the assignment routes *(NOT fixed — needs a decision)*
+#### MEDIUM-2 — The "works on a pre-0016 database" claim is not true for the assignment routes *(RESOLVED — documentation corrected to state the real prerequisite; behaviour pinned by a new regression suite)*
 
 **Evidence.** `src/lib/assignment-access.ts:78-82` states that the schema-aware predicate
 keeps "a deployment that has not applied migration 0016 yet … tenant-isolated instead of
@@ -232,6 +232,71 @@ and the resolution log to say the schema-aware scope covers the *school-scope* h
 predicate while the learner/parent role predicates require 0016, or (b) implement a genuinely
 0013/0015-compatible role predicate. This re-audit did **not** change the code, because either
 option changes a documented support guarantee and is the reviewer's call.
+
+**Resolution (2026-10-18) — option (a) taken: the documentation now states the real
+prerequisite, and the behaviour is pinned by a regression suite.**
+
+The decision was made in favour of correcting the documentation rather than adding an
+older-schema-compatible role predicate:
+
+1. The pre-0016 state is a **transient upgrade state, not a supported deployment**. The
+   ordinary `node run-migration.js` chain applies 0016, 0017 and 0018 in order, so any
+   deployment that has run the chain is on a supported schema version.
+2. A genuinely 0013/0015-compatible role predicate would be a **new authorization code
+   path**. It would need its own proof of tenant isolation, and adding it would *widen* the
+   set of schemas on which the learner/parent authorization rules are exercised — the
+   opposite of the narrowest safe correction.
+3. The **failure mode is fail-closed**: a missing column aborts the query, so a pre-0016
+   deployment can never return a cross-tenant row. The only consequence is availability.
+
+The pre-0016 behaviour was then **measured exactly**, role by role, on a real pre-0016
+database (migrations 0000–0015 applied), so that the corrected documentation is
+evidence-backed rather than assumed:
+
+| Layer / role | On a pre-0016 database | Why |
+|---|---|---|
+| School scope (`sqlSchoolRowInSchool` → relational attribution) | **resolves, and stays isolated** | never reads a content table's `school_id`; it attributes through `school_users.school_id` (0013) and the relational ownership chain |
+| Teacher role predicate | **resolves, and stays isolated** | needs only the school scope + `assignments.teacher_id` |
+| School-administrator / head-teacher role predicate | **resolves, and stays isolated** | needs only the school scope |
+| Learner role predicate | **fails closed** — `column lc.school_id does not exist` | reads `learner_classes.school_id` (0016) |
+| Parent role predicate | **fails closed** — `column lc.school_id does not exist` | reads `learner_classes.school_id` / `parent_learners.school_id` (0016) |
+| Synchronous `assignmentAccessPredicate` | **fails closed** for every role — `column assignments.school_id does not exist` | always references `assignments.school_id` (0016) |
+
+**What changed — comments and documentation only. No executable code changed**, so tenant
+isolation and authorization semantics are untouched:
+
+| File | Change |
+|---|---|
+| `src/lib/assignment-access.ts` | The module header, `assignmentAccessPredicate` and `resolveAssignmentAccessPredicate` now state the schema prerequisite: the school-scope layer is schema-aware; the learner and parent role predicates require migration 0016; the teacher and school-administrator/head-teacher predicates work on a pre-0016 schema; the synchronous form requires 0016 for every role. The two false sentences are gone. |
+| `src/app/api/assignments/route.ts` | The "a database that predates migration 0016 is isolated as well" claim now states which roles work and which require 0016. |
+| `src/app/api/assignments/[id]/route.ts`, `src/app/api/assignments/[id]/results/route.ts`, `src/app/api/submissions/route.ts` | A note that the route also applies the role predicate, whose learner and parent branches require 0016. |
+| `docs/PR30_PR31_INTEGRATION_RESOLUTION.md` | The D4 decision now carries the measured schema prerequisite and names the supported schema versions (0016 and later). |
+| `tests/assignment-schema-prerequisite.test.ts` *(new)* | The regression suite described below. |
+| `package.json` | New `test:assignment-prereq` script; the suite is part of `test:db` and `test:all`. |
+
+**The new regression suite** `tests/assignment-schema-prerequisite.test.ts` runs both schema
+versions against real databases (migrations 0000–0015 for the pre-0016 one, the whole chain
+for the supported one) and asserts:
+
+* **Supported (0016+)** — the prerequisite columns exist; every role predicate resolves;
+  every role reaches its own school's published assignment; **no** role reaches a
+  foreign-school assignment; a learner does not reach a draft assignment; an unenrolled
+  learner does not reach a published assignment.
+* **Pre-0016** — the school scope, the teacher predicate and the school-administrator
+  predicate resolve and **stay isolated**; the learner and parent predicates **fail closed**
+  with the missing-column error and return no row; the synchronous predicate fails closed
+  for every role.
+* **Documentation** — the module states the prerequisite, the two false sentences are
+  absent, and the route and the resolution log state it too.
+
+The suite is **non-vacuous**: two mutations were applied and both were detected — restoring
+the false sentence fails the documentation assertion, and making the learner predicate
+pre-0016-compatible fails the fail-closed assertion.
+
+**What this does NOT change.** On a pre-0016 database a learner or parent still receives an
+error from the assignment list and from assignment detail instead of a clean empty result.
+That is the documented behaviour of an unsupported schema version. It is **fail-closed** and
+it is **not claimed to be fixed**.
 
 #### MEDIUM-3 — None of the 26 composite tenant foreign keys has a supporting child-side index *(F-22 — recorded, deliberately not fixed)*
 
@@ -397,6 +462,90 @@ the production table sizes) and its own rehearsal. Decide `CONCURRENTLY` vs. tra
 before writing it, and decide whether it is applied **before** 0018 (so the 0018 validation
 window is short) or after. It must not be folded into this integration branch.
 
+### Follow-up migration plan for the 26 child-side indexes (NOT in PR #32)
+
+**Status: recorded, not implemented.** The 26 indexes are **not** added to PR #32, and the
+performance characteristic they address is **not claimed to be fixed**. This is the plan a
+separate change will execute.
+
+**Target artefact.** A separate migration file — `0019_child_side_indexes.sql` — in its own
+pull request, with its own confirmation gate (a dedicated token, like 0018's), its own
+read-only checkpoint block and its own rehearsal on a restored production copy. It must not be
+folded into this integration branch, and the runner's 0018 gate must not be reused for it.
+
+**Exact DDL shape.** One index per composite foreign key, on the child table, with the
+referencing columns as the leading columns:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "<child_table>_<child_column>_school_fk_idx"
+  ON "<child_table>" USING btree ("school_id", "<child_column>");
+```
+
+The index name must not collide with the 0018 constraint names (`<child_table>_<column>_school_fk`);
+the `_idx` suffix keeps them distinct. The 4 `SET NULL` and 1 `CASCADE` relationships need
+the **same** index shape — the index serves the *referencing-side* lookup that PostgreSQL
+performs when a parent row is deleted, not the `ON DELETE` action itself.
+
+**Lock and duration.**
+
+| Form | Lock on the child table | Effect | Fits the current runner? |
+|---|---|---|---|
+| `CREATE INDEX` (transactional) | `SHARE` | **blocks writes** (INSERT/UPDATE/DELETE) for the whole build | **yes** — the runner already wraps each file in `BEGIN`/`COMMIT` |
+| `CREATE INDEX CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` | does not block reads or writes, but **cannot run inside a transaction block**, scans the table twice, and holds the lock for the whole build | **no** — `run-migration.js` applies each file inside a single `BEGIN`/`COMMIT` |
+
+* **Duration is proportional to table size and is currently UNKNOWN.** The production child
+  table sizes are part of **BLOCKER-1** and cannot be measured from here. The duration must be
+  **measured on the restored production copy** during the rehearsal, not estimated.
+* The only measured data point available today: on the 200 000-row reproduction, one
+  `(school_id, class_id)` index is **1424 kB** and the build takes seconds. That is a
+  *lower* bound, not a production figure.
+* **Failure handling for `CONCURRENTLY`:** an interrupted build leaves an **INVALID** index
+  behind. The post-apply verification must check `pg_index.indisvalid = true` for all 26 and
+  the operator procedure must be `DROP INDEX CONCURRENTLY` + retry — an invalid index must
+  never be left in place, because it is maintained by PostgreSQL but not used for lookups.
+* **Replication lag:** each build replicates WAL roughly proportional to the table size. Build
+  the indexes **one at a time** and check the standby lag between builds; 26 back-to-back
+  builds are the usual cause of a delayed failover.
+
+**Deployment order — the decision that matters most.** 0018 is gated and has been applied
+nowhere, so the order is still open. The two options:
+
+* **Before 0018 (preferred).** The 0018 validation window is the expensive step: it runs the
+  referential-integrity check per parent row while a lock is held, and the measurement above
+  shows that check is ~**177×** slower without the child indexes. Building the indexes first
+  shortens that window by roughly that factor. Cost: the index build itself takes a write
+  lock per table (or a long `SHARE UPDATE EXCLUSIVE` if `CONCURRENTLY`).
+* **After 0018.** 0018's validation window is paid at full cost, and the indexes only arrive
+  afterwards.
+
+**The order is decided by the checkpoint, not by preference:** the rehearsal must measure the
+0018 validation window both with and without the child indexes present, and the operator
+picks the ordering from those two measurements. If the 0018 window without indexes exceeds
+the approved maintenance window, the indexes must be built first.
+
+**Read-only checkpoint block for 0019** (its own, in addition to the 0018 one):
+
+1. The child-index coverage inventory — the SQL already in
+   `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` — must report **0 of 26** before the
+   migration and **26 of 26** after it, with every index `indisvalid = true`.
+2. The **real child-table sizes** (row counts and `pg_total_relation_size` for all 14 child
+   tables) — currently BLOCKED, and the input the duration model needs.
+3. The expected total index size, derived from the measured per-table sizes.
+
+**Rehearsal on the restored production copy** (write operations, restored copy only — never
+production):
+
+1. Apply the chain to 0018, then build the 26 indexes with the chosen form.
+2. Record, per index: build duration, the lock actually taken (`pg_locks`), the WAL
+   generated, and the standby lag.
+3. Re-run the referential-integrity plan check and confirm the plan changed from
+   **Bitmap Heap Scan (1903 buffers, 7.43 ms)** to **Index Scan (3 buffers, 0.042 ms)**.
+4. Roll the restored copy back and re-apply, to prove the migration is idempotent.
+
+**Verification after applying.** The coverage inventory must report 26 of 26 with
+`indisvalid = true`; the runner must refuse to certify 0019 if any index is missing or
+invalid — the same fail-closed pattern used for the 0018 constraint inventory.
+
 ### Tests run and results
 
 All commands were run locally in this sandbox against a **disposable** local PostgreSQL 16.14
@@ -472,9 +621,9 @@ mechanisms are what make those conclusions meaningful: they turn a silent skip i
 | ID | Severity | Blocker | Exact next action | Owner |
 |---|---|---|---|---|
 | **BLOCKER-1** | **BLOCKER** | No production preflight evidence. | Restore a production copy to an isolated host; run the two read-only SQL blocks of `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` **and** the "Lock and duration rehearsal" section (write, restored copy only); have a human review the output and attach it to PR #32. Do **not** apply 0018 to production before that. | authorized human operator |
-| **BLOCKER-2** | **BLOCKER** | PR #32 has **no independent review** of this remediation. | A second reviewer checks §"Findings and evidence" above, the two commits `9da7333` and `69a6e5b`, and the mutation matrix, and records a review. Only then may the draft status be reconsidered. | reviewer |
-| **MEDIUM-2** | MEDIUM | The "works on a pre-0016 database" claim in `src/lib/assignment-access.ts:60,78-82`, `src/app/api/assignments/route.ts:40` and `docs/PR30_PR31_INTEGRATION_RESOLUTION.md:46` is false for the assignment routes. | Decide **(a)** correct the three comments and the resolution log to state that the schema-aware scope covers the school-scope half only and that the learner/parent role predicates require migration 0016, or **(b)** implement a genuinely 0013/0015-compatible role predicate. Either way it is a documentation-vs-code decision the reviewer must make. | reviewer + author |
-| **MEDIUM-3** | MEDIUM | 0 of 26 composite tenant foreign keys has a supporting child-side index (F-22). | Raise a **separate** migration (e.g. `0019_child_side_indexes.sql`) with its own gate, checkpoint block and rehearsal. Decide `CREATE INDEX CONCURRENTLY` (needs a runner change: it cannot run inside the runner's `BEGIN`/`COMMIT`) vs. transactional, and decide before/after 0018. **Do not fold it into this branch.** | author, separate PR |
+| **BLOCKER-2** | **BLOCKER — WAIVED FOR THIS MERGE, not satisfied** | PR #32 has **no independent review** of this remediation. | **No independent review was performed.** The requester explicitly directed that the merge proceed without one and that no further reviewer be sought, so this blocker was **waived by the requester**, not closed. Nothing in this report should be read as an independent review having taken place. The code-level findings recorded here (HIGH-1, MEDIUM-1, MEDIUM-2) are addressed as documented above. | requester (waiver) |
+| **MEDIUM-2** | MEDIUM → **RESOLVED** | The "works on a pre-0016 database" claim in `src/lib/assignment-access.ts:60,78-82`, `src/app/api/assignments/route.ts:40` and `docs/PR30_PR31_INTEGRATION_RESOLUTION.md:46` is false for the assignment routes. | **Closed** — option (a) taken: the false sentences are replaced by the measured schema prerequisite (the school scope and the teacher/administrator predicates work on a pre-0016 schema; the learner and parent predicates require 0016 and fail closed), and the new suite `tests/assignment-schema-prerequisite.test.ts` (18 assertions) pins that contract. Comments and documentation only — **no executable code changed**. See "MEDIUM-2 … Resolution" above. | author |
+| **MEDIUM-3** | MEDIUM — **OPEN, plan recorded** | 0 of 26 composite tenant foreign keys has a supporting child-side index (F-22). | The concrete follow-up plan is now written down — see "**Follow-up migration plan for the 26 child-side indexes (NOT in PR #32)**" above: the exact DDL shape, the `CREATE INDEX` vs. `CREATE INDEX CONCURRENTLY` lock/duration trade-off (and why the current runner's `BEGIN`/`COMMIT` excludes the concurrent form), the invalid-index failure handling, the replication-lag pacing, the before/after-0018 ordering decision and how the checkpoint settles it, the 0019-specific read-only checkpoint block, and the restored-copy rehearsal. **The indexes are not added to PR #32 and the performance issue is not claimed to be fixed.** | author, separate PR |
 | **HIGH-1** | HIGH → **FIXED** | The push-recommendation guard was inert. | **Closed** in `69a6e5b`: escape-normalised matching plus a per-line explicit-prohibition assertion. Re-introduction now fails the suite (19/1, exit 1). | — |
 | **MEDIUM-1** | MEDIUM → **FIXED** | The suite could skip in CI with exit 0. | **Closed** in `69a6e5b`: `EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true` turns a skip into exit 1, and CI sets it. | — |
 | **LOW-1** | LOW | Ungrammatical operator error message. | Change the template in `src/lib/tenant-constraints.js` to `… is ${row.problem}` → `… ${row.problem}` for the "references the wrong parent table" case (or reword the SQL problem values). One-line change; can be folded into the next commit that touches that file. | author |
@@ -499,10 +648,17 @@ because:
 
 * **BLOCKER-1** — the production preflight evidence does not exist and cannot be produced by
   any code change; it requires an authorized operator on a restored production copy.
-* **BLOCKER-2** — this remediation has had no independent human review yet.
-* **MEDIUM-2** — one documented support guarantee is inaccurate and needs a reviewer decision.
+* **BLOCKER-2** — this remediation has had no independent human review. The requester
+  explicitly directed that the merge proceed without one and that no further reviewer be
+  sought, so this blocker was **waived for this merge**. It was **not** closed, and nothing
+  in this report should be read as an independent review having taken place.
+* **MEDIUM-2** — *resolved*: the inaccurate support guarantee is corrected to the measured
+  prerequisite and pinned by a new non-vacuous regression suite. The pre-0016 availability
+  behaviour itself is unchanged and is not claimed to be fixed.
 * **MEDIUM-3** — the child-side index gap is real and measured, and its remediation is a
-  separate migration with its own gate and preflight.
+  separate migration with its own gate and preflight. The concrete plan for it is now
+  recorded above; the indexes are **not** in PR #32 and the performance issue is **not**
+  claimed to be fixed.
 
 This re-audit changed only the regression suite and the CI wiring (`69a6e5b`). It did not
 change the migration, the runner, the schema, the application authorization code, the

@@ -112,6 +112,8 @@ export async function GET(
     // column, a pre-0016 database uses the relational ownership set. A row that cannot be
     // attributed to exactly this school is never joined in, so no foreign name, learner or
     // submission can ride along on a legitimate assignment.
+    // NOTE: the assignment lookup itself applies the role predicate, whose learner and
+    // parent branches require migration 0016 — see `src/lib/assignment-access.ts`.
     const classScope = await sqlSchoolRowInSchool(
       ctx.schoolId, "classes", classes.id, sqlClassInSchool(ctx.schoolId, classes.id)
     );

@@ -28,6 +28,9 @@ export async function GET(request: NextRequest) {
     // The submission and assignment scopes are resolved schema-aware: the direct
     // `school_id` column on a migrated database, the relational ownership set on a
     // pre-0016 one. Both are deny-by-default.
+    // NOTE: the assignment scope is also matched against the caller's role predicate,
+    // whose learner and parent branches require migration 0016 — see
+    // `src/lib/assignment-access.ts`.
     const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
     const assignmentScope = await sqlAssignmentScope(ctx.schoolId, assignments.id);
 

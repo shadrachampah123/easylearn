@@ -163,6 +163,8 @@ export async function GET(
     // the direct `submissions.school_id` on a migrated database, the relational ownership
     // set on a pre-0016 one. A submission that cannot be attributed to exactly this school
     // is never returned.
+    // NOTE: the assignment lookup itself applies the role predicate, whose learner and
+    // parent branches require migration 0016 — see `src/lib/assignment-access.ts`.
     const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
 
     const staffView = hasSchoolAdminExtendedRole(ctx) || ctx.school.role === "teacher";

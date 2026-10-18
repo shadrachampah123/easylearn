@@ -39,15 +39,28 @@ PR #31's `sqlAssignmentInSchool` / `sqlSubmissionInSchool` make the direct `scho
 authoritative and keep the relational ownership set only as a fallback for legacy rows whose
 `school_id` is still NULL. PR #30's purely-relational version would deny a legitimate
 assignment of a teacher who holds a second active membership, because the relational set
-then resolves to two schools. PR #30's relational predicate is *kept* as the pre-0016
-fallback so no compatibility path is lost.
+then resolves to two schools. PR #30's relational predicate is *kept* as the fallback used
+when the direct column is absent, so no compatibility path is lost.
 
 **D4 — Schema-aware scoping is layered *under* the role rules (not replaced).**
-PR #30 introduced `sqlSchoolRowInSchool()` to keep working on a pre-0016 database that has
-no `school_id` column. PR #31 introduced role-based, query-level authorization
+PR #30 introduced `sqlSchoolRowInSchool()` so the school scope keeps working on a database
+that has no `school_id` column. PR #31 introduced role-based, query-level authorization
 (`assignmentAccessPredicate`). The merged code keeps both: the school scope is resolved
 schema-aware (direct column when present, relational ownership when not) and the role rules
 are applied on top of it.
+
+> **Schema prerequisite (measured — see `tests/assignment-schema-prerequisite.test.ts`).**
+> The school-scope layer is genuinely schema-aware: it attributes a row through
+> `school_users.school_id` (migration 0013) and the relational ownership chain, and never
+> reads a content table's `school_id`. The **learner and parent role predicates** are the
+> exception: they read `learner_classes.school_id` and `parent_learners.school_id`, which
+> **migration 0016** adds. Consequently the teacher and school-administrator/head-teacher
+> authorization paths work on a pre-0016 schema, while learner and parent assignment access
+> requires migration 0016. On a pre-0016 schema the learner and parent paths fail closed with
+> a missing-column error — never a cross-tenant row, but a request error rather than an empty
+> result. The supported schema versions are **0016 and later** (0017 makes `school_id` NOT
+> NULL, 0018 adds the composite tenant foreign keys). The ordinary `node run-migration.js`
+> chain applies 0016, so any deployment that has run the chain is on a supported version.
 
 **D5 — Answer-key suppression is preserved and extended.**
 PR #31's allowlisted learner/parent DTOs (`toAssignmentQuestionDto`,
