@@ -455,9 +455,9 @@ async function main() {
 
     await test("Production read-only checkpoint SQL runs only against disposable PostgreSQL here", async () => {
       const checkpoint = fs.readFileSync(path.join(REPO_ROOT, "docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md"), "utf8");
-      const sqlBlock = checkpoint.match(/```sql\n([\s\S]*?)\n```/);
-      assert(sqlBlock, "read-only checkpoint SQL block must exist");
-      await db.query(sqlBlock[1]);
+      const sqlBlocks = Array.from(checkpoint.matchAll(/```sql\n([\s\S]*?)\n```/g), (match) => match[1]);
+      assert(sqlBlocks.length >= 2, "read-only checkpoint and conditional ledger SQL blocks must exist");
+      for (const sql of sqlBlocks) await db.query(sql);
     });
 
     await test("Runner baseline requires confirmation and only records a sequential prefix", async () => {

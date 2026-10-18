@@ -8,14 +8,14 @@
 
 1. An authorized operator selects the intended Vercel project, production alias, and read-only database role. Confirm the target out-of-band before running SQL. Do not paste connection strings, credentials, customer records, or personal data into tickets/chat.
 2. Record UTC time, project/alias, deployment ID and commit SHA from the provider's read-only deployment UI/API. Preserve sanitized output only. Deployment identity and DB state are separate evidence.
-3. Connect with a role that cannot write. Run the SQL below in a fresh session. It starts a read-only transaction and does not call the application migration runner.
+3. Connect with a database role that lacks write privileges. Run each SQL block in a fresh session; each block starts a repeatable-read, read-only transaction and rolls it back. The procedure does not call the application migration runner. The SQL blocks contain only catalog/data `SELECT`s plus transaction-local settings and `ROLLBACK`; no migration ledger is created or baselined.
 4. Do not “fix” missing schema, constraints, nulls, or cross-school relationships from this session. Any anomaly is a stop condition; preserve the evidence and request a separately reviewed, backup-rehearsed remediation plan.
 5. If any relation/column is missing, stop that query batch and record the missing object. Do not infer that an older database is safe because later queries failed.
 
 ## Read-only PostgreSQL inspection
 
 ```sql
-BEGIN TRANSACTION READ ONLY;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL statement_timeout = '60s';
 SET LOCAL lock_timeout = '2s';
 
@@ -23,6 +23,7 @@ SET LOCAL lock_timeout = '2s';
 SELECT current_database() AS database_name,
        current_user AS inspection_role,
        current_setting('server_version') AS postgres_version,
+       current_setting('server_version_num') AS postgres_version_num,
        current_setting('transaction_read_only') AS read_only;
 
 -- 0016/0017 direct-school columns. Required A-class tables from migration 0017.
@@ -103,6 +104,21 @@ SELECT to_regclass('public.easylearn_schema_migrations') IS NOT NULL AS migratio
 -- If the ledger is present, inspect its content in a separate read-only statement after
 -- confirming the relation exists; compare names/checksums with the reviewed migration files.
 -- Do not infer a production baseline from an absent ledger or populate it from this session.
+
+-- Approximate size/row-count context for 0018's directly affected tables. These catalog
+-- estimates are not exact counts; the relationship mismatch checks below are exact scans.
+WITH expected(table_name) AS (
+  VALUES ('academic_years'), ('terms'), ('departments'), ('classes'), ('subjects'),
+         ('teacher_classes'), ('learner_classes'), ('assignments'), ('submissions'),
+         ('uploaded_files'), ('resources'), ('quizzes'), ('quiz_attempts'),
+         ('announcements'), ('attendance'), ('timetable_entries')
+)
+SELECT e.table_name,
+       GREATEST(c.reltuples, 0)::bigint AS estimated_rows,
+       pg_total_relation_size(c.oid) AS total_relation_bytes
+FROM expected e
+LEFT JOIN pg_class c ON c.oid = to_regclass(format('public.%I', e.table_name))
+ORDER BY e.table_name;
 
 -- 0018 expected validated composite foreign keys (26). This remains pending until reviewed,
 -- deployed, and independently confirmed in production.
@@ -280,18 +296,37 @@ ORDER BY relationship;
 ROLLBACK;
 ```
 
-The `ROLLBACK` ends the read-only transaction without changing data. Large production tables can make count checks expensive; the operator should obtain DBA approval for the query window and stop on timeout rather than raising limits or switching to a write-capable role.
+The `ROLLBACK` ends each read-only transaction without changing data. Repeatable read makes the result set internally consistent, but the long-lived snapshot can delay vacuum cleanup. Exact mismatch/NULL counts may scan large tables and impose I/O load; obtain DBA approval for the query window and stop on timeout rather than raising limits or switching to a write-capable role.
+
+## Conditional migration-history query (only when ledger presence is true)
+
+Run only after the preceding `migration_history_table_present` result is `true`. This is a separate read-only session/query; it does not create, baseline, or modify the ledger.
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL statement_timeout = '60s';
+SET LOCAL lock_timeout = '2s';
+
+SELECT filename, checksum, applied_at
+FROM public.easylearn_schema_migrations
+ORDER BY filename;
+
+ROLLBACK;
+```
+
+If the ledger is absent, do not run this block. Record “history ledger unavailable; applied migration sequence/checksums unverified” and continue only with the read-only catalog/data evidence. The operator must not infer the applied prefix from the repository's Drizzle journal or create a replacement ledger.
 
 ## Evidence interpretation and stop conditions
 
 - The expected relation list must be present. `school_id` must be `NOT NULL` on all 24 tables in the 0017 list; `school_users.school_id` is also required. `activity_logs.school_id` may remain nullable for platform events.
 - Each required null count and every core relationship mismatch above must be zero. Any nonzero value is an investigation/remediation item, not permission to stamp or move rows.
 - The 0016 school FKs must exist and be validated. The 24 0017 unique targets must be valid, ready, and unique. The 26 expected 0018 composite constraints are future work until their migration is independently reviewed, safely applied under separate authorization, and then appear validated. Capture counts and exact definitions; do not infer application of migrations from a successful deployment.
-- The repository's prior runner had no applied-migration ledger. The new runner adds a checksum ledger, transactions, and advisory locking on an unmerged branch; production state is still unknown. Do not treat an absent ledger, a Drizzle journal row, runner log absence, or deployment status as proof of execution. Catalog and data evidence are required. The explicit `--baseline` command only records an operator assertion; it does not verify database state and must not be used until an independently verified migration prefix is documented.
-- A successful read-only catalog check is still not proof of cross-school API behavior. Separately record non-mutating, role-approved smoke checks for one-school and dual-membership test accounts in each school. Do not seed or alter production data for those checks.
+- The repository's prior runner had no applied-migration ledger. The new runner adds a checksum ledger, transactions, and advisory locking on an unmerged branch; production state is still unknown. Do not treat an absent ledger, a Drizzle journal row, runner-log absence, or deployment status as proof of execution. Catalog and data evidence are required. The explicit `--baseline` command only records an operator assertion; it does not verify database state and must not be used as a substitute for this verification.
+- The SQL batch reports whether `public.easylearn_schema_migrations` exists. **Only if that result is true**, open a fresh read-only transaction and run the conditional history query below. If false, report the ledger as unavailable; do not run the query, invoke `run-migration.js`, or baseline the database. Compare returned checksums with the immutable migration files from the deployment/code revision claimed to have applied them—not just the current working branch. Report gaps, unknown filenames, or mismatches as unresolved; a ledger is a record, not proof, and must be corroborated against catalog/data state.
+- This procedure deliberately excludes live application smoke tests. Login, GET routes, and dashboards can write rate-limit, session, last-login, or audit records even when the requested operation appears read-only. Any behavior test needs separate authorization and a demonstrated non-mutating method; prefer staging/test fixtures. Do not treat that as part of this read-only checkpoint.
 
 ## Required operator report (sanitized)
 
-Return only: UTC timestamp; project/alias; deployment ID and commit SHA; database/version identity (no hostname or credentials); the 25-row column/nullability result; required NULL counts; activity-log NULL count; school and membership counts; migration-history table presence (not a state conclusion); validated school-FK count; valid 0017 target-index count; 0018 composite-constraint state; mismatch counts; read-only application smoke-test outcomes; query failures/timeouts. Redact personal data and all connection/configuration secrets.
+Return only: UTC timestamp; intended Vercel project/production alias; deployment ID and commit SHA; database/version identity including `server_version` and `server_version_num` (no hostname or credentials); 25-row column/nullability result; required NULL counts; activity-log NULL count; school and membership counts; table-size estimates; ledger presence and, only if present, sanitized filename/checksum/applied-at rows; validated school-FK count; valid 0017 target-index count; 0018 composite-constraint definitions/state; mismatch counts; query failures/timeouts. Do not include application smoke-test results in this read-only report. Redact personal data and all connection/configuration secrets.
 
 **If production DB access is unavailable:** report that the production DB gate remains unverified and provide this procedure to the authorized operator. Do not attempt a production connection, request a credential, run `run-migration.js`, or infer database state from deployment records.

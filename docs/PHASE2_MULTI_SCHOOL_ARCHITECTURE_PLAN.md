@@ -142,7 +142,7 @@ All local PostgreSQL validation uses disposable databases with an inert `DATABAS
 
 GitHub currently shows no submitted PR #30 review. A branch-protection API request returned 403 (`Resource not accessible by integration`), so required-review/check rules remain **unknown**, not absent. Do not merge or bypass any review/check. PR #28/#30 independent security review and the separately authorized, read-only production tenancy checkpoint remain outstanding. Do not start Phase 3 until both independent review and production verification are complete.
 
-No production migrations, data repair, or deployment were initiated. Migration 0018 has not been applied to production. The production read-only checkpoint now includes a 0018 constraint-state check and the ledger's presence check, while explicitly avoiding conclusions from an absent ledger; its SQL remains unexecuted against production.
+No production migrations, data repair, or deployment were initiated. Migration 0018 has not been applied to production. The read-only checkpoint now captures PostgreSQL version, intended deployment identity, migration-ledger presence and—only when present—recorded filenames/checksums, relevant schema/data consistency, and estimated affected-table sizes. It uses repeatable-read, read-only transactions and `ROLLBACK`; it does not create or baseline a ledger, and excludes application smoke tests that could have write side effects. Both SQL blocks were executed against disposable PostgreSQL 18 by the migration test suite. This verifies the procedure's syntax/read-only transaction behavior, not production state; independent review and production verification remain blocked.
 
 ## Phase status and commercial-launch work
 
