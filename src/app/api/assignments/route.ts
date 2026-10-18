@@ -8,12 +8,16 @@ import {
   isSubjectInSchool,
   isTermInSchool,
   sqlAssignmentInSchool,
+  sqlClassInSchool,
+  sqlSchoolRowInSchool,
+  sqlSubmissionInSchool,
+  sqlUserInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
-import { ensureFileUploadSchema, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
+import { ensureFileUploadSchema, isMissingColumn, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
 import { eq, desc, and, sql } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
@@ -34,7 +38,8 @@ export async function GET(request: NextRequest) {
     let useDirect = true;
     try {
       await db.execute(sql`select "school_id" from "assignments" limit 0`);
-    } catch {
+    } catch (error) {
+      if (!isMissingColumn(error)) throw error;
       useDirect = false;
     }
 
@@ -63,6 +68,10 @@ export async function GET(request: NextRequest) {
     }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+    const classScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "classes", classes.id, sqlClassInSchool(ctx.schoolId, classes.id)
+    );
+    const subjectScope = await sqlSchoolRowInSchool(ctx.schoolId, "subjects", subjects.id, sql`false`);
 
     const results = await db
       .select({
@@ -86,15 +95,18 @@ export async function GET(request: NextRequest) {
         teacherLastName: users.lastName,
       })
       .from(assignments)
-      .leftJoin(classes, eq(assignments.classId, classes.id))
-      .leftJoin(subjects, eq(assignments.subjectId, subjects.id))
-      .leftJoin(users, eq(assignments.teacherId, users.id))
+      .leftJoin(classes, and(eq(assignments.classId, classes.id), classScope))
+      .leftJoin(subjects, and(eq(assignments.subjectId, subjects.id), subjectScope))
+      .leftJoin(users, and(eq(assignments.teacherId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
       .where(whereClause)
       .orderBy(desc(assignments.createdAt))
       .limit(50);
 
-    // For learners, add submission status
+    // For learners, add submission status without following a foreign-school child row.
     if (ctx.school.role === "learner") {
+      const submissionScope = await sqlSchoolRowInSchool(
+        ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+      );
       const assignmentsWithStatus = await Promise.all(
         results.map(async (assignment) => {
           const [submission] = await db
@@ -109,7 +121,9 @@ export async function GET(request: NextRequest) {
             .from(submissions)
             .where(and(
               eq(submissions.assignmentId, assignment.id),
-              eq(submissions.learnerId, ctx.userId)
+              eq(submissions.learnerId, ctx.userId),
+              submissionScope,
+              sqlUserInSchool(ctx.schoolId, submissions.learnerId)
             ))
             .limit(1);
           return { ...assignment, submission: submission || null };

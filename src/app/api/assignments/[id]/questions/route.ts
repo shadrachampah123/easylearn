@@ -6,6 +6,7 @@ import {
   hasSchoolAdminRole,
   hasSchoolStaffRole,
   sqlAssignmentInSchool,
+  sqlSchoolRowInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and } from "drizzle-orm";
@@ -21,12 +22,15 @@ export async function GET(
     const ctx = auth.context;
 
     const { id } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
 
     // Check assignment exists
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, id), assignmentScope))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
@@ -66,6 +70,9 @@ export async function POST(
     }
 
     const { id } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
     const body = await request.json();
     const { questionType, questionText, options, correctAnswer, points, orderIndex, explanation } = body;
 
@@ -73,7 +80,7 @@ export async function POST(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, id), assignmentScope))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
@@ -126,6 +133,9 @@ export async function DELETE(
     }
 
     const { id: assignmentId } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
     const url = new URL(request.url);
     const questionId = url.searchParams.get("questionId");
 
@@ -142,7 +152,7 @@ export async function DELETE(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, assignmentId), assignmentScope))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");

@@ -6,9 +6,7 @@ import { eq, sql } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminRole,
-  sqlAssignmentInSchool,
-  sqlClassInSchool,
-  sqlUserInSchool,
+  sqlUserHasRoleInSchool,
 } from "@/lib/tenant";
 
 export async function GET(request: NextRequest) {
@@ -24,17 +22,17 @@ export async function GET(request: NextRequest) {
        counted with a direct school predicate like every other table. */
     if (hasSchoolAdminRole(ctx)) {
       const [totalTeachers] = await db.select({ count: sql<number>`count(*)` }).from(users)
-        .where(sql`${eq(users.role, "teacher")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`);
+        .where(sqlUserHasRoleInSchool(ctx.schoolId, users.id, "teacher"));
       const [totalLearners] = await db.select({ count: sql<number>`count(*)` }).from(users)
-        .where(sql`${eq(users.role, "learner")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`);
+        .where(sqlUserHasRoleInSchool(ctx.schoolId, users.id, "learner"));
       const [totalParents] = await db.select({ count: sql<number>`count(*)` }).from(users)
-        .where(sql`${eq(users.role, "parent")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`);
+        .where(sqlUserHasRoleInSchool(ctx.schoolId, users.id, "parent"));
       const [totalClasses] = await db.select({ count: sql<number>`count(*)` }).from(classes)
-        .where(sql`${eq(classes.schoolId, ctx.schoolId)} AND ${sqlClassInSchool(ctx.schoolId, classes.id)}`);
+        .where(eq(classes.schoolId, ctx.schoolId));
       const [totalSubjects] = await db.select({ count: sql<number>`count(*)` }).from(subjects)
         .where(eq(subjects.schoolId, ctx.schoolId));
       const [totalAssignments] = await db.select({ count: sql<number>`count(*)` }).from(assignments)
-        .where(sql`${eq(assignments.schoolId, ctx.schoolId)} AND ${sqlAssignmentInSchool(ctx.schoolId, assignments.id)}`);
+        .where(eq(assignments.schoolId, ctx.schoolId));
 
       return successResponse({
         teachers: Number(totalTeachers.count),

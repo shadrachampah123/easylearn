@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 
 interface Resource {
@@ -44,11 +44,8 @@ export default function LearnerResourcesPage() {
   const [filter, setFilter] = useState<string>("all");
   const [search, setSearch] = useState("");
 
-  useEffect(() => {
-    loadResources();
-  }, []);
 
-  async function loadResources() {
+  const loadResources = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch("/api/resources", {
@@ -61,7 +58,13 @@ export default function LearnerResourcesPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadResources();
+  }, [loadResources]);
 
   const filteredResources = resources.filter((r) => {
     if (filter !== "all" && r.type !== filter) return false;

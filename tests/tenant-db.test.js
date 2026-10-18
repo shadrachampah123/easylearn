@@ -107,15 +107,15 @@ async function main() {
     await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`);
     await admin.query(`CREATE DATABASE "${DB_NAME}"`);
 
-    const runMigrations = () =>
-      spawnSync(process.execPath, ["run-migration.js"], {
+    const runMigrations = (fileName) =>
+      spawnSync(process.execPath, fileName ? ["run-migration.js", fileName] : ["run-migration.js"], {
         cwd: REPO_ROOT,
         env: { ...process.env, DATABASE_URL: scratchUrl },
         encoding: "utf8",
       });
 
     let result = runMigrations();
-    await test("Migration runner applies 0000…0013 successfully", () => {
+    await test("Migration runner applies 0000…0018 successfully", () => {
       assertEq(result.status, 0, `run-migration.js exited ${result.status}:\n${(result.stdout || "") + (result.stderr || "")}`.slice(0, 8000));
       if (!String(result.stdout).includes("🎉 Migration complete")) {
         throw new Error("runner did not report completion");
@@ -140,6 +140,7 @@ async function main() {
       }
       throw new Error(`${label} — expected error ${code} but the statement succeeded`);
     };
+    const one = async (sql, values = []) => (await db.query(sql, values)).rows[0];
 
     /* ── 1. Schools can be represented correctly ── */
 
@@ -212,6 +213,285 @@ async function main() {
       );
       user2 = rows2[0];
       assert(/^[0-9a-f-]{36}$/i.test(user1.id) && /^[0-9a-f-]{36}$/i.test(user2.id), "user uuids");
+    });
+
+    await test("Composite tenant FKs reject cross-school references", async () => {
+      const deptA = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Tenant FK Dept A') RETURNING id`,
+        [schoolA.id]
+      );
+      const deptB = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Tenant FK Dept B') RETURNING id`,
+        [schoolB.id]
+      );
+      const subjectA = await one(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Tenant FK Subject A', $2) RETURNING id`,
+        [schoolA.id, deptA.id]
+      );
+      await expectError(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Cross-school Subject', $2)`,
+        [schoolA.id, deptB.id],
+        "23503",
+        "subject cannot reference another school's department"
+      );
+
+      const yearA = await one(
+        `INSERT INTO academic_years (school_id, name, start_date, end_date) VALUES ($1, 'Tenant FK Year A', '2026-01-01', '2026-12-31') RETURNING id`,
+        [schoolA.id]
+      );
+      const classA = await one(
+        `INSERT INTO classes (school_id, name, level, academic_year_id) VALUES ($1, 'Tenant FK Class A', 'primary', $2) RETURNING id`,
+        [schoolA.id, yearA.id]
+      );
+      await expectError(
+        `UPDATE classes SET school_id = $1 WHERE id = $2`,
+        [schoolB.id, classA.id],
+        "23503",
+        "updating a referenced child's school cannot cross its academic-year tenant"
+      );
+      await expectError(
+        `INSERT INTO classes (school_id, name, level, academic_year_id) VALUES ($1, 'Cross-school Class', 'primary', $2)`,
+        [schoolB.id, yearA.id],
+        "23503",
+        "class cannot reference another school's academic year"
+      );
+
+      const classB = await one(
+        `INSERT INTO classes (school_id, name, level) VALUES ($1, 'Tenant FK Class B', 'primary') RETURNING id`,
+        [schoolB.id]
+      );
+
+      // Rewind only migration 0018's constraints in this disposable DB, leaving the prior
+      // scalar FKs intact. This makes the runner create earlier 0018 constraints before the
+      // later bad relationship is encountered, so the test proves DDL rollback as well as
+      // ledger rollback and preservation of the offending row.
+      const compositeConstraintNames = [
+        "terms_school_academic_year_fk", "classes_school_academic_year_fk", "subjects_school_department_fk",
+        "teacher_classes_school_class_fk", "teacher_classes_school_subject_fk", "teacher_classes_school_academic_year_fk",
+        "learner_classes_school_class_fk", "learner_classes_school_academic_year_fk", "assignments_school_class_fk",
+        "assignments_school_subject_fk", "assignments_school_term_fk", "submissions_school_assignment_fk",
+        "uploaded_files_school_assignment_fk", "resources_school_class_fk", "resources_school_subject_fk",
+        "resources_school_term_fk", "quizzes_school_class_fk", "quizzes_school_subject_fk", "quizzes_school_term_fk",
+        "quiz_attempts_school_quiz_fk", "announcements_school_class_fk", "attendance_school_class_fk",
+        "timetable_entries_school_class_fk", "timetable_entries_school_subject_fk", "timetable_entries_school_term_fk",
+        "timetable_entries_school_academic_year_fk",
+      ];
+      const presentCompositeConstraints = await db.query(
+        `SELECT conname, conrelid::regclass::text AS table_name FROM pg_constraint WHERE conname = ANY($1)`,
+        [compositeConstraintNames]
+      );
+      assertEq(presentCompositeConstraints.rows.length, 26, "all 0018 constraints exist before the rollback simulation");
+      for (const constraint of presentCompositeConstraints.rows) {
+        await db.query(`ALTER TABLE ${constraint.table_name} DROP CONSTRAINT "${constraint.conname}"`);
+      }
+      const inconsistent = await one(
+        `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id) VALUES ($1, 'Legacy Cross-school Row', $2, $3, $4) RETURNING id`,
+        [schoolA.id, classB.id, subjectA.id, user1.id]
+      );
+      await db.query(`DELETE FROM easylearn_schema_migrations WHERE filename = $1`, ["0018_composite_school_foreign_keys.sql"]);
+      const rejectedMigration = runMigrations("0018_composite_school_foreign_keys.sql");
+      const rejectionOutput = `${rejectedMigration.stdout || ""}${rejectedMigration.stderr || ""}`;
+      assert(rejectedMigration.status !== 0, "0018 must fail on an existing cross-school reference");
+      assert(rejectionOutput.includes("assignments.class_id"), "failure must identify the offending relationship");
+      const preserved = await one(`SELECT id FROM assignments WHERE id = $1`, [inconsistent.id]);
+      assertEq(preserved.id, inconsistent.id, "failed migration must not modify or delete the legacy row");
+      const rolledBackConstraints = await one(
+        `SELECT count(*)::int AS count FROM pg_constraint WHERE conname = ANY($1)`,
+        [compositeConstraintNames]
+      );
+      assertEq(rolledBackConstraints.count, 0, "all earlier 0018 constraints must roll back after a later preflight failure");
+      const absentHistory = await one(
+        `SELECT count(*)::int AS count FROM easylearn_schema_migrations WHERE filename = $1`,
+        ["0018_composite_school_foreign_keys.sql"]
+      );
+      assertEq(absentHistory.count, 0, "failed migration must not create a history entry");
+
+      await db.query(`DELETE FROM assignments WHERE id = $1`, [inconsistent.id]);
+      const recoveredMigration = runMigrations("0018_composite_school_foreign_keys.sql");
+      assertEq(recoveredMigration.status, 0, `0018 should succeed after the test-only anomaly is removed: ${recoveredMigration.stderr || ""}`);
+
+      await expectError(
+        `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id) VALUES ($1, 'Cross-school Assignment', $2, $3, $4)`,
+        [schoolA.id, classB.id, subjectA.id, user1.id],
+        "23503",
+        "assignment cannot reference another school's class"
+      );
+
+      // Keep this regression fixture isolated from later cascade/membership tests.
+      await db.query(`DELETE FROM subjects WHERE id = $1`, [subjectA.id]);
+      await db.query(`DELETE FROM classes WHERE id = $1`, [classB.id]);
+      await db.query(`DELETE FROM classes WHERE id = $1`, [classA.id]);
+      await db.query(`DELETE FROM academic_years WHERE id = $1`, [yearA.id]);
+      await db.query(`DELETE FROM departments WHERE id IN ($1, $2)`, [deptA.id, deptB.id]);
+    });
+
+    await test("Composite FK catalog has all 26 ordered tenant relationships and intended actions", async () => {
+      const { rows } = await db.query(`
+        WITH expected(child_table, child_column, parent_table, constraint_name, expected_delete_code) AS (VALUES
+          ('terms', 'academic_year_id', 'academic_years', 'terms_school_academic_year_fk', 'a'),
+          ('classes', 'academic_year_id', 'academic_years', 'classes_school_academic_year_fk', 'a'),
+          ('subjects', 'department_id', 'departments', 'subjects_school_department_fk', 'a'),
+          ('teacher_classes', 'class_id', 'classes', 'teacher_classes_school_class_fk', 'a'),
+          ('teacher_classes', 'subject_id', 'subjects', 'teacher_classes_school_subject_fk', 'a'),
+          ('teacher_classes', 'academic_year_id', 'academic_years', 'teacher_classes_school_academic_year_fk', 'a'),
+          ('learner_classes', 'class_id', 'classes', 'learner_classes_school_class_fk', 'a'),
+          ('learner_classes', 'academic_year_id', 'academic_years', 'learner_classes_school_academic_year_fk', 'a'),
+          ('assignments', 'class_id', 'classes', 'assignments_school_class_fk', 'a'),
+          ('assignments', 'subject_id', 'subjects', 'assignments_school_subject_fk', 'a'),
+          ('assignments', 'term_id', 'terms', 'assignments_school_term_fk', 'a'),
+          ('submissions', 'assignment_id', 'assignments', 'submissions_school_assignment_fk', 'a'),
+          ('uploaded_files', 'assignment_id', 'assignments', 'uploaded_files_school_assignment_fk', 'n'),
+          ('resources', 'class_id', 'classes', 'resources_school_class_fk', 'a'),
+          ('resources', 'subject_id', 'subjects', 'resources_school_subject_fk', 'a'),
+          ('resources', 'term_id', 'terms', 'resources_school_term_fk', 'a'),
+          ('quizzes', 'class_id', 'classes', 'quizzes_school_class_fk', 'a'),
+          ('quizzes', 'subject_id', 'subjects', 'quizzes_school_subject_fk', 'a'),
+          ('quizzes', 'term_id', 'terms', 'quizzes_school_term_fk', 'a'),
+          ('quiz_attempts', 'quiz_id', 'quizzes', 'quiz_attempts_school_quiz_fk', 'a'),
+          ('announcements', 'class_id', 'classes', 'announcements_school_class_fk', 'a'),
+          ('attendance', 'class_id', 'classes', 'attendance_school_class_fk', 'a'),
+          ('timetable_entries', 'class_id', 'classes', 'timetable_entries_school_class_fk', 'c'),
+          ('timetable_entries', 'subject_id', 'subjects', 'timetable_entries_school_subject_fk', 'n'),
+          ('timetable_entries', 'term_id', 'terms', 'timetable_entries_school_term_fk', 'n'),
+          ('timetable_entries', 'academic_year_id', 'academic_years', 'timetable_entries_school_academic_year_fk', 'n')
+        )
+        SELECT e.*, c.oid IS NOT NULL AS exists,
+          c.convalidated,
+          c.confdeltype::text AS delete_code,
+          c.confupdtype::text AS update_code,
+          c.confrelid = to_regclass(format('public.%I', e.parent_table)) AS parent_matches,
+          to_json(ARRAY(
+            SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+            ORDER BY k.ord
+          )) AS child_columns,
+          to_json(ARRAY(
+            SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+            ORDER BY k.ord
+          )) AS parent_columns,
+          COALESCE(
+            i.indisunique AND i.indisvalid AND i.indnkeyatts = 2
+            AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = c.confrelid AND attname = 'school_id' AND NOT attisdropped)
+            AND i.indkey[1] = (SELECT attnum FROM pg_attribute WHERE attrelid = c.confrelid AND attname = 'id' AND NOT attisdropped),
+            false
+          ) AS target_index_valid
+        FROM expected e
+        LEFT JOIN pg_constraint c
+          ON c.conname = e.constraint_name
+         AND c.contype = 'f'
+         AND c.conrelid = to_regclass(format('public.%I', e.child_table))
+        LEFT JOIN pg_index i ON i.indexrelid = c.conindid
+        ORDER BY e.constraint_name
+      `);
+      assertEq(rows.length, 26, "catalog inventory must cover all 26 planned relationships");
+      for (const fk of rows) {
+        assertEq(fk.exists, true, `${fk.constraint_name} exists`);
+        assertEq(fk.convalidated, true, `${fk.constraint_name} is validated`);
+        assertEq(fk.parent_matches, true, `${fk.constraint_name} points to ${fk.parent_table}`);
+        assertEq(JSON.stringify(fk.child_columns), JSON.stringify(["school_id", fk.child_column]), `${fk.constraint_name} child column order`);
+        assertEq(JSON.stringify(fk.parent_columns), JSON.stringify(["school_id", "id"]), `${fk.constraint_name} parent column order`);
+        assertEq(fk.delete_code, fk.expected_delete_code, `${fk.constraint_name} ON DELETE action`);
+        assertEq(fk.update_code, "a", `${fk.constraint_name} keeps ON UPDATE NO ACTION`);
+        assertEq(fk.target_index_valid, true, `${fk.constraint_name} references a valid unique parent index`);
+      }
+      assertEq(rows.find((fk) => fk.constraint_name === "uploaded_files_school_assignment_fk").delete_code, "n", "uploaded files retain SET NULL on assignment deletion");
+      assertEq(rows.find((fk) => fk.constraint_name === "timetable_entries_school_class_fk").delete_code, "c", "timetable entries retain CASCADE on class deletion");
+      for (const name of ["subject", "term", "academic_year"]) {
+        assertEq(rows.find((fk) => fk.constraint_name === `timetable_entries_school_${name}_fk`).delete_code, "n", `timetable ${name} reference retains SET NULL`);
+      }
+    });
+
+    await test("Composite uploaded-file FK preserves assignment delete SET NULL behavior", async () => {
+      const dept = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Uploaded-file delete department') RETURNING id`,
+        [schoolA.id]
+      );
+      const subject = await one(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Uploaded-file delete subject', $2) RETURNING id`,
+        [schoolA.id, dept.id]
+      );
+      const klass = await one(
+        `INSERT INTO classes (school_id, name, level) VALUES ($1, 'Uploaded-file delete class', 'primary') RETURNING id`,
+        [schoolA.id]
+      );
+      const assignment = await one(
+        `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id)
+         VALUES ($1, 'Uploaded-file delete assignment', $2, $3, $4) RETURNING id`,
+        [schoolA.id, klass.id, subject.id, user1.id]
+      );
+      const uploadedFile = await one(
+        `INSERT INTO uploaded_files
+           (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, category, size_bytes)
+         VALUES ($1, $2, 'assignment', $3, 'brief.pdf', $4, 'document', 12) RETURNING id`,
+        [schoolA.id, user1.id, assignment.id, `tenant-fk-delete-${DB_NAME}.pdf`]
+      );
+
+      await db.query(`DELETE FROM assignments WHERE id = $1`, [assignment.id]);
+      const retainedFile = await one(
+        `SELECT assignment_id, school_id FROM uploaded_files WHERE id = $1`,
+        [uploadedFile.id]
+      );
+      assertEq(retainedFile.assignment_id, null, "deleting an assignment should detach, not block or delete, its uploaded file");
+      assertEq(retainedFile.school_id, schoolA.id, "detaching the assignment must preserve the uploaded file's tenant anchor");
+
+      await db.query(`DELETE FROM uploaded_files WHERE id = $1`, [uploadedFile.id]);
+      await db.query(`DELETE FROM subjects WHERE id = $1`, [subject.id]);
+      await db.query(`DELETE FROM classes WHERE id = $1`, [klass.id]);
+      await db.query(`DELETE FROM departments WHERE id = $1`, [dept.id]);
+    });
+
+    await test("Composite timetable FKs preserve CASCADE and selective SET NULL delete behavior", async () => {
+      const year = await one(
+        `INSERT INTO academic_years (school_id, name, start_date, end_date)
+         VALUES ($1, $2, '2026-01-01', '2026-12-31') RETURNING id`,
+        [schoolA.id, `Timetable FK actions ${DB_NAME}`]
+      );
+      const term = await one(
+        `INSERT INTO terms (school_id, name, academic_year_id, start_date, end_date)
+         VALUES ($1, 'term_1', $2, '2026-01-01', '2026-04-30') RETURNING id`,
+        [schoolA.id, year.id]
+      );
+      const dept = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Timetable FK action department') RETURNING id`,
+        [schoolA.id]
+      );
+      const subject = await one(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Timetable FK action subject', $2) RETURNING id`,
+        [schoolA.id, dept.id]
+      );
+      const klass = await one(
+        `INSERT INTO classes (school_id, name, level) VALUES ($1, 'Timetable FK action class', 'primary') RETURNING id`,
+        [schoolA.id]
+      );
+      const entry = await one(
+        `INSERT INTO timetable_entries (school_id, class_id, subject_id, term_id, academic_year_id, day_of_week, start_time, end_time)
+         VALUES ($1, $2, $3, $4, $5, 'monday', '09:00', '09:45') RETURNING id`,
+        [schoolA.id, klass.id, subject.id, term.id, year.id]
+      );
+
+      await db.query(`DELETE FROM subjects WHERE id = $1`, [subject.id]);
+      let retained = await one(`SELECT subject_id, term_id, academic_year_id, school_id FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(retained.subject_id, null, "deleting the optional subject nulls only subject_id");
+      assertEq(retained.term_id, term.id, "subject deletion preserves the other timetable references");
+      assertEq(retained.academic_year_id, year.id, "subject deletion preserves academic_year_id");
+      assertEq(retained.school_id, schoolA.id, "subject deletion preserves school_id");
+
+      await db.query(`DELETE FROM terms WHERE id = $1`, [term.id]);
+      retained = await one(`SELECT term_id, academic_year_id, school_id FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(retained.term_id, null, "deleting the optional term nulls only term_id");
+      assertEq(retained.academic_year_id, year.id, "term deletion preserves academic_year_id");
+      assertEq(retained.school_id, schoolA.id, "term deletion preserves school_id");
+
+      await db.query(`DELETE FROM academic_years WHERE id = $1`, [year.id]);
+      retained = await one(`SELECT academic_year_id, school_id FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(retained.academic_year_id, null, "deleting the optional academic year nulls only academic_year_id");
+      assertEq(retained.school_id, schoolA.id, "academic year deletion preserves school_id");
+
+      await db.query(`DELETE FROM classes WHERE id = $1`, [klass.id]);
+      const cascaded = await one(`SELECT count(*)::int AS count FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(cascaded.count, 0, "deleting the timetable class cascades its schedule entry");
+      await db.query(`DELETE FROM departments WHERE id = $1`, [dept.id]);
     });
 
     /* ── 3./4. Membership: valid, duplicate, and FK behavior ── */
@@ -364,11 +644,10 @@ async function main() {
       assertEq(second.status, 0, `second run exited ${second.status}:\n${(second.stdout || "") + (second.stderr || "")}`.slice(0, 8000));
     });
 
-    await test("Multi-school still works after the second full migration run", async () => {
-      // A naive follow-up fix would let 0013's CREATE UNIQUE INDEX IF NOT EXISTS
-      // resurrect the single-school guard on every re-run (failing once multi-school
-      // data exists). Prove the end state survives: insert a fresh user into BOTH
-      // schools and confirm the existing two-school membership is intact.
+    await test("Multi-school still works after the runner's second invocation", async () => {
+      // The history ledger must skip previously-applied migrations rather than replaying
+      // potentially data-changing SQL. Prove the multi-school state remains usable after
+      // that second invocation by inserting a user into BOTH schools.
       await db.query(
         `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'learner')`,
         [schoolA.id, user2.id]
@@ -378,11 +657,10 @@ async function main() {
         [schoolB.id, user2.id]
       );
       assert(/^[0-9a-f-]{36}$/i.test(rows[0].id), "user2 joined both schools after the re-run");
-      // Phase 2B update: migration 0015 backfills a CBISM membership for every
-      // non-super_admin user on each full-chain re-run, so user1 now legitimately holds
-      // THREE memberships (School A + School B + CBISM). The property this test guards is
-      // that multi-school membership survives a full re-run — assert it by school, not by
-      // a bare count, so the CBISM backfill is visible rather than silently absorbed.
+      // Migration 0015 is recorded once by the history ledger. A second runner invocation
+      // must not replay that data migration for users created afterward; it only verifies
+      // recorded checksums and skips applied files. The two explicitly-created memberships
+      // must remain intact.
       const { rows: user1Memberships } = await db.query(
         `SELECT s."slug", su."school_id" FROM "school_users" su
            JOIN "schools" s ON s."id" = su."school_id"
@@ -391,8 +669,8 @@ async function main() {
       );
       assertEq(
         user1Memberships.map((r) => r.slug).join(","),
-        "cbism,test-school-a,test-school-b",
-        "user1's memberships after the re-run (two pre-existing + the 0015 CBISM backfill)"
+        "test-school-a,test-school-b",
+        "user1's memberships after the re-run (0015 is not replayed for post-migration users)"
       );
       assertEq(
         user1Memberships.filter((r) => r.school_id === schoolA.id).length,
@@ -506,7 +784,7 @@ async function main() {
 
     await test("Boundary: exactly the 35 legacy tables + 2 new tables exist", async () => {
       const { rows } = await db.query(
-        `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
+        `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> 'easylearn_schema_migrations'`
       );
       const tables = new Set(rows.map((r) => r.table_name));
       const expected = [

@@ -6,6 +6,8 @@ import {
   hasSchoolAdminRole,
   hasSchoolStaffRole,
   sqlAssignmentInSchool,
+  sqlSchoolRowInSchool,
+  sqlUserInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and, desc } from "drizzle-orm";
@@ -21,6 +23,18 @@ export async function GET(
     const ctx = auth.context;
 
     const { id } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
+    const [assignment] = await db
+      .select({ teacherId: assignments.teacherId })
+      .from(assignments)
+      .where(and(eq(assignments.id, id), assignmentScope))
+      .limit(1);
+    if (!assignment) return notFoundResponse("Assignment");
+    if (ctx.school.role === "teacher" && assignment.teacherId !== ctx.userId) {
+      return errorResponse("You can only view corrections for your own assignments", 403);
+    }
 
     const corrections = await db
       .select({
@@ -34,8 +48,11 @@ export async function GET(
         questionText: assignmentQuestions.questionText,
       })
       .from(assignmentCorrections)
-      .leftJoin(assignmentQuestions, eq(assignmentCorrections.questionId, assignmentQuestions.id))
-      .leftJoin(users, eq(assignmentCorrections.postedBy, users.id))
+      .leftJoin(assignmentQuestions, and(
+        eq(assignmentCorrections.questionId, assignmentQuestions.id),
+        eq(assignmentQuestions.assignmentId, id)
+      ))
+      .leftJoin(users, and(eq(assignmentCorrections.postedBy, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
       .where(eq(assignmentCorrections.assignmentId, id))
       .orderBy(desc(assignmentCorrections.postedAt));
 
@@ -61,6 +78,9 @@ export async function POST(
     }
 
     const { id: assignmentId } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
     const body = await request.json();
     const { questionId, correctionText } = body;
 
@@ -68,7 +88,7 @@ export async function POST(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, assignmentId), assignmentScope))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");

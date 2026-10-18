@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { teacherNav } from "@/lib/teacher-nav";
 
@@ -26,9 +26,8 @@ export default function TeacherAttendancePage() {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
 
-  useEffect(() => { loadClasses(); }, []);
 
-  async function loadClasses() {
+  const loadClasses = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch("/api/classes", { headers: { Authorization: `Bearer ${token}` } });
@@ -37,7 +36,13 @@ export default function TeacherAttendancePage() {
     } catch (err) {
       console.error(err);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadClasses();
+  }, [loadClasses]);
 
   async function loadLearners() {
     if (!selectedClass) return;

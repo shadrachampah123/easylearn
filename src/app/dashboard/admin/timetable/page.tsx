@@ -110,11 +110,15 @@ export default function AdminTimetablePage() {
   }, [classFilter]);
 
   useEffect(() => {
-    loadOptions();
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadOptions();
   }, [loadOptions]);
 
   useEffect(() => {
-    loadTimetable();
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadTimetable();
   }, [loadTimetable]);
 
   function openCreate(day?: DayValue) {

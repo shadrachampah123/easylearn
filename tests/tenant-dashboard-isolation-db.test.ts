@@ -325,6 +325,9 @@ async function main() {
         userId: ids[fixture.key],
         role: fixture.role,
         email: `${fixture.key}@example.test`,
+        // Test sessions represent an explicit School A choice for dual-membership fixtures;
+        // real multi-school users must select via /api/auth/select-school before access.
+        schoolId: fixture.memberships[0]?.schoolId,
       });
     }
 

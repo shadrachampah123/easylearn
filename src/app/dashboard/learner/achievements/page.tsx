@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 
 interface Achievement {
@@ -49,11 +49,8 @@ export default function LearnerAchievementsPage() {
   const [data, setData] = useState<LearnerStats | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    loadStats();
-  }, []);
 
-  async function loadStats() {
+  const loadStats = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch("/api/learner/stats", {
@@ -66,7 +63,13 @@ export default function LearnerAchievementsPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadStats();
+  }, [loadStats]);
 
   if (loading) {
     return (

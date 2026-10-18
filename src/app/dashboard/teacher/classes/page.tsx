@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
 import { teacherNav } from "@/lib/teacher-nav";
@@ -28,9 +28,8 @@ export default function TeacherClassesPage() {
   const [selectedClass, setSelectedClass] = useState("");
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => { loadData(); }, []);
 
-  async function loadData() {
+  const loadData = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
@@ -42,7 +41,13 @@ export default function TeacherClassesPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadData();
+  }, [loadData]);
 
   async function loadEnrollments(classId: string) {
     setSelectedClass(classId);

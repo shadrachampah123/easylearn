@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
 
@@ -38,11 +38,8 @@ export default function LearnerQuizzesPage() {
   const [quizzes, setQuizzes] = useState<Quiz[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    loadQuizzes();
-  }, []);
 
-  async function loadQuizzes() {
+  const loadQuizzes = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch("/api/quizzes", {
@@ -55,7 +52,13 @@ export default function LearnerQuizzesPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadQuizzes();
+  }, [loadQuizzes]);
 
   return (
     <DashboardShell navItems={learnerNav} roleLabel="Learner" roleColor="bg-gradient-to-r from-accent-500 to-accent-600">

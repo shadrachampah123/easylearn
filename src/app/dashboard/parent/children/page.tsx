@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
 
@@ -26,19 +26,7 @@ export default function ParentChildrenPage() {
   const [currentParentId, setCurrentParentId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.success) {
-          setCurrentParentId(data.data.user.id);
-          loadChildren(data.data.user.id);
-        }
-      });
-  }, []);
-
-  async function loadChildren(parentId: string) {
+  const loadChildren = useCallback(async (parentId: string) => {
     const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
@@ -64,7 +52,19 @@ export default function ParentChildrenPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    const token = localStorage.getItem("el_token");
+    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.success) {
+          setCurrentParentId(data.data.user.id);
+          void loadChildren(data.data.user.id);
+        }
+      });
+  }, [loadChildren]);
 
   return (
     <DashboardShell navItems={parentNav} roleLabel="Parent" roleColor="bg-gradient-to-r from-lavender to-purple-600">

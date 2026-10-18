@@ -13,12 +13,18 @@ export default function ChangePasswordPage() {
   const [user, setUser] = useState<any>(null);
 
   useEffect(() => {
-    const storedUser = localStorage.getItem("el_user");
-    if (!storedUser) {
-      router.push("/login");
-      return;
+    try {
+      const storedUser = localStorage.getItem("el_user");
+      if (storedUser) {
+        // The session profile is browser-only state; read it after hydration to keep SSR markup stable.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setUser(JSON.parse(storedUser));
+        return;
+      }
+    } catch {
+      // Malformed cached profile is treated like a missing session.
     }
-    setUser(JSON.parse(storedUser));
+    router.push("/login");
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {

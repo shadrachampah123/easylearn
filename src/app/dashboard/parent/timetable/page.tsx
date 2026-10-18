@@ -26,7 +26,9 @@ export default function ParentTimetablePage() {
   }
 
   useEffect(() => {
-    loadTimetable();
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadTimetable();
   }, []);
 
   const classNames = Array.from(

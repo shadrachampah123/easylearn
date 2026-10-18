@@ -97,7 +97,7 @@ export async function POST(request: NextRequest) {
     // supplied school id is never read or trusted (see src/lib/tenant.ts). This helper
     // never throws: a user without a membership (e.g. a platform super_admin) still logs in
     // with `school: null`, so nobody is locked out by the backfill.
-    const { resolveLoginSchoolContext, toSchoolSummary } = await import("@/lib/tenant");
+    const { isPlatformRole, resolveLoginSchoolContext, toSchoolSummary } = await import("@/lib/tenant");
     const { memberships, school } = await resolveLoginSchoolContext(user.id);
 
     const token = await createToken({
@@ -108,6 +108,8 @@ export async function POST(request: NextRequest) {
       // Hints only — authorization re-derives membership from the database.
       schoolId: school?.schoolId,
       membershipId: school?.membershipId,
+      // Keep an unselected login ambiguous for its lifetime, even if memberships later change.
+      schoolSelectionRequired: !isPlatformRole(user.role) && memberships.length !== 1,
     });
 
     await db
@@ -123,6 +125,7 @@ export async function POST(request: NextRequest) {
         firstName: user.firstName,
         lastName: user.lastName,
         avatarUrl: user.avatarUrl,
+        mustChangePassword: Boolean(user.mustChangePassword),
       },
       // Phase 2B additive context. Server-derived and read-only for the client: sending a
       // `school`/`schoolId` back has no effect anywhere (see src/lib/tenant.ts).

@@ -301,8 +301,8 @@ test('Tenant module: password hashes never leave the module', () => {
 
 /* ── 5. JWT / session ── */
 
-test('JWT: token schema version 2 is additive and legacy tokens still verify', () => {
-  assert(auth.includes('export const TOKEN_SCHEMA_VERSION = 2'), 'version constant');
+test('JWT: token schema version 3 records explicit school selection and legacy tokens still verify', () => {
+  assert(auth.includes('export const TOKEN_SCHEMA_VERSION = 3'), 'version constant');
   assert(auth.includes('export const LEGACY_TOKEN_SCHEMA_VERSION = 1'), 'legacy version constant');
   assert(auth.includes('LEGACY_TOKEN_SCHEMA_VERSION'), 'a missing ver claim must fall back to 1');
   assert(
@@ -317,6 +317,7 @@ test('JWT: token schema version 2 is additive and legacy tokens still verify', (
 test('JWT: school claims are surfaced as untrusted hints, not authorization inputs', () => {
   assert(auth.includes('schoolIdHint'), 'schoolId must be exposed as a hint');
   assert(auth.includes('membershipIdHint'), 'membershipId must be exposed as a hint');
+  assert(auth.includes('schoolSelectionRequired'), 'unselected multi-membership login cannot fall into a remaining school');
   assert(!/return\s*{[^}]*\bschoolId:/.test(auth), 'verifyToken must not return a bare schoolId');
   assert(/UNTRUSTED HINTS/.test(auth), 'the untrusted nature must be documented at the type site');
   assert(auth.includes('uuidClaim'), 'claims must be shape-validated');
@@ -482,8 +483,8 @@ test('Boundary: no middleware / hostname tenant resolution (Phase 2E)', () => {
   assert(!tenant.includes('x-forwarded-host'), 'no host-based tenant resolution yet');
 });
 
-test('Boundary: no school switching, branding, billing or RLS in this phase', () => {
-  assert(!fs.existsSync(path.join(__dirname, '..', 'src', 'app', 'api', 'auth', 'select-school')), 'no school switcher route');
+test('Boundary: explicit membership-validated school switching exists; unrelated phases remain deferred', () => {
+  assert(fs.existsSync(path.join(__dirname, '..', 'src', 'app', 'api', 'auth', 'select-school', 'route.ts')), 'school switcher route exists');
   assert(!fs.existsSync(path.join(__dirname, '..', 'src', 'app', 'api', 'platform')), 'no platform routes yet');
   assert(!/schoolBranding|school_branding/.test(readFile('src/db/schema.ts')), 'no branding table');
   assert(!/ROW LEVEL SECURITY/i.test(migrationSql), 'no RLS');

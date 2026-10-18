@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
 
@@ -19,9 +19,7 @@ export default function AdminAttendancePage() {
   const [loading, setLoading] = useState(true);
   const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
 
-  useEffect(() => { loadData(); }, [date]);
-
-  async function loadData() {
+  const loadData = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
@@ -33,7 +31,13 @@ export default function AdminAttendancePage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [date]);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadData();
+  }, [loadData]);
 
   const present = records.filter((r) => r.isPresent).length;
   const absent = records.length - present;
