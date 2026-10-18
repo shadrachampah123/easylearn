@@ -144,22 +144,32 @@ const membershipSelection = {
   schoolStatus: schools.status,
 };
 
-function toMembership(row: Record<string, unknown>): SchoolMembership | null {
-  // Defence in depth: a platform role must never be interpreted as a school membership,
-  // even if such a row somehow existed.
+export function toSchoolMembership(row: Record<string, unknown>): SchoolMembership | null {
+  // Defence in depth: a platform role, malformed membership status, or malformed school
+  // lifecycle status must never be interpreted as a valid school membership. In particular,
+  // unknown/missing lifecycle values must not fall back to `active`.
   const role = toSchoolRole(row.role);
-  if (!role || !isUuid(row.schoolId) || !isUuid(row.userId)) return null;
+  const membershipStatus = isMembershipStatus(row.status) ? row.status : null;
+  const schoolStatus = isSchoolLifecycleStatus(row.schoolStatus) ? row.schoolStatus : null;
+  if (
+    !role ||
+    !isUuid(row.membershipId) ||
+    !isUuid(row.schoolId) ||
+    !isUuid(row.userId) ||
+    !membershipStatus ||
+    !schoolStatus
+  ) {
+    return null;
+  }
   return {
-    membershipId: String(row.membershipId),
+    membershipId: row.membershipId,
     schoolId: row.schoolId,
     userId: row.userId,
     role,
-    status: isMembershipStatus(row.status) ? row.status : ACTIVE_MEMBERSHIP_STATUS,
+    status: membershipStatus,
     schoolSlug: typeof row.schoolSlug === "string" ? row.schoolSlug : "",
     schoolName: typeof row.schoolName === "string" ? row.schoolName : "",
-    schoolStatus: isSchoolLifecycleStatus(row.schoolStatus)
-      ? row.schoolStatus
-      : ACTIVE_SCHOOL_LIFECYCLE_STATUS,
+    schoolStatus,
     createdAt: row.createdAt instanceof Date ? row.createdAt : null,
   };
 }
@@ -199,7 +209,7 @@ export async function listSchoolMemberships(
       .orderBy(asc(schoolUsers.createdAt), asc(schoolUsers.id));
 
     return (rows as unknown as Record<string, unknown>[])
-      .map(toMembership)
+      .map(toSchoolMembership)
       .filter((membership): membership is SchoolMembership => membership !== null);
   } catch (error) {
     if (isMissingRelation(error)) {
@@ -227,9 +237,9 @@ export async function listActiveSchoolMemberships(userId: string): Promise<Schoo
  * `options.schoolId` is a NARROWING hint for trusted server-side callers (Phase 2E will
  * pass the host-resolved school). It is matched against rows already fetched for THIS
  * user, so it can never widen the result: an unknown, forged or foreign school id simply
- * yields `null`. Without it, the deterministic first membership is returned — for the
- * current single-school CBISM deployment that is the CBISM membership. It is not a school
- * switcher, and no client input reaches it.
+ * yields `null`. Without it, a membership is returned only when the user has exactly one
+ * active school; a multi-school user must provide an explicit server-validated selection.
+ * It is not a school switcher, and no client input reaches it.
  */
 export async function resolveSchoolMembership(
   userId: string,
@@ -243,7 +253,7 @@ export async function resolveSchoolMembership(
     return memberships.find((membership) => membership.schoolId === options.schoolId) ?? null;
   }
 
-  return memberships[0] ?? null;
+  return memberships.length === 1 ? memberships[0] ?? null : null;
 }
 
 /** Like `resolveSchoolMembership`, but throws `AuthContextError(403)` when there is none. */
@@ -1162,7 +1172,14 @@ export async function addSchoolMembership(params: {
   status?: MembershipStatus;
 }): Promise<{ id: string; role: SchoolRole } | null> {
   const role = toSchoolRole(params.role);
-  if (!role || !isUuid(params.schoolId) || !isUuid(params.userId)) return null;
+  if (
+    !role ||
+    !isUuid(params.schoolId) ||
+    !isUuid(params.userId) ||
+    (params.status !== undefined && !isMembershipStatus(params.status))
+  ) {
+    return null;
+  }
 
   const [row] = await db
     .insert(schoolUsers)
@@ -1170,7 +1187,7 @@ export async function addSchoolMembership(params: {
       schoolId: params.schoolId,
       userId: params.userId,
       role,
-      status: params.status && isMembershipStatus(params.status) ? params.status : ACTIVE_MEMBERSHIP_STATUS,
+      status: params.status ?? ACTIVE_MEMBERSHIP_STATUS,
     })
     .onConflictDoNothing({ target: [schoolUsers.schoolId, schoolUsers.userId] })
     .returning({ id: schoolUsers.id, role: schoolUsers.role });

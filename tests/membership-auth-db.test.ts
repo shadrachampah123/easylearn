@@ -344,6 +344,38 @@ async function main() {
 
     const tenant = await import("@/lib/tenant");
     const auth = await import("@/lib/auth");
+
+    await test("Security: unknown or missing lifecycle and membership statuses fail closed", () => {
+      const validRow = {
+        membershipId: crypto.randomUUID(),
+        schoolId: crypto.randomUUID(),
+        userId: crypto.randomUUID(),
+        role: "teacher",
+        status: "active",
+        schoolSlug: "safe-school",
+        schoolName: "Safe School",
+        schoolStatus: "active",
+        createdAt: null,
+      };
+      assert(tenant.toSchoolMembership(validRow), "valid membership row should parse");
+      assertEq(
+        tenant.toSchoolMembership({ ...validRow, schoolStatus: "mystery" }),
+        null,
+        "unknown school lifecycle status must not become active"
+      );
+      const missingLifecycle = { ...validRow };
+      delete (missingLifecycle as Record<string, unknown>).schoolStatus;
+      assertEq(
+        tenant.toSchoolMembership(missingLifecycle),
+        null,
+        "missing school lifecycle status must be denied"
+      );
+      assertEq(
+        tenant.toSchoolMembership({ ...validRow, status: "mystery" }),
+        null,
+        "unknown membership status must not become active"
+      );
+    });
     const cbismSchoolId = (await one(`SELECT id FROM schools WHERE slug = 'cbism'`)).id;
 
     await test("Resolve: an active user resolves to their own CBISM membership", async () => {
@@ -365,7 +397,12 @@ async function main() {
         parent: "parent",
       };
       for (const [key, role] of Object.entries(expected)) {
-        assertEq(await tenant.getEffectiveSchoolRole(userIds[key]), role, `${key} effective school role`);
+        const options = key === "teacher" ? { schoolId: cbismSchoolId } : undefined;
+        assertEq(
+          await tenant.getEffectiveSchoolRole(userIds[key], options),
+          role,
+          `${key} effective school role`
+        );
       }
     });
 
@@ -457,6 +494,16 @@ async function main() {
 
       const aMemberships = await tenant.listActiveSchoolMemberships(userA);
       assertEq(aMemberships.length, 2, "User A has two memberships");
+      assertEq(
+        await tenant.resolveSchoolMembership(userA),
+        null,
+        "multi-school users must not receive an implicit first-school context"
+      );
+      assertEq(
+        await tenant.getEffectiveSchoolRole(userA),
+        null,
+        "multi-school users must not receive an implicit first-school role"
+      );
       for (const membership of aMemberships) {
         assertEq(membership.userId, userA, "every resolved membership must belong to User A");
       }
