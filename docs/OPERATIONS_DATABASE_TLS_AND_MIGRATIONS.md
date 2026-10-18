@@ -11,6 +11,31 @@
 > migration authorization. Nothing in this repository applies a migration to production on
 > its own.
 
+> ## ⛔ Never run `drizzle-kit push` against a database EasyLearn manages
+>
+> `npx drizzle-kit push` (and `--force`) diffs the live database against
+> `src/db/schema.ts`. **That schema cannot express a composite foreign key**, so push
+> treats the 26 tenant constraints that migration `0018` installs as objects it does not
+> know about and emits `ALTER TABLE … DROP CONSTRAINT` for every one of them. On a
+> disposable copy this was measured:
+>
+> | Object | Before `push --force` | After |
+> |---|---|---|
+> | Composite tenant foreign keys (0018) | 26 | **0** |
+> | `public.easylearn_schema_migrations` | present | **dropped** (`CASCADE`) |
+> | `*_school_id_id_unique` targets (0017) | 24 | **7** |
+>
+> None of that asks for a confirmation token, runs in a transaction, or leaves a record.
+>
+> **The supported way to change the schema is `node run-migration.js`.** It is
+> transactional, checksummed, gated where it needs to be, and it verifies the ledger
+> against the catalog. `node db-schema-sync.js` (also `npm run db:schema-sync`) is the
+> only sanctioned use of `drizzle-kit push`: it runs push **only** on a brand-new, empty
+> database and refuses to touch one that is already in use.
+>
+> If a database was already damaged by an unauthorized schema sync, recover it with
+> §4.1 — do not "fix" it by running push again.
+
 ---
 
 ## 1. Certificate requirements
@@ -135,10 +160,26 @@ The skip is printed prominently and the migration is visibly absent from the led
   2. the read-only preflight in `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` has been
      run against a **restored copy** of the target database and its report has been
      reviewed;
-  3. the table/lock impact has been assessed (the migration takes `ACCESS EXCLUSIVE`
-     locks while validating each constraint);
+  3. the table/lock impact has been assessed (see the lock table below);
   4. a backup and a rollback plan exist.
+* **Lock levels actually taken** (measured on PostgreSQL 16.2 by sampling `pg_locks`
+  during each phase — these are the *real* levels, not an upper bound):
+
+  | Phase | Statement | Lock on the child table | Lock on the parent table | Effect |
+  |---|---|---|---|---|
+  | add | `ADD CONSTRAINT … NOT VALID` | `SHARE ROW EXCLUSIVE` | `SHARE ROW EXCLUSIVE` | blocks concurrent DDL and other `SHARE ROW EXCLUSIVE` work; **reads and writes continue** |
+  | validate | `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` | `ROW SHARE` | blocks DDL; **reads and writes continue** |
+
+  The migration takes **no `ACCESS EXCLUSIVE` lock**: it never rewrites a table, because
+  `NOT VALID` skips the existing-row scan and the scan happens under the weaker
+  `SHARE UPDATE EXCLUSIVE` lock during `VALIDATE CONSTRAINT`. The real cost is therefore
+  **duration, not blocking** — the validation scan reads the child tables, so the time it
+  takes scales with the size of those tables. Measure it on the restored copy (§4.1) and
+  schedule the window accordingly.
 * **After applying:** confirm the ledger row exists and that the constraints are present.
+  The runner does this itself: it prints
+  `✅ Verification - composite tenant foreign keys: 26/26 present, validated and correct`
+  and exits non-zero if the ledger and the catalog disagree.
 
 The 0018 preflight is also available in the disposable test suite
 (`tests/migration-0017-school-id-not-null.test.ts` asserts that the preflight detects
@@ -165,6 +206,48 @@ CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS \
 Without it the baseline is refused. This closes the only route by which the ledger could
 otherwise claim that a gated migration had been applied when it had not.
 
+**A token is necessary but not sufficient.** A baseline that includes
+`0018_composite_school_foreign_keys.sql` is additionally refused unless the database
+**actually has** the 26 composite tenant foreign keys that migration installs, each
+present, validated, and referencing the right parent and columns:
+
+```
+❌ Migration failed: Baseline refused: the prefix includes 0018_composite_school_foreign_keys.sql,
+   but this database does not have the 26 composite tenant foreign keys it installs (0 of 26 are present and correct).
+  - missing constraint announcements_school_class_fk on public.announcements
+  ...
+```
+
+A baseline may record an assertion about migration **history**; it may not certify a schema
+that does not have the objects the migration installs. This is what stops a damaged
+database from being "blessed" back into a state the ledger calls correct.
+
+**Record a prefix that stops before the gated migration** and apply 0018 properly instead:
+
+```bash
+CONFIRM_MIGRATION_BASELINE=I_HAVE_VERIFIED_THESE_MIGRATIONS \
+  node run-migration.js --baseline 0000_wet_legion.sql,…,0017_school_id_not_null.sql
+CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS \
+  node run-migration.js 0018_composite_school_foreign_keys.sql
+```
+
+### 3.3 The runner verifies the ledger against the catalog
+
+On every invocation the runner cross-checks the ledger against PostgreSQL. If the ledger
+records `0018` but the catalog does not have the 26 constraints, the runner **fails
+closed** and names the exact objects:
+
+```
+❌ Migration failed: Migration history records 0018_composite_school_foreign_keys.sql as applied,
+   but the database does not have the 26 composite tenant foreign keys it installs (25 of 26 are present and correct).
+  - missing constraint assignments_school_class_fk on public.assignments
+```
+
+This is what makes a schema-sync bypass **visible**: the ledger can no longer certify a
+database that no longer enforces tenant ownership. The same check runs after applying a
+migration, so a migration that recorded itself without leaving the expected objects
+behind cannot pass silently.
+
 ---
 
 ## 4. Operator runbook
@@ -189,6 +272,63 @@ otherwise claim that a gated migration had been applied when it had not.
 4. If the application fails to connect, read the error: an untrusted CA and a hostname
    mismatch are different messages. Do not "fix" it by weakening `sslmode`.
 
+### 4.1 Recovery after an unauthorized schema sync
+
+If `drizzle-kit push` (or any other tool) has dropped the composite tenant foreign keys,
+the migration ledger and the 0017 `UNIQUE (school_id, id)` targets, the tenant boundary is
+**not enforced** until it is repaired. Treat the database as untrusted for cross-tenant
+writes in the meantime.
+
+**Preferred: restore from backup.** That is the only recovery that restores the exact
+state. Restore, then re-run the read-only checkpoint to confirm, then continue.
+
+**Otherwise, repair in place** — on a restored copy first, never first on production:
+
+```bash
+# 1. Confirm the damage (read-only). Prints what is missing.
+node run-migration.js --repair-tenant-integrity
+
+# 2. Run it for real.
+CONFIRM_REPAIR_TENANT_INTEGRITY=I_HAVE_VERIFIED_THE_DATABASE_NEEDS_REPAIR \
+  node run-migration.js --repair-tenant-integrity
+```
+
+The repair does exactly two things, both of which can only make the database *more*
+truthful:
+
+1. it recreates any missing `UNIQUE (school_id, id)` target using migration 0017's exact
+   idempotent statement (it never touches application rows);
+2. it removes the ledger row for `0018` **only** when the composite constraints are
+   demonstrably absent, so the ledger stops claiming something the database does not have.
+
+It never creates the composite foreign keys — that stays behind the 0018 gate. Finish the
+recovery by re-applying 0018 under its normal confirmation, and then re-run the checkpoint:
+
+```bash
+CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS \
+  node run-migration.js 0018_composite_school_foreign_keys.sql
+```
+
+If the ledger itself was dropped, record the verified prefix **without** 0018 first
+(§3.2) — a baseline that includes 0018 is refused until the constraints are really there.
+
+**Never** respond to a schema gap by running `drizzle-kit push`. It is the thing that
+caused the damage.
+
+### 4.2 Setting up a brand-new database
+
+`npm run db:schema-sync` (i.e. `node db-schema-sync.js`) runs `drizzle-kit push` **only**
+when the target database is empty. On a database that already holds objects, the ledger or
+any tenant constraint, it refuses and points at `node run-migration.js`.
+
+```bash
+# A brand-new, empty database:
+DATABASE_URL="postgres://…" npm run db:schema-sync
+# → runs drizzle-kit push, then tells you to record the history with --baseline
+```
+
+An existing database is migrated with `node run-migration.js` — never with push.
+
 ---
 
 ## 5. How this is verified
@@ -201,3 +341,4 @@ otherwise claim that a gated migration had been applied when it had not.
 | `pg-connection-string` declared and pinned as a direct production dependency | `tests/postgres-tls.test.js` |
 | Migration gate: default run skips, unconfirmed explicit run is refused, confirmed run applies | `tests/migration-0017-school-id-not-null.test.ts` |
 | Runner fail-closed behaviour (no ledger, checksum drift, gaps, missing files, per-file rollback, advisory lock, baseline confirmation) | `tests/migration-0017-school-id-not-null.test.ts`, `tests/tenant-db.test.js` |
+| **Tenant constraint integrity**: the shared inventory matches migrations 0017/0018; `drizzle-kit push --force` is reproduced and then contained; the ledger cannot certify missing/unvalidated/wrongly-shaped constraints; baseline cannot certify an invalid schema; the guarded schema sync refuses a managed database and still works on an empty one; the repair restores the unique targets and recovers the database | `tests/migration-tenant-constraint-integrity.test.ts` |

@@ -61,6 +61,8 @@ jobs:
         run: npm run test:mutation
       - name: PR integration regression suite (PostgreSQL required)
         run: npm run test:integration
+      - name: Tenant constraint integrity / schema-sync bypass regression (PostgreSQL required)
+        run: npm run test:tenant-integrity
       - name: Typecheck
         run: npm run typecheck
       - name: Production build

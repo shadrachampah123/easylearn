@@ -54,6 +54,30 @@ npx drizzle-kit push --force
 
 This creates or synchronizes all existing EasyLearn tables before Next.js is compiled. If the database URL is missing or invalid, the Vercel deployment fails instead of deploying a site with broken authentication.
 
+> **⚠️ This instruction is obsolete and must not be followed.**
+>
+> This repository does **not** contain a `vercel.json`, and it must not gain one that runs
+> `drizzle-kit push` at build time. `drizzle-kit push` diffs the live database against
+> `src/db/schema.ts`, which cannot express a composite foreign key, so on a database that
+> already holds objects it **drops** the 26 tenant foreign keys that migration
+> `0018_composite_school_foreign_keys.sql` installs, drops
+> `public.easylearn_schema_migrations` (`CASCADE`), and drops 17 of the 24
+> `UNIQUE (school_id, id)` targets that migration `0017` creates — with no confirmation
+> token, no transaction and no record. Running it on every Vercel build would silently
+> destroy the tenant boundary of the production database on the next deploy.
+>
+> **Use the migration runner instead.** It is transactional, checksummed, gated where it
+> needs to be, and it verifies the ledger against the catalog:
+>
+> ```bash
+> export DATABASE_URL='PASTE_THE_NEON_CONNECTION_STRING'
+> node run-migration.js
+> ```
+>
+> A Vercel build must not apply schema changes. Apply them deliberately, from an
+> operator's terminal, with a reviewed preflight. See
+> `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md`.
+
 ## Vercel environment variables
 
 Open **Vercel → Project → Settings → Environment Variables**.

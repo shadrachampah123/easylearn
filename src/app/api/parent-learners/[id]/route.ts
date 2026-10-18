@@ -167,7 +167,12 @@ export async function DELETE(
   } catch (error) {
     console.error("Parent link DELETE error:", error);
     if (isMissingRelation(error)) {
-      return errorResponse("The parent_learners table is missing. Run `npx drizzle-kit push`, then retry.", 503);
+      return errorResponse(
+        "The parent_learners table is missing. An administrator must run `node run-migration.js`, " +
+          "then retry. Do not run `drizzle-kit push`: it drops the tenant foreign keys, the " +
+          "migration ledger and the 0017 unique targets on a database that is already in use.",
+        503
+      );
     }
     return errorResponse(clientSafeErrorMessage(error, "The parent link could not be removed. Please retry."), 503);
   }

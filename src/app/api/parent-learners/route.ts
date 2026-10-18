@@ -146,7 +146,11 @@ export async function GET(request: NextRequest) {
           degraded: true,
           warning: {
             area: "parentLearners",
-            message: "Parent-learner links are unavailable because the parent_learners table is missing. Run `npx drizzle-kit push` (or `node run-migration.js`) to create the base tables.",
+            message:
+              "Parent-learner links are unavailable because the parent_learners table is missing. " +
+              "An administrator must run `node run-migration.js` to create the base tables. " +
+              "Do not run `drizzle-kit push`: it drops the tenant foreign keys, the migration " +
+              "ledger and the 0017 unique targets on a database that is already in use.",
           },
         },
       });

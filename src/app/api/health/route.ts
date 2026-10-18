@@ -65,11 +65,15 @@ export async function GET() {
       for (const item of optional) {
         checks.optionalMigrations[item.feature] = item.present;
         if (!item.present) {
+          const remedy = item.autoRepairable
+            ? item.repairEnabled
+              ? "EasyLearn creates it on demand, but run `node run-migration.js` to make it official."
+              : "AUTO_SCHEMA_REPAIR is off, so the related dashboard sections stay disabled."
+            : "EasyLearn never creates this automatically. An administrator must run " +
+              "`node run-migration.js` under the documented preflight, because the tenant " +
+              "boundary must not change without review.";
           checks.migrationWarnings.push(
-            `${item.migration} has not been applied (${item.feature} missing) - ` +
-              (item.repairEnabled
-                ? "EasyLearn creates it on demand, but run `node run-migration.js` to make it official."
-                : "AUTO_SCHEMA_REPAIR is off, so the related dashboard sections stay disabled.")
+            `${item.migration} has not been applied (${item.feature} missing) - ${remedy}`
           );
         }
       }

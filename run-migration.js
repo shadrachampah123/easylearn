@@ -7,6 +7,17 @@ const {
   createPostgresConnectionConfig,
   getDatabaseUrlFromEnvironment,
 } = require("./src/lib/postgres-tls.js");
+const {
+  COMPOSITE_TENANT_FOREIGN_KEYS,
+  COMPOSITE_TENANT_FOREIGN_KEY_COUNT,
+  COMPOSITE_TENANT_MIGRATION,
+  CONSTRAINT_INVENTORY_SQL,
+  UNIQUE_SCHOOL_ID_TARGET_TABLES,
+  UNIQUE_TARGET_INVENTORY_SQL,
+  describeConstraintProblems,
+  summarizeConstraintInventory,
+  uniqueTargetIndexSql,
+} = require("./src/lib/tenant-constraints.js");
 
 const MIGRATIONS = [
   "0000_wet_legion.sql",
@@ -39,6 +50,7 @@ const HISTORY_SQL = `
   )
 `;
 const BASELINE_CONFIRMATION = "I_HAVE_VERIFIED_THESE_MIGRATIONS";
+const REPAIR_CONFIRMATION = "I_HAVE_VERIFIED_THE_DATABASE_NEEDS_REPAIR";
 
 /* ── Gated migrations ──
    Some migrations must never be applied as part of an ordinary "apply everything" run.
@@ -102,7 +114,19 @@ ${Object.entries(GATED_MIGRATIONS)
     ([fileName, gate]) =>
       `  ${fileName}\n    ${gate.env}=${gate.token} node run-migration.js ${fileName}`
   )
-  .join("\n")}`);
+  .join("\n")}
+
+Recovery after an unauthorized schema sync (for example \`drizzle-kit push\`, which drops
+the composite tenant foreign keys, the ledger and some 0017 unique targets):
+  node run-migration.js --repair-tenant-integrity
+    CONFIRM_REPAIR_TENANT_INTEGRITY=${REPAIR_CONFIRMATION} node run-migration.js --repair-tenant-integrity
+  It restores the missing 0017 UNIQUE targets and clears a false ledger claim. It never
+  creates the composite foreign keys: re-apply ${COMPOSITE_TENANT_MIGRATION} under its gate.
+
+Never run \`drizzle-kit push\` against a database this repository manages. It cannot express
+a composite foreign key and therefore drops the ${COMPOSITE_TENANT_FOREIGN_KEY_COUNT} tenant
+constraints that ${COMPOSITE_TENANT_MIGRATION} installs. See
+docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md.`);
 }
 
 function migrationPath(fileName) {
@@ -128,6 +152,10 @@ function loadMigration(fileName) {
 function parseArgs(args) {
   if (args.length === 0) return { mode: "run", files: MIGRATIONS, explicit: false };
   if (args[0] === "--help" || args[0] === "-h") return { mode: "help", files: [], explicit: false };
+  if (args[0] === "--repair-tenant-integrity") {
+    if (args.length !== 1) throw new Error("--repair-tenant-integrity takes no arguments");
+    return { mode: "repair-tenant-integrity", files: [], explicit: false };
+  }
   if (args[0] === "--baseline") {
     if (args.length !== 2 || !args[1]) {
       throw new Error("--baseline requires a comma-separated migration prefix");
@@ -200,6 +228,67 @@ function assertHistoryMatchesFiles(history) {
   }
 }
 
+/* ── Tenant constraint integrity ──
+   The migration ledger records what the runner did. It does not, on its own, prove that
+   the database still has the objects that migration installed.
+
+   That distinction matters here. `drizzle-kit push` diffs the live database against
+   src/db/schema.ts, which cannot express a composite foreign key, so it treats all
+   ${COMPOSITE_TENANT_FOREIGN_KEY_COUNT} constraints of ${COMPOSITE_TENANT_MIGRATION} as
+   unknown objects and drops them — together with the ledger table and 17 of the 24
+   UNIQUE (school_id, id) targets. If the ledger survived that, the database would
+   claim tenant isolation it does not enforce.
+
+   So the runner verifies the ledger against the catalog on every invocation, and the
+   baseline procedure refuses to certify ${COMPOSITE_TENANT_MIGRATION} unless those
+   constraints are verifiably present. */
+
+async function readConstraintInventory(client) {
+  const result = await client.query(CONSTRAINT_INVENTORY_SQL);
+  return summarizeConstraintInventory(result.rows);
+}
+
+async function readUniqueTargetInventory(client) {
+  const result = await client.query(UNIQUE_TARGET_INVENTORY_SQL);
+  return result.rows;
+}
+
+function missingUniqueTargets(rows) {
+  return rows
+    .filter((row) => !row.present || !row.is_unique || !row.is_valid || !row.is_ready)
+    .map((row) => row.table_name);
+}
+
+/**
+ * Fail closed when the ledger says a gated tenant migration ran but the catalog says
+ * otherwise. The message names the exact objects that must be repaired and the exact
+ * recovery command, so the operator never has to guess.
+ */
+function assertTenantConstraintIntegrity(inventory, history) {
+  if (!history.has(COMPOSITE_TENANT_MIGRATION)) return;
+  if (inventory.complete) return;
+
+  const gate = GATED_MIGRATIONS[COMPOSITE_TENANT_MIGRATION];
+  const reapply = gate
+    ? `${gate.env}=${gate.token} node run-migration.js ${COMPOSITE_TENANT_MIGRATION}`
+    : `node run-migration.js ${COMPOSITE_TENANT_MIGRATION}`;
+
+  throw new Error(
+    `Migration history records ${COMPOSITE_TENANT_MIGRATION} as applied, but the database does ` +
+      `not have the ${inventory.expected} composite tenant foreign keys it installs ` +
+      `(${inventory.valid} of ${inventory.expected} are present and correct).\n` +
+      `${describeConstraintProblems(inventory)}\n` +
+      "   The ledger and the catalog disagree, so the tenant boundary is NOT enforced. " +
+      "A schema-sync tool (for example `drizzle-kit push`) causes this, because " +
+      "src/db/schema.ts cannot express a composite foreign key and push therefore drops " +
+      "constraints it does not know about.\n" +
+      "   Do NOT run `drizzle-kit push` against this database. Recover with:\n" +
+      "     node run-migration.js --repair-tenant-integrity   # restore the 0017 UNIQUE targets, clear the false ledger claim\n" +
+      `     ${reapply}\n` +
+      "   See docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md for the full recovery procedure."
+  );
+}
+
 async function baseline(client, files) {
   assertSequentialPrefix(files);
   if (process.env.CONFIRM_MIGRATION_BASELINE !== BASELINE_CONFIRMATION) {
@@ -217,6 +306,30 @@ async function baseline(client, files) {
           `   ${gate.reason}\n` +
           `   Set ${gate.env}=${gate.token} to confirm that the preflight has been reviewed ` +
           "and that the migration really was applied to this database."
+      );
+    }
+  }
+  /* A confirmation token says the operator reviewed the preflight. It must not be usable
+     to certify a schema that does not actually have the migration's constraints: a
+     baseline that claims ${COMPOSITE_TENANT_MIGRATION} is applied while the composite
+     tenant foreign keys are absent is exactly the false state this check exists to
+     prevent. The catalog, not the token, decides. */
+  if (files.includes(COMPOSITE_TENANT_MIGRATION)) {
+    const inventory = await readConstraintInventory(client);
+    if (!inventory.complete) {
+      const gate = GATED_MIGRATIONS[COMPOSITE_TENANT_MIGRATION];
+      const applyCommand = gate
+        ? `${gate.env}=${gate.token} node run-migration.js ${COMPOSITE_TENANT_MIGRATION}`
+        : `node run-migration.js ${COMPOSITE_TENANT_MIGRATION}`;
+      throw new Error(
+        `Baseline refused: the prefix includes ${COMPOSITE_TENANT_MIGRATION}, but this database ` +
+          `does not have the ${inventory.expected} composite tenant foreign keys it installs ` +
+          `(${inventory.valid} of ${inventory.expected} are present and correct).\n` +
+          `${describeConstraintProblems(inventory)}\n` +
+          "   A baseline may record an assertion about migration HISTORY, but it may not " +
+          "certify a schema that does not have the objects the migration installs.\n" +
+          `   Apply ${COMPOSITE_TENANT_MIGRATION} first (${applyCommand}), or baseline a ` +
+          "prefix that stops before it."
       );
     }
   }
@@ -247,8 +360,92 @@ async function baseline(client, files) {
   console.log("   This ledger records the supplied assertion and is not evidence that the database was inspected.");
 }
 
-async function applyMigration(client, fileName) {
-  const { sql, checksum } = loadMigration(fileName);
+/**
+ * Controlled recovery for the damage an unauthorized schema sync causes.
+ *
+ * It can only ever make the database MORE truthful:
+ *   1. it recreates a `UNIQUE (school_id, id)` target that migration 0017 defines and that
+ *      a schema sync dropped, using 0017's exact idempotent statement, and
+ *   2. it removes a ledger row for ${COMPOSITE_TENANT_MIGRATION} when the composite tenant
+ *      foreign keys that migration installs are demonstrably absent, so the ledger stops
+ *      claiming something the database does not have.
+ *
+ * It never creates the composite foreign keys themselves. That stays behind the 0018
+ * gate, so the reviewed preflight is still required.
+ */
+async function repairTenantIntegrity(client) {
+  if (process.env.CONFIRM_REPAIR_TENANT_INTEGRITY !== REPAIR_CONFIRMATION) {
+    throw new Error(
+      `Repair refused: set CONFIRM_REPAIR_TENANT_INTEGRITY=${REPAIR_CONFIRMATION} to confirm ` +
+        "that this database was damaged by an unauthorized schema sync and that the repair " +
+        "should run."
+    );
+  }
+
+  const inventory = await readConstraintInventory(client);
+  const targetRows = await readUniqueTargetInventory(client);
+  const missingTargets = missingUniqueTargets(targetRows);
+
+  console.log("\n🔎 Tenant integrity before repair:");
+  console.log(
+    `   composite tenant foreign keys: ${inventory.valid}/${inventory.expected} present and correct`
+  );
+  console.log(
+    `   UNIQUE (school_id, id) targets: ${UNIQUE_SCHOOL_ID_TARGET_TABLES.length - missingTargets.length}/` +
+      `${UNIQUE_SCHOOL_ID_TARGET_TABLES.length} present`
+  );
+  if (inventory.problems.length > 0) {
+    console.log(describeConstraintProblems(inventory, 10));
+  }
+
+  const history = await historyExists(client) ? await readHistory(client) : new Map();
+  const ledgerClaimsTenantMigration = history.has(COMPOSITE_TENANT_MIGRATION);
+
+  await client.query("BEGIN");
+  try {
+    for (const table of missingTargets) {
+      await client.query(uniqueTargetIndexSql(table));
+      console.log(`   ✅ restored UNIQUE (school_id, id) target on public.${table}`);
+    }
+    if (ledgerClaimsTenantMigration && !inventory.complete) {
+      /* The ledger claims a migration whose constraints are not there. Dropping the row
+         makes the claim true again — 0018 becomes pending and is re-applied under its
+         own gate, with its own preflight. */
+      await client.query(
+        `DELETE FROM public.${HISTORY_TABLE} WHERE filename = $1`,
+        [COMPOSITE_TENANT_MIGRATION]
+      );
+      console.log(
+        `   ✅ removed the false ledger claim for ${COMPOSITE_TENANT_MIGRATION} ` +
+          "(the migration is pending again)"
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  }
+
+  console.log("\n✅ Tenant integrity repair finished.");
+  if (!inventory.complete) {
+    const gate = GATED_MIGRATIONS[COMPOSITE_TENANT_MIGRATION];
+    const reapply = gate
+      ? `${gate.env}=${gate.token} node run-migration.js ${COMPOSITE_TENANT_MIGRATION}`
+      : `node run-migration.js ${COMPOSITE_TENANT_MIGRATION}`;
+    console.log(
+      `   The composite tenant foreign keys are still missing. Re-apply them under the normal gate:\n` +
+        `     ${reapply}`
+    );
+  } else {
+    console.log("   The composite tenant foreign keys are intact; the ledger was left unchanged.");
+  }
+  console.log(
+    "   Re-run the read-only checkpoint in docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md " +
+      "to confirm the repaired state."
+  );
+}
+
+async function applyMigration(client, fileName) {  const { sql, checksum } = loadMigration(fileName);
   const statements = sql
     .split("--> statement-breakpoint")
     .map((statement) => statement.trim())
@@ -382,6 +579,11 @@ async function main() {
       return;
     }
 
+    if (options.mode === "repair-tenant-integrity") {
+      await repairTenantIntegrity(client);
+      return;
+    }
+
     const hadHistory = await historyExists(client);
     if (!hadHistory && await hasPublicApplicationObjects(client)) {
       throw new Error(
@@ -392,6 +594,13 @@ async function main() {
     await ensureHistoryTable(client);
     const history = await readHistory(client);
     assertHistoryMatchesFiles(history);
+
+    /* Fail closed before doing any more work if the ledger already disagrees with the
+       catalog about the tenant constraints. Continuing would apply further migrations on
+       top of a database that no longer enforces tenant ownership. */
+    if (history.has(COMPOSITE_TENANT_MIGRATION)) {
+      assertTenantConstraintIntegrity(await readConstraintInventory(client), history);
+    }
 
     const selected = options.files;
     const pending = selected.filter((fileName) => !history.has(fileName));
@@ -442,6 +651,17 @@ async function main() {
       for (const fileName of toApply) await applyMigration(client, fileName);
     }
 
+    /* Re-verify the ledger against the catalog after applying. A migration that recorded
+       itself but did not leave the expected objects behind must not pass silently. */
+    const finalHistory = await readHistory(client);
+    if (finalHistory.has(COMPOSITE_TENANT_MIGRATION)) {
+      const inventory = await readConstraintInventory(client);
+      assertTenantConstraintIntegrity(inventory, finalHistory);
+      console.log(
+        `\n✅ Verification - composite tenant foreign keys: ${inventory.valid}/${inventory.expected} present, validated and correct.`
+      );
+    }
+
     for (const fileName of skippedGated) {
       const gate = GATED_MIGRATIONS[fileName];
       console.log(`\n⚠️  GATED MIGRATION NOT APPLIED: ${fileName}`);
@@ -475,4 +695,5 @@ module.exports = {
   GATED_MIGRATIONS,
   HISTORY_TABLE,
   MIGRATIONS,
+  REPAIR_CONFIRMATION,
 };

@@ -45,8 +45,17 @@ This is the fastest way to get a permanent PWA link.
 
 After deploying, run this in your terminal:
 ```bash
-DATABASE_URL="your-neon-connection-string" npx drizzle-kit push
+DATABASE_URL="your-neon-connection-string" npm run db:schema-sync
 ```
+
+> **This step is for a brand-new, empty database only.** `db:schema-sync` runs
+> `drizzle-kit push` *only* after checking that the target database is empty; on a
+> database that already holds tables it refuses and points you at the migration runner.
+> Never run `npx drizzle-kit push` yourself against a database EasyLearn manages: the
+> Drizzle schema cannot express a composite foreign key, so push would drop the tenant
+> foreign keys, the migration ledger and the `UNIQUE (school_id, id)` targets, without
+> asking for any confirmation. See
+> `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md`.
 
 Then open your deployed app and go to `/api/seed` (POST request) to create demo data.
 
@@ -79,6 +88,32 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0018_composite_
 CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS \
   DATABASE_URL="your-neon-connection-string" node run-migration.js 0018_composite_school_foreign_keys.sql
 ```
+
+**The runner verifies the ledger against the database.** A ledger that claims
+`0018` is applied while the 26 composite tenant foreign keys are missing, unvalidated or
+wrongly shaped makes the runner **fail closed** and name the exact object, instead of
+reporting success. `--baseline` likewise refuses to record `0018` unless the constraints
+are really there, so a damaged database cannot be blessed back into a state the ledger
+calls correct.
+
+**If a database was damaged by an unauthorized schema sync** (for example
+`npx drizzle-kit push`, which drops the tenant constraints, the ledger and the
+`UNIQUE (school_id, id)` targets), recover it with the procedure in
+`docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md` §4.1:
+
+```bash
+CONFIRM_REPAIR_TENANT_INTEGRITY=I_HAVE_VERIFIED_THE_DATABASE_NEEDS_REPAIR \
+  DATABASE_URL="your-neon-connection-string" node run-migration.js --repair-tenant-integrity
+```
+
+The repair restores the missing unique targets and clears the false ledger claim. It never
+creates the composite foreign keys — re-apply `0018` under its own gate afterwards.
+
+> **Never run `npx drizzle-kit push` against a database EasyLearn manages.** The Drizzle
+> schema cannot express a composite foreign key, so push drops constraints it does not know
+> about — together with the migration ledger and the 0017 unique targets — with no
+> confirmation, no transaction and no record. `npm run db:schema-sync` is the only
+> sanctioned use of push and it runs on a brand-new, empty database only.
 
 **PostgreSQL TLS:** the application pool and the migration runner both require a verified
 TLS connection — a trusted certificate chain **and** a matching hostname. `sslmode=disable`,
