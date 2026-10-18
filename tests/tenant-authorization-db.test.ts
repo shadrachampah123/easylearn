@@ -914,54 +914,46 @@ async function main() {
       assertEq(rows.length, 1, "the file row must still exist");
     });
 
-    await test("Assignments: child submissions and enrollment rows obey their own school_id", async () => {
-      const foreignSubmission = (await one(
-        `INSERT INTO submissions (school_id, assignment_id, learner_id, status, content)
-         VALUES ($1, $2, $3, 'submitted', 'CROSS-SCHOOL-ASSIGNMENT-CHILD-SECRET') RETURNING id`,
-        [schoolB, assignA, ids["learner-b"]]
-      )).id as string;
-      const foreignEnrollment = (await one(
-        `INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id)
-         VALUES ($1, $2, $3, $4) RETURNING id`,
-        [schoolB, ids["learner-b"], classA, yearB]
-      )).id as string;
-      try {
-        const response = await call("assignments/[id]", {
-          token: tokens["teacher-a"], params: { id: assignA },
-        });
-        assertEq(response.status, 200, "legitimate same-school assignment remains readable");
-        assert(response.json.data.submissions.some((row: any) => row.id === subA), "same-school submission remains visible");
-        assert(!bodyText(response).includes(foreignSubmission), "foreign school submission id is not exposed");
-        assert(!bodyText(response).includes("CROSS-SCHOOL-ASSIGNMENT-CHILD-SECRET"), "foreign submission content is not exposed");
-        assert(!bodyText(response).includes(ids["learner-b"]), "foreign learner identity is not exposed");
-        assert(!bodyText(response).includes(foreignEnrollment), "foreign enrollment is not exposed");
-        const list = await call("submissions", {
-          token: tokens["teacher-a"], query: { assignmentId: assignA },
-        });
-        assertEq(list.status, 200, "same-school submission list stays available");
-        assert(!bodyText(list).includes(foreignSubmission), "submission list excludes foreign child rows");
-        const single = await call("submissions/[id]", {
-          token: tokens["teacher-a"], params: { id: foreignSubmission },
-        });
-        assertEq(single.status, 404, "foreign child submission is not readable by the assignment's school");
-        const grade = await call("submissions/[id]/grade", {
-          token: tokens["teacher-a"], method: "POST", params: { id: foreignSubmission },
-          body: { score: 10, maxScore: 100 },
-        });
-        assertEq(grade.status, 404, "foreign child submission cannot be graded through the assignment");
-        const results = await call("assignments/[id]/results", {
-          token: tokens["teacher-a"], params: { id: assignA },
-        });
-        assertEq(results.status, 200, "same-school results remain accessible");
-        assert(!bodyText(results).includes(foreignSubmission), "results summary excludes foreign child rows");
-        const parentAttempt = await call("assignments/[id]/results", {
-          token: tokens["parent-a"], params: { id: assignA }, query: { learnerId: ids["learner-b"] },
-        });
-        assertEq(parentAttempt.status, 403, "parent cannot use a foreign learner id for results");
-      } finally {
-        await q(`DELETE FROM learner_classes WHERE id = $1`, [foreignEnrollment]);
-        await q(`DELETE FROM submissions WHERE id = $1`, [foreignSubmission]);
-      }
+    await test("Assignments: composite tenant FKs reject cross-school child rows", async () => {
+      await assert.rejects(
+        () => db.query(
+          `INSERT INTO submissions (school_id, assignment_id, learner_id, status, content)
+           VALUES ($1, $2, $3, 'submitted', 'CROSS-SCHOOL-ASSIGNMENT-CHILD-SECRET')`,
+          [schoolB, assignA, ids["learner-b"]]
+        ),
+        (error: any) => error.code === "23503",
+        "a submission cannot point to another school's assignment"
+      );
+      await assert.rejects(
+        () => db.query(
+          `INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id)
+           VALUES ($1, $2, $3, $4)`,
+          [schoolB, ids["learner-b"], classA, yearB]
+        ),
+        (error: any) => error.code === "23503",
+        "an enrollment cannot point to another school's class"
+      );
+
+      const response = await call("assignments/[id]", {
+        token: tokens["teacher-a"], params: { id: assignA },
+      });
+      assertEq(response.status, 200, "legitimate same-school assignment remains readable");
+      assert(response.json.data.submissions.some((row: any) => row.id === subA), "same-school submission remains visible");
+      assert(!bodyText(response).includes(ids["learner-b"]), "foreign learner identity is not exposed");
+      const list = await call("submissions", {
+        token: tokens["teacher-a"], query: { assignmentId: assignA },
+      });
+      assertEq(list.status, 200, "same-school submission list stays available");
+      assert(!bodyText(list).includes(subB), "School A's submission list excludes School B's existing submission");
+      const results = await call("assignments/[id]/results", {
+        token: tokens["teacher-a"], params: { id: assignA },
+      });
+      assertEq(results.status, 200, "same-school results remain accessible");
+      assert(!bodyText(results).includes(subB), "results summary excludes School B's submission");
+      const parentAttempt = await call("assignments/[id]/results", {
+        token: tokens["parent-a"], params: { id: assignA }, query: { learnerId: ids["learner-b"] },
+      });
+      assertEq(parentAttempt.status, 403, "parent cannot use a foreign learner id for results");
     });
 
     await test("Corrections: assignment and question joins stay within the selected school", async () => {

@@ -107,15 +107,15 @@ async function main() {
     await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`);
     await admin.query(`CREATE DATABASE "${DB_NAME}"`);
 
-    const runMigrations = () =>
-      spawnSync(process.execPath, ["run-migration.js"], {
+    const runMigrations = (fileName) =>
+      spawnSync(process.execPath, fileName ? ["run-migration.js", fileName] : ["run-migration.js"], {
         cwd: REPO_ROOT,
         env: { ...process.env, DATABASE_URL: scratchUrl },
         encoding: "utf8",
       });
 
     let result = runMigrations();
-    await test("Migration runner applies 0000…0013 successfully", () => {
+    await test("Migration runner applies 0000…0018 successfully", () => {
       assertEq(result.status, 0, `run-migration.js exited ${result.status}:\n${(result.stdout || "") + (result.stderr || "")}`.slice(0, 8000));
       if (!String(result.stdout).includes("🎉 Migration complete")) {
         throw new Error("runner did not report completion");
@@ -140,6 +140,7 @@ async function main() {
       }
       throw new Error(`${label} — expected error ${code} but the statement succeeded`);
     };
+    const one = async (sql, values = []) => (await db.query(sql, values)).rows[0];
 
     /* ── 1. Schools can be represented correctly ── */
 
@@ -212,6 +213,80 @@ async function main() {
       );
       user2 = rows2[0];
       assert(/^[0-9a-f-]{36}$/i.test(user1.id) && /^[0-9a-f-]{36}$/i.test(user2.id), "user uuids");
+    });
+
+    await test("Composite tenant FKs reject cross-school references", async () => {
+      const deptA = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Tenant FK Dept A') RETURNING id`,
+        [schoolA.id]
+      );
+      const deptB = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Tenant FK Dept B') RETURNING id`,
+        [schoolB.id]
+      );
+      const subjectA = await one(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Tenant FK Subject A', $2) RETURNING id`,
+        [schoolA.id, deptA.id]
+      );
+      await expectError(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Cross-school Subject', $2)`,
+        [schoolA.id, deptB.id],
+        "23503",
+        "subject cannot reference another school's department"
+      );
+
+      const yearA = await one(
+        `INSERT INTO academic_years (school_id, name, start_date, end_date) VALUES ($1, 'Tenant FK Year A', '2026-01-01', '2026-12-31') RETURNING id`,
+        [schoolA.id]
+      );
+      await expectError(
+        `INSERT INTO classes (school_id, name, level, academic_year_id) VALUES ($1, 'Cross-school Class', 'primary', $2)`,
+        [schoolB.id, yearA.id],
+        "23503",
+        "class cannot reference another school's academic year"
+      );
+
+      const classB = await one(
+        `INSERT INTO classes (school_id, name, level) VALUES ($1, 'Tenant FK Class B', 'primary') RETURNING id`,
+        [schoolB.id]
+      );
+
+      // Simulate pre-existing inconsistent data on this disposable DB. The migration runner
+      // must report it, roll back the entire migration file, and leave the row untouched.
+      await db.query(`ALTER TABLE assignments DROP CONSTRAINT assignments_school_class_fk`);
+      const inconsistent = await one(
+        `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id) VALUES ($1, 'Legacy Cross-school Row', $2, $3, $4) RETURNING id`,
+        [schoolA.id, classB.id, subjectA.id, user1.id]
+      );
+      await db.query(`DELETE FROM easylearn_schema_migrations WHERE filename = $1`, ["0018_composite_school_foreign_keys.sql"]);
+      const rejectedMigration = runMigrations("0018_composite_school_foreign_keys.sql");
+      const rejectionOutput = `${rejectedMigration.stdout || ""}${rejectedMigration.stderr || ""}`;
+      assert(rejectedMigration.status !== 0, "0018 must fail on an existing cross-school reference");
+      assert(rejectionOutput.includes("assignments.class_id"), "failure must identify the offending relationship");
+      const preserved = await one(`SELECT id FROM assignments WHERE id = $1`, [inconsistent.id]);
+      assertEq(preserved.id, inconsistent.id, "failed migration must not modify or delete the legacy row");
+      const absentHistory = await one(
+        `SELECT count(*)::int AS count FROM easylearn_schema_migrations WHERE filename = $1`,
+        ["0018_composite_school_foreign_keys.sql"]
+      );
+      assertEq(absentHistory.count, 0, "failed migration must not create a history entry");
+
+      await db.query(`DELETE FROM assignments WHERE id = $1`, [inconsistent.id]);
+      const recoveredMigration = runMigrations("0018_composite_school_foreign_keys.sql");
+      assertEq(recoveredMigration.status, 0, `0018 should succeed after the test-only anomaly is removed: ${recoveredMigration.stderr || ""}`);
+
+      await expectError(
+        `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id) VALUES ($1, 'Cross-school Assignment', $2, $3, $4)`,
+        [schoolA.id, classB.id, subjectA.id, user1.id],
+        "23503",
+        "assignment cannot reference another school's class"
+      );
+
+      // Keep this regression fixture isolated from later cascade/membership tests.
+      await db.query(`DELETE FROM subjects WHERE id = $1`, [subjectA.id]);
+      await db.query(`DELETE FROM classes WHERE id = $1`, [classB.id]);
+      await db.query(`DELETE FROM academic_years WHERE id = $1`, [yearA.id]);
+      await db.query(`DELETE FROM departments WHERE id IN ($1, $2)`, [deptA.id, deptB.id]);
     });
 
     /* ── 3./4. Membership: valid, duplicate, and FK behavior ── */
@@ -364,11 +439,10 @@ async function main() {
       assertEq(second.status, 0, `second run exited ${second.status}:\n${(second.stdout || "") + (second.stderr || "")}`.slice(0, 8000));
     });
 
-    await test("Multi-school still works after the second full migration run", async () => {
-      // A naive follow-up fix would let 0013's CREATE UNIQUE INDEX IF NOT EXISTS
-      // resurrect the single-school guard on every re-run (failing once multi-school
-      // data exists). Prove the end state survives: insert a fresh user into BOTH
-      // schools and confirm the existing two-school membership is intact.
+    await test("Multi-school still works after the runner's second invocation", async () => {
+      // The history ledger must skip previously-applied migrations rather than replaying
+      // potentially data-changing SQL. Prove the multi-school state remains usable after
+      // that second invocation by inserting a user into BOTH schools.
       await db.query(
         `INSERT INTO "school_users" ("school_id", "user_id", "role") VALUES ($1, $2, 'learner')`,
         [schoolA.id, user2.id]
@@ -378,11 +452,10 @@ async function main() {
         [schoolB.id, user2.id]
       );
       assert(/^[0-9a-f-]{36}$/i.test(rows[0].id), "user2 joined both schools after the re-run");
-      // Phase 2B update: migration 0015 backfills a CBISM membership for every
-      // non-super_admin user on each full-chain re-run, so user1 now legitimately holds
-      // THREE memberships (School A + School B + CBISM). The property this test guards is
-      // that multi-school membership survives a full re-run — assert it by school, not by
-      // a bare count, so the CBISM backfill is visible rather than silently absorbed.
+      // Migration 0015 is recorded once by the history ledger. A second runner invocation
+      // must not replay that data migration for users created afterward; it only verifies
+      // recorded checksums and skips applied files. The two explicitly-created memberships
+      // must remain intact.
       const { rows: user1Memberships } = await db.query(
         `SELECT s."slug", su."school_id" FROM "school_users" su
            JOIN "schools" s ON s."id" = su."school_id"
@@ -391,8 +464,8 @@ async function main() {
       );
       assertEq(
         user1Memberships.map((r) => r.slug).join(","),
-        "cbism,test-school-a,test-school-b",
-        "user1's memberships after the re-run (two pre-existing + the 0015 CBISM backfill)"
+        "test-school-a,test-school-b",
+        "user1's memberships after the re-run (0015 is not replayed for post-migration users)"
       );
       assertEq(
         user1Memberships.filter((r) => r.school_id === schoolA.id).length,
@@ -506,7 +579,7 @@ async function main() {
 
     await test("Boundary: exactly the 35 legacy tables + 2 new tables exist", async () => {
       const { rows } = await db.query(
-        `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
+        `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> 'easylearn_schema_migrations'`
       );
       const tables = new Set(rows.map((r) => r.table_name));
       const expected = [

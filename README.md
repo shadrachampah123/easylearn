@@ -50,18 +50,29 @@ DATABASE_URL="your-neon-connection-string" npx drizzle-kit push
 
 Then open your deployed app and go to `/api/seed` (POST request) to create demo data.
 
-#### Step 4b: Keep migrations up to date
+#### Step 4b: Apply reviewed migrations safely
 
-`drizzle-kit push` creates the base schema, but every feature since then ships a numbered SQL
-file in `drizzle/`. Apply them after deploys:
+Numbered SQL files in the repository are applied in order by `run-migration.js`. Each file runs
+in its own transaction; the runner serializes concurrent invocations with a PostgreSQL advisory
+lock and records the file name plus SHA-256 checksum in `public.easylearn_schema_migrations`.
+Already-recorded files are skipped, changed checksums and missing files fail closed, and the
+runner never treats broad “already exists”/“duplicate” messages as success.
 
 ```bash
-# all pending migrations (idempotent - safe to re-run)
+# Apply the next pending migration(s) after reviewing the target and backup/rollback plan.
 DATABASE_URL="your-neon-connection-string" node run-migration.js
 
-# a single file
+# Apply one registered file only after all earlier migrations are recorded.
 DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_identity_columns.sql
 ```
+
+**Existing databases:** if public tables exist without the new history ledger, the normal runner
+refuses to replay them. First establish the applied migration prefix from independently verified
+catalog/data evidence. Only then may an authorized operator use `--baseline` to record that
+asserted prefix; the command does not inspect or prove the database state, and the confirmation
+environment variable is an acknowledgment, not validation. See
+`docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md`; that procedure is read-only and not a migration
+authorization. Do not run either command against production without separate approval.
 
 | File | What it adds |
 | --- | --- |
@@ -77,7 +88,8 @@ DATABASE_URL="your-neon-connection-string" node run-migration.js 0006_user_ident
 | `0010_object_storage.sql` | Cloud object storage: `uploaded_files.storage_backend` (`local` \| `object`) so file bytes can live in S3 / Cloudflare R2 / MinIO |
 | `0013_multi_school_foundation.sql` | Phase 2A multi-school foundation: `schools` (tenant root) + `school_users` (membership). Purely additive — no existing table or data is touched (see `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`) |
 | `0014_drop_single_school_guard.sql` | Phase 2A follow-up: replaces the single-school partial unique index with a non-unique placeholder of the same name, so a user can belong to several schools and a full re-run can never resurrect the restriction |
-| `0015_cbism_school_and_membership_backfill.sql` | Phase 2B membership backfill: creates the canonical CBISM `schools` row (`slug = 'cbism'`) if missing and gives every existing non-`super_admin` user a `school_users` membership for it (role preserved, `status` mirrors `users.is_active`). Additive + idempotent — nothing is updated, deleted or re-hashed. The runner prints the affected counts. See `docs/PHASE2B_MEMBERSHIP_AUTH.md` |
+| `0015_cbism_school_and_membership_backfill.sql` | Phase 2B one-time membership backfill: creates the canonical CBISM `schools` row (`slug = 'cbism'`) if missing and gives each existing non-`super_admin` user a `school_users` membership (role preserved, `status` mirrors `users.is_active`). The hardened runner records it once; newly created users receive membership through the users API. See `docs/PHASE2B_MEMBERSHIP_AUTH.md` |
+| `0018_composite_school_foreign_keys.sql` | Adds 26 validated composite foreign keys between school-owned records so parent/child references must share a `school_id`. It reports cross-school/orphan data and rolls back without rewriting rows. Pending review and not production-applied; root and `drizzle/` copies must match. |
 
 Notes:
 
@@ -102,26 +114,29 @@ Notes:
 
 #### School membership & authentication context (Phase 2B)
 
-CBISM is now a real tenant: `schools` holds one canonical row (`slug = 'cbism'`) and every
-application user has a `school_users` membership for it. Details, the audited auth flow and
+CBISM is now a real tenant: `schools` holds one canonical row (`slug = 'cbism'`) and each
+backfilled non-platform application user has a `school_users` membership for it. Platform
+`super_admin` accounts remain outside school memberships. Details, the audited auth flow and
 every decision are in **`docs/PHASE2B_MEMBERSHIP_AUTH.md`**; the multi-school architecture is
 in `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`.
 
-- **`src/lib/tenant.ts` is the only place that resolves school context.** It exposes
-  `resolveAuthContext` / `requireSchoolContext` / `resolveSchoolMembership` /
-  `requireActiveSchoolMembership` / `getEffectiveSchoolRole` and reads membership exclusively
-  from `school_users` — a client can never pick a school (no body, query or header is read),
-  and an arbitrary `school_id` resolves to nothing rather than to somebody else's membership.
+- **`src/lib/tenant.ts` is the central school-context resolver.** It loads the caller's active
+  `school_users` rows from the database on every request. A submitted school ID is only a
+  selection request to `/api/auth/select-school`; it is accepted only if that fresh membership
+  list contains the school. Arbitrary body, query, or header values never grant a tenant.
 - **`super_admin` stays a platform role.** It is excluded from the backfill, `toSchoolRole()`
-  rejects it, and it never grants school-wide access through the tenant module.
-- **Login and `/api/auth/me` now return `school` / `schools`** (server-derived, additive).
-  Sessions carry `ver: 2` plus `schoolId` / `membershipId`, surfaced by `verifyToken()` as
-  `schoolIdHint` / `membershipIdHint` — hints only. Authorization still re-reads the database,
-  so a stale or forged claim cannot widen access, and tokens issued before Phase 2B keep
-  working until they expire (no forced re-login).
-- **Nothing else changed yet**: no tenant filtering, no `school_id` columns, no middleware.
-  Users without a membership still log in (`school: null`), so the backfill cannot lock
-  anybody out. Wiring the central gate into the API routes is Phase 2C.
+  rejects it, and it receives no school context or school-wide access through the tenant module.
+- **Login and `/api/auth/me` return server-derived `school` / `schools`.** Current sessions use
+  token schema v3 with signed school/membership hints plus a `schoolSelectionRequired` guard;
+  hints are revalidated and never authorize by themselves. Multi-school users must select a
+  school on login and can explicitly switch in the dashboard. Legacy pre-Phase-2B tokens remain
+  compatible only when current membership resolution is unambiguous; a selected school is never
+  silently replaced by a different school after revocation.
+- School-owned tables have direct `school_id` columns and tenant-scoped API predicates from
+  Phase 2C–2E. Hostname/custom-domain tenant resolution, cookie-only sessions, CSRF hardening,
+  and RLS remain deferred. Production deployment, migration state, and behavior are not inferred
+  from repository code; see the roadmap and read-only checkpoint. The current branch's school
+  picker and switching code is still unmerged and not production-verified.
 
 #### Quizzes and grading
 

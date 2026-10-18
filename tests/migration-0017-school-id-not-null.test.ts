@@ -130,12 +130,21 @@ async function main() {
       encoding: "utf8",
     });
 
-  const run0017Only = () =>
-    spawnSync(process.execPath, ["run-migration.js", "0017_school_id_not_null.sql"], {
-      cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: scratchUrl },
-      encoding: "utf8",
-    });
+  // Re-execute 0017's SQL directly only inside this disposable test database. The migration
+  // runner now consults its history ledger and correctly skips already-recorded migrations.
+  const run0017Only = async () => {
+    try {
+      await db.query("BEGIN");
+      const source = fs.readFileSync(path.join(REPO_ROOT, "0017_school_id_not_null.sql"), "utf8");
+      const statements = source.split("--> statement-breakpoint").map((part) => part.trim()).filter(Boolean);
+      for (const statement of statements) await db.query(statement);
+      await db.query("COMMIT");
+      return { status: 0, stdout: "0017 SQL re-executed in disposable test transaction", stderr: "" };
+    } catch (error: any) {
+      await db.query("ROLLBACK").catch(() => {});
+      return { status: 1, stdout: "", stderr: error.message };
+    }
+  };
 
   try {
     console.log("\n🎯 Migration 0017 — school_id NOT NULL validation\n");
@@ -152,12 +161,16 @@ async function main() {
         "utf8"
       );
       assertEq(root, drizzle, "root and drizzle copies must be identical");
+      const compositeRoot = fs.readFileSync(path.join(REPO_ROOT, "0018_composite_school_foreign_keys.sql"), "utf8");
+      const compositeDrizzle = fs.readFileSync(path.join(REPO_ROOT, "drizzle", "0018_composite_school_foreign_keys.sql"), "utf8");
+      assertEq(compositeRoot, compositeDrizzle, "0018 root and drizzle copies must be identical");
       const runner = fs.readFileSync(path.join(REPO_ROOT, "run-migration.js"), "utf8");
       assert(runner.includes('"0017_school_id_not_null.sql"'), "run-migration.js must list 0017");
+      assert(runner.includes('"0018_composite_school_foreign_keys.sql"'), "run-migration.js must list 0018");
     });
 
     let result = runMigrations();
-    await test("Full chain 0000…0017 applies successfully", () => {
+    await test("Full chain 0000…0018 applies successfully", () => {
       assertEq(
         result.status,
         0,
@@ -177,10 +190,20 @@ async function main() {
         0,
         `second run exited ${second.status}:\n${((second.stdout || "") + (second.stderr || "")).slice(-4000)}`
       );
+      assert(String(second.stdout).includes("already recorded with matching checksums"), "second run must skip from ledger");
     });
 
     const q = async (sql: string, values: unknown[] = []) => (await db.query(sql, values)).rows;
     const one = async (sql: string, values: unknown[] = []) => (await q(sql, values))[0];
+
+    await test("Runner records ordered checksummed migration history", async () => {
+      const rows = await q(`SELECT filename, checksum FROM easylearn_schema_migrations ORDER BY filename`);
+      assertEq(rows.length, 19, "all migrations 0000 through 0018 recorded");
+      for (const row of rows) {
+        assert(/^[0-9a-f]{64}$/.test(row.checksum), `${row.filename} has a SHA-256 checksum`);
+      }
+      assertEq(rows[18].filename, "0018_composite_school_foreign_keys.sql", "0018 is the final applied migration");
+    });
 
     await test("NOT NULL on required A-tables; activity_logs stays nullable", async () => {
       const rows = await q(
@@ -258,7 +281,7 @@ async function main() {
       assertEq(term.school_id, null, "fixture term starts NULL");
 
       // A second year with a DIFFERENT school would be multi-school; keep single school.
-      const rerun = run0017Only();
+      const rerun = await run0017Only();
       assertEq(
         rerun.status,
         0,
@@ -303,7 +326,7 @@ async function main() {
         `INSERT INTO gallery_items (title, image_url) VALUES ('orphan-gallery', 'https://example.test/x.jpg')`
       );
 
-      const aborted = run0017Only();
+      const aborted = await run0017Only();
       assert(
         aborted.status !== 0,
         "0017 must fail when multi-school + unresolved NULL remain"
@@ -325,7 +348,7 @@ async function main() {
         `UPDATE gallery_items SET school_id = $1 WHERE school_id IS NULL`,
         [schoolB.id]
       );
-      const fixed = run0017Only();
+      const fixed = await run0017Only();
       assertEq(
         fixed.status,
         0,
@@ -351,7 +374,7 @@ async function main() {
       assertEq(deptA.school_id, a);
       assertEq(deptB.school_id, b);
 
-      const rerun = run0017Only();
+      const rerun = await run0017Only();
       assertEq(rerun.status, 0, "re-run must succeed with fully attributed data");
 
       const againA = await one(`SELECT school_id FROM departments WHERE id = $1`, [deptA.id]);
@@ -360,7 +383,24 @@ async function main() {
       assertEq(againB.school_id, b, "school B attribution preserved");
     });
 
-    console.log(`\n📊 Migration 0017 results: ${passed} passed, ${failed} failed\n`);
+    await test("Production read-only checkpoint SQL runs only against disposable PostgreSQL here", async () => {
+      const checkpoint = fs.readFileSync(path.join(REPO_ROOT, "docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md"), "utf8");
+      const sqlBlock = checkpoint.match(/```sql\n([\s\S]*?)\n```/);
+      assert(sqlBlock, "read-only checkpoint SQL block must exist");
+      await db.query(sqlBlock[1]);
+    });
+
+    await test("Runner fails closed on an existing schema without migration history", async () => {
+      await db.query(`DROP TABLE easylearn_schema_migrations`);
+      const untracked = runMigrations();
+      const output = `${untracked.stdout || ""}${untracked.stderr || ""}`;
+      assert(untracked.status !== 0, "untracked existing database must not replay the migration chain");
+      assert(output.includes("Existing public tables were found"), "runner should explain the baseline requirement");
+      const ledger = await one(`SELECT to_regclass('public.easylearn_schema_migrations') AS relation`);
+      assertEq(ledger.relation, null, "refusal must not create or modify the missing ledger");
+    });
+
+    console.log(`\n📊 Migration 0017/0018 results: ${passed} passed, ${failed} failed\n`);
   } finally {
     await db.end().catch(() => {});
     try {

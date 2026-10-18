@@ -1,7 +1,7 @@
 /**
  * Phase 2B — User membership + authentication context: LIVE DATABASE tests.
  *
- * Applies the project's real migration chain (0000…0017) to a throwaway PostgreSQL
+ * Applies the project's real migration chain (0000…0018) to a throwaway PostgreSQL
  * database and then exercises the real application modules against it:
  *
  *   MEMBERSHIP
@@ -33,6 +33,7 @@
  */
 
 import assert from "assert";
+import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
@@ -138,13 +139,29 @@ async function main() {
         encoding: "utf8",
       });
 
+    // Migration SQL is replayed directly only in this disposable DB to test its idempotent
+    // data-backfill behavior. The production runner itself must skip files recorded in its ledger.
+    const executeMigrationSqlForTest = async (fileName: string) => {
+      try {
+        await db.query("BEGIN");
+        const source = fs.readFileSync(path.join(REPO_ROOT, fileName), "utf8");
+        const statements = source.split("--> statement-breakpoint").map((part) => part.trim()).filter(Boolean);
+        for (const statement of statements) await db.query(statement);
+        await db.query("COMMIT");
+        return { status: 0, stderr: "" };
+      } catch (error) {
+        await db.query("ROLLBACK").catch(() => {});
+        return { status: 1, stderr: (error as Error).message };
+      }
+    };
+
     const q = async (sql: string, values: unknown[] = []): Promise<any[]> =>
       (await db.query(sql, values)).rows;
     const one = async (sql: string, values: unknown[] = []) => (await q(sql, values))[0];
 
     /* ── 1. Fresh migration chain ── */
 
-    await test("Migration: fresh chain (0000…0015) applies cleanly", () => {
+    await test("Migration: fresh chain (0000…0018) applies cleanly", () => {
       const result = runMigrations();
       assertEq(
         result.status,
@@ -201,17 +218,18 @@ async function main() {
       userIds[fixture.key] = row.id;
     }
 
-    /* ── 2./3. Backfill on the next deploy (run-migration.js replays the whole chain) ── */
+    /* ── 2./3. Backfill SQL behavior on a disposable database ── */
 
-    await test("Migration: re-running the chain backfills CBISM memberships for existing users", () => {
-      const result = runMigrations();
-      assertEq(
-        result.status,
-        0,
-        `second run exited ${result.status}:\n${((result.stdout || "") + (result.stderr || "")).slice(-6000)}`
+    await test("Migration 0015 backfills existing users when its SQL is applied", async () => {
+      const result = await executeMigrationSqlForTest("0015_cbism_school_and_membership_backfill.sql");
+      assertEq(result.status, 0, `0015 SQL failed: ${result.stderr}`);
+      const counts = await one(
+        `SELECT
+           (SELECT count(*)::int FROM users WHERE role <> 'super_admin') AS eligible,
+           (SELECT count(*)::int FROM school_users su JOIN schools s ON s.id = su.school_id WHERE s.slug = 'cbism') AS memberships`
       );
-      assert(/0015: cbism school .+ - 7 eligible users, 7 memberships/.test(String(result.stdout)),
-        "0015 must report 7 eligible users / 7 memberships");
+      assertEq(counts.eligible, 7, "eligible users");
+      assertEq(counts.memberships, 7, "0015 backfills 7 CBISM memberships");
     });
 
     await test("Membership: every non-super_admin user received a membership", async () => {
@@ -270,13 +288,14 @@ async function main() {
 
     const membershipIdsBefore = await q(`SELECT id FROM school_users ORDER BY id`);
 
-    await test("Migration: a third full run exits 0 and creates nothing new", async () => {
+    await test("Migration runner skips the recorded chain without replaying data migrations", async () => {
       const result = runMigrations();
       assertEq(
         result.status,
         0,
-        `third run exited ${result.status}:\n${((result.stdout || "") + (result.stderr || "")).slice(-6000)}`
+        `runner re-run exited ${result.status}:\n${((result.stdout || "") + (result.stderr || "")).slice(-6000)}`
       );
+      assert(String(result.stdout).includes("already recorded with matching checksums"), "runner must use migration history");
       const after = await q(`SELECT id FROM school_users ORDER BY id`);
       assertEq(after.length, membershipIdsBefore.length, "membership count must not grow");
       assertEq(
@@ -291,10 +310,10 @@ async function main() {
       // Backfill is a backfill, not a synchroniser: ON CONFLICT DO NOTHING must not
       // overwrite a role that was changed after the first run.
       await q(`UPDATE school_users SET role = 'head_teacher' WHERE user_id = $1`, [userIds["teacher"]]);
-      const result = runMigrations();
-      assertEq(result.status, 0, `run exited ${result.status}`);
+      const result = await executeMigrationSqlForTest("0015_cbism_school_and_membership_backfill.sql");
+      assertEq(result.status, 0, `0015 SQL replay failed: ${result.stderr}`);
       const row = await one(`SELECT role FROM school_users WHERE user_id = $1`, [userIds["teacher"]]);
-      assertEq(row.role, "head_teacher", "existing membership must not be overwritten by a re-run");
+      assertEq(row.role, "head_teacher", "existing membership must not be overwritten by a replay of the backfill SQL");
       await q(`UPDATE school_users SET role = 'teacher' WHERE user_id = $1`, [userIds["teacher"]]);
     });
 
@@ -931,10 +950,11 @@ async function main() {
       );
       assertEq(counts.cbism, 1, "still exactly one CBISM school");
       assertEq(counts.schools, 2, "both fixture schools present");
-      // Every eligible user (created before OR after the first backfill) plus the one
-      // hand-made School B membership.
-      const eligible = (await one(`SELECT count(*)::int AS n FROM users WHERE role <> 'super_admin'`)).n;
-      assertEq(counts.memberships, eligible + 1, "one membership per eligible user, plus School B");
+      // The migration fixtures have seven eligible users and the teacher has one additional
+      // School B membership. The rate-limit test later creates a standalone identity directly;
+      // unlike the users API, direct SQL does not create a school membership.
+      const fixtureEligible = fixtureUsers.filter((fixture) => fixture.role !== "super_admin").length;
+      assertEq(counts.memberships, fixtureEligible + 1, "one CBISM membership per fixture user, plus School B");
       assertEq(
         (await one(`SELECT count(*)::int AS n FROM school_users WHERE role = 'super_admin'`)).n,
         0,

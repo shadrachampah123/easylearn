@@ -2,7 +2,7 @@
 
 **Purpose:** establish the actual production application/build and PostgreSQL tenancy state before any further Phase 2 schema work. This is an inspection plan only; it does not authorize a migration, data repair, deployment, or production write.
 
-**Status (2026-10-18):** Not executed in production. SQL syntax was exercised against a migrated disposable PostgreSQL 18 database; no production database connection or credentials were used. The successful GitHub Production deployment record is not evidence that migrations 0013–0017 ran or that a custom-domain alias serves that build.
+**Status (2026-10-18):** Not executed in production. SQL syntax was exercised against a migrated disposable PostgreSQL 18 database; no production database connection or credentials were used. Migration 0018 and migration-runner/history hardening are repository-only changes on an unmerged PR branch; they have not been deployed or run against production. The successful GitHub Production deployment record is not evidence that migrations 0013–0017 ran or that a custom-domain alias serves that build.
 
 ## Safety and evidence rules
 
@@ -95,6 +95,43 @@ WHERE n.nspname = 'public'
   AND c.confrelid = 'public.schools'::regclass
 ORDER BY c.conrelid::regclass::text, c.conname;
 
+-- The hardened runner's ledger is only a recorded migration history, not proof of live
+-- schema/data state. It may be absent on an existing database and must not be created or
+-- baselined during this read-only checkpoint.
+SELECT to_regclass('public.easylearn_schema_migrations') IS NOT NULL AS migration_history_table_present;
+
+-- If the ledger is present, inspect its content in a separate read-only statement after
+-- confirming the relation exists; compare names/checksums with the reviewed migration files.
+-- Do not infer a production baseline from an absent ledger or populate it from this session.
+
+-- 0018 expected validated composite foreign keys (26). This remains pending until reviewed,
+-- deployed, and independently confirmed in production.
+WITH expected(table_name, constraint_name) AS (
+  VALUES
+    ('terms','terms_school_academic_year_fk'), ('classes','classes_school_academic_year_fk'),
+    ('subjects','subjects_school_department_fk'), ('teacher_classes','teacher_classes_school_class_fk'),
+    ('teacher_classes','teacher_classes_school_subject_fk'), ('teacher_classes','teacher_classes_school_academic_year_fk'),
+    ('learner_classes','learner_classes_school_class_fk'), ('learner_classes','learner_classes_school_academic_year_fk'),
+    ('assignments','assignments_school_class_fk'), ('assignments','assignments_school_subject_fk'),
+    ('assignments','assignments_school_term_fk'), ('submissions','submissions_school_assignment_fk'),
+    ('uploaded_files','uploaded_files_school_assignment_fk'), ('resources','resources_school_class_fk'),
+    ('resources','resources_school_subject_fk'), ('resources','resources_school_term_fk'),
+    ('quizzes','quizzes_school_class_fk'), ('quizzes','quizzes_school_subject_fk'),
+    ('quizzes','quizzes_school_term_fk'), ('quiz_attempts','quiz_attempts_school_quiz_fk'),
+    ('announcements','announcements_school_class_fk'), ('attendance','attendance_school_class_fk'),
+    ('timetable_entries','timetable_entries_school_class_fk'),
+    ('timetable_entries','timetable_entries_school_subject_fk'),
+    ('timetable_entries','timetable_entries_school_term_fk'),
+    ('timetable_entries','timetable_entries_school_academic_year_fk')
+)
+SELECT e.table_name, e.constraint_name, c.convalidated,
+       pg_get_constraintdef(c.oid) AS definition
+FROM expected e
+LEFT JOIN pg_constraint c
+  ON c.conname = e.constraint_name
+ AND c.conrelid = to_regclass(format('public.%I', e.table_name))
+ORDER BY e.table_name, e.constraint_name;
+
 -- 0017 UNIQUE (school_id, id) targets must be valid and unique (24 expected).
 SELECT tablename, indexname, indexdef,
        i.indisvalid AS is_valid,
@@ -120,31 +157,111 @@ WHERE p.schemaname = 'public'
   )
 ORDER BY tablename, indexname;
 
--- Direct ownership inconsistencies in core relationships. Zero rows is expected.
--- This checks relational attribution; it does not replace the complete FK audit.
+-- 0018 composite-FK relationships. Zero mismatch/orphan counts are expected.
+-- NULL optional references are intentionally excluded.
 SELECT 'terms.academic_year' AS relationship, count(*) AS mismatch_count
-FROM public.terms t JOIN public.academic_years y ON y.id = t.academic_year_id
-WHERE t.school_id <> y.school_id
+FROM public.terms c LEFT JOIN public.academic_years p ON p.id = c.academic_year_id
+WHERE c.academic_year_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
 UNION ALL
-SELECT 'classes.academic_year', count(*)
-FROM public.classes c JOIN public.academic_years y ON y.id = c.academic_year_id
-WHERE c.school_id <> y.school_id
+SELECT 'classes.academic_year' AS relationship, count(*) AS mismatch_count
+FROM public.classes c LEFT JOIN public.academic_years p ON p.id = c.academic_year_id
+WHERE c.academic_year_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
 UNION ALL
-SELECT 'subjects.department', count(*)
-FROM public.subjects s JOIN public.departments d ON d.id = s.department_id
-WHERE s.school_id <> d.school_id
+SELECT 'subjects.department' AS relationship, count(*) AS mismatch_count
+FROM public.subjects c LEFT JOIN public.departments p ON p.id = c.department_id
+WHERE c.department_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
 UNION ALL
-SELECT 'teacher_classes.class', count(*)
-FROM public.teacher_classes tc JOIN public.classes c ON c.id = tc.class_id
-WHERE tc.school_id <> c.school_id
+SELECT 'teacher_classes.class' AS relationship, count(*) AS mismatch_count
+FROM public.teacher_classes c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
 UNION ALL
-SELECT 'teacher_classes.subject', count(*)
-FROM public.teacher_classes tc JOIN public.subjects s ON s.id = tc.subject_id
-WHERE tc.school_id <> s.school_id
+SELECT 'teacher_classes.subject' AS relationship, count(*) AS mismatch_count
+FROM public.teacher_classes c LEFT JOIN public.subjects p ON p.id = c.subject_id
+WHERE c.subject_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
 UNION ALL
-SELECT 'learner_classes.class', count(*)
-FROM public.learner_classes lc JOIN public.classes c ON c.id = lc.class_id
-WHERE lc.school_id <> c.school_id
+SELECT 'teacher_classes.academic_year' AS relationship, count(*) AS mismatch_count
+FROM public.teacher_classes c LEFT JOIN public.academic_years p ON p.id = c.academic_year_id
+WHERE c.academic_year_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'learner_classes.class' AS relationship, count(*) AS mismatch_count
+FROM public.learner_classes c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'learner_classes.academic_year' AS relationship, count(*) AS mismatch_count
+FROM public.learner_classes c LEFT JOIN public.academic_years p ON p.id = c.academic_year_id
+WHERE c.academic_year_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'assignments.class' AS relationship, count(*) AS mismatch_count
+FROM public.assignments c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'assignments.subject' AS relationship, count(*) AS mismatch_count
+FROM public.assignments c LEFT JOIN public.subjects p ON p.id = c.subject_id
+WHERE c.subject_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'assignments.term' AS relationship, count(*) AS mismatch_count
+FROM public.assignments c LEFT JOIN public.terms p ON p.id = c.term_id
+WHERE c.term_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'submissions.assignment' AS relationship, count(*) AS mismatch_count
+FROM public.submissions c LEFT JOIN public.assignments p ON p.id = c.assignment_id
+WHERE c.assignment_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'uploaded_files.assignment' AS relationship, count(*) AS mismatch_count
+FROM public.uploaded_files c LEFT JOIN public.assignments p ON p.id = c.assignment_id
+WHERE c.assignment_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'resources.class' AS relationship, count(*) AS mismatch_count
+FROM public.resources c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'resources.subject' AS relationship, count(*) AS mismatch_count
+FROM public.resources c LEFT JOIN public.subjects p ON p.id = c.subject_id
+WHERE c.subject_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'resources.term' AS relationship, count(*) AS mismatch_count
+FROM public.resources c LEFT JOIN public.terms p ON p.id = c.term_id
+WHERE c.term_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'quizzes.class' AS relationship, count(*) AS mismatch_count
+FROM public.quizzes c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'quizzes.subject' AS relationship, count(*) AS mismatch_count
+FROM public.quizzes c LEFT JOIN public.subjects p ON p.id = c.subject_id
+WHERE c.subject_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'quizzes.term' AS relationship, count(*) AS mismatch_count
+FROM public.quizzes c LEFT JOIN public.terms p ON p.id = c.term_id
+WHERE c.term_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'quiz_attempts.quiz' AS relationship, count(*) AS mismatch_count
+FROM public.quiz_attempts c LEFT JOIN public.quizzes p ON p.id = c.quiz_id
+WHERE c.quiz_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'announcements.class' AS relationship, count(*) AS mismatch_count
+FROM public.announcements c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'attendance.class' AS relationship, count(*) AS mismatch_count
+FROM public.attendance c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'timetable_entries.class' AS relationship, count(*) AS mismatch_count
+FROM public.timetable_entries c LEFT JOIN public.classes p ON p.id = c.class_id
+WHERE c.class_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'timetable_entries.subject' AS relationship, count(*) AS mismatch_count
+FROM public.timetable_entries c LEFT JOIN public.subjects p ON p.id = c.subject_id
+WHERE c.subject_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'timetable_entries.term' AS relationship, count(*) AS mismatch_count
+FROM public.timetable_entries c LEFT JOIN public.terms p ON p.id = c.term_id
+WHERE c.term_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
+UNION ALL
+SELECT 'timetable_entries.academic_year' AS relationship, count(*) AS mismatch_count
+FROM public.timetable_entries c LEFT JOIN public.academic_years p ON p.id = c.academic_year_id
+WHERE c.academic_year_id IS NOT NULL AND (p.id IS NULL OR c.school_id IS DISTINCT FROM p.school_id)
 UNION ALL
 SELECT 'parent_learners.parent_membership', count(*)
 FROM public.parent_learners pl
@@ -159,24 +276,7 @@ WHERE NOT EXISTS (
   SELECT 1 FROM public.school_users su
   WHERE su.user_id = pl.learner_id AND su.school_id = pl.school_id AND su.status = 'active'
 )
-UNION ALL
-SELECT 'assignments.class', count(*)
-FROM public.assignments a JOIN public.classes c ON c.id = a.class_id
-WHERE a.school_id <> c.school_id
-UNION ALL
-SELECT 'assignments.subject', count(*)
-FROM public.assignments a JOIN public.subjects s ON s.id = a.subject_id
-WHERE a.school_id <> s.school_id
-UNION ALL
-SELECT 'assignments.term', count(*)
-FROM public.assignments a JOIN public.terms t ON t.id = a.term_id
-WHERE a.school_id <> t.school_id
-UNION ALL
-SELECT 'submissions.assignment', count(*)
-FROM public.submissions s JOIN public.assignments a ON a.id = s.assignment_id
-WHERE s.school_id <> a.school_id
 ORDER BY relationship;
-
 ROLLBACK;
 ```
 
@@ -186,12 +286,12 @@ The `ROLLBACK` ends the read-only transaction without changing data. Large produ
 
 - The expected relation list must be present. `school_id` must be `NOT NULL` on all 24 tables in the 0017 list; `school_users.school_id` is also required. `activity_logs.school_id` may remain nullable for platform events.
 - Each required null count and every core relationship mismatch above must be zero. Any nonzero value is an investigation/remediation item, not permission to stamp or move rows.
-- The 0016 school FKs must exist and be validated. The 24 0017 unique targets must be valid, ready, and unique. Capture the count and exact definitions; do not infer application of migrations from a successful deployment.
-- The custom `run-migration.js` runner has no applied-migration ledger. Do not treat a Drizzle journal row, runner log absence, or deployment status as proof of execution. Catalog and data evidence are required.
+- The 0016 school FKs must exist and be validated. The 24 0017 unique targets must be valid, ready, and unique. The 26 expected 0018 composite constraints are future work until their migration is independently reviewed, safely applied under separate authorization, and then appear validated. Capture counts and exact definitions; do not infer application of migrations from a successful deployment.
+- The repository's prior runner had no applied-migration ledger. The new runner adds a checksum ledger, transactions, and advisory locking on an unmerged branch; production state is still unknown. Do not treat an absent ledger, a Drizzle journal row, runner log absence, or deployment status as proof of execution. Catalog and data evidence are required. The explicit `--baseline` command only records an operator assertion; it does not verify database state and must not be used until an independently verified migration prefix is documented.
 - A successful read-only catalog check is still not proof of cross-school API behavior. Separately record non-mutating, role-approved smoke checks for one-school and dual-membership test accounts in each school. Do not seed or alter production data for those checks.
 
 ## Required operator report (sanitized)
 
-Return only: UTC timestamp; project/alias; deployment ID and commit SHA; database/version identity (no hostname or credentials); the 25-row column/nullability result; required NULL counts; activity-log NULL count; school and membership counts; validated school-FK count; valid 0017 target-index count; mismatch counts; read-only application smoke-test outcomes; query failures/timeouts. Redact personal data and all connection/configuration secrets.
+Return only: UTC timestamp; project/alias; deployment ID and commit SHA; database/version identity (no hostname or credentials); the 25-row column/nullability result; required NULL counts; activity-log NULL count; school and membership counts; migration-history table presence (not a state conclusion); validated school-FK count; valid 0017 target-index count; 0018 composite-constraint state; mismatch counts; read-only application smoke-test outcomes; query failures/timeouts. Redact personal data and all connection/configuration secrets.
 
 **If production DB access is unavailable:** report that the production DB gate remains unverified and provide this procedure to the authorized operator. Do not attempt a production connection, request a credential, run `run-migration.js`, or infer database state from deployment records.
