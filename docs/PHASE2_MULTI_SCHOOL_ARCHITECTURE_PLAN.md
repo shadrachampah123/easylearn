@@ -1,9 +1,9 @@
 # EasyLearn — Canonical Nine-Phase Roadmap
 
 **Audit date:** 2026-10-18 · **Repository:** `shadrachampah123/easylearn`
-**Latest repository main verified after this follow-up:** `0adb2052841055b994b266618c56ba7ba2d9df40` (PR #28, merged 2026-10-18).
-**Latest application-code checkpoint:** `0adb2052841055b994b266618c56ba7ba2d9df40` includes the focused tenant-isolation repair (PR #28, merged 2026-10-18); the prior code checkpoint was `9a654a9ded904734250149206604193fe7133e5e` (PR #25).
-**Next action — pending:** obtain independent review of the merged tenant-isolation repair, then obtain an authorized, read-only production tenancy checkpoint confirming deployed identity, migrations 0013–0017, schema/data integrity, and post-repair behavior. Do not run migrations, deploy, or begin Phase 3 until both review and production evidence gates are satisfied.
+**Latest repository main verified after this follow-up:** `8931095c5333e4f39f527d4520c0185805bf536f` (PR #29, merged 2026-10-18).
+**Latest application-code checkpoint:** `0adb2052841055b994b266618c56ba7ba2d9df40` includes the focused tenant-isolation repair (PR #28, merged 2026-10-18); PR #29 updates roadmap documentation only.
+**Next action — pending:** obtain an independent review of the merged PR #28 tenant-isolation repair (GitHub currently shows no submitted reviews), then obtain an authorized, read-only production tenancy checkpoint confirming deployed identity, migrations 0013–0017, schema/data integrity, and post-repair behavior. This branch also contains an unmerged explicit school-selection/CI follow-up. Do not run migrations, deploy, or begin Phase 3 until independent review and production evidence gates are satisfied.
 
 This current roadmap supersedes the historical architecture audit retained below, including
 its proposed numbering, table counts, future migration numbers and old “remaining” lists.
@@ -17,6 +17,7 @@ connections, migrations or deployments were performed for this audit.
 - GitHub `main` and fetched `origin/main` agree on the SHA above. The supplied checkpoint
   `c9adf6f41389f768de32417474e9b6f8bcdeecd9` is an ancestor (assignment/submission
   filter-overwrite fix in [PR #20](https://github.com/shadrachampah123/easylearn/pull/20)), not latest main.
+- [PR #29](https://github.com/shadrachampah123/easylearn/pull/29) merged this roadmap follow-up at `8931095`; latest main has no open PRs and no GitHub Actions workflow runs returned at the 2026-10-18 checkpoint. PR #29 has successful Vercel Preview Comments and Preview status.
 - [PR #16](https://github.com/shadrachampah123/easylearn/pull/16) merged Phase 1 at `eaed78c`;
   Production deployment **6402657266** succeeded 2026-09-11 22:16:59 UTC.
 - Phase 2 foundations: [#17](https://github.com/shadrachampah123/easylearn/pull/17) `18d32f8` (2A),
@@ -34,6 +35,10 @@ connections, migrations or deployments were performed for this audit.
   [Vercel deployment](https://vercel.com/shadrachampah123s-projects/easylearn/GEDjSsuUKbwrSsW8Q45Gk4dUXRUh).
   This proves a successful Production deployment record, **not** database execution, custom-domain
   routing, functional correctness, or that today's production alias still serves that build.
+- GitHub also records successful Production deployment **7156708039** for main SHA
+  `8931095c5333e4f39f527d4520c0185805bf536f` (status updated 2026-10-18 15:32:44 UTC).
+  This later status is deployment metadata only; it does not resolve the intended Vercel project/alias
+  ambiguity or establish production DB migration state.
 - Open PRs at audit start: **none**. GitHub Actions runs: **none returned**, no `.github/workflows`.
   Main's Vercel status is success; main has no check runs. PR #25's preview Vercel context is
   **ERROR**, last updated 2026-10-13, while Preview Comments succeeded. Its bot comment lists
@@ -58,7 +63,7 @@ Drizzle journals are file metadata, not production execution evidence. `package.
 with `next build`, **not** the migration runner; no checked-in deployment hook proves automatic
 migration execution. The #23 claim that redeploy applies migrations is therefore insufficient.
 
-### Test evidence (2026-10-18)
+### Historical test evidence at pre-follow-up audit checkpoint (2026-10-18; superseded by the working-branch evidence below)
 
 - Fresh `npm ci --ignore-scripts --no-audit --no-fund`; no tracked dependency changes.
 - `npm test` initially stopped after security tests because `DATABASE_URL` is required at import.
@@ -95,18 +100,33 @@ production evidence gate above.
 | Activity and dashboards | Activity endpoint/dashboard feed now require `activity_logs.school_id = ctx.schoolId` in addition to actor membership. `NULL school_id` remains explicitly platform-global and is excluded from school feeds; no school feed grants platform visibility. Dashboard counts and joins add direct predicates for each relevant owned row (`classes`, `assignments`, `quizzes`, `resources`, `announcements`, `attendance`, `submissions`); users remain membership-scoped because `users` is a global identity table. Dual-member tests cover aggregates and activity rows attributed to both schools. | Implemented and merged in PR #28; DB regression and Vercel checks pass; independent review pending. |
 | Global user identity | School admins can update only the active membership role for their own school. Global profile, `is_active`, legacy global role, and password mutations are platform-only; a school admin cannot deactivate a shared identity or reset another school's/global password. Reads return the current school's membership role. Dual-membership PostgreSQL regression confirms School A role changes leave School B membership and global identity fields untouched; existing cross-school denial and same-school user administration tests pass. | Implemented and merged in PR #28; DB regression and Vercel checks pass; independent review pending. |
 
-**Validation on this branch:** `npm test` passed (101 source/pure authorization/foundation
+**PR #28 validation record:** `npm test` passed (101 source/pure authorization/foundation
 checks, using an inert loopback port-1 `DATABASE_URL`); `npm run typecheck` passed;
 `npm run build` passed with the same inert URL. `npm run test:tenant-auth` passed against
 throwaway embedded PostgreSQL (76 authorization, 17 catalog, 11 assignment/submission, and
 21 dashboard-isolation checks); `npm run test:db` passed against disposable PostgreSQL,
-including write-attribution and migration-0017 suites. `npm run lint` remains at the established
-baseline failure of 20 errors / 16 warnings in unrelated existing UI files; no lint findings
-were introduced by these changes. Build and database suites used no production database.
+including write-attribution and migration-0017 suites. At that earlier checkpoint, lint was
+reported at 20 errors / 16 warnings in existing UI files. The current unmerged branch has since
+repaired those errors; its latest lint result is recorded in the working-branch validation
+section below. Build and database suites used no production database.
 
 **Independent review:** still pending; no independent approval is claimed. Do not start Phase 3
 until a reviewer other than the implementation pass reviews this repair and the production
 verification gate is separately satisfied.
+
+## Current branch continuation — explicit school selection and required CI (2026-10-18)
+
+The working branch `arena/dc9adcab-easylearn` is based on current main `8931095c5333e4f39f527d4520c0185805bf536f` (PR #29). The following work is **implemented but not merged, independently reviewed, or deployed**:
+
+- Token schema v3 carries only server-issued school/membership hints. `resolveAuthContext` reloads active memberships and rejects revoked/mismatched hints; a signed `schoolSelectionRequired` guard keeps a multi/zero-membership login unselected even if membership count later drops to one. Old tokens can still enter an unambiguous single-membership school, but legacy first-membership hints do not silently select for a multi-school account.
+- `/api/auth/select-school` treats the submitted ID as a request, validates it against the caller's active database memberships, and issues a new selected-context token. Login provides an explicit school picker for multi-membership users; the dashboard offers an explicit switcher. No host/custom-domain resolution was added.
+- Tests were updated to model an explicit selected school where fixtures intentionally act as dual members. Disposable PostgreSQL tests prove unselected dual-member denial (including no implicit switch if the active count drops to one), valid school switching, non-member and mismatched school/membership hint rejection, disabled-membership revocation without fallback, same-school behavior, and corrections/question joins cannot cross assignment boundaries.
+- `.github/workflows/ci.yml` adds ephemeral PostgreSQL CI for the full required local suite. It is not yet verified by any GitHub Actions run or required-check/branch-protection record.
+- Added `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` for an authorized operator. Its SQL syntax was tested against a migrated disposable PostgreSQL database only; it has not been executed in production. No production connection, migration, mutation or deployment was performed in this branch.
+
+**Workspace verification (2026-10-18; all PostgreSQL runs used disposable embedded PostgreSQL):** `npm test` **101 passed** (28 security, 15 real authorization, 23 tenant foundation, 35 membership foundation); `npm run test:db` passed its component suites (tenant DB 26, membership DB 45, catalog 17, assignments/submissions 11, write attribution 11, migration 0017 12, dashboard isolation 21); `npm run test:tenant-auth` passed (tenant authorization 80, catalog 17, assignments/submissions 11, dashboard isolation 21); `npm run test:mutation` **7/7**; typecheck passed; production build passed with an inert loopback port-1 `DATABASE_URL`; lint exits successfully with **0 errors and 15 warnings**. The production-dependency audit reports **0 vulnerabilities**; the full audit still reports 9 development-tool advisories (4 moderate, 5 high), with proposed fixes requiring incompatible major changes. The initial `test:db` attempt exposed a grade UPDATE alias-scope failure; it was corrected by anchoring the parent assignment school check to the verified submission's assignment ID, then the full DB suite passed. An initial dashboard suite run used unselected dual-member fixture tokens and failed as expected under the new fail-closed rule; fixtures now explicitly represent a School A choice and pass. The read-only operator SQL was also executed against a migrated disposable PostgreSQL database for syntax/shape validation only. These are implementation-run results, not independent review or GitHub-attested checks.
+
+**Independent review gate:** PR #28 has no submitted GitHub reviews at this checkpoint. The implementation agent's code inspection and test runs are not an independent review. Do not start Phase 3 until an independent reviewer examines the tenant isolation repair and this selection boundary, and the separate authorized production evidence gate is satisfied.
 
 ## Phase status and commercial-launch work
 
@@ -138,8 +158,8 @@ similarly named PR merged.
 | **2D Direct tenant data access** | **complete** for delivered 0016/schema/route isolation and filter-overwrite fixes, #20 (`c9adf6f` included); I/M/D yes; DB reported, unverified; V unverified. | Migration surface is **25 school-owned tables plus school_users**, not the historical “21” count. NOT NULL belongs to delivered 2E, not future 2D work. Acceptance: direct attribution/filtering and cross-school read/write denial hold. | Verify 0016 state and behavior; do not blindly execute. |
 | **2E Write/DB/query hardening** | **in progress** overall; delivered slices complete in #21–25: write attribution, 0017, aggregate isolation, override scope, question-parent DELETE; I/M/D yes for those slices. DB reported, unverified; V unverified. | Do not relist fixed dashboard/report/override/question gaps as unfixed. Still missing composite tenant FKs (0017 only supplies unique targets), audited fallback cleanup after schema baseline, migration ledger/runner hardening. Check historical compatibility catches cannot widen operations on supported schemas. Acceptance: no cross-school relational rows, zero required NULLs, constraint and isolation suites executed. | Evidence first; future constraint/runner code requires reviewed migration, deployment and verification. |
 | **2F CBISM production reconciliation** | **blocked** on independent production evidence, not known missing execution. | Reconcile actual catalog, FK validation/indexes, required NULL counts, orphan and cross-school relationships against 0016/17 and intended build. Preserve allowed platform activity NULLs. Require backup/restore rehearsal before any separately approved remediation. | Read-only verification now; controlled migration only if a proven gap is later authorized. |
-| **2G Isolation testing / launch hardening** | **in progress**: extensive DB/mutation suites exist (#19–25), but no automated CI execution evidence. | Wire mandatory non-skipping ephemeral-DB CI; full route/role/two-school matrix, dual membership, forged IDs, public content/files, revocation and aggregate regressions. Finish independent security review and production smoke evidence. | CI/code deployment where changed; no production fixture seeding. |
-| **Tenant selection (original proposed 2E)** | **not started** end-to-end; host-resolution helper is not wired; earliest active membership is selected today (`memberships[0]`). | Implement trusted host/picker/switch flow with server-side membership and host/session cross-check; no client-selected arbitrary school. Dual members currently act in their earliest school: misattribution/correctness risk, not evidence of foreign-school access. | Deployment + staging/production verification; domain/session schema migration if needed. |
+| **2G Isolation testing / launch hardening** | **In progress.** Existing DB/mutation suites now pass on disposable PostgreSQL in this workspace. A required PostgreSQL GitHub Actions workflow exists on the current unmerged branch; no GitHub run/check evidence exists yet. | Branch workflow runs npm test, DB, tenant-auth, mutation, typecheck, build, lint and production audit against ephemeral PostgreSQL. Require successful PR checks and branch-protection enforcement; complete an independent review and production smoke evidence. | CI workflow must be merged and observed green before treating as a release gate; no production fixtures.
+| **Tenant selection (original proposed 2E)** | **In progress; explicit membership-validated account picker and in-session switch are implemented on the current unmerged branch.** No host-resolved tenancy is implemented. | Branch introduces v3 signed school/membership hints revalidated from active DB memberships, no automatic first-school selection for multi-school users, `/api/auth/select-school`, login picker, and dashboard switcher. Tests cover forged/non-member selection, disabled selected membership (no fallback), and valid dual membership. Independent review, merge/required CI, staging/production behavior and any trusted-host/custom-domain cross-check remain outstanding. | Do not claim deployed or verified. Finish review/CI; production verification remains read-only and separately authorized. |
 | **DB defense-in-depth** | **not started** for composite FK enforcement / RLS. | Composite FK validation after clean data; prove transaction-scoped RLS safe under Neon pooling or document approved alternative. Never infer RLS from application predicates. | Migrations, pool rehearsal, negative tests and verification; depends on reconciliation. |
 | **Session security** | **not started** for cookie-only/CSRF/revocation completion. | Replace localStorage bearer flow safely, session invalidation/password-change behavior, secure cookie and CSRF tests. Preserve current auth gates. | Deployment, possible session schema migration, production verification. |
 | **Tenant branding/storage/support/audit** | **not started** for complete designed scope; existing file authorization, object storage and activity logs are implemented baselines. | Dynamic branding/public tenant content and metadata; school storage namespace/quotas and lifecycle; immutable school/platform audit attribution; expiring, explicit audited support access instead of implicit platform bypass. Decide global gamification data-sharing policy (currently intentional global totals). | Schema migrations as designed + deployment + isolation/operational verification; branding UI also Phase 3. |

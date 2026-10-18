@@ -17,9 +17,7 @@ import { eq, sql, desc, and } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
-  sqlAssignmentInSchool,
-  sqlClassInSchool,
-  sqlQuizInSchool,
+  sqlUserHasRoleInSchool,
   sqlUserInSchool,
 } from "@/lib/tenant";
 import { alias } from "drizzle-orm/pg-core";
@@ -272,13 +270,13 @@ export async function GET(request: NextRequest) {
        predicate exactly like every other catalog/content table — no longer an unattributed
        exception. */
     const statQueries: Array<[keyof RawStats, () => Promise<number>]> = [
-      ["teachers", () => countFrom(users, sql`${eq(users.role, "teacher")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
-      ["learners", () => countFrom(users, sql`${eq(users.role, "learner")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
-      ["parents", () => countFrom(users, sql`${eq(users.role, "parent")} AND ${sqlUserInSchool(ctx.schoolId, users.id)}`)],
-      ["classes", () => countFrom(classes, sql`${eq(classes.schoolId, ctx.schoolId)} AND ${sqlClassInSchool(ctx.schoolId, classes.id)}`)],
+      ["teachers", () => countFrom(users, sqlUserHasRoleInSchool(ctx.schoolId, users.id, "teacher"))],
+      ["learners", () => countFrom(users, sqlUserHasRoleInSchool(ctx.schoolId, users.id, "learner"))],
+      ["parents", () => countFrom(users, sqlUserHasRoleInSchool(ctx.schoolId, users.id, "parent"))],
+      ["classes", () => countFrom(classes, eq(classes.schoolId, ctx.schoolId))],
       ["subjects", () => countFrom(subjects, eq(subjects.schoolId, ctx.schoolId))],
-      ["assignments", () => countFrom(assignments, sql`${eq(assignments.schoolId, ctx.schoolId)} AND ${sqlAssignmentInSchool(ctx.schoolId, assignments.id)}`)],
-      ["quizzes", () => countFrom(quizzes, sql`${eq(quizzes.schoolId, ctx.schoolId)} AND ${sqlQuizInSchool(ctx.schoolId, quizzes.id)}`)],
+      ["assignments", () => countFrom(assignments, eq(assignments.schoolId, ctx.schoolId))],
+      ["quizzes", () => countFrom(quizzes, eq(quizzes.schoolId, ctx.schoolId))],
       ["resources", () => countFrom(resources, sql`${eq(resources.schoolId, ctx.schoolId)} AND ${sqlUserInSchool(ctx.schoolId, resources.teacherId)}`)],
       ["announcements", () => countFrom(announcements, sql`${eq(announcements.schoolId, ctx.schoolId)} AND ${sqlUserInSchool(ctx.schoolId, announcements.authorId)}`)],
     ];
@@ -327,7 +325,7 @@ export async function GET(request: NextRequest) {
           .leftJoin(assignments, and(eq(assignments.classId, classes.id), eq(assignments.schoolId, ctx.schoolId)))
           .leftJoin(submissions, and(eq(submissions.assignmentId, assignments.id), eq(submissions.schoolId, ctx.schoolId)))
           // Phase 2C: only classes attributable to this school.
-          .where(and(eq(classes.schoolId, ctx.schoolId), sqlClassInSchool(ctx.schoolId, classes.id)))
+          .where(eq(classes.schoolId, ctx.schoolId))
           .groupBy(classes.id, classes.name)
           .orderBy(sql`COALESCE(AVG(${submissions.percentage}), 0) DESC`)
           .limit(5),

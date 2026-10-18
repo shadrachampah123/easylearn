@@ -17,20 +17,46 @@ interface DashboardShellProps {
   roleColor: string;
 }
 
+type SchoolSummary = { schoolId: string; membershipId: string; name: string; role: string };
+type DashboardUser = {
+  firstName: string;
+  lastName: string;
+  email: string;
+  role: string;
+  globalRole?: string;
+  school?: SchoolSummary | null;
+  schools?: SchoolSummary[];
+};
+
+function dashboardPath(role: string) {
+  if (role === "school_admin" || role === "super_admin") return "/dashboard/admin";
+  if (role === "head_teacher" || role === "teacher") return "/dashboard/teacher";
+  if (role === "parent") return "/dashboard/parent";
+  return "/dashboard/learner";
+}
+
 export default function DashboardShell({ children, navItems, roleLabel, roleColor }: DashboardShellProps) {
   const router = useRouter();
   const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [user, setUser] = useState<{ firstName: string; lastName: string; email: string; role: string } | null>(null);
+  const [user, setUser] = useState<DashboardUser | null>(null);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [schoolSwitchError, setSchoolSwitchError] = useState("");
+  const [switchingSchool, setSwitchingSchool] = useState(false);
 
   useEffect(() => {
-    const stored = localStorage.getItem("el_user");
-    if (stored) {
-      setUser(JSON.parse(stored));
-    } else {
-      router.push("/login");
+    try {
+      const stored = localStorage.getItem("el_user");
+      if (stored) {
+        // localStorage is browser-only; defer session hydration to avoid SSR/client markup mismatch.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setUser(JSON.parse(stored));
+        return;
+      }
+    } catch {
+      // Invalid cached state is treated as a missing session.
     }
+    router.push("/login");
   }, [router]);
 
   useEffect(() => {
@@ -41,7 +67,44 @@ export default function DashboardShell({ children, navItems, roleLabel, roleColo
         .then((data) => { if (data.success) setUnreadCount(data.data.unread); })
         .catch(console.error);
     }
-  }, []);
+  }, [user?.school?.schoolId]);
+
+  async function handleSchoolSwitch(schoolId: string) {
+    const token = localStorage.getItem("el_token");
+    if (!token || !user || schoolId === user.school?.schoolId) return;
+    setSchoolSwitchError("");
+    setUnreadCount(0);
+    setSwitchingSchool(true);
+    try {
+      const response = await fetch("/api/auth/select-school", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ schoolId }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        setSchoolSwitchError(result?.error || "School could not be switched. Please sign in again.");
+        return;
+      }
+      const selected = result.data.school as SchoolSummary;
+      const updatedUser: DashboardUser = {
+        ...user,
+        globalRole: user.globalRole ?? user.role,
+        role: selected.role,
+        school: selected,
+        schools: result.data.schools,
+      };
+      localStorage.setItem("el_token", result.data.token);
+      localStorage.setItem("el_user", JSON.stringify(updatedUser));
+      setUser(updatedUser);
+      router.push(dashboardPath(selected.role));
+      router.refresh();
+    } catch {
+      setSchoolSwitchError("Network error while switching schools.");
+    } finally {
+      setSwitchingSchool(false);
+    }
+  }
 
   async function handleLogout() {
     await fetch("/api/auth/logout", { method: "POST" });
@@ -142,6 +205,22 @@ export default function DashboardShell({ children, navItems, roleLabel, roleColo
               </div>
             </div>
             <div className="flex items-center gap-2">
+              {user.schools && user.schools.length > 1 && (
+                <label className="flex items-center gap-2 text-xs text-slate-500">
+                  <span className="hidden sm:inline">School</span>
+                  <select
+                    aria-label="Switch school"
+                    value={user.school?.schoolId ?? ""}
+                    disabled={switchingSchool}
+                    onChange={(event) => void handleSchoolSwitch(event.target.value)}
+                    className="max-w-36 rounded-lg border border-slate-200 bg-white px-2 py-2 text-sm text-slate-700 disabled:opacity-60"
+                  >
+                    {(user.schools ?? []).map((school) => (
+                      <option key={school.membershipId} value={school.schoolId}>{school.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
               {/* Search */}
               <div className="hidden md:flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-100 w-64">
                 <span className="text-slate-400 text-sm">🔍</span>
@@ -183,6 +262,7 @@ export default function DashboardShell({ children, navItems, roleLabel, roleColo
 
         {/* Page Content */}
         <main className="flex-1 p-4 md:p-6 overflow-y-auto">
+          {schoolSwitchError && <p role="alert" className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{schoolSwitchError}</p>}
           {children}
         </main>
       </div>

@@ -8,6 +8,10 @@ import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
   sqlAssignmentInSchool,
+  sqlParentLearnerDirectInSchool,
+  sqlSchoolRowInSchool,
+  sqlSubmissionInSchool,
+  sqlUserInSchool,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { eq, and, desc } from "drizzle-orm";
@@ -24,12 +28,24 @@ export async function GET(
 
     const { id: assignmentId } = await params;
     const learnerId = request.nextUrl.searchParams.get("learnerId");
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
+    const submissionScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+    );
+    const parentLinkScope = await sqlSchoolRowInSchool(
+      ctx.schoolId,
+      "parent_learners",
+      parentLearners.id,
+      and(sqlUserInSchool(ctx.schoolId, parentLearners.parentId), sqlUserInSchool(ctx.schoolId, parentLearners.learnerId))!
+    );
 
     // Check assignment exists
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, assignmentId), assignmentScope))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
@@ -54,7 +70,9 @@ export async function GET(
         .from(submissions)
         .where(and(
           eq(submissions.assignmentId, assignmentId),
-          eq(submissions.learnerId, ctx.userId)
+          eq(submissions.learnerId, ctx.userId),
+          submissionScope,
+          sqlUserInSchool(ctx.schoolId, submissions.learnerId)
         ))
         .limit(1);
 
@@ -105,7 +123,9 @@ export async function GET(
           .from(submissions)
           .where(and(
             eq(submissions.assignmentId, assignmentId),
-            eq(submissions.learnerId, learnerId)
+            eq(submissions.learnerId, learnerId),
+            submissionScope,
+            sqlUserInSchool(ctx.schoolId, submissions.learnerId)
           ))
           .limit(1);
 
@@ -166,8 +186,12 @@ export async function GET(
           gradedAt: submissions.gradedAt,
         })
         .from(submissions)
-        .leftJoin(users, eq(submissions.learnerId, users.id))
-        .where(eq(submissions.assignmentId, assignmentId))
+        .leftJoin(users, and(eq(submissions.learnerId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
+        .where(and(
+          eq(submissions.assignmentId, assignmentId),
+          submissionScope,
+          sqlUserInSchool(ctx.schoolId, submissions.learnerId)
+        ))
         .orderBy(desc(submissions.submittedAt));
 
       return successResponse({
@@ -193,7 +217,10 @@ export async function GET(
         .from(parentLearners)
         .where(and(
           eq(parentLearners.parentId, ctx.userId),
-          eq(parentLearners.learnerId, learnerId)
+          eq(parentLearners.learnerId, learnerId),
+          parentLinkScope,
+          sqlUserInSchool(ctx.schoolId, parentLearners.parentId),
+          sqlUserInSchool(ctx.schoolId, parentLearners.learnerId)
         ))
         .limit(1);
 
@@ -206,7 +233,9 @@ export async function GET(
         .from(submissions)
         .where(and(
           eq(submissions.assignmentId, assignmentId),
-          eq(submissions.learnerId, learnerId)
+          eq(submissions.learnerId, learnerId),
+          submissionScope,
+          sqlUserInSchool(ctx.schoolId, submissions.learnerId)
         ))
         .limit(1);
 
@@ -222,7 +251,7 @@ export async function GET(
       const [learner] = await db
         .select({ firstName: users.firstName, lastName: users.lastName })
         .from(users)
-        .where(eq(users.id, learnerId))
+        .where(and(eq(users.id, learnerId), sqlUserInSchool(ctx.schoolId, users.id)))
         .limit(1);
 
       const detailedAnswers = answers.map((ans) => {

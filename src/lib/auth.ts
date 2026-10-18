@@ -9,13 +9,11 @@ const TOKEN_EXPIRY = "24h";
 /**
  * Token schema version (architecture plan §9.2).
  *
- * Phase 2B adds `ver`, `schoolId` and `membershipId` to newly issued tokens. Nothing is
- * removed or renamed, `JWT_SECRET` is unchanged, and no code branches authorization on
- * `ver`, so tokens minted before this deploy (no `ver` → treated as 1) keep verifying until
- * their natural 24 h expiry. The rollout therefore needs no rotation window and forces no
- * re-login.
+ * Phase 2B added membership hints; Phase 2F adds an explicit school-selection version.
+ * Existing tokens continue verifying through expiry, but old multi-school hints are not
+ * treated as explicit user selection. The active membership is still re-read from the DB.
  */
-export const TOKEN_SCHEMA_VERSION = 2;
+export const TOKEN_SCHEMA_VERSION = 3;
 
 /** A token without `ver` predates Phase 2B. */
 export const LEGACY_TOKEN_SCHEMA_VERSION = 1;
@@ -57,6 +55,8 @@ export async function createToken(payload: {
    */
   schoolId?: string;
   membershipId?: string;
+  /** Prevent an unselected login session from falling into a remaining school after revocation. */
+  schoolSelectionRequired?: boolean;
 }): Promise<string> {
   return new SignJWT({ ...payload, ver: TOKEN_SCHEMA_VERSION })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
@@ -98,6 +98,8 @@ export async function verifyToken(token: string) {
        */
       schoolIdHint: uuidClaim(payload.schoolId),
       membershipIdHint: uuidClaim(payload.membershipId),
+      /** A server-issued no-selection guard for logins that had zero or multiple memberships. */
+      schoolSelectionRequired: payload.schoolSelectionRequired === true,
     };
   } catch {
     return null;

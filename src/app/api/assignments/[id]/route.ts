@@ -16,13 +16,18 @@ import {
   hasSchoolAdminExtendedRole,
   hasSchoolAdminRole,
   sqlAssignmentInSchool,
+  sqlClassInSchool,
+  sqlLearnerClassInSchool,
+  sqlSchoolRowInSchool,
+  sqlSubmissionInSchool,
+  sqlUserInSchool,
 } from "@/lib/tenant";
 
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { EASYAI_MAX_MARKS_MAX, EASYAI_MAX_MARKS_MIN } from "@/lib/easyai";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 
 export async function GET(
   request: NextRequest,
@@ -37,6 +42,23 @@ export async function GET(
     await ensureFileUploadSchema();
 
     const { id } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
+    const classScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "classes", classes.id, sqlClassInSchool(ctx.schoolId, classes.id)
+    );
+    // Subject names are optional on a legacy schema; when the school_id column is absent,
+    // omit the join result rather than attributing a potentially foreign subject.
+    const subjectScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "subjects", subjects.id, sql`false`
+    );
+    const submissionScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+    );
+    const learnerClassScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "learner_classes", learnerClasses.id, sqlLearnerClassInSchool(ctx.schoolId, learnerClasses.id)
+    );
 
     const [assignment] = await db
       .select({
@@ -63,10 +85,10 @@ export async function GET(
         teacherLastName: users.lastName,
       })
       .from(assignments)
-      .leftJoin(classes, eq(assignments.classId, classes.id))
-      .leftJoin(subjects, eq(assignments.subjectId, subjects.id))
-      .leftJoin(users, eq(assignments.teacherId, users.id))
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .leftJoin(classes, and(eq(assignments.classId, classes.id), classScope))
+      .leftJoin(subjects, and(eq(assignments.subjectId, subjects.id), subjectScope))
+      .leftJoin(users, and(eq(assignments.teacherId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
+      .where(and(eq(assignments.id, id), assignmentScope))
       .limit(1);
 
     if (!assignment) {
@@ -101,8 +123,12 @@ export async function GET(
           learnerId: submissions.learnerId,
         })
         .from(submissions)
-        .leftJoin(users, eq(submissions.learnerId, users.id))
-        .where(eq(submissions.assignmentId, id))
+        .leftJoin(users, and(eq(submissions.learnerId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
+        .where(and(
+          eq(submissions.assignmentId, id),
+          submissionScope,
+          sqlUserInSchool(ctx.schoolId, submissions.learnerId)
+        ))
         .orderBy(desc(submissions.submittedAt));
 
       // Get questions with correct answers for teacher view
@@ -120,8 +146,12 @@ export async function GET(
           lastName: users.lastName,
         })
         .from(learnerClasses)
-        .leftJoin(users, eq(learnerClasses.learnerId, users.id))
-        .where(eq(learnerClasses.classId, assignment.classId));
+        .leftJoin(users, and(eq(learnerClasses.learnerId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
+        .where(and(
+          eq(learnerClasses.classId, assignment.classId),
+          learnerClassScope,
+          sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId)
+        ));
 
       const submittedIds = new Set(submissionsList.map((s) => s.learnerId));
       const missing = enrolledLearners.filter((row) => !submittedIds.has(row.learnerId));
@@ -142,7 +172,9 @@ export async function GET(
         .from(submissions)
         .where(and(
           eq(submissions.assignmentId, id),
-          eq(submissions.learnerId, ctx.userId)
+          eq(submissions.learnerId, ctx.userId),
+          submissionScope,
+          sqlUserInSchool(ctx.schoolId, submissions.learnerId)
         ))
         .limit(1);
 
@@ -211,12 +243,15 @@ export async function PUT(
     const ctx = auth.context;
 
     const { id } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
 
     // Check ownership
     const [existing] = await db
       .select({ teacherId: assignments.teacherId, aiMaxMarks: assignments.aiMaxMarks })
       .from(assignments)
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, id), assignmentScope))
       .limit(1);
 
     if (!existing) return notFoundResponse("Assignment");
@@ -275,7 +310,7 @@ export async function PUT(
         ...easyAiUpdate,
         updatedAt: new Date(),
       })
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, id), assignmentScope))
       .returning();
 
     return successResponse(updated);
@@ -298,11 +333,14 @@ export async function DELETE(
     const ctx = auth.context;
 
     const { id } = await params;
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
 
     const [existing] = await db
       .select({ teacherId: assignments.teacherId })
       .from(assignments)
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)))
+      .where(and(eq(assignments.id, id), assignmentScope))
       .limit(1);
 
     if (!existing) return notFoundResponse("Assignment");
@@ -313,7 +351,7 @@ export async function DELETE(
 
     await db
       .delete(assignments)
-      .where(and(eq(assignments.id, id), sqlAssignmentInSchool(ctx.schoolId, assignments.id)));
+      .where(and(eq(assignments.id, id), assignmentScope));
 
     return successResponse({ message: "Assignment deleted" });
   } catch (error) {

@@ -365,8 +365,10 @@ async function main() {
         parent: "parent",
       };
       for (const [key, role] of Object.entries(expected)) {
-        assertEq(await tenant.getEffectiveSchoolRole(userIds[key]), role, `${key} effective school role`);
+        const context = key === "teacher" ? { schoolId: cbismSchoolId } : {};
+        assertEq(await tenant.getEffectiveSchoolRole(userIds[key], context), role, `${key} effective school role`);
       }
+      assertEq(await tenant.getEffectiveSchoolRole(userIds["teacher"]), null, "multi-school role is ambiguous without a selection");
     });
 
     await test("Resolve: a disabled membership is NOT an active membership", async () => {
@@ -478,6 +480,7 @@ async function main() {
 
     const loginRoute = await import("@/app/api/auth/login/route");
     const meRoute = await import("@/app/api/auth/me/route");
+    const selectSchoolRoute = await import("@/app/api/auth/select-school/route");
     const changePasswordRoute = await import("@/app/api/auth/change-password/route");
     const logoutRoute = await import("@/app/api/auth/logout/route");
 
@@ -544,7 +547,8 @@ async function main() {
       assertEq(claims!.role, "learner", "token role claim is server-derived");
     });
 
-    await test("Login: username login still works and resolves the same context", async () => {
+    let multiSchoolToken = "";
+    await test("Login: multi-school users receive an unselected session, not a first-school default", async () => {
       const response = await loginRoute.POST(
         postJson("/api/auth/login", {
           username: `2b-teacher-${DB_NAME.slice(-8)}`,
@@ -553,9 +557,73 @@ async function main() {
       );
       assertEq(response.status, 200, "username login status");
       const body: any = await response.json();
-      assertEq(body.data.user.role, "teacher", "teacher role");
+      assertEq(body.data.user.role, "teacher", "global role remains in the identity profile");
       assertEq(body.data.schools.length, 2, "teacher belongs to two schools");
-      assertEq(body.data.school.schoolId, cbismSchoolId, "deterministic first membership is CBISM");
+      assertEq(body.data.school, null, "multi-school login must not silently choose the first school");
+      multiSchoolToken = body.data.token;
+      const claims = await auth.verifyToken(multiSchoolToken);
+      assert(claims, "multi-school token verifies");
+      assertEq(claims!.ver, 3, "new token selection schema");
+      assertEq(claims!.schoolIdHint, undefined, "no school is chosen until user selection");
+      assertEq(claims!.membershipIdHint, undefined, "no membership is chosen until user selection");
+      assertEq(claims!.schoolSelectionRequired, true, "server binds this login to an explicit selection flow");
+
+      const unauthorized = await tenant.guardSchoolContext(
+        new NextRequest("http://localhost:3000/api/notifications", { headers: bearer(multiSchoolToken) })
+      );
+      assertEq(unauthorized.ok, false, "unselected multi-school user cannot access school data");
+      if (!unauthorized.ok) {
+        assertEq(unauthorized.response.status, 403, "selection required status");
+        const denied: any = await unauthorized.response.json();
+        assert(/select one of your schools/i.test(denied.error), "clear selection-required error");
+      }
+    });
+
+    await test("School switch: only active memberships can be selected, and selected context is revalidated", async () => {
+      const response = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: schoolBId }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(response.status, 200, "member school selection status");
+      const body: any = await response.json();
+      assertEq(body.data.school.schoolId, schoolBId, "selected school B");
+      assertEq(body.data.school.role, "school_admin", "role comes from School B membership");
+      assertEq(body.data.schools.length, 2, "available memberships returned");
+      const switchedToken = body.data.token;
+      const switchedClaims = await auth.verifyToken(switchedToken);
+      assertEq(switchedClaims!.schoolIdHint, schoolBId, "server-issued selected school hint");
+      assertEq(switchedClaims!.membershipIdHint, body.data.school.membershipId, "server-issued membership hint");
+      assertEq(switchedClaims!.schoolSelectionRequired, false, "selected token no longer carries the unselected-login guard");
+
+      const me = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(switchedToken) }) as never);
+      const meBody: any = await me.json();
+      assertEq(meBody.data.school.schoolId, schoolBId, "session resolves to selected school B");
+      assertEq(meBody.data.school.role, "school_admin", "selected membership role is authoritative");
+
+      const schoolAMembership = await one(
+        `SELECT id FROM school_users WHERE school_id = $1 AND user_id = $2 AND status = 'active'`,
+        [cbismSchoolId, userIds["teacher"]]
+      );
+      const mismatchedMembershipToken = await auth.createToken({
+        userId: userIds["teacher"], role: "teacher", email: "teacher@example.test",
+        schoolId: schoolBId, membershipId: schoolAMembership.id,
+      });
+      const mismatched = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(mismatchedMembershipToken) }) as never);
+      const mismatchedBody: any = await mismatched.json();
+      assertEq(mismatchedBody.data.school, null, "school and membership hints must identify the same active membership");
+
+      const denied = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: crypto.randomUUID() }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(denied.status, 403, "non-member school cannot be selected");
+
+      await q(`UPDATE school_users SET status = 'disabled' WHERE school_id = $1 AND user_id = $2`, [schoolBId, userIds["teacher"]]);
+      const revoked = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(switchedToken) }) as never);
+      const revokedBody: any = await revoked.json();
+      assertEq(revokedBody.data.school, null, "disabled selected membership does not fall back to another school");
+      const stillUnselected = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(multiSchoolToken) }) as never);
+      const unselectedBody: any = await stillUnselected.json();
+      assertEq(unselectedBody.data.school, null, "a no-selection token never silently adopts the one remaining school");
+      await q(`UPDATE school_users SET status = 'active' WHERE school_id = $1 AND user_id = $2`, [schoolBId, userIds["teacher"]]);
     });
 
     await test("Login: every role can authenticate (admin, head teacher, teacher, parent, learner)", async () => {
@@ -569,7 +637,12 @@ async function main() {
         assertEq(response.status, 200, `${key} login status`);
         const body: any = await response.json();
         assert(body.data.token, `${key} token issued`);
-        assertEq(body.data.school.slug, "cbism", `${key} school context`);
+        if (key === "teacher") {
+          assertEq(body.data.schools.length, 2, "dual-member teacher sees both choices");
+          assertEq(body.data.school, null, "dual-member teacher must select a school");
+        } else {
+          assertEq(body.data.school.slug, "cbism", `${key} school context`);
+        }
       }
     });
 

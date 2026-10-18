@@ -7,7 +7,10 @@ import { clientSafeErrorMessage } from "@/lib/schema-resilience";
 import {
   hasSchoolRole,
   guardSchoolContext,
+  sqlAssignmentInSchool,
+  sqlSchoolRowInSchool,
   sqlSubmissionInSchool,
+  sqlUserInSchool,
 } from "@/lib/tenant";
 
 /**
@@ -28,6 +31,12 @@ export async function GET(
     }
 
     const { id } = await params;
+    const submissionScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "submissions", submissions.id, sqlSubmissionInSchool(ctx.schoolId, submissions.id)
+    );
+    const assignmentScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "assignments", assignments.id, sqlAssignmentInSchool(ctx.schoolId, assignments.id)
+    );
 
     const [submission] = await db
       .select({
@@ -47,9 +56,12 @@ export async function GET(
         teacherId: assignments.teacherId,
       })
       .from(submissions)
-      .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      // Phase 2C tenant predicate: another school's submission is "not found".
-      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
+      .leftJoin(assignments, and(eq(submissions.assignmentId, assignments.id), assignmentScope))
+      // Both the child row and its assignment anchor must be owned by the selected school.
+      .where(and(
+        eq(submissions.id, id), submissionScope, assignmentScope,
+        sqlUserInSchool(ctx.schoolId, submissions.learnerId)
+      ))
       .limit(1);
 
     if (!submission) return notFoundResponse("Submission");

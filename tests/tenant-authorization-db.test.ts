@@ -372,8 +372,16 @@ async function main() {
       );
       await q(`INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1,$2,$3,'active')`, [schoolA, row.id, role]);
       await q(`INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1,$2,$3,'active')`, [schoolB, row.id, role]);
-      const token = await auth.createToken({ userId: row.id, role, email: `${label}@example.test` });
-      return { id: row.id as string, token };
+      const membership = await one(
+        `SELECT id FROM school_users WHERE school_id = $1 AND user_id = $2 AND status = 'active'`,
+        [schoolA, row.id]
+      );
+      const token = await auth.createToken({
+        userId: row.id, role, email: `${label}@example.test`,
+        schoolId: schoolA, membershipId: membership.id,
+      });
+      const unselectedToken = await auth.createToken({ userId: row.id, role, email: `${label}@example.test` });
+      return { id: row.id as string, token, unselectedToken };
     };
     const dualTeacher = await createDualMember("dual-teacher", "teacher");
     const dualPeer = await createDualMember("dual-peer", "teacher");
@@ -846,6 +854,12 @@ async function main() {
         assertEq(state.relationship, "guardian", "foreign relationship remains unchanged");
         assertEq((await call("parent-learners/[id]", { token: tokens["admin-b"], params: { id: link } })).status, 200, "School B retains legitimate link read");
         assertEq((await call("parent-learners/[id]", { token: tokens["admin-b"], method: "PUT", params: { id: link }, body: { relationship: "mother" } })).status, 200, "School B retains legitimate update");
+        const mixedIdentityLink = await one(
+          `SELECT id FROM parent_learners WHERE school_id = $1 AND parent_id = $2 AND learner_id = $3`,
+          [schoolB, ids["parent-a"], ids["learner-b"]]
+        );
+        const schoolBCollection = await call("parent-learners", { token: tokens["admin-b"] });
+        assert(!bodyText(schoolBCollection).includes(mixedIdentityLink.id), "link row cannot expose an identity that is not a School B member");
         assertEq((await call("parent-learners", { token: tokens["admin-b"], method: "DELETE", query: { parentId: dualParent.id, learnerId: dualLearner.id } })).status, 200, "School B retains legitimate collection delete");
         assertEq((await one(`SELECT id FROM parent_learners WHERE id=$1`, [link])), undefined, "School B deletion removes only its owned link");
       } finally {
@@ -898,6 +912,97 @@ async function main() {
       assertEq(result.status, 404, "cross-school delete");
       const rows = await q(`SELECT 1 FROM uploaded_files WHERE id = $1`, [fileB]);
       assertEq(rows.length, 1, "the file row must still exist");
+    });
+
+    await test("Assignments: child submissions and enrollment rows obey their own school_id", async () => {
+      const foreignSubmission = (await one(
+        `INSERT INTO submissions (school_id, assignment_id, learner_id, status, content)
+         VALUES ($1, $2, $3, 'submitted', 'CROSS-SCHOOL-ASSIGNMENT-CHILD-SECRET') RETURNING id`,
+        [schoolB, assignA, ids["learner-b"]]
+      )).id as string;
+      const foreignEnrollment = (await one(
+        `INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id)
+         VALUES ($1, $2, $3, $4) RETURNING id`,
+        [schoolB, ids["learner-b"], classA, yearB]
+      )).id as string;
+      try {
+        const response = await call("assignments/[id]", {
+          token: tokens["teacher-a"], params: { id: assignA },
+        });
+        assertEq(response.status, 200, "legitimate same-school assignment remains readable");
+        assert(response.json.data.submissions.some((row: any) => row.id === subA), "same-school submission remains visible");
+        assert(!bodyText(response).includes(foreignSubmission), "foreign school submission id is not exposed");
+        assert(!bodyText(response).includes("CROSS-SCHOOL-ASSIGNMENT-CHILD-SECRET"), "foreign submission content is not exposed");
+        assert(!bodyText(response).includes(ids["learner-b"]), "foreign learner identity is not exposed");
+        assert(!bodyText(response).includes(foreignEnrollment), "foreign enrollment is not exposed");
+        const list = await call("submissions", {
+          token: tokens["teacher-a"], query: { assignmentId: assignA },
+        });
+        assertEq(list.status, 200, "same-school submission list stays available");
+        assert(!bodyText(list).includes(foreignSubmission), "submission list excludes foreign child rows");
+        const single = await call("submissions/[id]", {
+          token: tokens["teacher-a"], params: { id: foreignSubmission },
+        });
+        assertEq(single.status, 404, "foreign child submission is not readable by the assignment's school");
+        const grade = await call("submissions/[id]/grade", {
+          token: tokens["teacher-a"], method: "POST", params: { id: foreignSubmission },
+          body: { score: 10, maxScore: 100 },
+        });
+        assertEq(grade.status, 404, "foreign child submission cannot be graded through the assignment");
+        const results = await call("assignments/[id]/results", {
+          token: tokens["teacher-a"], params: { id: assignA },
+        });
+        assertEq(results.status, 200, "same-school results remain accessible");
+        assert(!bodyText(results).includes(foreignSubmission), "results summary excludes foreign child rows");
+        const parentAttempt = await call("assignments/[id]/results", {
+          token: tokens["parent-a"], params: { id: assignA }, query: { learnerId: ids["learner-b"] },
+        });
+        assertEq(parentAttempt.status, 403, "parent cannot use a foreign learner id for results");
+      } finally {
+        await q(`DELETE FROM learner_classes WHERE id = $1`, [foreignEnrollment]);
+        await q(`DELETE FROM submissions WHERE id = $1`, [foreignSubmission]);
+      }
+    });
+
+    await test("Corrections: assignment and question joins stay within the selected school", async () => {
+      const foreignQuestionId = (await one(
+        `INSERT INTO assignment_questions (assignment_id, question_type, question_text)
+         VALUES ($1, 'short_answer', 'CROSS-SCHOOL-QUESTION-SECRET') RETURNING id`,
+        [assignB]
+      )).id as string;
+      const foreignAssignmentCorrectionId = (await one(
+        `INSERT INTO assignment_corrections (assignment_id, correction_text, posted_by)
+         VALUES ($1, 'CROSS-SCHOOL-CORRECTION-SECRET', $2) RETURNING id`,
+        [assignB, ids["teacher-b"]]
+      )).id as string;
+      const mismatchedQuestionCorrectionId = (await one(
+        `INSERT INTO assignment_corrections (assignment_id, question_id, correction_text, posted_by)
+         VALUES ($1, $2, 'LOCAL-CORRECTION-WITH-FOREIGN-QUESTION', $3) RETURNING id`,
+        [assignA, foreignQuestionId, ids["teacher-a"]]
+      )).id as string;
+      try {
+        const foreign = await call("assignments/[id]/corrections", {
+          token: tokens["teacher-a"], params: { id: assignB },
+        });
+        assertEq(foreign.status, 404, "foreign assignment corrections are hidden");
+        assert(!bodyText(foreign).includes("CROSS-SCHOOL-CORRECTION-SECRET"), "foreign correction text is not returned");
+        const own = await call("assignments/[id]/corrections", {
+          token: tokens["teacher-a"], params: { id: assignA },
+        });
+        assertEq(own.status, 200, "legitimate same-school corrections endpoint remains accessible");
+        assert(!bodyText(own).includes(foreignAssignmentCorrectionId), "foreign correction id is absent");
+        assert(!bodyText(own).includes("CROSS-SCHOOL-QUESTION-SECRET"), "foreign question text cannot leak through a mismatched questionId");
+        assert(bodyText(own).includes("LOCAL-CORRECTION-WITH-FOREIGN-QUESTION"), "the same-school correction itself remains visible");
+      } finally {
+        await q(`DELETE FROM assignment_corrections WHERE id IN ($1, $2)`, [foreignAssignmentCorrectionId, mismatchedQuestionCorrectionId]);
+        await q(`DELETE FROM assignment_questions WHERE id=$1`, [foreignQuestionId]);
+      }
+    });
+
+    await test("Membership: a dual-school account without a validated selection is denied", async () => {
+      const denied = await call("users", { token: dualTeacher.unselectedToken });
+      assertEq(denied.status, 403, "an ambiguous multi-school token has no tenant context");
+      assert(/select one of your schools/i.test(String(denied.json?.error)), "selection-required response is explicit");
     });
 
     /* ════════════════════ 9. Submissions ════════════════════ */
@@ -1020,6 +1125,35 @@ async function main() {
 
     /* ════════════════════ 11. Legitimate access (nothing broke) ════════════════════ */
 
+    await test("Tenant roles: directory and dashboards use per-school membership roles, not global users.role", async () => {
+      const beforeAdmin = await call("dashboard/admin", { token: tokens["admin-a"] });
+      const beforeStatsA = await call("dashboard/stats", { token: tokens["admin-a"] });
+      const beforeStatsB = await call("dashboard/stats", { token: tokens["admin-b"] });
+      const shared = (await one(
+        `INSERT INTO users (email, username, password_hash, role, first_name, last_name, is_active)
+         VALUES ($1,$2,$3,'teacher','Split','Role',true) RETURNING id`,
+        [`split-role-${DB_NAME}@example.test`, `split-${DB_NAME.slice(-8)}`, passwordHash]
+      )).id as string;
+      try {
+        await q(`INSERT INTO school_users (school_id,user_id,role,status) VALUES ($1,$2,'parent','active'),($3,$2,'learner','active')`, [schoolA, shared, schoolB]);
+        const parentDirectory = await call("users", { token: tokens["admin-a"], query: { role: "parent" } });
+        const splitParent = parentDirectory.json.data.users.find((item: any) => item.id === shared);
+        assert(splitParent, "School A directory includes the identity under its parent membership role");
+        assertEq(splitParent.role, "parent", "directory role is the selected school's membership role");
+        const teacherDirectory = await call("users", { token: tokens["admin-a"], query: { role: "teacher" } });
+        assert(!bodyText(teacherDirectory).includes(shared), "global teacher role cannot override School A's parent role");
+
+        const afterAdmin = await call("dashboard/admin", { token: tokens["admin-a"] });
+        const afterStatsA = await call("dashboard/stats", { token: tokens["admin-a"] });
+        const afterStatsB = await call("dashboard/stats", { token: tokens["admin-b"] });
+        assertEq(afterAdmin.json.data.rawStats.parents, beforeAdmin.json.data.rawStats.parents + 1, "admin dashboard counts School A parent membership");
+        assertEq(afterStatsA.json.data.parents, beforeStatsA.json.data.parents + 1, "stats dashboard counts School A parent membership");
+        assertEq(afterStatsB.json.data.learners, beforeStatsB.json.data.learners + 1, "School B counts the same identity as a learner");
+      } finally {
+        await q(`DELETE FROM users WHERE id=$1`, [shared]);
+      }
+    });
+
     await test("Users: school administration changes only its membership role, not shared identity", async () => {
       const globalBefore = await one(`SELECT role, first_name, is_active FROM users WHERE id=$1`, [dualTeacher.id]);
       const a = await call("users/[id]", { token: tokens["admin-a"], method: "PUT", params: { id: dualTeacher.id }, body: { role: "head_teacher" } });
@@ -1134,7 +1268,12 @@ async function main() {
         schoolB,
         dual,
       ]);
-      const dualToken = await auth.createToken({ userId: dual, role: "learner", email: "dual@example.test" });
+      const dualMembershipA = await one(`SELECT id FROM school_users WHERE school_id=$1 AND user_id=$2`, [schoolA, dual]);
+      const dualToken = await auth.createToken({
+        userId: dual, role: "learner", email: "dual@example.test",
+        schoolId: schoolA, membershipId: dualMembershipA.id,
+      });
+      const unselectedDualToken = await auth.createToken({ userId: dual, role: "learner", email: "dual@example.test" });
       await q(`INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
         schoolA,
         dual,
@@ -1164,7 +1303,9 @@ async function main() {
           assertEq(result.status, 404, "a file two schools can reach must be denied to both");
         }
 
-        /* The dual member is still a legitimate member of each school individually. */
+        /* The dual member must choose; only the signed, selected school token carries context. */
+        const noSelection = await call("attendance", { token: unselectedDualToken, query: { learnerId: dual } });
+        assertEq(noSelection.status, 403, "unselected dual-member context is denied");
         const self = await call("attendance", { token: dualToken, query: { learnerId: dual } });
         assertEq(self.status, 200, "the learner may still read their own attendance");
       } finally {

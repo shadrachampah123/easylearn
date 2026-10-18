@@ -35,17 +35,13 @@ export default function TeacherMessagesPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const storedUser = localStorage.getItem("el_user");
-    if (storedUser) {
-      const user = JSON.parse(storedUser);
-      setCurrentUserId(user.id);
-      // Need user id - fetch via /api/auth/me
-      fetch("/api/auth/me", { headers: { Authorization: `Bearer ${localStorage.getItem("el_token")}` } })
-        .then((r) => r.json())
-        .then((data) => { if (data.success) setCurrentUserId(data.data.user.id); });
-    }
-    loadConversations();
-    loadUsers();
+    // Confirm the current id from the server session; the local profile is only a UI cache.
+    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${localStorage.getItem("el_token")}` } })
+      .then((r) => r.json())
+      .then((data) => { if (data.success) setCurrentUserId(data.data.user.id); });
+    // These network loaders own their loading/data state transitions.
+    void loadConversations();
+    void loadUsers();
   }, []);
 
   async function loadConversations() {

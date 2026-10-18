@@ -83,7 +83,10 @@ const mutations: Mutation[] = [
     name: "membership check removed (no membership → fabricated school context)",
     find: `  const context = await resolveAuthContext(request, tokenOverride);
   if (!context.school) {
-    throw new AuthContextError("You do not have an active school membership", 403);
+    const message = context.memberships.length > 1
+      ? "Select one of your schools before continuing"
+      : "You do not have an active school membership";
+    throw new AuthContextError(message, 403);
   }`,
     replace: `  const context = await resolveAuthContext(request, tokenOverride);
   if (!context.school) {

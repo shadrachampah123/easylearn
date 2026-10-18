@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
 
@@ -40,11 +40,8 @@ export default function LearnerAssignmentsPage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "pending" | "submitted" | "graded">("all");
 
-  useEffect(() => {
-    loadAssignments();
-  }, []);
 
-  async function loadAssignments() {
+  const loadAssignments = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch("/api/assignments?status=published", {
@@ -57,7 +54,13 @@ export default function LearnerAssignmentsPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadAssignments();
+  }, [loadAssignments]);
 
   const filteredAssignments = assignments.filter((a) => {
     if (filter === "all") return true;
