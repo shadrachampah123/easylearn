@@ -46,9 +46,12 @@ export async function GET(request: NextRequest) {
         .leftJoin(sender, eq(messages.senderId, sender.id))
         .leftJoin(receiver, eq(messages.receiverId, receiver.id))
         .where(
-          or(
-            and(eq(messages.senderId, ctx.userId), eq(messages.receiverId, otherUserId)),
-            and(eq(messages.senderId, otherUserId), eq(messages.receiverId, ctx.userId))
+          and(
+            eq(messages.schoolId, ctx.schoolId),
+            or(
+              and(eq(messages.senderId, ctx.userId), eq(messages.receiverId, otherUserId)),
+              and(eq(messages.senderId, otherUserId), eq(messages.receiverId, ctx.userId))
+            )
           )
         )
         .orderBy(desc(messages.createdAt))
@@ -59,6 +62,7 @@ export async function GET(request: NextRequest) {
         .update(messages)
         .set({ isRead: true })
         .where(and(
+          eq(messages.schoolId, ctx.schoolId),
           eq(messages.senderId, otherUserId),
           eq(messages.receiverId, ctx.userId)
         ));
@@ -80,9 +84,10 @@ export async function GET(request: NextRequest) {
         .from(messages)
         .leftJoin(sender, eq(messages.senderId, sender.id))
         .leftJoin(receiver, eq(messages.receiverId, receiver.id))
-        .where(
+        .where(and(
+          eq(messages.schoolId, ctx.schoolId),
           or(eq(messages.senderId, ctx.userId), eq(messages.receiverId, ctx.userId))
-        )
+        ))
         .orderBy(desc(messages.createdAt))
         .limit(100);
 

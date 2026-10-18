@@ -1,9 +1,9 @@
 # EasyLearn — Canonical Nine-Phase Roadmap
 
 **Audit date:** 2026-10-18 · **Repository:** `shadrachampah123/easylearn`
-**Latest repository main:** `74e881aa88b23f3d73b65eef6f842ddc6890fbdc` (documentation-only PR #26, merged 2026-10-18).
-**Latest verified application-code commit:** `9a654a9ded904734250149206604193fe7133e5e` (PR #25, merged 2026-09-13); PR #26 changed documentation only.
-**Next action — pending:** obtain an authorized, read-only production tenancy checkpoint confirming the deployed application identity, migrations 0013–0017, schema/data integrity, and post-#25 tenant-isolation behavior. Do not run migrations or begin Phase 3 until the evidence is reviewed.
+**Latest repository main verified for this follow-up:** `f19f776a1c32265ea442fb1b44914cfb86d93bbb` (documentation-only PR #27, merged 2026-10-18).
+**Latest verified application-code checkpoint before this follow-up:** `9a654a9ded904734250149206604193fe7133e5e` (PR #25, merged 2026-09-13). The focused repair described below is on the working branch, not yet merged/deployed.
+**Next action — pending:** merge and independently review the focused tenant-isolation repair, then obtain an authorized, read-only production tenancy checkpoint confirming deployed identity, migrations 0013–0017, schema/data integrity, and post-repair behavior. Do not run migrations, deploy, or begin Phase 3 until the required review and production evidence gates are satisfied.
 
 This current roadmap supersedes the historical architecture audit retained below, including
 its proposed numbering, table counts, future migration numbers and old “remaining” lists.
@@ -74,6 +74,38 @@ migration execution. The #23 claim that redeploy applies migrations is therefore
   database provisioned); build not rerun. Some DB harnesses explicitly skip with exit 0 when
   neither `TEST_DATABASE_URL` nor embedded PostgreSQL exists: an exit code alone is not coverage.
   Future CI must require all DB suites to execute against an ephemeral database, never production.
+
+### Focused tenant-isolation audit follow-up (2026-10-18)
+
+**Scope/status:** Source-confirmed findings from the latest production audit were repaired
+against the actual fetched `origin/main` (`f19f776a1c32265ea442fb1b44914cfb86d93bbb`),
+not just the supplied older application checkpoint. The application changes and executable
+regressions are implemented and passed on the working branch; merge, deployment, independent
+review, and production behavior are **not yet verified**. This closes the code/test finding
+only; it does not certify production. No production database, secrets, migrations, or deploys
+were accessed/performed. Phase 3 remains blocked pending independent review and the separate
+production evidence gate above.
+
+| Finding | Repair and regression evidence | Status |
+| --- | --- | --- |
+| Parent-learner links | `/api/parent-learners` collection reads, pair lookups/deletes, and `/[id]` reads/updates/deletes now predicate on the link row's own `school_id`; dual-member endpoints cannot claim a School B link from School A. Disposable PostgreSQL tests cover both schools and preserve School B's legitimate read/update/delete. | Implemented; DB regression passes; merge/review pending. |
+| Messages | Conversation and inbox reads plus read-status updates predicate on `messages.school_id` and preserve participant checks. Disposable PostgreSQL test uses two participants who each belong to both schools; School A returns/marks only its message while School B remains hidden/unread. | Implemented; DB regression passes; merge/review pending. |
+| Notifications | Listing, totals/unread counts, single-ID updates and mark-all updates use both recipient and `notifications.school_id`. Dual-member test proves both schools' notifications stay isolated. | Implemented; DB regression passes; merge/review pending. |
+| Activity and dashboards | Activity endpoint/dashboard feed now require `activity_logs.school_id = ctx.schoolId` in addition to actor membership. `NULL school_id` remains explicitly platform-global and is excluded from school feeds; no school feed grants platform visibility. Dashboard counts and joins add direct predicates for each relevant owned row (`classes`, `assignments`, `quizzes`, `resources`, `announcements`, `attendance`, `submissions`); users remain membership-scoped because `users` is a global identity table. Dual-member tests cover aggregates and activity rows attributed to both schools. | Implemented; DB regression passes; merge/review pending. |
+| Global user identity | School admins can update only the active membership role for their own school. Global profile, `is_active`, legacy global role, and password mutations are platform-only; a school admin cannot deactivate a shared identity or reset another school's/global password. Reads return the current school's membership role. Dual-membership PostgreSQL regression confirms School A role changes leave School B membership and global identity fields untouched; existing cross-school denial and same-school user administration tests pass. | Implemented; DB regression passes; merge/review pending. |
+
+**Validation on this branch:** `npm test` passed (101 source/pure authorization/foundation
+checks, using an inert loopback port-1 `DATABASE_URL`); `npm run typecheck` passed;
+`npm run build` passed with the same inert URL. `npm run test:tenant-auth` passed against
+throwaway embedded PostgreSQL (76 authorization, 17 catalog, 11 assignment/submission, and
+21 dashboard-isolation checks); `npm run test:db` passed against disposable PostgreSQL,
+including write-attribution and migration-0017 suites. `npm run lint` remains at the established
+baseline failure of 20 errors / 16 warnings in unrelated existing UI files; no lint findings
+were introduced by these changes. Build and database suites used no production database.
+
+**Independent review:** still pending; no independent approval is claimed. Do not start Phase 3
+until a reviewer other than the implementation pass reviews this repair and the production
+verification gate is separately satisfied.
 
 ## Phase status and commercial-launch work
 
