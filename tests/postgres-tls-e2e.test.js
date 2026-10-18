@@ -29,7 +29,9 @@
  *   3. common system locations for a PostgreSQL 16 installation.
  *
  * If no TLS-capable PostgreSQL 16 can be found, the suite SKIPS with an explicit message
- * (exit 0). It never reports a skip as a pass.
+ *   (exit 0). It never reports a skip as a pass. Set `EASY_LEARN_REQUIRE_TLS_E2E=true`
+ *   to turn a skip into a failure — CI does exactly that, so the job proves these
+ *   assertions really ran.
  */
 
 const assert = require("assert");
@@ -243,21 +245,37 @@ function describeError(error) {
 async function main() {
   console.log("🔐 End-to-end PostgreSQL TLS tests (real TLS-enabled PostgreSQL 16 server)\n");
 
+  /* Locally the suite skips gracefully when no TLS-capable PostgreSQL 16 exists. In CI
+     (`EASY_LEARN_REQUIRE_TLS_E2E=true`) a skip is a FAILURE: the CI job must actually
+     execute these assertions, not quietly pass without them. */
+  const requireExecution = process.env.EASY_LEARN_REQUIRE_TLS_E2E === "true";
+  const skip = (message) => {
+    console.log(message);
+    if (requireExecution) {
+      console.error("❌ FAIL: EASY_LEARN_REQUIRE_TLS_E2E=true — the TLS end-to-end suite must run, not skip.");
+      process.exitCode = 1;
+    }
+  };
+
   if (!fs.existsSync(path.join(os.tmpdir(), "."))) {
     throw new Error("temporary directory is unavailable");
   }
 
-  let bin = findPostgresBin();
+  const bin = findPostgresBin();
   if (!bin) {
-    console.log("⏭️  SKIP: no PostgreSQL 16 server binary was found.");
-    console.log("   Install the optional dependency with `npm ci` on linux-x64/darwin-x64,");
-    console.log("   or point EASY_LEARN_TLS_PG_BIN at a PostgreSQL 16 bin directory.");
+    skip(
+      "⏭️  SKIP: no PostgreSQL 16 server binary was found.\n" +
+        "   Install the optional dependency with `npm ci` on linux-x64/darwin-x64,\n" +
+        "   or point EASY_LEARN_TLS_PG_BIN at a PostgreSQL 16 bin directory."
+    );
     return;
   }
   if (!bin.hasOpenSsl) {
-    console.log(`⏭️  SKIP: the PostgreSQL build at ${bin.dir} is not linked against OpenSSL,`);
-    console.log("   so it cannot serve TLS. Provide a TLS-capable build via");
-    console.log("   EASY_LEARN_TLS_PG_BIN to run this suite.");
+    skip(
+      `⏭️  SKIP: the PostgreSQL build at ${bin.dir} is not linked against OpenSSL,\n` +
+        "   so it cannot serve TLS. Provide a TLS-capable build via\n" +
+        "   EASY_LEARN_TLS_PG_BIN to run this suite."
+    );
     return;
   }
 

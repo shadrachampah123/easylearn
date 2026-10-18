@@ -197,6 +197,7 @@ otherwise claim that a gated migration had been applied when it had not.
 |---|---|
 | TLS policy (10 assertions, including real `tls` handshakes) | `tests/postgres-tls.test.js` |
 | **End-to-end against a real TLS-enabled PostgreSQL 16** (trusted, untrusted, hostname mismatch, `sslmode=require` not downgraded, the local escape hatch not weakening TLS) | `tests/postgres-tls-e2e.test.js` |
+| The end-to-end TLS suite actually **ran** (a skip fails the job) | `.github/workflows/ci.yml` sets `EASY_LEARN_REQUIRE_TLS_E2E=true` |
 | `pg-connection-string` declared and pinned as a direct production dependency | `tests/postgres-tls.test.js` |
 | Migration gate: default run skips, unconfirmed explicit run is refused, confirmed run applies | `tests/migration-0017-school-id-not-null.test.ts` |
 | Runner fail-closed behaviour (no ledger, checksum drift, gaps, missing files, per-file rollback, advisory lock, baseline confirmation) | `tests/migration-0017-school-id-not-null.test.ts`, `tests/tenant-db.test.js` |

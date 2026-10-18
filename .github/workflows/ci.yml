@@ -49,6 +49,9 @@ jobs:
       - name: Unit and source-security tests
         run: npm test
       - name: End-to-end PostgreSQL TLS tests (TLS-enabled PostgreSQL 16 required)
+        env:
+          # A skip must fail this job: the end-to-end TLS assertions have to actually run.
+          EASY_LEARN_REQUIRE_TLS_E2E: "true"
         run: npm run test:tls-e2e
       - name: Database, migration, and membership suites (PostgreSQL required)
         run: npm run test:db
