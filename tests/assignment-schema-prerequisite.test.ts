@@ -42,6 +42,9 @@ import { createRequire } from "module";
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
 const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
+const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
+  "./tests/helpers/scratch-db.js"
+);
 
 const RUN_ID = crypto.randomBytes(4).toString("hex");
 const SUPPORTED_DB = `easylearn_prereq_supported_${RUN_ID}`;
@@ -494,6 +497,56 @@ async function runSupportedScenario(databaseUrl: string): Promise<void> {
     assertEq(probe.parent.rows, 1, "the linked parent must reach the published assignment");
   });
 
+  await test(
+    "the synchronous and the schema-aware predicate select exactly the same rows",
+    async () => {
+      /* The submit route used to be the only one using the synchronous predicate. It now
+         uses the schema-aware one, which is only safe because the two are equivalent on
+         a supported schema — this assertion is what makes that reasoning checkable. */
+      const { db: appDb } = await import("@/db");
+      const { assignments } = await import("@/db/schema");
+      const access = await import("@/lib/assignment-access");
+
+      const roles: Array<{ name: string; ctx: any; options?: any }> = [
+        { name: "teacher", ctx: schoolContext("teacher", fixture.teacherA, fixture.schoolA) },
+        {
+          name: "school_admin",
+          ctx: schoolContext("school_admin", fixture.adminA, fixture.schoolA),
+        },
+        { name: "learner", ctx: schoolContext("learner", fixture.learnerA, fixture.schoolA) },
+        {
+          name: "parent",
+          ctx: schoolContext("parent", fixture.parentA, fixture.schoolA),
+          options: { learnerId: fixture.linkedLearnerId },
+        },
+      ];
+
+      for (const role of roles) {
+        const syncRows = (
+          await appDb
+            .select({ id: assignments.id })
+            .from(assignments)
+            .where(access.assignmentAccessPredicate(role.ctx, role.options))
+        )
+          .map((row: any) => row.id)
+          .sort();
+        const asyncRows = (
+          await appDb
+            .select({ id: assignments.id })
+            .from(assignments)
+            .where(await access.resolveAssignmentAccessPredicate(role.ctx, role.options))
+        )
+          .map((row: any) => row.id)
+          .sort();
+        assert.deepEqual(
+          asyncRows,
+          syncRows,
+          `the ${role.name} role must select the same rows with both predicates`
+        );
+      }
+    }
+  );
+
   await test("no role reaches a foreign-school assignment", async () => {
     assertEq(probe.scopeForeign.rows, 0, "the school scope must not reach a foreign assignment");
     assertEq(probe.teacherForeign.rows, 0, "a teacher must not reach a foreign assignment");
@@ -659,10 +712,22 @@ async function main(): Promise<void> {
      the cleanup path below can never mask the real failure with a configuration error. */
   process.env.DATABASE_URL = supportedUrl;
 
+  /* The scratch databases are created and removed by the shared helper, so they are
+     dropped even when a setup step or an assertion fails. See tests/helpers/scratch-db.js. */
+  const scratches: Array<{
+    dispose: () => Promise<{ ok: boolean; error: Error | null }>;
+  }> = [];
+  let primaryError: any = null;
+
   try {
     for (const dbName of [SUPPORTED_DB, PRE0016_DB]) {
-      await admin.query(`DROP DATABASE IF EXISTS "${dbName}"`);
-      await admin.query(`CREATE DATABASE "${dbName}"`);
+      const scratch = await createScratchDatabase({
+        admin,
+        adminUrl: adminUrl as string,
+        dbName,
+        label: "assignment-schema-prerequisite",
+      });
+      scratches.push(scratch);
     }
 
     /* The supported database: the whole chain, the way an operator applies it. */
@@ -714,18 +779,21 @@ async function main(): Promise<void> {
 
     await runSupportedScenario(supportedUrl);
     await runDocumentationTests();
+  } catch (error) {
+    /* Remember the original failure: the teardown must never replace it. */
+    primaryError = error;
+    throw error;
   } finally {
     await import("@/db")
       .then((mod) => mod.pool.end())
       .catch(() => undefined);
-    for (const dbName of [SUPPORTED_DB, PRE0016_DB]) {
-      await admin
-        .query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, [dbName])
-        .catch(() => undefined);
-      await admin.query(`DROP DATABASE IF EXISTS "${dbName}"`).catch(() => undefined);
+    const cleanups: Array<{ ok: boolean; error: Error | null }> = [];
+    for (const scratch of scratches) {
+      cleanups.push(await scratch.dispose());
     }
     await admin.end().catch(() => undefined);
     if (stopServer) await stopServer().catch(() => undefined);
+    assertCleanupSucceeded(cleanups, primaryError);
   }
 
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed`);

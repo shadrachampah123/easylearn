@@ -16,7 +16,7 @@ import {
   type EasyAIReport,
 } from "@/lib/easyai";
 import { eq, and } from "drizzle-orm";
-import { assignmentAccessPredicate } from "@/lib/assignment-access";
+import { resolveAssignmentAccessPredicate } from "@/lib/assignment-access";
 
 /** Learner-points reward tiers, shared by both grading paths. */
 function pointsForPercentage(percentage: number): number {
@@ -49,11 +49,15 @@ export async function POST(
     // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
 
-    // Get the assignment
+    /* Get the assignment. The authorization predicate is the schema-aware one every
+       other assignment route uses. On a migrated (0016+) schema it resolves to exactly
+       the same scope as the former synchronous form — the direct `school_id` column
+       combined with the same in-school check — and only a learner can reach this code
+       path, whose role rule needs migration 0016 either way. */
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(and(eq(assignments.id, assignmentId), assignmentAccessPredicate(ctx)))
+      .where(and(eq(assignments.id, assignmentId), await resolveAssignmentAccessPredicate(ctx)))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");

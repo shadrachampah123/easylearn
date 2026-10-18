@@ -313,6 +313,10 @@ value `"references the wrong parent table"`. The rendered operator message there
 table"**. Observed live. Cosmetic only — the message is unambiguous about which object is
 wrong — but it is the text an operator reads during an incident.
 
+**Follow-up (2026-10-18): FIXED.** Only this one of the eleven problem values was
+ungrammatical; the single SQL literal was reworded so the existing template renders a
+correct sentence. See *"LOW-1 — the ungrammatical operator message — FIXED"* above.
+
 #### LOW-2 — The assignment submit route is the only one using the non-schema-aware predicate
 
 `src/app/api/assignments/[id]/submit/route.ts:19,56` uses the synchronous
@@ -321,6 +325,11 @@ wrong — but it is the text an operator reads during an incident.
 equivalent isolation, and on a pre-0016 database **both** fail (see MEDIUM-2), so there is no
 practical divergence today. It is an inconsistency that will become one if the fallback is
 ever made genuinely 0013-compatible.
+
+**Follow-up (2026-10-18): FIXED.** The route now uses `resolveAssignmentAccessPredicate`
+like every sibling route, and the equivalence that makes the change a no-op is now
+asserted by the regression suite for all four roles. See *"LOW-2 — the submit route used
+the non-schema-aware predicate — FIXED"* above.
 
 #### LOW-3 — The policy mirror documents a teacher-access rule no route implements
 
@@ -333,6 +342,10 @@ implements ownership only (`eq(assignments.teacherId, context.userId)`,
 than the mirror), but a reviewer reading the mirror would conclude a co-teacher is supported
 when such a teacher is in fact denied.
 
+**Follow-up (2026-10-18): FIXED.** The mirror now states exactly what the routes enforce
+(ownership only) and the reserved flag is documented as **RESERVED** and asserted to grant
+nothing. See *"LOW-3 — the policy mirror granted a rule no route implements — FIXED"* above.
+
 #### LOW-4 — The relational "reachable schools" helpers do not check the school lifecycle
 
 `sqlUserInSchool`, `sqlUserRoleInSchool`, `sqlUserHasRoleInSchool` and `sqlSchoolsOfUser`
@@ -341,6 +354,15 @@ content-ownership helpers — `sqlSchoolsOfClass` (`:677`), `sqlSchoolsOfTeacher
 `sqlSchoolsOfLearnerClass`, `sqlSchoolsOfAssignment`, `sqlSchoolsOfQuiz`
 (`src/lib/tenant.ts:677-800`) — check only `su."status" = 'active'` and never the school's
 lifecycle status.
+
+**Follow-up (2026-10-18): measured, NOT implemented.** The "defence in depth" remedy that
+was proposed for this finding — adding the school lifecycle filter to these helpers — was
+measured on a real database and turns out to **loosen** the rule: it removes a suspended
+school from the reachable set, so a row reachable from an active *and* a suspended school
+changes from **denied** to **allowed**. The requested school is always active anyway. This
+finding therefore stays open as a non-defect and the remedy is **not** applied. See
+*"LOW-4 — the "reachable schools" helpers omit the school lifecycle check — NOT FIXED, and
+the proposed remedy is a loosening"* above.
 
 **Not exploitable, and here is why.** These helpers feed `sqlOwnedBySchool`
 (`src/lib/tenant.ts:803-810`), which requires the row to be reachable from **exactly** the
@@ -361,6 +383,13 @@ block); the older tenant suites do not. On a CI runner this is invisible — the
 container is destroyed with the job — but on a long-lived developer or self-hosted CI
 database the scratch databases accumulate. No correctness or isolation impact; housekeeping
 only.
+
+**Follow-up (2026-10-18): FIXED.** All twelve database-creating suites were audited; the
+four that never dropped their database and the three that swallowed their cleanup failure
+now share one lifecycle helper that always removes the scratch database, surfaces a
+cleanup failure instead of swallowing it, and preserves the original failure. A new
+contract suite pins the behaviour and fails CI if it is skipped. See *"LOW-5 — the
+disposable test databases are now always removed — FIXED"* above.
 
 #### Environment observation — the local `.git` was re-cloned between sessions
 
@@ -663,6 +692,167 @@ because:
 This re-audit changed only the regression suite and the CI wiring (`69a6e5b`). It did not
 change the migration, the runner, the schema, the application authorization code, the
 production environment, or PR #32's draft status, and it did not merge anything.
+
+---
+
+## Follow-up work (2026-10-18) — the LOW findings, after PR #32 was merged
+
+PR #32 was merged into `main` as `90ec043`. This section records the follow-up work that
+was done afterwards, in its own branch and its own pull request, against the merged tree.
+
+**Scope.** The LOW findings recorded above. **BLOCKER-1 and MEDIUM-3 were deliberately left
+alone**: the production preflight needs an authorized operator on a restored production
+copy, and the 26 child-side indexes are a separate, separately gated migration.
+
+### LOW-5 — the disposable test databases are now always removed — FIXED
+
+**Measured first.** Every suite that creates a disposable PostgreSQL database was audited
+(12 suites in total), and the finding was reproduced on the merged tree: a run of the four
+worst suites left **4** scratch databases on the admin database — `easylearn_2c_test_*`,
+`easylearn_2d_test_*`, `easylearn_2d_reg_*` and `easylearn_2e_dash_*` — one per suite.
+
+| Suite | Scratch database | Teardown before |
+|---|---|---|
+| `tests/tenant-authorization-db.test.ts` | `easylearn_2c_test_*` | **none** — the `finally` never dropped it |
+| `tests/tenant-catalog-db.test.ts` | `easylearn_2d_test_*` | **none** |
+| `tests/tenant-assignments-submissions-regression.test.ts` | `easylearn_2d_reg_*` | **none** |
+| `tests/tenant-dashboard-isolation-db.test.ts` | `easylearn_2e_dash_*` | **none** |
+| `tests/tenant-integration-regression.test.ts` | `easylearn_integration_*` | dropped, but the failure was **swallowed** (`.catch(() => undefined)`) |
+| `tests/assignment-access-db.test.ts` | `easylearn_assignment_auth_*` | dropped, but the failure was **swallowed** |
+| `tests/assignment-schema-prerequisite.test.ts` | `easylearn_prereq_*` | dropped, but the failure was **swallowed** |
+| `tests/tenant-db.test.js`, `tests/membership-auth-db.test.ts`, `tests/tenant-write-attribution-db.test.ts`, `tests/migration-0017-school-id-not-null.test.ts`, `tests/migration-tenant-constraint-integrity.test.ts` | — | already dropped in a `finally`; left unchanged |
+
+Two further gaps were closed by the same change, because the old teardown had them too:
+
+* **A failure in a setup step leaked the database.** The old pattern created the database
+  *before* entering the suite's `try` block, so a suite that died between
+  `CREATE DATABASE` and the `try` could never drop it.
+* **A failed teardown was invisible.** `.catch(() => undefined)` turned "the scratch
+  database could not be removed" into silence.
+
+**The fix.** One shared helper, `tests/helpers/scratch-db.js`, now owns the lifecycle:
+
+* `createScratchDatabase()` removes any stale database of the same name (a killed run
+  leaves one behind), creates a fresh one, connects a client, and — if any of those steps
+  fails — removes what it created before re-throwing, so **a failed setup never leaves a
+  database behind**;
+* `dropScratchDatabase()` terminates the backends still attached, drops the database, and
+  **verifies against the catalog that it is gone**. It retries, and it **never throws**: it
+  returns `{ ok, error }`;
+* `assertCleanupSucceeded()` composes the two outcomes: when the test body already failed,
+  the **original failure is what fails the suite** and the cleanup failure is printed (never
+  swallowed) and attached to it as `cleanupError`; when the test body succeeded, the cleanup
+  failure **fails the suite on its own**, with a message that names the database and the
+  `DROP DATABASE` command the operator has to run.
+
+All seven suites above now use it, and the change is small in each: the helper replaces
+the manual `CREATE DATABASE` block, a `catch` clause records the primary error, and the
+`finally` disposes the scratch database.
+
+**The contract is pinned by a new suite**, `tests/scratch-db-lifecycle.test.ts`
+(7 assertions): the teardown removes the database after a successful body; it removes it
+after a **failed** body; a **failed setup** removes the database it created; a **stale**
+database is replaced; a cleanup failure is **surfaced with an actionable message**; a
+cleanup failure **does not replace** the original failure; and a cleanup failure **fails the
+suite** when nothing else failed. The suite is part of `test:db` and `test:all`, and a
+skip fails the CI job (`EASY_LEARN_REQUIRE_SCRATCH_DB_LIFECYCLE=true`).
+
+**Verified** (disposable PostgreSQL 16.14, the CI sequence replicated locally with every
+fail-on-skip safeguard on):
+
+* every suite touched by this follow-up was run **three times in a row** — the four
+  leaking suites (80 / 17 / 11 / 21 assertions), the three silent-swallow suites
+  (11 / 7 / 23), the new contract suite (7), the policy suite and the tenant-constraint
+  integrity suite (20) — **3/3 green every time**, leaving **0** scratch databases;
+* the whole CI sequence — `npm test`, the TLS end-to-end suite (6 assertions against a
+  real TLS-enabled PostgreSQL 16), `test:db`, `test:tenant-auth`, `test:mutation`,
+  `test:integration`, `test:tenant-integrity`, typecheck, production build and lint —
+  is **green end to end**, and leaves **0** databases behind on the admin database
+  (before this change the same sequence left 13).
+
+### LOW-1 — the ungrammatical operator message — FIXED
+
+The inventory SQL produced one problem value that was a full clause while the other ten
+were noun phrases, and the message template inserted `is` in front of all of them:
+
+```
+constraint assignments_school_class_fk on public.assignments is references the wrong parent table
+```
+
+Only that one case was ungrammatical; the other ten already read correctly. The single
+SQL literal was changed to `a foreign key to the wrong parent table`, so the message now
+reads *"constraint … on public.… is a foreign key to the wrong parent table"*. Nothing else
+changed: the `problem` field has no enumerated contract, the only two assertions on these
+messages (`is not validated`, `is wrong child columns`) still hold, and the drift guard
+between the module and migration 0018 is unaffected.
+
+### LOW-2 — the submit route used the non-schema-aware predicate — FIXED
+
+`src/app/api/assignments/[id]/submit/route.ts` was the only assignment route still using
+the synchronous `assignmentAccessPredicate`, which always references `assignments.school_id`
+and therefore requires migration 0016 for every role. It now uses
+`resolveAssignmentAccessPredicate`, like every other route.
+
+**The change is a no-op, and that was verified rather than assumed.** Only a **learner** can
+reach this code path (`ctx.school.role !== "learner"` → 403), and the learner role rule
+needs `learner_classes.school_id` either way — so on a pre-0016 schema both forms fail
+closed identically, and on a migrated schema the two predicates select **exactly the same
+rows**. That equivalence is now asserted by the regression suite: *"the synchronous and the
+schema-aware predicate select exactly the same rows"*, checked for the teacher, the school
+administrator, the learner and the parent.
+
+### LOW-3 — the policy mirror granted a rule no route implements — FIXED
+
+`src/lib/assignment-policy.ts` granted a teacher `manage-full` when `explicitlyAuthorized`
+was true, but **no route and no schema column ever populates that flag** — the enforced
+teacher rule in `assignment-access.ts` is ownership only. A mirror that hands out access
+the database-backed routes never grant is a mirror that misleads every reader who trusts
+it.
+
+The mirror now states exactly what the routes enforce: the teacher branch is ownership
+only, and the flag is kept in the input type, documented as **RESERVED**, so the intended
+capability stays visible and has an obvious place to be wired when it is implemented. The
+policy test was updated to assert that the reserved flag grants **nothing** — a stronger
+guard than the one it replaces. The function is used only by tests, so no production
+behaviour changed.
+
+### LOW-4 — the "reachable schools" helpers omit the school lifecycle check — NOT FIXED, and the proposed remedy is a loosening
+
+The handoff proposed adding `join schools s on s.id = … and s.status = 'active'` to the
+`sqlSchoolsOf*` helpers "for defence in depth". **That change was measured and it is not a
+no-op — it weakens the rule.**
+
+`sqlOwnedBySchool()` grants a row to a school only when that school is in the reachable set
+**and is the only school in it**; a row reachable from two schools is attributable to
+neither and is denied (fail closed). Filtering the reachable set by the school lifecycle
+removes a **suspended** school from that set, so a row that is reachable from an active
+school *and* from a suspended school changes from **denied** to **allowed**:
+
+| | Reachable-school set | `sqlOwnedBySchool(A, set)` |
+|---|---|---|
+| today | `{A (active), B (suspended)}` | **false** → the row is DENIED for A |
+| with the proposed filter | `{A}` | **true** → the row would be ALLOWED for A |
+
+(Measured on a real PostgreSQL 16.14 database: school A active, school B suspended, one
+teacher with an active membership in **both**, a class in A homeroomed by that teacher, and
+an assignment in that class.)
+
+**The requested school is always active anyway** — the membership resolution
+(`sqlSchoolsOfUser`) already joins `schools` with `status = 'active'`, so a suspended
+school can never be the school a request asks for. The finding therefore stays **open as a
+non-defect**: the helpers omit a check that cannot be reached, and the only way to add it
+would relax the dual-attribution rule. It is **not** implemented here.
+
+### What this follow-up did not do
+
+* **BLOCKER-1 is still BLOCKED.** The production preflight has **not** been performed and
+  the restored-production-copy checkpoint has **not** been completed.
+* **MEDIUM-3 is untouched.** The 26 child-side indexes are still missing, the performance
+  issue is **not** fixed, and the follow-up plan above stands as written.
+* No production migration was run, no production connection was opened, no production data
+  or setting was changed, no manual deployment was performed, and no branch protection was
+  altered. The migration 0018 gate, the baseline confirmation and the repair confirmation
+  are untouched, and the tenant-integrity and TLS safeguards are unchanged.
 
 ---
 

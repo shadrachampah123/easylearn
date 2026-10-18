@@ -205,7 +205,7 @@ SELECT
     WHEN c.oid IS NULL THEN 'missing'
     WHEN c.contype <> 'f' THEN 'not a foreign key'
     WHEN NOT c.convalidated THEN 'not validated'
-    WHEN c.confrelid IS DISTINCT FROM r.parent_oid THEN 'references the wrong parent table'
+    WHEN c.confrelid IS DISTINCT FROM r.parent_oid THEN 'a foreign key to the wrong parent table'
     WHEN r.child_school_att IS NULL OR r.child_ref_att IS NULL THEN 'child column missing'
     WHEN c.conkey IS DISTINCT FROM ARRAY[r.child_school_att, r.child_ref_att]::smallint[]
       THEN 'wrong child columns'
