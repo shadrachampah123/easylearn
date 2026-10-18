@@ -71,7 +71,9 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
   }, [role, search]);
 
   useEffect(() => {
-    fetchUsers();
+    // Loading state intentionally starts alongside the network request.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void fetchUsers();
   }, [fetchUsers]);
 
   function resetCreateForm() {

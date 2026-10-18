@@ -32,7 +32,7 @@ console.log('🔒 Running Phase 1 Security Tests\n');
 test('Authentication: users route requires admin role', () => {
   const content = readFile('src/app/api/users/route.ts');
   assert(content.includes('Only administrators can view user directory'), 'Should restrict to admins');
-  assert(content.includes('super_admin') && content.includes('school_admin'), 'Should check admin roles');
+  assert(content.includes('hasSchoolAdminRole') && content.includes('hasSchoolAdminExtendedRole'), 'Should check database-derived school membership roles');
 });
 
 test('Authentication: announcements public vs private', () => {

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - arena/dc9adcab-easylearn
+
+jobs:
+  quality:
+    name: Tests, PostgreSQL isolation, typecheck, build, lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: easylearn_test
+          POSTGRES_PASSWORD: easylearn_test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U easylearn_test -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # These are disposable CI-only credentials. DB tests create and drop isolated scratch DBs.
+      TEST_DATABASE_URL: postgres://easylearn_test:easylearn_test@127.0.0.1:5432/postgres
+      # Pure tests/build must not inherit the PostgreSQL service as the application DB.
+      DATABASE_URL: postgres://test:test@127.0.0.1:1/testdb
+      JWT_SECRET: ci-only-not-a-production-secret-at-least-32-characters
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+      - name: Use Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
+      - name: Require disposable PostgreSQL configuration
+        run: test -n "$TEST_DATABASE_URL"
+      - name: Unit and source-security tests
+        run: npm test
+      - name: End-to-end PostgreSQL TLS tests (TLS-enabled PostgreSQL 16 required)
+        env:
+          # A skip must fail this job: the end-to-end TLS assertions have to actually run.
+          EASY_LEARN_REQUIRE_TLS_E2E: "true"
+        run: npm run test:tls-e2e
+      - name: Database, migration, and membership suites (PostgreSQL required)
+        env:
+          # A skip must fail this job: the assignment schema-prerequisite assertions have to
+          # actually run.
+          EASY_LEARN_REQUIRE_ASSIGNMENT_PREREQ: "true"
+        run: npm run test:db
+      - name: Tenant authorization suites (PostgreSQL required)
+        run: npm run test:tenant-auth
+      - name: Tenant negative mutation tests
+        run: npm run test:mutation
+      - name: PR integration regression suite (PostgreSQL required)
+        run: npm run test:integration
+      - name: Tenant constraint integrity / schema-sync bypass regression (PostgreSQL required)
+        env:
+          # A skip must fail this job: the schema-sync bypass regression has to actually run.
+          EASY_LEARN_REQUIRE_TENANT_INTEGRITY: "true"
+        run: npm run test:tenant-integrity
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Production build
+        run: npm run build
+      - name: Lint
+        run: npm run lint

@@ -1,11 +1,7 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { assignments, submissions, assignmentQuestions, assignmentAnswers, notifications, learnerPoints } from "@/db/schema";
-import {
-  guardSchoolContext,
-  isAssignmentInSchool,
-  sqlSubmissionInSchool,
-} from "@/lib/tenant";
+import { guardSchoolContext } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
@@ -20,6 +16,7 @@ import {
   type EasyAIReport,
 } from "@/lib/easyai";
 import { eq, and } from "drizzle-orm";
+import { assignmentAccessPredicate } from "@/lib/assignment-access";
 
 /** Learner-points reward tiers, shared by both grading paths. */
 function pointsForPercentage(percentage: number): number {
@@ -46,10 +43,6 @@ export async function POST(
 
     const { id: assignmentId } = await params;
 
-    /* Phase 2C: another school's assignment does not exist for this learner. */
-    if (!(await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
-      return notFoundResponse("Assignment");
-    }
     const body = await request.json();
     const { answers, content, attachments } = body; // answers = { [questionId]: answerText }
 
@@ -60,7 +53,7 @@ export async function POST(
     const [assignment] = await db
       .select()
       .from(assignments)
-      .where(eq(assignments.id, assignmentId))
+      .where(and(eq(assignments.id, assignmentId), assignmentAccessPredicate(ctx)))
       .limit(1);
 
     if (!assignment) return notFoundResponse("Assignment");
@@ -75,7 +68,11 @@ export async function POST(
     const [enrollment] = await db
       .select({ id: learnerClasses.id })
       .from(learnerClasses)
-      .where(and(eq(learnerClasses.learnerId, ctx.userId), eq(learnerClasses.classId, assignment.classId)))
+      .where(and(
+        eq(learnerClasses.schoolId, ctx.schoolId),
+        eq(learnerClasses.learnerId, ctx.userId),
+        eq(learnerClasses.classId, assignment.classId)
+      ))
       .limit(1);
 
     if (!enrollment) {
@@ -115,6 +112,7 @@ export async function POST(
       .from(submissions)
       .where(and(
         eq(submissions.assignmentId, assignmentId),
+        eq(submissions.schoolId, ctx.schoolId),
         eq(submissions.learnerId, ctx.userId)
       ))
       .limit(1);
@@ -140,7 +138,7 @@ export async function POST(
       .insert(submissions)
       .values({
         // Phase 2E (Step 1): the assignment was proven to belong to the caller's
-        // school (isAssignmentInSchool + direct check above), so the submission
+        // school (the assignment query above is direct-school scoped), so the submission
         // carries that school.
         schoolId: ctx.schoolId,
         assignmentId,
@@ -264,8 +262,6 @@ export async function POST(
           isCorrect,
           pointsAwarded,
           pointsPossible: questionPoints,
-          correctAnswer: question.correctAnswer,
-          explanation: question.explanation,
           gradedBy: "easyai",
           partialCredit: Math.round(partialCredit * 100) / 100,
         });
@@ -324,8 +320,6 @@ export async function POST(
         isCorrect,
         pointsAwarded,
         pointsPossible: questionPoints,
-        correctAnswer: question.correctAnswer,
-        explanation: question.explanation,
       });
     }
 

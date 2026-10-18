@@ -7,8 +7,12 @@ import {
   isClassInSchool,
   isSubjectInSchool,
   isTermInSchool,
-  sqlAssignmentInSchool,
+  sqlClassInSchool,
+  sqlSchoolRowInSchool,
+  sqlSubmissionScope,
+  sqlUserInSchool,
 } from "@/lib/tenant";
+import { resolveAssignmentListPredicate } from "@/lib/assignment-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
@@ -29,40 +33,28 @@ export async function GET(request: NextRequest) {
     const subjectId = request.nextUrl.searchParams.get("subjectId");
     const status = request.nextUrl.searchParams.get("status");
 
-    // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
-    // Always include schoolId = ctx.schoolId (direct), fallback to relational for pre-0016 DB
-    let useDirect = true;
-    try {
-      await db.execute(sql`select "school_id" from "assignments" limit 0`);
-    } catch {
-      useDirect = false;
-    }
+    // Authorization is part of the assignment query, not a fetch-then-filter step. Learners
+    // and parents are limited to published content tied to enrollment/parent linkage;
+    // teachers are limited to assignments they own; school administrators and head teachers
+    // receive the full school-scoped management view. The school scope is resolved
+    // schema-aware, so the teacher and school-administrator roles also work on a database
+    // that predates migration 0016. The learner and parent roles require migration 0016
+    // (their predicates read `learner_classes.school_id` / `parent_learners.school_id`); on a
+    // pre-0016 schema they fail closed with a missing-column error rather than returning
+    // rows. See `src/lib/assignment-access.ts`.
+    const conditions: any[] = [await resolveAssignmentListPredicate(ctx)];
 
-    const conditions: any[] = useDirect
-      ? [eq(assignments.schoolId, ctx.schoolId)]
-      : [sqlAssignmentInSchool(ctx.schoolId, assignments.id)];
-
-    // For teachers, show their own assignments
-    if (ctx.school.role === "teacher") {
-      conditions.push(eq(assignments.teacherId, ctx.userId));
-    }
-
-    // Filter by class
-    if (classId) {
-      conditions.push(eq(assignments.classId, classId));
-    }
-
-    // Filter by subject
-    if (subjectId) {
-      conditions.push(eq(assignments.subjectId, subjectId));
-    }
-
-    // Filter by status
+    if (classId) conditions.push(eq(assignments.classId, classId));
+    if (subjectId) conditions.push(eq(assignments.subjectId, subjectId));
     if (status) {
       conditions.push(eq(assignments.status, status as "draft" | "published" | "closed"));
     }
 
-    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+    const whereClause = and(...conditions);
+    const classScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "classes", classes.id, sqlClassInSchool(ctx.schoolId, classes.id)
+    );
+    const subjectScope = await sqlSchoolRowInSchool(ctx.schoolId, "subjects", subjects.id, sql`false`);
 
     const results = await db
       .select({
@@ -86,15 +78,16 @@ export async function GET(request: NextRequest) {
         teacherLastName: users.lastName,
       })
       .from(assignments)
-      .leftJoin(classes, eq(assignments.classId, classes.id))
-      .leftJoin(subjects, eq(assignments.subjectId, subjects.id))
-      .leftJoin(users, eq(assignments.teacherId, users.id))
+      .leftJoin(classes, and(eq(assignments.classId, classes.id), classScope))
+      .leftJoin(subjects, and(eq(assignments.subjectId, subjects.id), subjectScope))
+      .leftJoin(users, and(eq(assignments.teacherId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
       .where(whereClause)
       .orderBy(desc(assignments.createdAt))
       .limit(50);
 
-    // For learners, add submission status
+    // For learners, add submission status without following a foreign-school child row.
     if (ctx.school.role === "learner") {
+      const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
       const assignmentsWithStatus = await Promise.all(
         results.map(async (assignment) => {
           const [submission] = await db
@@ -109,7 +102,9 @@ export async function GET(request: NextRequest) {
             .from(submissions)
             .where(and(
               eq(submissions.assignmentId, assignment.id),
-              eq(submissions.learnerId, ctx.userId)
+              eq(submissions.learnerId, ctx.userId),
+              submissionScope,
+              sqlUserInSchool(ctx.schoolId, submissions.learnerId)
             ))
             .limit(1);
           return { ...assignment, submission: submission || null };

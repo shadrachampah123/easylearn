@@ -83,7 +83,10 @@ const mutations: Mutation[] = [
     name: "membership check removed (no membership → fabricated school context)",
     find: `  const context = await resolveAuthContext(request, tokenOverride);
   if (!context.school) {
-    throw new AuthContextError("You do not have an active school membership", 403);
+    const message = context.memberships.length > 1
+      ? "Select one of your schools before continuing"
+      : "You do not have an active school membership in an active school";
+    throw new AuthContextError(message, 403);
   }`,
     replace: `  const context = await resolveAuthContext(request, tokenOverride);
   if (!context.school) {
@@ -135,8 +138,13 @@ const mutations: Mutation[] = [
     id: "M4",
     name: "inactive-membership filter removed (disabled membership grants access)",
     find: `  const conditions = [eq(schoolUsers.userId, userId)];
-  if (!options.includeInactive) conditions.push(eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS));`,
-    replace: `  // MUTANT M4: membership status ignored.
+  if (!options.includeInactive) {
+    conditions.push(
+      eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS),
+      eq(schools.status, ACTIVE_SCHOOL_LIFECYCLE_STATUS)
+    );
+  }`,
+    replace: `  // MUTANT M4: membership and school lifecycle status ignored.
   const conditions = [eq(schoolUsers.userId, userId)];`,
   },
   {

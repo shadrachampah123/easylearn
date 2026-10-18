@@ -7,14 +7,12 @@
  *
  * SECURITY INVARIANTS (each one is covered by tests/membership-auth-db.test.ts):
  *
- *  1. A client can NEVER choose a school. `resolveAuthContext` reads exactly one thing from
- *     the request — the token — and every membership comes from `school_users`. There is no
- *     body/query/header `schoolId` read anywhere in this module.
- *  2. The optional `schoolId` accepted by the resolvers can only NARROW the caller's own
- *     already-verified memberships; an arbitrary or foreign value resolves to `null` instead
- *     of returning somebody else's membership.
- *  3. Token claims are hints. Nothing here trusts `schoolIdHint` / `membershipIdHint`;
- *     membership is re-derived from the database on every call.
+ *  1. A client may request a school switch only through `/api/auth/select-school`; the
+ *     request is accepted only when the school is in the caller's active DB memberships.
+ *  2. Token claims are hints. `schoolIdHint` / `membershipIdHint` are revalidated against
+ *     fresh `school_users` rows on every request and never supply a role.
+ *  3. A multi-school account without a v3 selection has no school context; it must select
+ *     one before reaching any school-scoped API. A legacy token hint is not a selection.
  *  4. `super_admin` is a PLATFORM role (plan §7). It yields no membership, `toSchoolRole()`
  *     returns `null` for it, and there is no `role === 'super_admin'` branch below — a
  *     platform account never acquires school-wide access through this module.
@@ -28,7 +26,7 @@ import { db } from "@/db";
 import { schools, schoolUsers, users } from "@/db/schema";
 import { errorResponse } from "@/lib/api-helpers";
 import { findAuthUser, getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { isMissingRelation } from "@/lib/schema-resilience";
+import { isMissingColumn, isMissingRelation } from "@/lib/schema-resilience";
 
 /* ── Roles ── */
 
@@ -52,6 +50,20 @@ export type SchoolRole = (typeof SCHOOL_ROLES)[number];
 export const MEMBERSHIP_STATUSES = ["active", "invited", "disabled"] as const;
 export type MembershipStatus = (typeof MEMBERSHIP_STATUSES)[number];
 export const ACTIVE_MEMBERSHIP_STATUS: MembershipStatus = "active";
+
+/**
+ * Ordinary tenant APIs may run only for an active school. Lifecycle rows are intentionally
+ * retained so platform records/export workflows can inspect them without granting tenant
+ * access. This uses the existing varchar/check column; no migration is needed.
+ */
+export const SCHOOL_LIFECYCLE_STATUSES = [
+  "provisioned",
+  "active",
+  "suspended",
+  "archived",
+] as const;
+export type SchoolLifecycleStatus = (typeof SCHOOL_LIFECYCLE_STATUSES)[number];
+export const ACTIVE_SCHOOL_LIFECYCLE_STATUS: SchoolLifecycleStatus = "active";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -87,6 +99,10 @@ function isMembershipStatus(value: unknown): value is MembershipStatus {
   return typeof value === "string" && (MEMBERSHIP_STATUSES as readonly string[]).includes(value);
 }
 
+function isSchoolLifecycleStatus(value: unknown): value is SchoolLifecycleStatus {
+  return typeof value === "string" && (SCHOOL_LIFECYCLE_STATUSES as readonly string[]).includes(value);
+}
+
 /* ── Errors ── */
 
 /** Thrown by the `require*` helpers so Phase 2C routes can map it straight onto a response. */
@@ -109,8 +125,8 @@ export type SchoolMembership = {
   status: MembershipStatus;
   schoolSlug: string;
   schoolName: string;
-  /** School lifecycle (plan §4.4). Surfaced for later phases; not filtered here. */
-  schoolStatus: string;
+  /** School lifecycle (plan §4.4). Only `active` is returned by active-context reads. */
+  schoolStatus: SchoolLifecycleStatus;
   createdAt: Date | null;
 };
 
@@ -126,20 +142,32 @@ const membershipSelection = {
   schoolStatus: schools.status,
 };
 
-function toMembership(row: Record<string, unknown>): SchoolMembership | null {
-  // Defence in depth: a platform role must never be interpreted as a school membership,
-  // even if such a row somehow existed.
+export function toSchoolMembership(row: Record<string, unknown>): SchoolMembership | null {
+  // Defence in depth: a platform role, malformed membership status, or malformed school
+  // lifecycle status must never be interpreted as a valid school membership. In particular,
+  // unknown/missing lifecycle values must not fall back to `active`.
   const role = toSchoolRole(row.role);
-  if (!role || !isUuid(row.schoolId) || !isUuid(row.userId)) return null;
+  const membershipStatus = isMembershipStatus(row.status) ? row.status : null;
+  const schoolStatus = isSchoolLifecycleStatus(row.schoolStatus) ? row.schoolStatus : null;
+  if (
+    !role ||
+    !isUuid(row.membershipId) ||
+    !isUuid(row.schoolId) ||
+    !isUuid(row.userId) ||
+    !membershipStatus ||
+    !schoolStatus
+  ) {
+    return null;
+  }
   return {
-    membershipId: String(row.membershipId),
+    membershipId: row.membershipId,
     schoolId: row.schoolId,
     userId: row.userId,
     role,
-    status: isMembershipStatus(row.status) ? row.status : ACTIVE_MEMBERSHIP_STATUS,
+    status: membershipStatus,
     schoolSlug: typeof row.schoolSlug === "string" ? row.schoolSlug : "",
     schoolName: typeof row.schoolName === "string" ? row.schoolName : "",
-    schoolStatus: typeof row.schoolStatus === "string" ? row.schoolStatus : "",
+    schoolStatus,
     createdAt: row.createdAt instanceof Date ? row.createdAt : null,
   };
 }
@@ -148,7 +176,9 @@ let missingMembershipTableReported = false;
 
 /**
  * Every membership the user holds, newest-independent and deterministic
- * (`created_at`, then `id`). Only `active` rows unless `includeInactive` is set.
+ * (`created_at`, then `id`). Only active membership rows in active schools are returned by
+ * the default path. `includeInactive` is reserved for platform/lifecycle inspection and may
+ * include disabled memberships and non-active school rows; it never grants tenant context.
  *
  * Degrades to `[]` when `school_users` does not exist yet (migration 0013/0015 not
  * applied) — the same degrade-instead-of-crash rule the rest of the codebase follows, so
@@ -161,7 +191,12 @@ export async function listSchoolMemberships(
   if (!isUuid(userId)) return [];
 
   const conditions = [eq(schoolUsers.userId, userId)];
-  if (!options.includeInactive) conditions.push(eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS));
+  if (!options.includeInactive) {
+    conditions.push(
+      eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS),
+      eq(schools.status, ACTIVE_SCHOOL_LIFECYCLE_STATUS)
+    );
+  }
 
   try {
     const rows = await db
@@ -172,7 +207,7 @@ export async function listSchoolMemberships(
       .orderBy(asc(schoolUsers.createdAt), asc(schoolUsers.id));
 
     return (rows as unknown as Record<string, unknown>[])
-      .map(toMembership)
+      .map(toSchoolMembership)
       .filter((membership): membership is SchoolMembership => membership !== null);
   } catch (error) {
     if (isMissingRelation(error)) {
@@ -200,9 +235,9 @@ export async function listActiveSchoolMemberships(userId: string): Promise<Schoo
  * `options.schoolId` is a NARROWING hint for trusted server-side callers (Phase 2E will
  * pass the host-resolved school). It is matched against rows already fetched for THIS
  * user, so it can never widen the result: an unknown, forged or foreign school id simply
- * yields `null`. Without it, the deterministic first membership is returned — for the
- * current single-school CBISM deployment that is the CBISM membership. It is not a school
- * switcher, and no client input reaches it.
+ * yields `null`. Without it, a membership is returned only when the user has exactly one
+ * active school; a multi-school user must provide an explicit server-validated selection.
+ * It is not a school switcher, and no client input reaches it.
  */
 export async function resolveSchoolMembership(
   userId: string,
@@ -216,7 +251,7 @@ export async function resolveSchoolMembership(
     return memberships.find((membership) => membership.schoolId === options.schoolId) ?? null;
   }
 
-  return memberships[0] ?? null;
+  return memberships.length === 1 ? memberships[0] ?? null : null;
 }
 
 /** Like `resolveSchoolMembership`, but throws `AuthContextError(403)` when there is none. */
@@ -305,6 +340,25 @@ export async function resolveAuthContext(
   const role = typeof user.role === "string" ? user.role : "";
   const memberships = await listActiveSchoolMemberships(user.id);
 
+  // v3 hints are emitted only by login (single membership) or the validated switch route.
+  // Older token hints were generated by choosing the first membership at login, not by an
+  // explicit choice, so they cannot silently select a tenant for multi-school accounts.
+  // A hint is only ever a hint: it is matched against a freshly loaded active membership,
+  // so a forged, stale or foreign hint simply resolves to "no school".
+  let school: SchoolMembership | null = null;
+  if (!isPlatformRole(role)) {
+    if (claims.ver >= 3 && claims.schoolIdHint) {
+      const candidate = memberships.find((item) =>
+        item.schoolId === claims.schoolIdHint &&
+        (!claims.membershipIdHint || item.membershipId === claims.membershipIdHint)
+      );
+      school = candidate ?? null;
+    } else if (memberships.length === 1 && !claims.schoolSelectionRequired) {
+      // Backward-compatible and unambiguous unless this v3 login explicitly required a choice.
+      school = memberships[0] ?? null;
+    }
+  }
+
   return {
     userId: user.id,
     role,
@@ -314,14 +368,14 @@ export async function resolveAuthContext(
     isPlatformAdmin: isPlatformRole(role),
     user,
     memberships,
-    school: memberships[0] ?? null,
+    school,
   };
 }
 
 /**
- * `resolveAuthContext` + a required active school membership. This is the Phase 2C gate;
- * it is intentionally not wired into the existing routes yet (Phase 2B keeps every current
- * authorization path exactly as it was).
+ * `resolveAuthContext` + a required active school membership. Lifecycle status is re-read on
+ * every request, so an existing token loses ordinary tenant access as soon as its school is no
+ * longer active. Multi-school users must first use the server-side selection route.
  */
 export async function requireSchoolContext(
   request: Request,
@@ -329,7 +383,10 @@ export async function requireSchoolContext(
 ): Promise<SchoolAuthContext> {
   const context = await resolveAuthContext(request, tokenOverride);
   if (!context.school) {
-    throw new AuthContextError("You do not have an active school membership", 403);
+    const message = context.memberships.length > 1
+      ? "Select one of your schools before continuing"
+      : "You do not have an active school membership in an active school";
+    throw new AuthContextError(message, 403);
   }
   return {
     ...context,
@@ -340,10 +397,8 @@ export async function requireSchoolContext(
 }
 
 /**
- * Validate a candidate school (Phase 2E: the host-resolved school) against the caller's own
- * memberships. Rejects anything the user is not an active member of — this is the
- * host/session cross-check the architecture plan calls for, with the database as the source
- * of truth.
+ * Validate a requested school against the caller's freshly loaded active memberships.
+ * Client input selects only among those rows; it never creates school authority.
  */
 export function selectSchoolForContext(context: AuthContext, schoolId: unknown): SchoolAuthContext {
   if (!isUuid(schoolId)) {
@@ -367,13 +422,16 @@ export function selectSchoolForContext(context: AuthContext, schoolId: unknown):
  * Membership context for a login response / token. NEVER throws: a missing membership (or a
  * database without the tenant tables) must not lock anybody out in Phase 2B — membership is
  * additive context here, not a gate. Errors are logged and degrade to "no school context".
+ * A school is selected automatically only when exactly one active school remains; this avoids
+ * silently assigning a dual member to the first row returned by the database.
  */
 export async function resolveLoginSchoolContext(
   userId: string
 ): Promise<{ memberships: SchoolMembership[]; school: SchoolMembership | null }> {
   try {
     const memberships = await listActiveSchoolMemberships(userId);
-    return { memberships, school: memberships[0] ?? null };
+    // Automatic context is safe only when unambiguous. Multi-school users select explicitly.
+    return { memberships, school: memberships.length === 1 ? memberships[0] ?? null : null };
   } catch (error) {
     console.error("[tenant] school context resolution failed during login:", error);
     return { memberships: [], school: null };
@@ -572,10 +630,38 @@ function assertSchoolId(schoolId: string): string {
 export function sqlUserInSchool(schoolId: string, userRef: SQL | AnyColumn): SQL {
   assertSchoolId(schoolId);
   return sql`exists (
-    select 1 from "school_users" su
+    select 1
+      from "school_users" su
+      join "schools" s on s."id" = su."school_id" and s."status" = 'active'
      where su."user_id" = ${userRef}
        and su."school_id" = ${schoolId}
        and su."status" = 'active'
+  )`;
+}
+
+/** The active membership role for this user in this school (global users.role is not authoritative). */
+export function sqlUserRoleInSchool(schoolId: string, userRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`(
+    select su."role" from "school_users" su
+     join "schools" s on s."id" = su."school_id" and s."status" = 'active'
+     where su."user_id" = ${userRef}
+       and su."school_id" = ${schoolId}
+       and su."status" = 'active'
+     limit 1
+  )`;
+}
+
+/** Role-filter predicate for a user's active membership in this specific school. */
+export function sqlUserHasRoleInSchool(schoolId: string, userRef: SQL | AnyColumn, role: SchoolRole): SQL {
+  assertSchoolId(schoolId);
+  return sql`exists (
+    select 1 from "school_users" su
+     join "schools" s on s."id" = su."school_id" and s."status" = 'active'
+     where su."user_id" = ${userRef}
+       and su."school_id" = ${schoolId}
+       and su."status" = 'active'
+       and su."role" = ${role}
   )`;
 }
 
@@ -584,6 +670,7 @@ function sqlSchoolsOfUser(userRef: SQL | AnyColumn): SQL {
   return sql`(
     select su."school_id" as "school_id"
       from "school_users" su
+      join "schools" s on s."id" = su."school_id" and s."status" = 'active'
      where su."user_id" = ${userRef} and su."status" = 'active'
   )`;
 }
@@ -726,8 +813,57 @@ export function sqlClassInSchool(schoolId: string, classRef: SQL | AnyColumn): S
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfClass(classRef));
 }
 
-/** Content predicate: the assignment belongs to this school's alone. */
+/** Content predicate: the learner↔class enrollment belongs to this school alone. */
+export function sqlLearnerClassInSchool(schoolId: string, learnerClassRef: SQL | AnyColumn): SQL {
+  return sqlOwnedBySchool(schoolId, sql`(
+    select su."school_id" as "school_id"
+      from "learner_classes" lc
+      join "school_users" su on su."user_id" = lc."learner_id" and su."status" = 'active'
+     where lc."id" = ${learnerClassRef}
+    union
+    ${sqlSchoolsOfClass(sql`(select lc0."class_id" from "learner_classes" lc0 where lc0."id" = ${learnerClassRef})`)}
+  )`);
+}
+
+/**
+ * Content predicate for assignments. Migration 0016/0017 makes the direct school_id authoritative;
+ * the relational ownership check remains only for legacy rows whose school_id is still NULL.
+ * This preserves a legitimate multi-school teacher's selected-school assignments instead of
+ * treating the teacher's other active membership as a second owner.
+ */
 export function sqlAssignmentInSchool(schoolId: string, assignmentRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`(
+    exists (
+      select 1 from "assignments" a
+       where a."id" = ${assignmentRef} and a."school_id" = ${schoolId}
+    )
+    or (
+      not exists (
+        select 1 from "assignments" a
+         where a."id" = ${assignmentRef} and a."school_id" is not null
+      )
+      and ${sqlOwnedBySchool(schoolId, sqlSchoolsOfAssignment(assignmentRef))}
+    )
+  )`;
+}
+
+/**
+ * PURELY RELATIONAL assignment ownership.
+ *
+ * This is the pre-0016 fallback: a database that has no `assignments.school_id` column at
+ * all can only be attributed through the teacher/class membership chain. The row must be
+ * reachable from EXACTLY this school, so a cross-school assignment is still denied.
+ *
+ * It is deliberately NOT the same as `sqlAssignmentInSchool`: on a migrated schema the direct
+ * `school_id` wins, because the relational set of a teacher who belongs to two schools
+ * resolves to two schools and would deny the teacher's own, legitimate assignment.
+ */
+export function sqlAssignmentOwnedRelationally(
+  schoolId: string,
+  assignmentRef: SQL | AnyColumn
+): SQL {
+  assertSchoolId(schoolId);
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfAssignment(assignmentRef));
 }
 
@@ -736,9 +872,84 @@ export function sqlQuizInSchool(schoolId: string, quizRef: SQL | AnyColumn): SQL
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfQuiz(quizRef));
 }
 
-/** Content predicate: the submission belongs to this school's alone. */
+/**
+ * Content predicate for submissions. Direct school_id is authoritative after migration 0016;
+ * relational attribution is a guarded fallback for legacy NULL rows only.
+ */
 export function sqlSubmissionInSchool(schoolId: string, submissionRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`(
+    exists (
+      select 1 from "submissions" s
+       where s."id" = ${submissionRef} and s."school_id" = ${schoolId}
+    )
+    or (
+      not exists (
+        select 1 from "submissions" s
+         where s."id" = ${submissionRef} and s."school_id" is not null
+      )
+      and ${sqlOwnedBySchool(schoolId, sqlSchoolsOfSubmission(submissionRef))}
+    )
+  )`;
+}
+
+/**
+ * PURELY RELATIONAL submission ownership — the pre-0016 fallback used when the
+ * `submissions.school_id` column does not exist yet. The submission must be reachable from
+ * EXACTLY this school, so a cross-school submission is still denied.
+ */
+export function sqlSubmissionOwnedRelationally(
+  schoolId: string,
+  submissionRef: SQL | AnyColumn
+): SQL {
+  assertSchoolId(schoolId);
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfSubmission(submissionRef));
+}
+
+/**
+ * SCHEMA-AWARE assignment scope — the predicate a route puts in the assignment query.
+ *
+ * On a migrated (0016+) schema the direct `assignments.school_id` is authoritative, which is
+ * what PR #31's query-level authorization requires. On a pre-0016 schema that has no such
+ * column, the relational ownership set is used instead, which is what PR #30 added so an
+ * un-migrated deployment keeps working. Both are deny-by-default: a row that cannot be
+ * attributed to exactly this school never matches.
+ */
+export async function sqlAssignmentScope(
+  schoolId: string,
+  assignmentRef: SQL | AnyColumn
+): Promise<SQL> {
+  return sqlSchoolRowInSchool(
+    schoolId,
+    "assignments",
+    assignmentRef,
+    sqlAssignmentOwnedRelationally(schoolId, assignmentRef),
+    and(
+      sqlDirectSchoolId(schoolId, "assignments", assignmentRef),
+      sqlAssignmentInSchool(schoolId, assignmentRef)
+    )!
+  );
+}
+
+/**
+ * SCHEMA-AWARE submission scope — the predicate a route puts in the submission query.
+ * Mirrors `sqlAssignmentScope` (direct `school_id` when present, relational ownership on a
+ * pre-0016 schema).
+ */
+export async function sqlSubmissionScope(
+  schoolId: string,
+  submissionRef: SQL | AnyColumn
+): Promise<SQL> {
+  return sqlSchoolRowInSchool(
+    schoolId,
+    "submissions",
+    submissionRef,
+    sqlSubmissionOwnedRelationally(schoolId, submissionRef),
+    and(
+      sqlDirectSchoolId(schoolId, "submissions", submissionRef),
+      sqlSubmissionInSchool(schoolId, submissionRef)
+    )!
+  );
 }
 
 /** Content predicate: the teacher↔class assignment belongs to this school alone. */
@@ -805,9 +1016,11 @@ export async function getLearnerIdsInSchool(schoolId: string, learnerIds: string
   const rows = await db
     .select({ userId: schoolUsers.userId })
     .from(schoolUsers)
+    .innerJoin(schools, eq(schoolUsers.schoolId, schools.id))
     .where(
       and(
         eq(schoolUsers.schoolId, schoolId),
+        eq(schools.status, ACTIVE_SCHOOL_LIFECYCLE_STATUS),
         eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS),
         inArray(schoolUsers.userId, candidates)
       )
@@ -943,6 +1156,39 @@ function sqlDirectSchoolId(schoolId: string, tableName: string, idRef: SQL | Any
   return sql`exists (select 1 from ${sql.raw(`"${tableName}"`)} t where t."id" = ${idRef} and t."school_id" = ${schoolId})`;
 }
 
+const DIRECT_SCHOOL_TABLES = new Set([
+  "academic_years", "terms", "departments", "subjects", "classes", "teacher_classes",
+  "learner_classes", "parent_learners", "assignments", "submissions", "uploaded_files",
+  "resources", "quizzes", "quiz_attempts", "announcements", "notifications", "attendance",
+  "timetable_entries", "messages", "activity_logs", "dashboard_card_overrides", "gallery_items", "news",
+]);
+
+/**
+ * Prefer explicit ownership; use relational attribution only on a pre-0016 schema.
+ *
+ * `directPredicate` overrides the default `school_id = <school>` check. It exists because a
+ * table may need a richer direct rule than "the column equals the school" — for example
+ * `assignments`, whose direct predicate also keeps the relational fallback for legacy rows
+ * whose `school_id` is still NULL.
+ */
+export async function sqlSchoolRowInSchool(
+  schoolId: string,
+  tableName: string,
+  idRef: SQL | AnyColumn,
+  legacyPredicate: SQL,
+  directPredicate?: SQL
+): Promise<SQL> {
+  if (!DIRECT_SCHOOL_TABLES.has(tableName)) throw new Error("Unsupported school-owned table");
+  assertSchoolId(schoolId);
+  try {
+    await db.execute(sql`select "school_id" from ${sql.raw(`"${tableName}"`)} limit 0`);
+    return directPredicate ?? sqlDirectSchoolId(schoolId, tableName, idRef);
+  } catch (error) {
+    if (!isMissingColumn(error)) throw error;
+    return legacyPredicate;
+  }
+}
+
 /** Direct school_id check for academic_years */
 export function sqlAcademicYearInSchool(schoolId: string, ref: SQL | AnyColumn): SQL {
   return sqlDirectSchoolId(schoolId, "academic_years", ref);
@@ -1075,7 +1321,14 @@ export async function addSchoolMembership(params: {
   status?: MembershipStatus;
 }): Promise<{ id: string; role: SchoolRole } | null> {
   const role = toSchoolRole(params.role);
-  if (!role || !isUuid(params.schoolId) || !isUuid(params.userId)) return null;
+  if (
+    !role ||
+    !isUuid(params.schoolId) ||
+    !isUuid(params.userId) ||
+    (params.status !== undefined && !isMembershipStatus(params.status))
+  ) {
+    return null;
+  }
 
   const [row] = await db
     .insert(schoolUsers)
@@ -1083,7 +1336,7 @@ export async function addSchoolMembership(params: {
       schoolId: params.schoolId,
       userId: params.userId,
       role,
-      status: params.status && isMembershipStatus(params.status) ? params.status : ACTIVE_MEMBERSHIP_STATUS,
+      status: params.status ?? ACTIVE_MEMBERSHIP_STATUS,
     })
     .onConflictDoNothing({ target: [schoolUsers.schoolId, schoolUsers.userId] })
     .returning({ id: schoolUsers.id, role: schoolUsers.role });

@@ -2,10 +2,15 @@
  * Schema resilience helpers.
  *
  * EasyLearn ships migrations as plain SQL files (drizzle/00XX_*.sql) that are applied by
- * hand (`node run-migration.js` / `npx drizzle-kit push`). Those steps get forgotten - and
+ * hand (`node run-migration.js`). Those steps get forgotten - and
  * two of the files (0004/0005) were additionally unrunnable because they had been saved with
  * shell-escaped \" quotes. A missing table or column used to turn the whole admin dashboard,
  * the card-override CRUD and the activity feed into a bare "Internal server error" 500.
+ *
+ * Never point an operator at `drizzle-kit push` for a database that is already in use: it
+ * cannot express a composite foreign key and therefore drops the tenant constraints that
+ * migration 0018 installs, together with the migration ledger and the 0017 UNIQUE targets.
+ * The migration runner is the only supported way to change the schema.
  *
  * These helpers let route handlers:
  *  1. classify Postgres/Drizzle errors as "the schema is behind" vs "something else broke",
@@ -16,6 +21,10 @@
 import { sql } from "drizzle-orm";
 import { pool } from "@/db";
 import { getDatabaseErrorCode } from "@/lib/database-errors";
+import {
+  CONSTRAINT_INVENTORY_SQL,
+  summarizeConstraintInventory,
+} from "@/lib/tenant-constraints.js";
 
 /* ── Error classification ── */
 
@@ -204,7 +213,13 @@ export function schemaAwareErrorMessage(error: unknown, fallback: string): strin
     const object = missingObject(error);
     const migration = migrationFor(object);
     const gap = object ? `${object} is missing from this database` : "the database schema is out of date";
-    const run = migration ? ` Apply ${migration} (or \`npx drizzle-kit push\`), then retry.` : " Apply the pending files in drizzle/, then retry.";
+    /* Never suggest `drizzle-kit push` here. It diffs the live database against
+       src/db/schema.ts, which cannot express a composite foreign key, so on a database
+       that is already in use it drops the tenant foreign keys, the migration ledger and
+       the 0017 UNIQUE targets. The migration runner is the only supported path. */
+    const run = migration
+      ? ` Apply ${migration} with \`node run-migration.js\`, then retry.`
+      : " Apply the pending files in drizzle/ with `node run-migration.js`, then retry.";
     return `${fallback} The underlying issue is that ${gap}.${run}`;
   }
   return clientSafeErrorMessage(error, fallback);
@@ -227,7 +242,8 @@ export type SchemaFeature =
   | "quiz_question_images"
   | "uploaded_files"
   | "assignment_file_uploads"
-  | "uploaded_files_object_storage";
+  | "uploaded_files_object_storage"
+  | "composite_tenant_foreign_keys";
 
 const FEATURE_STATUS_TTL_MS = 60_000;
 
@@ -239,6 +255,7 @@ const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   uploaded_files: "drizzle/0009_file_uploads.sql",
   assignment_file_uploads: "drizzle/0009_file_uploads.sql",
   uploaded_files_object_storage: "drizzle/0010_object_storage.sql",
+  composite_tenant_foreign_keys: "0018_composite_school_foreign_keys.sql",
 };
 
 /** DDL mirrors the idempotent migration files; safe to run repeatedly. */
@@ -326,6 +343,14 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
     `ALTER TABLE "uploaded_files" ADD COLUMN IF NOT EXISTS "storage_backend" varchar(20) DEFAULT 'local' NOT NULL;`,
     `CREATE INDEX IF NOT EXISTS "uploaded_files_storage_backend_idx" ON "uploaded_files" USING btree ("storage_backend");`,
   ],
+  /* The composite tenant foreign keys are intentionally NOT auto-repairable. Migration
+     0018 is gated: it needs a reviewed read-only preflight against a restored copy
+     before it may touch a database, and it aborts atomically on legacy cross-school
+     references. The application must never create these constraints behind an
+     operator's back, and it must never drop them either. This feature is therefore
+     read-only: it reports whether the tenant boundary is enforced, and nothing else.
+     See src/lib/tenant-constraints.js and docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md. */
+  composite_tenant_foreign_keys: [],
 };
 
 /**
@@ -334,7 +359,8 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
  */
 type FeatureProbe =
   | { mode: "relation"; relation: string }
-  | { mode: "columns"; table: string; columns: string[] };
+  | { mode: "columns"; table: string; columns: string[] }
+  | { mode: "compositeTenantConstraints" };
 
 const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
   dashboard_card_overrides: { mode: "relation", relation: "dashboard_card_overrides" },
@@ -364,11 +390,15 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     table: "uploaded_files",
     columns: ["storage_backend"],
   },
+  composite_tenant_foreign_keys: { mode: "compositeTenantConstraints" },
 };
 
 function probeSql(probe: FeatureProbe): string {
   if (probe.mode === "relation") {
     return `SELECT to_regclass('public.${probe.relation}') AS object`;
+  }
+  if (probe.mode === "compositeTenantConstraints") {
+    return CONSTRAINT_INVENTORY_SQL;
   }
   const list = probe.columns.map((column) => `'${column}'`).join(", ");
   return `SELECT count(*)::int AS object FROM information_schema.columns
@@ -376,9 +406,19 @@ function probeSql(probe: FeatureProbe): string {
             AND column_name IN (${list})`;
 }
 
-function probeSatisfied(probe: FeatureProbe, value: unknown): boolean {
-  if (probe.mode === "relation") return Boolean(value);
-  return Number(value ?? 0) >= probe.columns.length;
+/**
+ * Decide whether a probe result satisfies the feature.
+ *
+ * The composite-tenant probe returns one row per expected constraint, so it is judged
+ * from the whole result set; the other probes return a single row.
+ */
+function probeSatisfied(probe: FeatureProbe, rows: unknown): boolean {
+  const list = (Array.isArray(rows) ? rows : []) as Record<string, unknown>[];
+  if (probe.mode === "relation") return Boolean(list[0]?.object);
+  if (probe.mode === "compositeTenantConstraints") {
+    return summarizeConstraintInventory(list as never).complete;
+  }
+  return Number(list[0]?.object ?? 0) >= probe.columns.length;
 }
 
 type FeatureState = { available: boolean; repaired: boolean; at: number };
@@ -426,7 +466,7 @@ export async function ensureSchemaFeature(feature: SchemaFeature): Promise<Featu
   let available = false;
   try {
     const probe = await pool.query(probeSql(spec));
-    available = probeSatisfied(spec, probe.rows[0]?.object);
+    available = probeSatisfied(spec, probe.rows);
   } catch (error) {
     console.error(`[schema] unable to probe ${feature}:`, error);
     return { feature, available: false, repaired: false, migration: FEATURE_MIGRATIONS[feature] };
@@ -450,7 +490,7 @@ export async function ensureSchemaFeature(feature: SchemaFeature): Promise<Featu
     if (executed.length > 0) {
       try {
         const recheck = await pool.query(recheckSql);
-        available = probeSatisfied(spec, recheck.rows[0]?.object);
+        available = probeSatisfied(spec, recheck.rows);
         repaired = available;
       } catch {
         available = false;
@@ -504,6 +544,12 @@ export interface OptionalSchemaStatus {
   present: boolean;
   migration: string;
   repairEnabled: boolean;
+  /**
+   * False for features the application must never create on its own — currently the
+   * composite tenant foreign keys, because migration 0018 is gated behind a reviewed
+   * preflight. A caller must not tell an operator that these are "created on demand".
+   */
+  autoRepairable: boolean;
 }
 
 /**
@@ -519,6 +565,7 @@ export async function probeSchemaFeatures(
     "uploaded_files",
     "assignment_file_uploads",
     "uploaded_files_object_storage",
+    "composite_tenant_foreign_keys",
   ]
 ): Promise<OptionalSchemaStatus[]> {
   const repairEnabled = autoSchemaRepairEnabled();
@@ -528,12 +575,18 @@ export async function probeSchemaFeatures(
       let present = false;
       try {
         const probe = await pool.query(probeSql(spec));
-        present = probeSatisfied(spec, probe.rows[0]?.object);
+        present = probeSatisfied(spec, probe.rows);
       } catch (error) {
         console.error(`[schema] health probe for ${feature} failed:`, inspectDbError(error).text);
         present = false;
       }
-      return { feature, present, migration: FEATURE_MIGRATIONS[feature], repairEnabled };
+      return {
+        feature,
+        present,
+        migration: FEATURE_MIGRATIONS[feature],
+        repairEnabled,
+        autoRepairable: FEATURE_SQL[feature].length > 0,
+      };
     })
   );
 }

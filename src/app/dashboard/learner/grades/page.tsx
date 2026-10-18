@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 
 interface Grade {
@@ -36,11 +36,8 @@ export default function LearnerGradesPage() {
   const [data, setData] = useState<GradesData | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    loadGrades();
-  }, []);
 
-  async function loadGrades() {
+  const loadGrades = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     try {
       const res = await fetch("/api/grades", {
@@ -53,7 +50,13 @@ export default function LearnerGradesPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadGrades();
+  }, [loadGrades]);
 
   function getGradeLetter(percentage: number) {
     if (percentage >= 90) return { letter: "A+", color: "text-green-600" };

@@ -4,8 +4,10 @@ import { parentLearners, users } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import {
   getLearnerIdsInSchool,
+  listActiveSchoolMemberships,
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
+  sqlUserInSchool,
 } from "@/lib/tenant";
 import { logActivity } from "@/lib/activity";
 import { eq, and, or, ilike, desc, inArray } from "drizzle-orm";
@@ -59,7 +61,11 @@ export async function GET(request: NextRequest) {
 
     // The relationship row itself is the tenant-owned resource. Do not infer its owner
     // only from member users: a shared identity can belong to multiple schools.
-    const conditions = [eq(parentLearners.schoolId, ctx.schoolId)];
+    const conditions = [
+      eq(parentLearners.schoolId, ctx.schoolId),
+      sqlUserInSchool(ctx.schoolId, parentAlias.id),
+      sqlUserInSchool(ctx.schoolId, learnerAlias.id),
+    ];
     if (!isAdmin && ctx.school.role === "parent") conditions.push(eq(parentLearners.parentId, ctx.userId));
     if (!isAdmin && ctx.school.role === "learner") conditions.push(eq(parentLearners.learnerId, ctx.userId));
     if (parentId) conditions.push(eq(parentLearners.parentId, parentId));
@@ -140,7 +146,11 @@ export async function GET(request: NextRequest) {
           degraded: true,
           warning: {
             area: "parentLearners",
-            message: "Parent-learner links are unavailable because the parent_learners table is missing. Run `npx drizzle-kit push` (or `node run-migration.js`) to create the base tables.",
+            message:
+              "Parent-learner links are unavailable because the parent_learners table is missing. " +
+              "An administrator must run `node run-migration.js` to create the base tables. " +
+              "Do not run `drizzle-kit push`: it drops the tenant foreign keys, the migration " +
+              "ledger and the 0017 unique targets on a database that is already in use.",
           },
         },
       });
@@ -177,14 +187,20 @@ export async function POST(request: NextRequest) {
     const relationship = parseRelationship((body as Record<string, unknown>).relationship);
     if (!relationship.ok) return errorResponse(relationship.message, 400);
 
-    /* Phase 2C: both sides of the link must be members of the caller's school. */
-    const members = await getLearnerIdsInSchool(ctx.schoolId, [parentId, learnerId]);
-    if (members.size !== 2) {
+    /* Both sides must be active school members, and their tenant-specific roles are the
+       roles that matter (a shared identity can be a parent in one school and staff in another). */
+    const [parentMemberships, learnerMemberships] = await Promise.all([
+      listActiveSchoolMemberships(parentId),
+      listActiveSchoolMemberships(learnerId),
+    ]);
+    const parentRole = parentMemberships.find((membership) => membership.schoolId === ctx.schoolId)?.role;
+    const learnerRole = learnerMemberships.find((membership) => membership.schoolId === ctx.schoolId)?.role;
+    if (!parentRole || !learnerRole) {
       return errorResponse("That parent or learner is not part of this school", 404);
     }
 
     const accounts = await db
-      .select({ id: users.id, role: users.role, firstName: users.firstName, lastName: users.lastName })
+      .select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
       .from(users)
       .where(inArray(users.id, [parentId, learnerId]));
 
@@ -193,12 +209,11 @@ export async function POST(request: NextRequest) {
 
     if (!parent) return errorResponse("Parent account not found", 404);
     if (!learner) return errorResponse("Learner account not found", 404);
-    // The account may be a parent, or a staff account that is also a guardian. Platform
-    // roles are irrelevant here: the membership gate above already scoped the request.
-    if (parent.role !== "parent" && !["school_admin", "head_teacher", "teacher"].includes(parent.role)) {
+    // The account may be a parent, or a staff member who is also a guardian in this school.
+    if (parentRole !== "parent" && !["school_admin", "head_teacher", "teacher"].includes(parentRole)) {
       return errorResponse("That account is not a parent", 400);
     }
-    if (learner.role !== "learner") {
+    if (learnerRole !== "learner") {
       return errorResponse("That account is not a learner", 400);
     }
 

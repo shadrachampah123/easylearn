@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { submissions, assignments, users } from "@/db/schema";
+import { submissions, assignments, users, learnerClasses } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { resolveUploadedAttachments } from "@/lib/attachment-auth";
 import { ensureFileUploadSchema, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
@@ -8,9 +8,13 @@ import { eq, and, desc } from "drizzle-orm";
 import {
   guardSchoolContext,
   hasSchoolAdminExtendedRole,
-  isAssignmentInSchool,
-  sqlSubmissionInSchool,
+  sqlAssignmentScope,
+  sqlLearnerClassInSchool,
+  sqlSchoolRowInSchool,
+  sqlSubmissionScope,
+  sqlUserInSchool,
 } from "@/lib/tenant";
+import { resolveAssignmentAccessPredicate } from "@/lib/assignment-access";
 
 export async function GET(request: NextRequest) {
   try {
@@ -21,19 +25,28 @@ export async function GET(request: NextRequest) {
 
     const assignmentId = request.nextUrl.searchParams.get("assignmentId");
 
+    // The submission and assignment scopes are resolved schema-aware: the direct
+    // `school_id` column on a migrated database, the relational ownership set on a
+    // pre-0016 one. Both are deny-by-default.
+    // NOTE: the assignment scope is also matched against the caller's role predicate,
+    // whose learner and parent branches require migration 0016 — see
+    // `src/lib/assignment-access.ts`.
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
+    const assignmentScope = await sqlAssignmentScope(ctx.schoolId, assignments.id);
+
     // Phase 2D fix: accumulated conditions array — single WHERE with AND, never overwritten
     // Always preserve tenant predicate + role, plus assignmentId filter
-    const conditions: any[] = [];
+    const conditions: any[] = [
+      submissionScope,
+      assignmentScope,
+      sqlUserInSchool(ctx.schoolId, submissions.learnerId),
+    ];
 
     if (schoolRole === "learner") {
       conditions.push(eq(submissions.learnerId, ctx.userId));
-      conditions.push(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
     } else if (schoolRole === "teacher") {
       conditions.push(eq(assignments.teacherId, ctx.userId));
-      conditions.push(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
-    } else if (hasSchoolAdminExtendedRole(ctx)) {
-      conditions.push(sqlSubmissionInSchool(ctx.schoolId, submissions.id));
-    } else {
+    } else if (!hasSchoolAdminExtendedRole(ctx)) {
       return errorResponse("You are not authorized to view submissions", 403);
     }
 
@@ -63,8 +76,8 @@ export async function GET(request: NextRequest) {
         learnerId: submissions.learnerId,
       })
       .from(submissions)
-      .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      .leftJoin(users, eq(submissions.learnerId, users.id))
+      .leftJoin(assignments, and(eq(submissions.assignmentId, assignments.id), assignmentScope))
+      .leftJoin(users, and(eq(submissions.learnerId, users.id), sqlUserInSchool(ctx.schoolId, users.id)))
       .where(whereClause)
       .orderBy(desc(submissions.submittedAt))
       .limit(100);
@@ -96,36 +109,14 @@ export async function POST(request: NextRequest) {
     // allow_file_uploads lives in the schema but only 0009 adds the column.
     await ensureFileUploadSchema();
 
-    // Check assignment exists and is published — Phase 2D: tenant predicate directly in query with relational fallback for legacy rows
-    let assignment: typeof assignments.$inferSelect | undefined;
-    try {
-      const direct = await db
-        .select()
-        .from(assignments)
-        .where(and(eq(assignments.id, assignmentId), eq(assignments.schoolId, ctx.schoolId)))
-        .limit(1);
-      assignment = direct[0];
-      if (!assignment) {
-        // Fallback: legacy row without school_id or NULL — verify via relational predicate
-        const legacy = await db
-          .select()
-          .from(assignments)
-          .where(eq(assignments.id, assignmentId))
-          .limit(1);
-        if (legacy[0] && (await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
-          assignment = legacy[0];
-        }
-      }
-    } catch {
-      const legacy = await db
-        .select()
-        .from(assignments)
-        .where(eq(assignments.id, assignmentId))
-        .limit(1);
-      if (legacy[0] && (await isAssignmentInSchool(ctx.schoolId, assignmentId))) {
-        assignment = legacy[0];
-      }
-    }
+    // The assignment lookup is itself the authorization query: it requires the learner's
+    // active enrollment, publication, active school context, and direct school ownership
+    // before any assignment or question data is used.
+    const [assignment] = await db
+      .select()
+      .from(assignments)
+      .where(and(eq(assignments.id, assignmentId), await resolveAssignmentAccessPredicate(ctx)))
+      .limit(1);
 
     if (!assignment) {
       return errorResponse("Assignment not found", 404);
@@ -140,11 +131,18 @@ export async function POST(request: NextRequest) {
        here — an explicit "if no enrollment found, allow" fallback. Phase 2C removes that
        permissive fallback (brief §3): the enrollment must exist, otherwise the submission is
        refused. */
-    const { learnerClasses } = await import("@/db/schema");
+    const learnerClassScope = await sqlSchoolRowInSchool(
+      ctx.schoolId, "learner_classes", learnerClasses.id, sqlLearnerClassInSchool(ctx.schoolId, learnerClasses.id)
+    );
     const [enrollment] = await db
       .select({ id: learnerClasses.id })
       .from(learnerClasses)
-      .where(and(eq(learnerClasses.learnerId, ctx.userId), eq(learnerClasses.classId, assignment.classId)))
+      .where(and(
+        eq(learnerClasses.learnerId, ctx.userId),
+        eq(learnerClasses.classId, assignment.classId),
+        learnerClassScope,
+        sqlUserInSchool(ctx.schoolId, learnerClasses.learnerId)
+      ))
       .limit(1);
 
     if (!enrollment) {
@@ -172,12 +170,15 @@ export async function POST(request: NextRequest) {
       resolvedAttachments = resolved.attachments;
     }
 
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
+
     // Check for existing submission
     const [existing] = await db
       .select({ id: submissions.id })
       .from(submissions)
       .where(and(
         eq(submissions.assignmentId, assignmentId),
+        submissionScope,
         eq(submissions.learnerId, ctx.userId)
       ))
       .limit(1);
@@ -185,7 +186,7 @@ export async function POST(request: NextRequest) {
     if (existing) {
       // Update existing submission
       const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
-      
+
       if (isLate && !assignment.allowLate) {
         return errorResponse("Late submissions are not allowed for this assignment");
       }
@@ -198,7 +199,7 @@ export async function POST(request: NextRequest) {
           status: isLate ? "late" : "submitted",
           submittedAt: new Date(),
         })
-        .where(eq(submissions.id, existing.id))
+        .where(and(eq(submissions.id, existing.id), submissionScope))
         .returning();
 
       return successResponse(updated);
@@ -206,7 +207,7 @@ export async function POST(request: NextRequest) {
 
     // Create new submission
     const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
-    
+
     if (isLate && !assignment.allowLate) {
       return errorResponse("Late submissions are not allowed for this assignment");
     }

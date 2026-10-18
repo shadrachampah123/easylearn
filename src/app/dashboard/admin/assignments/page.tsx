@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
 import { adminNav } from "@/lib/admin-nav";
@@ -26,9 +26,8 @@ export default function AdminAssignmentsPage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("all");
 
-  useEffect(() => { loadAssignments(); }, []);
 
-  async function loadAssignments() {
+  const loadAssignments = useCallback(async () => {
     const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
@@ -40,7 +39,13 @@ export default function AdminAssignmentsPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    // Network results update this page\'s data/loading state after the request resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadAssignments();
+  }, [loadAssignments]);
 
   const filtered = filter === "all" ? assignments : assignments.filter((a) => a.status === filter);
 

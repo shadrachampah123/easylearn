@@ -46,7 +46,7 @@ In Neon:
 
 ## 4. Apply the EasyLearn schema to Neon
 
-The migration is committed under `drizzle/`.
+The migrations are committed under `drizzle/` and at the repository root.
 
 From a local terminal or GitHub Codespace opened at the repository root:
 
@@ -54,22 +54,28 @@ From a local terminal or GitHub Codespace opened at the repository root:
 
 ```bash
 export DATABASE_URL='PASTE_THE_NEON_CONNECTION_STRING'
-npx drizzle-kit migrate
-```
-
-Alternatively, to synchronize the current schema directly:
-
-```bash
-export DATABASE_URL='PASTE_THE_NEON_CONNECTION_STRING'
-npx drizzle-kit push
+node run-migration.js
 ```
 
 ### Windows PowerShell
 
 ```powershell
 $env:DATABASE_URL='PASTE_THE_NEON_CONNECTION_STRING'
-npx drizzle-kit migrate
+node run-migration.js
 ```
+
+The runner applies every pending migration in order, each in its own transaction, and
+records the file name plus its SHA-256 checksum in `public.easylearn_schema_migrations`.
+
+> **Do not use `npx drizzle-kit migrate` or `npx drizzle-kit push` here.**
+> The Drizzle journal does not contain the later migrations, so `migrate` would leave the
+> database partly migrated, and `push` diffs the live database against a schema that
+> cannot express a composite foreign key — so it would **drop** the tenant foreign keys,
+> the migration ledger and the `UNIQUE (school_id, id)` targets, with no confirmation.
+>
+> For a **brand-new, empty** database only, `npm run db:schema-sync` runs
+> `drizzle-kit push` behind a guard that refuses to touch a database that is already in
+> use.
 
 Do not use the local `127.0.0.1` database URL for this operation. The command must use the Neon URL.
 

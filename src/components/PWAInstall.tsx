@@ -10,8 +10,11 @@ interface BeforeInstallPromptEvent extends Event {
 export default function PWAInstall() {
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [showBanner, setShowBanner] = useState(false);
-  const [isIOS, setIsIOS] = useState(false);
-  const [isStandalone, setIsStandalone] = useState(false);
+  const [isIOS] = useState(() => typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent));
+  const [isStandalone] = useState(() => typeof window !== "undefined" && (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    (window.navigator as Navigator & { standalone?: boolean }).standalone === true
+  ));
 
   useEffect(() => {
     // Register service worker
@@ -25,15 +28,6 @@ export default function PWAInstall() {
           console.log("EasyLearn SW registration failed:", error);
         });
     }
-
-    // Check if already installed
-    const isInStandaloneMode = window.matchMedia("(display-mode: standalone)").matches 
-      || (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
-    setIsStandalone(isInStandaloneMode);
-
-    // Check if iOS
-    const isIOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent);
-    setIsIOS(isIOSDevice);
 
     // Listen for install prompt
     const handleBeforeInstall = (e: Event) => {
@@ -50,7 +44,7 @@ export default function PWAInstall() {
     window.addEventListener("beforeinstallprompt", handleBeforeInstall);
 
     // Show iOS banner if applicable
-    if (isIOSDevice && !isInStandaloneMode) {
+    if (isIOS && !isStandalone) {
       const dismissed = localStorage.getItem("pwa_banner_dismissed");
       if (!dismissed || Date.now() - parseInt(dismissed) > 7 * 24 * 60 * 60 * 1000) {
         setTimeout(() => setShowBanner(true), 3000);
@@ -60,7 +54,7 @@ export default function PWAInstall() {
     return () => {
       window.removeEventListener("beforeinstallprompt", handleBeforeInstall);
     };
-  }, []);
+  }, [isIOS, isStandalone]);
 
   const handleInstall = async () => {
     if (!installPrompt) return;

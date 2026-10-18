@@ -39,6 +39,7 @@ import { NextRequest } from "next/server";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
+const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
 
 const DB_NAME = `easylearn_2e_test_${crypto.randomBytes(4).toString("hex")}`;
 const JWT_SECRET = "phase-2e-integration-test-secret-0123456789";
@@ -157,12 +158,7 @@ async function main() {
     process.env.OBJECT_STORAGE_REGION = "us-east-1";
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-    const runMigrations = () =>
-      spawnSync(process.execPath, ["run-migration.js"], {
-        cwd: REPO_ROOT,
-        env: { ...process.env, DATABASE_URL: scratchUrl, JWT_SECRET },
-        encoding: "utf8",
-      });
+    const runMigrations = () => runMigrationChain({ databaseUrl: scratchUrl, env: { JWT_SECRET } });
 
     const q = async (sql: string, values: unknown[] = []): Promise<any[]> =>
       (await db.query(sql, values)).rows;
@@ -562,8 +558,10 @@ async function main() {
     });
 
     await test("Legacy: a pre-0016 database (column missing) still gets the narrow fallback", async () => {
-      // Simulate a database that predates migration 0016 by dropping the column.
-      await q(`ALTER TABLE academic_years DROP COLUMN school_id`);
+      // Simulate a pre-0016 ORM view without destructively dropping the column: rename it
+      // and make it nullable while preserving composite constraints/index dependencies.
+      await q(`ALTER TABLE academic_years RENAME COLUMN school_id TO legacy_school_id`);
+      await q(`ALTER TABLE academic_years ALTER COLUMN legacy_school_id DROP NOT NULL`);
       try {
         const result = await call("academic-years", {
           token: tokens["admin-a"],
@@ -571,13 +569,9 @@ async function main() {
         });
         assertEq(result.status, 201, "the legacy fallback must still work on pre-0016 databases");
       } finally {
-        // Restore the column and re-attribute the rows so the final sweep (h) stays
-        // meaningful. NOTE: dropping a column destroys its stored values, so EVERY
-        // academic_years row is NULL again after the re-add — all rows created in
-        // this test belong to school A (school B's year is created later, with the
-        // column in place).
-        // Restore the post-0017 shape: column present, attributed, NOT NULL.
-        await q(`ALTER TABLE academic_years ADD COLUMN IF NOT EXISTS school_id uuid`);
+        // Restore the post-0017 shape and attribute the one fallback row before restoring
+        // NOT NULL. Existing rows retain their tenant values throughout this simulation.
+        await q(`ALTER TABLE academic_years RENAME COLUMN legacy_school_id TO school_id`);
         await q(`UPDATE academic_years SET school_id = $1 WHERE school_id IS NULL`, [schoolA]);
         await q(`ALTER TABLE academic_years ALTER COLUMN school_id SET NOT NULL`);
       }

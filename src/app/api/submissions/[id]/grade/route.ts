@@ -9,13 +9,15 @@ import {
   learnerPoints,
 } from "@/db/schema";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and, inArray, sql } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
 import { clientSafeErrorMessage } from "@/lib/schema-resilience";
 import {
   guardSchoolContext,
   hasSchoolRole,
-  sqlSubmissionInSchool,
+  sqlAssignmentScope,
+  sqlSubmissionScope,
+  sqlUserInSchool,
 } from "@/lib/tenant";
 
 type AnswerGrade = {
@@ -48,6 +50,8 @@ export async function POST(
     }
 
     const { id } = await params;
+    const submissionScope = await sqlSubmissionScope(ctx.schoolId, submissions.id);
+    const assignmentScope = await sqlAssignmentScope(ctx.schoolId, assignments.id);
     const body = await request.json();
     const { score, maxScore, feedback, answers } = body as {
       score?: number;
@@ -68,14 +72,24 @@ export async function POST(
         teacherId: assignments.teacherId,
       })
       .from(submissions)
-      .leftJoin(assignments, eq(submissions.assignmentId, assignments.id))
-      // Phase 2C tenant predicate: grades of another school's submission cannot be written.
-      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
+      .leftJoin(assignments, and(eq(submissions.assignmentId, assignments.id), assignmentScope))
+      // Both the submission and its assignment anchor must belong to the selected school.
+      .where(and(
+        eq(submissions.id, id), submissionScope, assignmentScope,
+        sqlUserInSchool(ctx.schoolId, submissions.learnerId)
+      ))
       .limit(1);
 
     if (!submission) {
       return notFoundResponse("Submission");
     }
+
+    // In an UPDATE statement there is no assignments table in the outer FROM clause, so
+    // anchor the parent-scope check to the assignment id just read from this submission.
+    const updateAssignmentScope = await sqlAssignmentScope(
+      ctx.schoolId,
+      sql`${submission.assignmentId}::uuid`
+    );
 
     if (ctx.school.role === "teacher" && submission.teacherId !== ctx.userId) {
       return errorResponse("You can only grade submissions for your own assignments", 403);
@@ -163,7 +177,13 @@ export async function POST(
         aiReport: null,
         gradedAt: new Date(),
       })
-      .where(and(eq(submissions.id, id), sqlSubmissionInSchool(ctx.schoolId, submissions.id)))
+      .where(and(
+        eq(submissions.id, id),
+        eq(submissions.assignmentId, submission.assignmentId),
+        submissionScope,
+        updateAssignmentScope,
+        sqlUserInSchool(ctx.schoolId, submissions.learnerId)
+      ))
       .returning();
 
     await db.insert(notifications).values({

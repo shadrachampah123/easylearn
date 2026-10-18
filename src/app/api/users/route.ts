@@ -10,7 +10,9 @@ import {
   guardSchoolContext,
   hasSchoolAdminRole,
   hasSchoolAdminExtendedRole,
+  sqlUserHasRoleInSchool,
   sqlUserInSchool,
+  sqlUserRoleInSchool,
 } from "@/lib/tenant";
 import {
   clientSafeErrorMessage,
@@ -49,9 +51,15 @@ export async function GET(request: NextRequest) {
     const limit = parseInt(request.nextUrl.searchParams.get("limit") || "50");
     const offset = (page - 1) * limit;
 
-    // Tenant boundary first: only members of the caller's school are visible.
+    // The school_users membership role, not global users.role, is authoritative within
+    // this tenant. A shared identity can legitimately have different roles in each school.
     const conditions = [sqlUserInSchool(ctx.schoolId, users.id)];
-    if (role) conditions.push(eq(users.role, role as "teacher" | "parent" | "learner" | "super_admin" | "school_admin" | "head_teacher"));
+    if (role) {
+      const validRoles = ["teacher", "parent", "learner", "school_admin", "head_teacher"] as const;
+      conditions.push((validRoles as readonly string[]).includes(role)
+        ? sqlUserHasRoleInSchool(ctx.schoolId, users.id, role as (typeof validRoles)[number])
+        : sql`false`);
+    }
     if (search && search.trim()) {
       conditions.push(
         or(
@@ -69,7 +77,7 @@ export async function GET(request: NextRequest) {
       email: users.email,
       firstName: users.firstName,
       lastName: users.lastName,
-      role: users.role,
+      role: sql<string>`${sqlUserRoleInSchool(ctx.schoolId, users.id)}`,
       phone: users.phone,
       gender: users.gender,
       isActive: users.isActive,
@@ -102,7 +110,10 @@ export async function GET(request: NextRequest) {
         "Usernames are hidden because drizzle/0006_user_identity_columns.sql has not been applied to this database.";
     }
 
-    const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(users).where(where);
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(users)
+      .where(where);
 
     if (!degradedMessage) {
       return successResponse({

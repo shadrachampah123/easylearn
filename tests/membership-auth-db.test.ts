@@ -1,7 +1,7 @@
 /**
  * Phase 2B — User membership + authentication context: LIVE DATABASE tests.
  *
- * Applies the project's real migration chain (0000…0017) to a throwaway PostgreSQL
+ * Applies the project's real migration chain (0000…0018) to a throwaway PostgreSQL
  * database and then exercises the real application modules against it:
  *
  *   MEMBERSHIP
@@ -33,6 +33,7 @@
  */
 
 import assert from "assert";
+import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
@@ -42,6 +43,7 @@ import { NextRequest } from "next/server";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
+const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/migrations.js");
 
 const DB_NAME = `easylearn_2b_test_${crypto.randomBytes(4).toString("hex")}`;
 const TEST_PASSWORD = "Phase2b-Test-Password!";
@@ -131,12 +133,23 @@ async function main() {
     process.env.DATABASE_URL = scratchUrl;
     process.env.JWT_SECRET = JWT_SECRET;
 
-    const runMigrations = () =>
-      spawnSync(process.execPath, ["run-migration.js"], {
-        cwd: REPO_ROOT,
-        env: { ...process.env, DATABASE_URL: scratchUrl, JWT_SECRET },
-        encoding: "utf8",
-      });
+    const runMigrations = () => runMigrationChain({ databaseUrl: scratchUrl, env: { JWT_SECRET } });
+
+    // Migration SQL is replayed directly only in this disposable DB to test its idempotent
+    // data-backfill behavior. The production runner itself must skip files recorded in its ledger.
+    const executeMigrationSqlForTest = async (fileName: string) => {
+      try {
+        await db.query("BEGIN");
+        const source = fs.readFileSync(path.join(REPO_ROOT, fileName), "utf8");
+        const statements = source.split("--> statement-breakpoint").map((part) => part.trim()).filter(Boolean);
+        for (const statement of statements) await db.query(statement);
+        await db.query("COMMIT");
+        return { status: 0, stderr: "" };
+      } catch (error) {
+        await db.query("ROLLBACK").catch(() => {});
+        return { status: 1, stderr: (error as Error).message };
+      }
+    };
 
     const q = async (sql: string, values: unknown[] = []): Promise<any[]> =>
       (await db.query(sql, values)).rows;
@@ -144,7 +157,7 @@ async function main() {
 
     /* ── 1. Fresh migration chain ── */
 
-    await test("Migration: fresh chain (0000…0015) applies cleanly", () => {
+    await test("Migration: fresh chain (0000…0018) applies cleanly", () => {
       const result = runMigrations();
       assertEq(
         result.status,
@@ -201,17 +214,18 @@ async function main() {
       userIds[fixture.key] = row.id;
     }
 
-    /* ── 2./3. Backfill on the next deploy (run-migration.js replays the whole chain) ── */
+    /* ── 2./3. Backfill SQL behavior on a disposable database ── */
 
-    await test("Migration: re-running the chain backfills CBISM memberships for existing users", () => {
-      const result = runMigrations();
-      assertEq(
-        result.status,
-        0,
-        `second run exited ${result.status}:\n${((result.stdout || "") + (result.stderr || "")).slice(-6000)}`
+    await test("Migration 0015 backfills existing users when its SQL is applied", async () => {
+      const result = await executeMigrationSqlForTest("0015_cbism_school_and_membership_backfill.sql");
+      assertEq(result.status, 0, `0015 SQL failed: ${result.stderr}`);
+      const counts = await one(
+        `SELECT
+           (SELECT count(*)::int FROM users WHERE role <> 'super_admin') AS eligible,
+           (SELECT count(*)::int FROM school_users su JOIN schools s ON s.id = su.school_id WHERE s.slug = 'cbism') AS memberships`
       );
-      assert(/0015: cbism school .+ - 7 eligible users, 7 memberships/.test(String(result.stdout)),
-        "0015 must report 7 eligible users / 7 memberships");
+      assertEq(counts.eligible, 7, "eligible users");
+      assertEq(counts.memberships, 7, "0015 backfills 7 CBISM memberships");
     });
 
     await test("Membership: every non-super_admin user received a membership", async () => {
@@ -270,13 +284,14 @@ async function main() {
 
     const membershipIdsBefore = await q(`SELECT id FROM school_users ORDER BY id`);
 
-    await test("Migration: a third full run exits 0 and creates nothing new", async () => {
+    await test("Migration runner skips the recorded chain without replaying data migrations", async () => {
       const result = runMigrations();
       assertEq(
         result.status,
         0,
-        `third run exited ${result.status}:\n${((result.stdout || "") + (result.stderr || "")).slice(-6000)}`
+        `runner re-run exited ${result.status}:\n${((result.stdout || "") + (result.stderr || "")).slice(-6000)}`
       );
+      assert(String(result.stdout).includes("already recorded with matching checksums"), "runner must use migration history");
       const after = await q(`SELECT id FROM school_users ORDER BY id`);
       assertEq(after.length, membershipIdsBefore.length, "membership count must not grow");
       assertEq(
@@ -291,10 +306,10 @@ async function main() {
       // Backfill is a backfill, not a synchroniser: ON CONFLICT DO NOTHING must not
       // overwrite a role that was changed after the first run.
       await q(`UPDATE school_users SET role = 'head_teacher' WHERE user_id = $1`, [userIds["teacher"]]);
-      const result = runMigrations();
-      assertEq(result.status, 0, `run exited ${result.status}`);
+      const result = await executeMigrationSqlForTest("0015_cbism_school_and_membership_backfill.sql");
+      assertEq(result.status, 0, `0015 SQL replay failed: ${result.stderr}`);
       const row = await one(`SELECT role FROM school_users WHERE user_id = $1`, [userIds["teacher"]]);
-      assertEq(row.role, "head_teacher", "existing membership must not be overwritten by a re-run");
+      assertEq(row.role, "head_teacher", "existing membership must not be overwritten by a replay of the backfill SQL");
       await q(`UPDATE school_users SET role = 'teacher' WHERE user_id = $1`, [userIds["teacher"]]);
     });
 
@@ -344,6 +359,38 @@ async function main() {
 
     const tenant = await import("@/lib/tenant");
     const auth = await import("@/lib/auth");
+
+    await test("Security: unknown or missing lifecycle and membership statuses fail closed", () => {
+      const validRow = {
+        membershipId: crypto.randomUUID(),
+        schoolId: crypto.randomUUID(),
+        userId: crypto.randomUUID(),
+        role: "teacher",
+        status: "active",
+        schoolSlug: "safe-school",
+        schoolName: "Safe School",
+        schoolStatus: "active",
+        createdAt: null,
+      };
+      assert(tenant.toSchoolMembership(validRow), "valid membership row should parse");
+      assertEq(
+        tenant.toSchoolMembership({ ...validRow, schoolStatus: "mystery" }),
+        null,
+        "unknown school lifecycle status must not become active"
+      );
+      const missingLifecycle = { ...validRow };
+      delete (missingLifecycle as Record<string, unknown>).schoolStatus;
+      assertEq(
+        tenant.toSchoolMembership(missingLifecycle),
+        null,
+        "missing school lifecycle status must be denied"
+      );
+      assertEq(
+        tenant.toSchoolMembership({ ...validRow, status: "mystery" }),
+        null,
+        "unknown membership status must not become active"
+      );
+    });
     const cbismSchoolId = (await one(`SELECT id FROM schools WHERE slug = 'cbism'`)).id;
 
     await test("Resolve: an active user resolves to their own CBISM membership", async () => {
@@ -365,8 +412,14 @@ async function main() {
         parent: "parent",
       };
       for (const [key, role] of Object.entries(expected)) {
-        assertEq(await tenant.getEffectiveSchoolRole(userIds[key]), role, `${key} effective school role`);
+        const options = key === "teacher" ? { schoolId: cbismSchoolId } : undefined;
+        assertEq(
+          await tenant.getEffectiveSchoolRole(userIds[key], options),
+          role,
+          `${key} effective school role`
+        );
       }
+      assertEq(await tenant.getEffectiveSchoolRole(userIds["teacher"]), null, "multi-school role is ambiguous without a selection");
     });
 
     await test("Resolve: a disabled membership is NOT an active membership", async () => {
@@ -457,6 +510,16 @@ async function main() {
 
       const aMemberships = await tenant.listActiveSchoolMemberships(userA);
       assertEq(aMemberships.length, 2, "User A has two memberships");
+      assertEq(
+        await tenant.resolveSchoolMembership(userA),
+        null,
+        "multi-school users must not receive an implicit first-school context"
+      );
+      assertEq(
+        await tenant.getEffectiveSchoolRole(userA),
+        null,
+        "multi-school users must not receive an implicit first-school role"
+      );
       for (const membership of aMemberships) {
         assertEq(membership.userId, userA, "every resolved membership must belong to User A");
       }
@@ -478,6 +541,7 @@ async function main() {
 
     const loginRoute = await import("@/app/api/auth/login/route");
     const meRoute = await import("@/app/api/auth/me/route");
+    const selectSchoolRoute = await import("@/app/api/auth/select-school/route");
     const changePasswordRoute = await import("@/app/api/auth/change-password/route");
     const logoutRoute = await import("@/app/api/auth/logout/route");
 
@@ -492,6 +556,9 @@ async function main() {
 
     let learnerToken = "";
     let learnerMembershipId = "";
+    let multiSchoolToken = "";
+    let selectedSchoolToken = "";
+    let platformToken = "";
 
     await test("Login: a learner logs in and receives the server-derived CBISM context", async () => {
       const response = await loginRoute.POST(
@@ -544,7 +611,7 @@ async function main() {
       assertEq(claims!.role, "learner", "token role claim is server-derived");
     });
 
-    await test("Login: username login still works and resolves the same context", async () => {
+    await test("Login: multi-school users receive an unselected session, not a first-school default", async () => {
       const response = await loginRoute.POST(
         postJson("/api/auth/login", {
           username: `2b-teacher-${DB_NAME.slice(-8)}`,
@@ -553,9 +620,168 @@ async function main() {
       );
       assertEq(response.status, 200, "username login status");
       const body: any = await response.json();
-      assertEq(body.data.user.role, "teacher", "teacher role");
+      assertEq(body.data.user.role, "teacher", "global role remains in the identity profile");
       assertEq(body.data.schools.length, 2, "teacher belongs to two schools");
-      assertEq(body.data.school.schoolId, cbismSchoolId, "deterministic first membership is CBISM");
+      assertEq(body.data.school, null, "multi-school login must not silently choose the first school");
+      multiSchoolToken = body.data.token;
+      const claims = await auth.verifyToken(multiSchoolToken);
+      assert(claims, "multi-school token verifies");
+      assertEq(claims!.ver, 3, "new token selection schema");
+      assertEq(claims!.schoolIdHint, undefined, "no school is chosen until user selection");
+      assertEq(claims!.membershipIdHint, undefined, "no membership is chosen until user selection");
+      assertEq(claims!.schoolSelectionRequired, true, "server binds this login to an explicit selection flow");
+
+      const unauthorized = await tenant.guardSchoolContext(
+        new NextRequest("http://localhost:3000/api/notifications", { headers: bearer(multiSchoolToken) })
+      );
+      assertEq(unauthorized.ok, false, "unselected multi-school user cannot access school data");
+      if (!unauthorized.ok) {
+        assertEq(unauthorized.response.status, 403, "selection required status");
+        const denied: any = await unauthorized.response.json();
+        assert(/select one of your schools/i.test(denied.error), "clear selection-required error");
+      }
+    });
+
+    await test("School switch: only active memberships can be selected, and selected context is revalidated", async () => {
+      const response = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: schoolBId }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(response.status, 200, "member school selection status");
+      const body: any = await response.json();
+      assertEq(body.data.school.schoolId, schoolBId, "selected school B");
+      assertEq(body.data.school.role, "school_admin", "role comes from School B membership");
+      assertEq(body.data.schools.length, 2, "available memberships returned");
+      const switchedToken = body.data.token;
+      const switchedClaims = await auth.verifyToken(switchedToken);
+      assertEq(switchedClaims!.schoolIdHint, schoolBId, "server-issued selected school hint");
+      assertEq(switchedClaims!.membershipIdHint, body.data.school.membershipId, "server-issued membership hint");
+      assertEq(switchedClaims!.schoolSelectionRequired, false, "selected token no longer carries the unselected-login guard");
+
+      const me = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(switchedToken) }) as never);
+      const meBody: any = await me.json();
+      assertEq(meBody.data.school.schoolId, schoolBId, "session resolves to selected school B");
+      assertEq(meBody.data.school.role, "school_admin", "selected membership role is authoritative");
+
+      const schoolAMembership = await one(
+        `SELECT id FROM school_users WHERE school_id = $1 AND user_id = $2 AND status = 'active'`,
+        [cbismSchoolId, userIds["teacher"]]
+      );
+      const mismatchedMembershipToken = await auth.createToken({
+        userId: userIds["teacher"], role: "teacher", email: "teacher@example.test",
+        schoolId: schoolBId, membershipId: schoolAMembership.id,
+      });
+      const mismatched = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(mismatchedMembershipToken) }) as never);
+      const mismatchedBody: any = await mismatched.json();
+      assertEq(mismatchedBody.data.school, null, "school and membership hints must identify the same active membership");
+
+      const denied = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: crypto.randomUUID() }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(denied.status, 403, "non-member school cannot be selected");
+
+      await q(`UPDATE school_users SET status = 'disabled' WHERE school_id = $1 AND user_id = $2`, [schoolBId, userIds["teacher"]]);
+      const revoked = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(switchedToken) }) as never);
+      const revokedBody: any = await revoked.json();
+      assertEq(revokedBody.data.school, null, "disabled selected membership does not fall back to another school");
+      const stillUnselected = await meRoute.GET(new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(multiSchoolToken) }) as never);
+      const unselectedBody: any = await stillUnselected.json();
+      assertEq(unselectedBody.data.school, null, "a no-selection token never silently adopts the one remaining school");
+      await q(`UPDATE school_users SET status = 'active' WHERE school_id = $1 AND user_id = $2`, [schoolBId, userIds["teacher"]]);
+    });
+
+    await test("School selection: only a server-validated active membership can become session context", async () => {
+      const denied = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: crypto.randomUUID() }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(denied.status, 403, "foreign school selection must be denied");
+
+      const selected = await selectSchoolRoute.POST(
+        postJson("/api/auth/select-school", { schoolId: schoolBId }, bearer(multiSchoolToken)) as never
+      );
+      assertEq(selected.status, 200, "own active school selection");
+      const selectedBody: any = await selected.json();
+      selectedSchoolToken = selectedBody.data.token;
+      assertEq(selectedBody.data.school.schoolId, schoolBId, "selected school");
+      assertEq(selectedBody.data.school.role, "school_admin", "role comes from School B membership");
+      const selectedClaims = await auth.verifyToken(selectedBody.data.token);
+      assertEq(selectedClaims!.schoolIdHint, schoolBId, "selected token school hint");
+      assertEq(selectedClaims!.membershipIdHint, selectedBody.data.school.membershipId, "selected membership hint");
+
+      const selectedContext = await tenant.resolveAuthContext(
+        new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(selectedBody.data.token) }) as never
+      );
+      assertEq(selectedContext.school?.schoolId, schoolBId, "selected context is revalidated from the database");
+    });
+
+    await test("School lifecycle: only active schools grant context, existing sessions are rechecked, and history remains", async () => {
+      const platformLogin = await loginRoute.POST(
+        postJson("/api/auth/login", {
+          email: `2b-platform-${DB_NAME}@example.test`,
+          password: TEST_PASSWORD,
+        }) as never
+      );
+      assertEq(platformLogin.status, 200, "platform login for lifecycle check");
+      platformToken = (await platformLogin.json()).data.token;
+
+      const beforeMemberships = await one(`SELECT count(*)::int AS n FROM school_users WHERE school_id = $1`, [schoolBId]);
+      const originalStatuses = ["active", "provisioned", "suspended", "archived"];
+      for (const status of originalStatuses) {
+        await q(`UPDATE schools SET status = $1 WHERE id = $2`, [status, schoolBId]);
+        const login = await loginRoute.POST(
+          postJson("/api/auth/login", {
+            username: `2b-teacher-${DB_NAME.slice(-8)}`,
+            password: TEST_PASSWORD,
+          }) as never
+        );
+        assertEq(login.status, 200, `${status} identity login remains available`);
+        const loginBody: any = await login.json();
+        assert(
+          status === "active"
+            ? loginBody.data.schools.some((school: any) => school.schoolId === schoolBId)
+            : !loginBody.data.schools.some((school: any) => school.schoolId === schoolBId),
+          `${status} school is ${status === "active" ? "listed" : "not listed"} in login context`
+        );
+
+        const me = await meRoute.GET(
+          new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(selectedSchoolToken) }) as never
+        );
+        assertEq(me.status, 200, `${status} /api/auth/me remains an authenticated identity response`);
+        const meBody: any = await me.json();
+        assertEq(
+          meBody.data.school?.schoolId ?? null,
+          status === "active" ? schoolBId : null,
+          `${status} /api/auth/me school context`
+        );
+
+        if (status === "archived") {
+          const historical = await tenant.listSchoolMemberships(userIds["teacher"], { includeInactive: true });
+          const archivedMembership = historical.find((membership) => membership.schoolId === schoolBId);
+          assert(archivedMembership, "platform/lifecycle reads retain archived memberships");
+          assertEq(archivedMembership!.schoolStatus, "archived", "historical school status remains visible to inspection");
+        }
+
+        const selectedRequest = new NextRequest("http://localhost:3000/api/notifications", {
+          headers: bearer(selectedSchoolToken),
+        });
+        const guarded = await tenant.guardSchoolContext(selectedRequest as never);
+        assertEq(guarded.ok, status === "active", `${status} ordinary school access`);
+
+        const choose = await selectSchoolRoute.POST(
+          postJson("/api/auth/select-school", { schoolId: schoolBId }, bearer(multiSchoolToken)) as never
+        );
+        assertEq(choose.status, status === "active" ? 200 : 403, `${status} selection gate`);
+      }
+      await q(`UPDATE schools SET status = 'active' WHERE id = $1`, [schoolBId]);
+      assertEq(
+        (await one(`SELECT count(*)::int AS n FROM school_users WHERE school_id = $1`, [schoolBId])).n,
+        beforeMemberships.n,
+        "lifecycle changes do not delete historical membership records"
+      );
+
+      const platform = await tenant.guardPlatformAdmin(
+        new NextRequest("http://localhost:3000/api/users", { headers: bearer(platformToken) }) as never
+      );
+      assertEq(platform.ok, true, "platform administrator global gate remains independent of school lifecycle");
     });
 
     await test("Login: every role can authenticate (admin, head teacher, teacher, parent, learner)", async () => {
@@ -569,7 +795,12 @@ async function main() {
         assertEq(response.status, 200, `${key} login status`);
         const body: any = await response.json();
         assert(body.data.token, `${key} token issued`);
-        assertEq(body.data.school.slug, "cbism", `${key} school context`);
+        if (key === "teacher") {
+          assertEq(body.data.school, null, "dual-school teacher must select a school");
+          assertEq(body.data.schools.length, 2, "dual-school teacher memberships remain visible");
+        } else {
+          assertEq(body.data.school.slug, "cbism", `${key} school context`);
+        }
       }
     });
 
@@ -583,6 +814,7 @@ async function main() {
       assertEq(response.status, 200, "super_admin must NOT be locked out");
       const body: any = await response.json();
       assertEq(body.data.user.role, "super_admin", "role");
+      platformToken = body.data.token;
       assertEq(body.data.school, null, "no school context for a platform account");
       assertEq(body.data.schools.length, 0, "no memberships");
       const claims = await auth.verifyToken(body.data.token);
@@ -858,10 +1090,11 @@ async function main() {
       );
       assertEq(counts.cbism, 1, "still exactly one CBISM school");
       assertEq(counts.schools, 2, "both fixture schools present");
-      // Every eligible user (created before OR after the first backfill) plus the one
-      // hand-made School B membership.
-      const eligible = (await one(`SELECT count(*)::int AS n FROM users WHERE role <> 'super_admin'`)).n;
-      assertEq(counts.memberships, eligible + 1, "one membership per eligible user, plus School B");
+      // The migration fixtures have seven eligible users and the teacher has one additional
+      // School B membership. The rate-limit test later creates a standalone identity directly;
+      // unlike the users API, direct SQL does not create a school membership.
+      const fixtureEligible = fixtureUsers.filter((fixture) => fixture.role !== "super_admin").length;
+      assertEq(counts.memberships, fixtureEligible + 1, "one CBISM membership per fixture user, plus School B");
       assertEq(
         (await one(`SELECT count(*)::int AS n FROM school_users WHERE role = 'super_admin'`)).n,
         0,
