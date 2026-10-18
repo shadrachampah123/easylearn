@@ -239,6 +239,16 @@ async function main() {
         `INSERT INTO academic_years (school_id, name, start_date, end_date) VALUES ($1, 'Tenant FK Year A', '2026-01-01', '2026-12-31') RETURNING id`,
         [schoolA.id]
       );
+      const classA = await one(
+        `INSERT INTO classes (school_id, name, level, academic_year_id) VALUES ($1, 'Tenant FK Class A', 'primary', $2) RETURNING id`,
+        [schoolA.id, yearA.id]
+      );
+      await expectError(
+        `UPDATE classes SET school_id = $1 WHERE id = $2`,
+        [schoolB.id, classA.id],
+        "23503",
+        "updating a referenced child's school cannot cross its academic-year tenant"
+      );
       await expectError(
         `INSERT INTO classes (school_id, name, level, academic_year_id) VALUES ($1, 'Cross-school Class', 'primary', $2)`,
         [schoolB.id, yearA.id],
@@ -251,9 +261,29 @@ async function main() {
         [schoolB.id]
       );
 
-      // Simulate pre-existing inconsistent data on this disposable DB. The migration runner
-      // must report it, roll back the entire migration file, and leave the row untouched.
-      await db.query(`ALTER TABLE assignments DROP CONSTRAINT assignments_school_class_fk`);
+      // Rewind only migration 0018's constraints in this disposable DB, leaving the prior
+      // scalar FKs intact. This makes the runner create earlier 0018 constraints before the
+      // later bad relationship is encountered, so the test proves DDL rollback as well as
+      // ledger rollback and preservation of the offending row.
+      const compositeConstraintNames = [
+        "terms_school_academic_year_fk", "classes_school_academic_year_fk", "subjects_school_department_fk",
+        "teacher_classes_school_class_fk", "teacher_classes_school_subject_fk", "teacher_classes_school_academic_year_fk",
+        "learner_classes_school_class_fk", "learner_classes_school_academic_year_fk", "assignments_school_class_fk",
+        "assignments_school_subject_fk", "assignments_school_term_fk", "submissions_school_assignment_fk",
+        "uploaded_files_school_assignment_fk", "resources_school_class_fk", "resources_school_subject_fk",
+        "resources_school_term_fk", "quizzes_school_class_fk", "quizzes_school_subject_fk", "quizzes_school_term_fk",
+        "quiz_attempts_school_quiz_fk", "announcements_school_class_fk", "attendance_school_class_fk",
+        "timetable_entries_school_class_fk", "timetable_entries_school_subject_fk", "timetable_entries_school_term_fk",
+        "timetable_entries_school_academic_year_fk",
+      ];
+      const presentCompositeConstraints = await db.query(
+        `SELECT conname, conrelid::regclass::text AS table_name FROM pg_constraint WHERE conname = ANY($1)`,
+        [compositeConstraintNames]
+      );
+      assertEq(presentCompositeConstraints.rows.length, 26, "all 0018 constraints exist before the rollback simulation");
+      for (const constraint of presentCompositeConstraints.rows) {
+        await db.query(`ALTER TABLE ${constraint.table_name} DROP CONSTRAINT "${constraint.conname}"`);
+      }
       const inconsistent = await one(
         `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id) VALUES ($1, 'Legacy Cross-school Row', $2, $3, $4) RETURNING id`,
         [schoolA.id, classB.id, subjectA.id, user1.id]
@@ -265,6 +295,11 @@ async function main() {
       assert(rejectionOutput.includes("assignments.class_id"), "failure must identify the offending relationship");
       const preserved = await one(`SELECT id FROM assignments WHERE id = $1`, [inconsistent.id]);
       assertEq(preserved.id, inconsistent.id, "failed migration must not modify or delete the legacy row");
+      const rolledBackConstraints = await one(
+        `SELECT count(*)::int AS count FROM pg_constraint WHERE conname = ANY($1)`,
+        [compositeConstraintNames]
+      );
+      assertEq(rolledBackConstraints.count, 0, "all earlier 0018 constraints must roll back after a later preflight failure");
       const absentHistory = await one(
         `SELECT count(*)::int AS count FROM easylearn_schema_migrations WHERE filename = $1`,
         ["0018_composite_school_foreign_keys.sql"]
@@ -285,8 +320,178 @@ async function main() {
       // Keep this regression fixture isolated from later cascade/membership tests.
       await db.query(`DELETE FROM subjects WHERE id = $1`, [subjectA.id]);
       await db.query(`DELETE FROM classes WHERE id = $1`, [classB.id]);
+      await db.query(`DELETE FROM classes WHERE id = $1`, [classA.id]);
       await db.query(`DELETE FROM academic_years WHERE id = $1`, [yearA.id]);
       await db.query(`DELETE FROM departments WHERE id IN ($1, $2)`, [deptA.id, deptB.id]);
+    });
+
+    await test("Composite FK catalog has all 26 ordered tenant relationships and intended actions", async () => {
+      const { rows } = await db.query(`
+        WITH expected(child_table, child_column, parent_table, constraint_name, expected_delete_code) AS (VALUES
+          ('terms', 'academic_year_id', 'academic_years', 'terms_school_academic_year_fk', 'a'),
+          ('classes', 'academic_year_id', 'academic_years', 'classes_school_academic_year_fk', 'a'),
+          ('subjects', 'department_id', 'departments', 'subjects_school_department_fk', 'a'),
+          ('teacher_classes', 'class_id', 'classes', 'teacher_classes_school_class_fk', 'a'),
+          ('teacher_classes', 'subject_id', 'subjects', 'teacher_classes_school_subject_fk', 'a'),
+          ('teacher_classes', 'academic_year_id', 'academic_years', 'teacher_classes_school_academic_year_fk', 'a'),
+          ('learner_classes', 'class_id', 'classes', 'learner_classes_school_class_fk', 'a'),
+          ('learner_classes', 'academic_year_id', 'academic_years', 'learner_classes_school_academic_year_fk', 'a'),
+          ('assignments', 'class_id', 'classes', 'assignments_school_class_fk', 'a'),
+          ('assignments', 'subject_id', 'subjects', 'assignments_school_subject_fk', 'a'),
+          ('assignments', 'term_id', 'terms', 'assignments_school_term_fk', 'a'),
+          ('submissions', 'assignment_id', 'assignments', 'submissions_school_assignment_fk', 'a'),
+          ('uploaded_files', 'assignment_id', 'assignments', 'uploaded_files_school_assignment_fk', 'n'),
+          ('resources', 'class_id', 'classes', 'resources_school_class_fk', 'a'),
+          ('resources', 'subject_id', 'subjects', 'resources_school_subject_fk', 'a'),
+          ('resources', 'term_id', 'terms', 'resources_school_term_fk', 'a'),
+          ('quizzes', 'class_id', 'classes', 'quizzes_school_class_fk', 'a'),
+          ('quizzes', 'subject_id', 'subjects', 'quizzes_school_subject_fk', 'a'),
+          ('quizzes', 'term_id', 'terms', 'quizzes_school_term_fk', 'a'),
+          ('quiz_attempts', 'quiz_id', 'quizzes', 'quiz_attempts_school_quiz_fk', 'a'),
+          ('announcements', 'class_id', 'classes', 'announcements_school_class_fk', 'a'),
+          ('attendance', 'class_id', 'classes', 'attendance_school_class_fk', 'a'),
+          ('timetable_entries', 'class_id', 'classes', 'timetable_entries_school_class_fk', 'c'),
+          ('timetable_entries', 'subject_id', 'subjects', 'timetable_entries_school_subject_fk', 'n'),
+          ('timetable_entries', 'term_id', 'terms', 'timetable_entries_school_term_fk', 'n'),
+          ('timetable_entries', 'academic_year_id', 'academic_years', 'timetable_entries_school_academic_year_fk', 'n')
+        )
+        SELECT e.*, c.oid IS NOT NULL AS exists,
+          c.convalidated,
+          c.confdeltype::text AS delete_code,
+          c.confupdtype::text AS update_code,
+          c.confrelid = to_regclass(format('public.%I', e.parent_table)) AS parent_matches,
+          to_json(ARRAY(
+            SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+            ORDER BY k.ord
+          )) AS child_columns,
+          to_json(ARRAY(
+            SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+            ORDER BY k.ord
+          )) AS parent_columns,
+          COALESCE(
+            i.indisunique AND i.indisvalid AND i.indnkeyatts = 2
+            AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = c.confrelid AND attname = 'school_id' AND NOT attisdropped)
+            AND i.indkey[1] = (SELECT attnum FROM pg_attribute WHERE attrelid = c.confrelid AND attname = 'id' AND NOT attisdropped),
+            false
+          ) AS target_index_valid
+        FROM expected e
+        LEFT JOIN pg_constraint c
+          ON c.conname = e.constraint_name
+         AND c.contype = 'f'
+         AND c.conrelid = to_regclass(format('public.%I', e.child_table))
+        LEFT JOIN pg_index i ON i.indexrelid = c.conindid
+        ORDER BY e.constraint_name
+      `);
+      assertEq(rows.length, 26, "catalog inventory must cover all 26 planned relationships");
+      for (const fk of rows) {
+        assertEq(fk.exists, true, `${fk.constraint_name} exists`);
+        assertEq(fk.convalidated, true, `${fk.constraint_name} is validated`);
+        assertEq(fk.parent_matches, true, `${fk.constraint_name} points to ${fk.parent_table}`);
+        assertEq(JSON.stringify(fk.child_columns), JSON.stringify(["school_id", fk.child_column]), `${fk.constraint_name} child column order`);
+        assertEq(JSON.stringify(fk.parent_columns), JSON.stringify(["school_id", "id"]), `${fk.constraint_name} parent column order`);
+        assertEq(fk.delete_code, fk.expected_delete_code, `${fk.constraint_name} ON DELETE action`);
+        assertEq(fk.update_code, "a", `${fk.constraint_name} keeps ON UPDATE NO ACTION`);
+        assertEq(fk.target_index_valid, true, `${fk.constraint_name} references a valid unique parent index`);
+      }
+      assertEq(rows.find((fk) => fk.constraint_name === "uploaded_files_school_assignment_fk").delete_code, "n", "uploaded files retain SET NULL on assignment deletion");
+      assertEq(rows.find((fk) => fk.constraint_name === "timetable_entries_school_class_fk").delete_code, "c", "timetable entries retain CASCADE on class deletion");
+      for (const name of ["subject", "term", "academic_year"]) {
+        assertEq(rows.find((fk) => fk.constraint_name === `timetable_entries_school_${name}_fk`).delete_code, "n", `timetable ${name} reference retains SET NULL`);
+      }
+    });
+
+    await test("Composite uploaded-file FK preserves assignment delete SET NULL behavior", async () => {
+      const dept = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Uploaded-file delete department') RETURNING id`,
+        [schoolA.id]
+      );
+      const subject = await one(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Uploaded-file delete subject', $2) RETURNING id`,
+        [schoolA.id, dept.id]
+      );
+      const klass = await one(
+        `INSERT INTO classes (school_id, name, level) VALUES ($1, 'Uploaded-file delete class', 'primary') RETURNING id`,
+        [schoolA.id]
+      );
+      const assignment = await one(
+        `INSERT INTO assignments (school_id, title, class_id, subject_id, teacher_id)
+         VALUES ($1, 'Uploaded-file delete assignment', $2, $3, $4) RETURNING id`,
+        [schoolA.id, klass.id, subject.id, user1.id]
+      );
+      const uploadedFile = await one(
+        `INSERT INTO uploaded_files
+           (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, category, size_bytes)
+         VALUES ($1, $2, 'assignment', $3, 'brief.pdf', $4, 'document', 12) RETURNING id`,
+        [schoolA.id, user1.id, assignment.id, `tenant-fk-delete-${DB_NAME}.pdf`]
+      );
+
+      await db.query(`DELETE FROM assignments WHERE id = $1`, [assignment.id]);
+      const retainedFile = await one(
+        `SELECT assignment_id, school_id FROM uploaded_files WHERE id = $1`,
+        [uploadedFile.id]
+      );
+      assertEq(retainedFile.assignment_id, null, "deleting an assignment should detach, not block or delete, its uploaded file");
+      assertEq(retainedFile.school_id, schoolA.id, "detaching the assignment must preserve the uploaded file's tenant anchor");
+
+      await db.query(`DELETE FROM uploaded_files WHERE id = $1`, [uploadedFile.id]);
+      await db.query(`DELETE FROM subjects WHERE id = $1`, [subject.id]);
+      await db.query(`DELETE FROM classes WHERE id = $1`, [klass.id]);
+      await db.query(`DELETE FROM departments WHERE id = $1`, [dept.id]);
+    });
+
+    await test("Composite timetable FKs preserve CASCADE and selective SET NULL delete behavior", async () => {
+      const year = await one(
+        `INSERT INTO academic_years (school_id, name, start_date, end_date)
+         VALUES ($1, $2, '2026-01-01', '2026-12-31') RETURNING id`,
+        [schoolA.id, `Timetable FK actions ${DB_NAME}`]
+      );
+      const term = await one(
+        `INSERT INTO terms (school_id, name, academic_year_id, start_date, end_date)
+         VALUES ($1, 'term_1', $2, '2026-01-01', '2026-04-30') RETURNING id`,
+        [schoolA.id, year.id]
+      );
+      const dept = await one(
+        `INSERT INTO departments (school_id, name) VALUES ($1, 'Timetable FK action department') RETURNING id`,
+        [schoolA.id]
+      );
+      const subject = await one(
+        `INSERT INTO subjects (school_id, name, department_id) VALUES ($1, 'Timetable FK action subject', $2) RETURNING id`,
+        [schoolA.id, dept.id]
+      );
+      const klass = await one(
+        `INSERT INTO classes (school_id, name, level) VALUES ($1, 'Timetable FK action class', 'primary') RETURNING id`,
+        [schoolA.id]
+      );
+      const entry = await one(
+        `INSERT INTO timetable_entries (school_id, class_id, subject_id, term_id, academic_year_id, day_of_week, start_time, end_time)
+         VALUES ($1, $2, $3, $4, $5, 'monday', '09:00', '09:45') RETURNING id`,
+        [schoolA.id, klass.id, subject.id, term.id, year.id]
+      );
+
+      await db.query(`DELETE FROM subjects WHERE id = $1`, [subject.id]);
+      let retained = await one(`SELECT subject_id, term_id, academic_year_id, school_id FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(retained.subject_id, null, "deleting the optional subject nulls only subject_id");
+      assertEq(retained.term_id, term.id, "subject deletion preserves the other timetable references");
+      assertEq(retained.academic_year_id, year.id, "subject deletion preserves academic_year_id");
+      assertEq(retained.school_id, schoolA.id, "subject deletion preserves school_id");
+
+      await db.query(`DELETE FROM terms WHERE id = $1`, [term.id]);
+      retained = await one(`SELECT term_id, academic_year_id, school_id FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(retained.term_id, null, "deleting the optional term nulls only term_id");
+      assertEq(retained.academic_year_id, year.id, "term deletion preserves academic_year_id");
+      assertEq(retained.school_id, schoolA.id, "term deletion preserves school_id");
+
+      await db.query(`DELETE FROM academic_years WHERE id = $1`, [year.id]);
+      retained = await one(`SELECT academic_year_id, school_id FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(retained.academic_year_id, null, "deleting the optional academic year nulls only academic_year_id");
+      assertEq(retained.school_id, schoolA.id, "academic year deletion preserves school_id");
+
+      await db.query(`DELETE FROM classes WHERE id = $1`, [klass.id]);
+      const cascaded = await one(`SELECT count(*)::int AS count FROM timetable_entries WHERE id = $1`, [entry.id]);
+      assertEq(cascaded.count, 0, "deleting the timetable class cascades its schedule entry");
+      await db.query(`DELETE FROM departments WHERE id = $1`, [dept.id]);
     });
 
     /* ── 3./4. Membership: valid, duplicate, and FK behavior ── */

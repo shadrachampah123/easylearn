@@ -2,7 +2,7 @@
 
 **Purpose:** establish the actual production application/build and PostgreSQL tenancy state before any further Phase 2 schema work. This is an inspection plan only; it does not authorize a migration, data repair, deployment, or production write.
 
-**Status (2026-10-18):** Not executed in production. SQL syntax was exercised against a migrated disposable PostgreSQL 18 database; no production database connection or credentials were used. Migration 0018 and migration-runner/history hardening are repository-only changes on an unmerged PR branch; they have not been deployed or run against production. The successful GitHub Production deployment record is not evidence that migrations 0013–0017 ran or that a custom-domain alias serves that build.
+**Status (2026-10-18):** Not executed in production. SQL syntax was exercised against a migrated disposable PostgreSQL 18 database; no production database connection or credentials were used. Migration 0018 and migration-runner/history hardening are repository-only changes on an unmerged PR branch; they have not been deployed or run against production. The current 0018 SQL uses PostgreSQL 15+ selective column-list `ON DELETE SET NULL`; capture `server_version` in this read-only checkpoint and stop before any application if the deployed server is older or the version is uncertain. The successful GitHub Production deployment record is not evidence that migrations 0013–0017 ran or that a custom-domain alias serves that build.
 
 ## Safety and evidence rules
 

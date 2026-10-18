@@ -4,6 +4,16 @@
 --
 -- This migration deliberately does not repair mismatched data. It reports the affected
 -- relationship and aborts atomically so operators can investigate before retrying.
+-- Selective column-list ON DELETE SET NULL requires PostgreSQL 15 or newer.
+DO $$
+BEGIN
+  IF current_setting('server_version_num')::integer < 150000 THEN
+    RAISE EXCEPTION '0018 requires PostgreSQL 15 or newer (server_version_num=%)',
+      current_setting('server_version_num');
+  END IF;
+END $$;
+
+--> statement-breakpoint
 DO $$
 DECLARE
   rel record;
@@ -31,7 +41,7 @@ BEGIN
       ('assignments', 'subject_id', 'subjects', 'assignments_school_subject_fk', 'NO ACTION', '', 'a'),
       ('assignments', 'term_id', 'terms', 'assignments_school_term_fk', 'NO ACTION', '', 'a'),
       ('submissions', 'assignment_id', 'assignments', 'submissions_school_assignment_fk', 'NO ACTION', '', 'a'),
-      ('uploaded_files', 'assignment_id', 'assignments', 'uploaded_files_school_assignment_fk', 'NO ACTION', '', 'a'),
+      ('uploaded_files', 'assignment_id', 'assignments', 'uploaded_files_school_assignment_fk', 'SET NULL', ' (assignment_id)', 'n'),
       ('resources', 'class_id', 'classes', 'resources_school_class_fk', 'NO ACTION', '', 'a'),
       ('resources', 'subject_id', 'subjects', 'resources_school_subject_fk', 'NO ACTION', '', 'a'),
       ('resources', 'term_id', 'terms', 'resources_school_term_fk', 'NO ACTION', '', 'a'),

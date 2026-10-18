@@ -19,7 +19,7 @@ import assert from "assert";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { createRequire } from "module";
 import fs from "fs";
 
@@ -164,6 +164,10 @@ async function main() {
       const compositeRoot = fs.readFileSync(path.join(REPO_ROOT, "0018_composite_school_foreign_keys.sql"), "utf8");
       const compositeDrizzle = fs.readFileSync(path.join(REPO_ROOT, "drizzle", "0018_composite_school_foreign_keys.sql"), "utf8");
       assertEq(compositeRoot, compositeDrizzle, "0018 root and drizzle copies must be identical");
+      assert(
+        compositeRoot.includes("current_setting('server_version_num')::integer < 150000"),
+        "0018 must fail clearly before DDL when PostgreSQL is older than 15"
+      );
       const runner = fs.readFileSync(path.join(REPO_ROOT, "run-migration.js"), "utf8");
       assert(runner.includes('"0017_school_id_not_null.sql"'), "run-migration.js must list 0017");
       assert(runner.includes('"0018_composite_school_foreign_keys.sql"'), "run-migration.js must list 0018");
@@ -203,6 +207,72 @@ async function main() {
         assert(/^[0-9a-f]{64}$/.test(row.checksum), `${row.filename} has a SHA-256 checksum`);
       }
       assertEq(rows[18].filename, "0018_composite_school_foreign_keys.sql", "0018 is the final applied migration");
+    });
+
+    await test("Runner rejects checksum drift and migration-history gaps", async () => {
+      const first = await one(
+        `SELECT filename, checksum FROM easylearn_schema_migrations WHERE filename = $1`,
+        ["0000_wet_legion.sql"]
+      );
+      await db.query(
+        `UPDATE easylearn_schema_migrations SET checksum = repeat('0', 64) WHERE filename = $1`,
+        [first.filename]
+      );
+      const drift = runMigrations();
+      const driftOutput = `${drift.stdout || ""}${drift.stderr || ""}`;
+      assert(drift.status !== 0, "modified applied checksum must stop the runner");
+      assert(driftOutput.includes("Checksum mismatch"), "checksum failure should identify drift");
+      await db.query(`UPDATE easylearn_schema_migrations SET checksum = $2 WHERE filename = $1`, [first.filename, first.checksum]);
+
+      const missing = await one(
+        `SELECT filename, checksum, applied_at FROM easylearn_schema_migrations WHERE filename = $1`,
+        ["0003_timetable.sql"]
+      );
+      await db.query(`DELETE FROM easylearn_schema_migrations WHERE filename = $1`, [missing.filename]);
+      const gap = runMigrations();
+      const gapOutput = `${gap.stdout || ""}${gap.stderr || ""}`;
+      assert(gap.status !== 0, "a ledger gap before later applied migrations must stop the runner");
+      assert(gapOutput.includes("history has a gap"), "gap failure should be explicit");
+      await db.query(
+        `INSERT INTO easylearn_schema_migrations (filename, checksum, applied_at) VALUES ($1, $2, $3)`,
+        [missing.filename, missing.checksum, missing.applied_at]
+      );
+    });
+
+    await test("Runner serializes concurrent invocations with its advisory lock", async () => {
+      const lockKey = [1163416649, 1296125510];
+      await db.query("SELECT pg_advisory_lock($1, $2)", lockKey);
+      let held = true;
+      const child = spawn(process.execPath, ["run-migration.js"], {
+        cwd: REPO_ROOT,
+        env: { ...process.env, DATABASE_URL: scratchUrl },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      try {
+        const completion = new Promise<{ status: number | null; output: string }>((resolve, reject) => {
+          let output = "";
+          child.stdout?.on("data", (chunk) => { output += chunk.toString(); });
+          child.stderr?.on("data", (chunk) => { output += chunk.toString(); });
+          child.on("error", reject);
+          child.on("close", (status) => resolve({ status, output }));
+        });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const waiting = await one(`
+          SELECT count(*)::int AS count FROM pg_stat_activity
+           WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'
+             AND query LIKE '%pg_advisory_lock%'
+        `);
+        assertEq(waiting.count > 0, true, "second runner should be waiting on the held migration lock");
+        assertEq(child?.exitCode, null, "second runner must not exit while the migration lock is held");
+        await db.query("SELECT pg_advisory_unlock($1, $2)", lockKey);
+        held = false;
+        const result = await completion;
+        assertEq(result.status, 0, `serialized runner should finish cleanly: ${result.output.slice(-2500)}`);
+        assert(result.output.includes("already recorded with matching checksums"), "serialized runner should recheck history after acquiring the lock");
+      } finally {
+        if (held) await db.query("SELECT pg_advisory_unlock($1, $2)", lockKey).catch(() => {});
+        if (child.exitCode === null) child.kill("SIGTERM");
+      }
     });
 
     await test("NOT NULL on required A-tables; activity_logs stays nullable", async () => {
@@ -388,6 +458,47 @@ async function main() {
       const sqlBlock = checkpoint.match(/```sql\n([\s\S]*?)\n```/);
       assert(sqlBlock, "read-only checkpoint SQL block must exist");
       await db.query(sqlBlock[1]);
+    });
+
+    await test("Runner baseline requires confirmation and only records a sequential prefix", async () => {
+      await db.query(`DROP TABLE easylearn_schema_migrations`);
+      const prefix = [
+        "0000_wet_legion.sql", "0001_assignment_grading.sql", "0002_optional_email.sql",
+        "0003_timetable.sql", "0004_dashboard_overrides.sql", "0005_activity_enhancements.sql",
+        "0006_user_identity_columns.sql", "0007_quiz_images.sql", "0008_easyai_grading.sql",
+        "0009_file_uploads.sql", "0010_object_storage.sql", "0011_attendance_unique_constraint.sql",
+        "0012_login_attempts.sql", "0013_multi_school_foundation.sql", "0014_drop_single_school_guard.sql",
+        "0015_cbism_school_and_membership_backfill.sql", "0016_school_id_columns.sql",
+        "0017_school_id_not_null.sql", "0018_composite_school_foreign_keys.sql",
+      ];
+      const baselineEnv = { ...process.env, DATABASE_URL: scratchUrl };
+      const unconfirmed = spawnSync(process.execPath, ["run-migration.js", "--baseline", prefix.join(",")], {
+        cwd: REPO_ROOT, env: baselineEnv, encoding: "utf8",
+      });
+      const unconfirmedOutput = `${unconfirmed.stdout || ""}${unconfirmed.stderr || ""}`;
+      assert(unconfirmed.status !== 0, "baseline without explicit operator confirmation must fail");
+      assert(unconfirmedOutput.includes("Baseline refused"), "baseline refusal should be explicit");
+      assertEq((await one(`SELECT to_regclass('public.easylearn_schema_migrations') AS relation`)).relation, null, "unconfirmed baseline creates no ledger");
+
+      const invalidPrefix = spawnSync(process.execPath, ["run-migration.js", "--baseline", "0001_assignment_grading.sql"], {
+        cwd: REPO_ROOT,
+        env: { ...baselineEnv, CONFIRM_MIGRATION_BASELINE: "I_HAVE_VERIFIED_THESE_MIGRATIONS" },
+        encoding: "utf8",
+      });
+      assert(invalidPrefix.status !== 0, "non-prefix baseline must fail before database mutation");
+      assert(`${invalidPrefix.stdout || ""}${invalidPrefix.stderr || ""}`.includes("sequential prefix"), "invalid baseline should explain required ordering");
+
+      const tableCountBefore = Number((await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`)).count);
+      const confirmed = spawnSync(process.execPath, ["run-migration.js", "--baseline", prefix.join(",")], {
+        cwd: REPO_ROOT,
+        env: { ...baselineEnv, CONFIRM_MIGRATION_BASELINE: "I_HAVE_VERIFIED_THESE_MIGRATIONS" },
+        encoding: "utf8",
+      });
+      assertEq(confirmed.status, 0, `explicit baseline should succeed in this disposable test DB: ${(confirmed.stdout || "") + (confirmed.stderr || "")}`);
+      assert((confirmed.stdout || "").includes("no migration SQL was executed"), "baseline must clearly report it did not apply SQL");
+      const tableCountAfter = Number((await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`)).count);
+      assertEq(tableCountAfter, tableCountBefore + 1, "baseline should add only the migration ledger table");
+      assertEq(Number((await one(`SELECT count(*)::int AS count FROM easylearn_schema_migrations`)).count), prefix.length, "baseline records only the supplied sequential prefix");
     });
 
     await test("Runner fails closed on an existing schema without migration history", async () => {
