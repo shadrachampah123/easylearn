@@ -19,6 +19,7 @@ import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
 import { NextRequest } from "next/server";
+import { createTestJwtSecret } from "./helpers/test-secret";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
@@ -28,7 +29,7 @@ const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
 );
 
 const DB_NAME = `easylearn_2d_test_${crypto.randomBytes(4).toString("hex")}`;
-const JWT_SECRET = "phase-2d-catalog-test-secret-0123456789";
+const JWT_SECRET = createTestJwtSecret();
 const UPLOAD_DIR = path.join(os.tmpdir(), `${DB_NAME}-uploads`);
 
 let passed = 0;

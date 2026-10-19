@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import { users } from "@/db/schema";
 import { eq, type SQL } from "drizzle-orm";
 import { getJwtSecret } from "@/lib/env";
+import { assertJwtSecretIsUsable, isJwtSecretConfigurationError } from "@/lib/jwt-policy";
 
 const TOKEN_EXPIRY = "24h";
 
@@ -24,11 +25,19 @@ function uuidClaim(value: unknown): string | undefined {
   return typeof value === "string" && UUID_CLAIM_PATTERN.test(value) ? value : undefined;
 }
 
+/**
+ * The single chokepoint for every JWT signing and verification operation.
+ *
+ * The secret policy is enforced HERE, not in the individual routes, so that no route
+ * can sign or verify a token with a secret that has not passed it. A route that adds
+ * its own check is redundant; a route that forgets one is still protected.
+ *
+ * `assertJwtSecretIsUsable` throws a `JwtSecretConfigurationError` whose message
+ * describes the requirement and never contains the secret itself.
+ */
 function getJwtKey(): Uint8Array {
   const secret = getJwtSecret();
-  if (!secret) {
-    throw new Error("JWT_SECRET is required");
-  }
+  assertJwtSecretIsUsable(secret);
   return new TextEncoder().encode(secret);
 }
 
@@ -101,7 +110,11 @@ export async function verifyToken(token: string) {
       /** A server-issued no-selection guard for logins that had zero or multiple memberships. */
       schoolSelectionRequired: payload.schoolSelectionRequired === true,
     };
-  } catch {
+  } catch (error) {
+    // A misconfigured JWT secret is an OPERATOR problem, not an invalid token. Swallowing
+    // it here would make every request answer 401 "Unauthorized" and hide the real cause
+    // from the health endpoint and the logs, so it is re-thrown and reported as a 503.
+    if (isJwtSecretConfigurationError(error)) throw error;
     return null;
   }
 }

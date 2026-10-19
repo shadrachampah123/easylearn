@@ -38,6 +38,7 @@ import os from "os";
 import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
+import { createTestJwtSecret } from "./helpers/test-secret";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
@@ -49,7 +50,7 @@ const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
 const RUN_ID = crypto.randomBytes(4).toString("hex");
 const SUPPORTED_DB = `easylearn_prereq_supported_${RUN_ID}`;
 const PRE0016_DB = `easylearn_prereq_pre0016_${RUN_ID}`;
-const JWT_SECRET = "assignment-prereq-test-secret-0123456789";
+const JWT_SECRET = createTestJwtSecret();
 const SCENARIO_ENV = "EASY_LEARN_PREREQ_SCENARIO";
 const PRE0016_URL_ENV = "EASY_LEARN_PREREQ_PRE0016_URL";
 /** In CI a skip must fail the job: the assertions have to actually run. */

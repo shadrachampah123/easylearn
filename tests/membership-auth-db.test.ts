@@ -40,6 +40,7 @@ import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
 import { NextRequest } from "next/server";
+import { createTestJwtSecret } from "./helpers/test-secret";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
@@ -48,7 +49,7 @@ const { runMigrations: runMigrationChain } = requireFromRepo("./tests/helpers/mi
 const DB_NAME = `easylearn_2b_test_${crypto.randomBytes(4).toString("hex")}`;
 const TEST_PASSWORD = "Phase2b-Test-Password!";
 const NEW_PASSWORD = "Phase2b-Rotated-Password!";
-const JWT_SECRET = "phase-2b-integration-test-secret-0123456789";
+const JWT_SECRET = createTestJwtSecret();
 
 let passed = 0;
 let failed = 0;
