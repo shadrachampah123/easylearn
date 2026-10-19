@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { teacherNav } from "@/lib/teacher-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Learner {
   id: string;
@@ -28,9 +29,8 @@ export default function TeacherAttendancePage() {
 
 
   const loadClasses = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/classes", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/classes");
       const data = await res.json();
       if (data.success) setClasses(data.data);
     } catch (err) {
@@ -46,13 +46,12 @@ export default function TeacherAttendancePage() {
 
   async function loadLearners() {
     if (!selectedClass) return;
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     setMessage("");
     try {
-      const res = await fetch("/api/attendance", {
+      const res = await apiFetch("/api/attendance", {
         method: "PUT",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ classId: selectedClass }),
       });
       const data = await res.json();
@@ -64,9 +63,7 @@ export default function TeacherAttendancePage() {
         setRecords(defaults);
 
         // Load existing attendance for this date
-        const attRes = await fetch(`/api/attendance?classId=${selectedClass}&date=${date}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const attRes = await apiFetch(`/api/attendance?classId=${selectedClass}&date=${date}`);
         const attData = await attRes.json();
         if (attData.success && attData.data.length > 0) {
           const existing: Record<string, boolean> = {};
@@ -84,16 +81,15 @@ export default function TeacherAttendancePage() {
   }
 
   async function handleSave() {
-    const token = localStorage.getItem("el_token");
     setSaving(true);
     setMessage("");
     try {
       const attendanceRecords = Object.entries(records).map(([learnerId, isPresent]) => ({
         learnerId, isPresent,
       }));
-      const res = await fetch("/api/attendance", {
+      const res = await apiFetch("/api/attendance", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ classId: selectedClass, date, records: attendanceRecords }),
       });
       const data = await res.json();

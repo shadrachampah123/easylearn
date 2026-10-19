@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Assignment {
   id: string;
@@ -28,10 +29,9 @@ export default function AdminAssignmentsPage() {
 
 
   const loadAssignments = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch("/api/assignments", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/assignments");
       const data = await res.json();
       if (data.success) setAssignments(data.data);
     } catch (err) {

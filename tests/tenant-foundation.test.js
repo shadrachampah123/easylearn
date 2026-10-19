@@ -326,8 +326,41 @@ test('Boundary: no tenant filtering added to authorization helpers', () => {
 });
 
 test('Boundary: no middleware/hostname tenant resolution', () => {
-  const middlewarePath = path.join(__dirname, '..', 'src', 'middleware.ts');
-  assert(!fs.existsSync(middlewarePath), 'src/middleware.ts must not exist yet (Phase 2E)');
+  // The original assertion was that the request-handler file must not exist, because a
+  // middleware that resolves a tenant from the hostname would let a request pick
+  // its own school. That property — not the absence of the file — is the boundary,
+  // so it is now asserted directly and against a file that does exist.
+  //
+  // The middleware that now exists performs the cross-site request policy and
+  // nothing else. It must never derive, select or influence a tenant.
+  const middlewarePath = path.join(__dirname, '..', 'src', 'proxy.ts');
+  assert(
+    fs.existsSync(middlewarePath),
+    'the cross-site request policy is enforced in src/proxy.ts, which must exist'
+  );
+
+  const middleware = readFile('src/proxy.ts');
+
+  assert(
+    !/from\s+["']@\/lib\/tenant["']/.test(middleware),
+    'the proxy must not import the tenant module'
+  );
+  assert(
+    !/\b(schoolId|school_id|membershipId|membership_id)\b/.test(middleware),
+    'the proxy must not read or derive a school or membership id'
+  );
+  assert(
+    !/headers\.get\(\s*["'](x-forwarded-host|host|x-tenant|x-school)["']\s*\)/i.test(middleware),
+    'the proxy must not read a tenant from a request header'
+  );
+  assert(
+    !/(selectSchool|resolveSchool|requireSchoolContext|guardSchoolContext|isUserInSchool)/.test(middleware),
+    'the proxy must not resolve a school context'
+  );
+  assert(
+    /evaluateCsrfRequestForRequest/.test(middleware),
+    'the proxy must apply the cross-site request policy'
+  );
 });
 
 test('Docs: README documents the 0013 migration', () => {

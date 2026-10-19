@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
 import TimetableGrid, { type TimetableEntry } from "@/components/dashboard/TimetableGrid";
+import { apiFetch } from "../../../../lib/api-client";
 
 export default function ParentTimetablePage() {
   const [entries, setEntries] = useState<TimetableEntry[]>([]);
@@ -11,11 +12,8 @@ export default function ParentTimetablePage() {
 
   async function loadTimetable() {
     setLoading(true);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/timetable", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch("/api/timetable");
       const data = await res.json();
       if (data.success) setEntries(data.data);
     } catch (err) {

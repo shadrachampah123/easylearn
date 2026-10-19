@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import QuestionImagePicker from "@/components/dashboard/QuestionImagePicker";
 import Link from "next/link";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Quiz {
   id: string;
@@ -60,14 +61,11 @@ export default function TeacherQuizzesPage() {
   }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
-    if (!token) return;
-
     try {
       const [quizRes, classRes, subjectRes] = await Promise.all([
-        fetch("/api/quizzes", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/classes", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/subjects", { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch("/api/quizzes"),
+        apiFetch("/api/classes"),
+        apiFetch("/api/subjects"),
       ]);
 
       const quizData = await quizRes.json();
@@ -116,11 +114,10 @@ export default function TeacherQuizzesPage() {
   async function togglePublish(quiz: Quiz, e: React.MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/quizzes/${quiz.id}`, {
+      const res = await apiFetch(`/api/quizzes/${quiz.id}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ isPublished: !quiz.isPublished }),
       });
       const data = await res.json();
@@ -141,14 +138,11 @@ export default function TeacherQuizzesPage() {
       return;
     }
     setSaving(true);
-
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/quizzes", {
+      const res = await apiFetch("/api/quizzes", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           ...formData,

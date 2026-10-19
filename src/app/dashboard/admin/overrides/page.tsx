@@ -1,9 +1,9 @@
-/* eslint-disable react-hooks/set-state-in-effect */
 "use client";
 
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface CardOverride {
   id: string;
@@ -52,10 +52,9 @@ export default function AdminOverridesPage() {
   useEffect(() => { load(); }, []);
 
   async function load() {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch("/api/dashboard/overrides", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/dashboard/overrides");
       const data = await res.json().catch(() => null);
       if (data?.success) {
         setOverrides(Array.isArray(data.data) ? data.data : []);
@@ -76,13 +75,12 @@ export default function AdminOverridesPage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
     try {
       const url = editing ? `/api/dashboard/overrides/${editing.id}` : "/api/dashboard/overrides";
       const method = editing ? "PUT" : "POST";
       const res = await fetch(url, {
         method,
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...form, scopeId: form.scopeId || null, sortOrder: Number(form.sortOrder) || 0 }),
       });
       const data = await res.json().catch(() => null);
@@ -125,9 +123,8 @@ export default function AdminOverridesPage() {
 
   async function handleDelete(id: string) {
     if (!confirm("Delete this override? Card will revert to live data.")) return;
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/dashboard/overrides/${id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/dashboard/overrides/${id}`, { method: "DELETE" });
       const data = await res.json().catch(() => null);
       if (data?.success) load();
       else {
@@ -139,9 +136,8 @@ export default function AdminOverridesPage() {
   }
 
   async function toggle(ov: CardOverride) {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/dashboard/overrides/${ov.id}`, { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ isEnabled: !ov.isEnabled }) });
+      const res = await apiFetch(`/api/dashboard/overrides/${ov.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isEnabled: !ov.isEnabled }) });
       const data = await res.json().catch(() => null);
       if (!data?.success) setLoadError(data?.error || `Could not update the override (HTTP ${res.status})`);
       load();

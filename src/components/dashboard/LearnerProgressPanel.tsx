@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { apiFetch } from "../../lib/api-client";
 
 interface LearnerSummary {
   id: string;
@@ -111,11 +112,8 @@ export default function LearnerProgressPanel() {
   async function loadLearners() {
     setLoading(true);
     setError("");
-    const token = localStorage.getItem("el_token");
     try {
-      const response = await fetch("/api/learner-reports", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch("/api/learner-reports");
       const data = (await response.json()) as { success?: boolean; data?: ReportsResponse; error?: string };
       if (!response.ok || !data.success || !data.data) {
         throw new Error(data.error || "Could not load learners");
@@ -134,11 +132,8 @@ export default function LearnerProgressPanel() {
     setReport(null);
     setReportLoading(true);
     setError("");
-    const token = localStorage.getItem("el_token");
     try {
-      const response = await fetch(`/api/learner-reports?learnerId=${encodeURIComponent(learnerId)}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/api/learner-reports?learnerId=${encodeURIComponent(learnerId)}`);
       const data = (await response.json()) as { success?: boolean; data?: ReportsResponse; error?: string };
       if (!response.ok || !data.success || !data.data?.report) {
         throw new Error(data.error || "Could not load this learner's report");

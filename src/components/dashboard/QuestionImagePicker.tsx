@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { apiFetch } from "../../lib/api-client";
 
 interface ImageResult {
   id: string;
@@ -53,13 +54,10 @@ export default function QuestionImagePicker({
     setSearching(true);
     setError("");
     setOpen(true);
-    const token = localStorage.getItem("el_token");
     try {
       const params = new URLSearchParams({ q: query });
       if (subjectName) params.set("subject", subjectName);
-      const response = await fetch(`/api/images/search?${params.toString()}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/api/images/search?${params.toString()}`);
       const data = (await response.json()) as ImageSearchResponse;
       if (!response.ok || !data.success || !data.data) {
         throw new Error(data.error || "No images found");

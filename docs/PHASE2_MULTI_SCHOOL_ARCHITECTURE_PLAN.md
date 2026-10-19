@@ -883,7 +883,7 @@ CREATE TABLE support_access_sessions (
 1. `easylearn.com` — platform marketing + login entry (`/login` handles: no membership →
    slug/email flow; one membership → auto-attach; several → picker).
 2. `{slug}.easylearn.com` — the school portal (public website **and** dashboards, same
-   deployment; new `src/middleware.ts` parses `host`, resolves slug → `schoolId`, and
+   deployment; a new request-handler file parses `host`, resolves slug → `schoolId`, and
    forwards it via a request header for that request only).
 3. **Login flow:** the login form carries the resolved school context (subdomain or
    explicit slug field); the server verifies the user **has an active membership in that
@@ -1005,7 +1005,8 @@ How the existing `src/lib/authorization.ts` fits:
   of Phase 2.
 - `/api/platform/*` routes use `requireSuperAdmin`; support-mode requests surface
   `ctx.supportSessionId`, which the audit helper records automatically.
-- `src/middleware.ts` does **routing only** (host → school attach), never authorization —
+- A request-handler file (now `src/proxy.ts` in Next.js 16) does **routing only**
+  (host → school attach), never authorization —
   decisions stay in the route layer where the database is reachable (middleware runs on
   the edge).
 
@@ -1503,7 +1504,7 @@ and audit last-but-continuous (2G).
 ## 23. EXACT FILES / MODULES LIKELY TO CHANGE (FUTURE IMPLEMENTATION)
 
 **New (core):** `src/lib/tenant.ts` (authorization gates) · `src/lib/client/api.ts`
-(cookie fetch wrapper) · `src/middleware.ts` (host → school) · `src/db/schema.ts`
+(cookie fetch wrapper) · `src/proxy.ts` (host → school, NOT implemented) · `src/db/schema.ts`
 additions (`schools`, `schoolUsers`, `schoolBranding`, `supportAccessSessions`,
 `auditLogs`, optional `platformConfig`) · `src/app/api/platform/*` (schools CRUD,
 support-sessions, metrics) · `/manifest.webmanifest` dynamic route.

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Assignment {
   id: string;
@@ -37,20 +38,18 @@ export default function ParentAssignmentsPage() {
   const [resultDetails, setResultDetails] = useState<any>(null);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/auth/me")
       .then((r) => r.json())
       .then((data) => { if (data.success) loadChildren(data.data.user.id); });
   }, []);
 
   async function loadChildren(parentId: string) {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/parent-learners?parentId=${parentId}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
       const data = await res.json();
       if (data.success) {
         const learnerIds = data.data.map((c: { learnerId: string }) => c.learnerId);
-        const userRes = await fetch("/api/users?role=learner&limit=100", { headers: { Authorization: `Bearer ${token}` } });
+        const userRes = await apiFetch("/api/users?role=learner&limit=100");
         const userData = await userRes.json();
         if (userData.success) {
           const kids = userData.data.users.filter((l: { id: string }) => learnerIds.includes(l.id));
@@ -65,10 +64,9 @@ export default function ParentAssignmentsPage() {
 
   async function loadAssignments(learnerId: string) {
     setChildId(learnerId);
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch("/api/assignments?status=published", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/assignments?status=published");
       const data = await res.json();
       if (data.success) setAssignments(data.data);
     } catch (err) {
@@ -80,11 +78,8 @@ export default function ParentAssignmentsPage() {
 
   async function viewResults(assignmentId: string) {
     if (!childId) return;
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/assignments/${assignmentId}/results?learnerId=${childId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch(`/api/assignments/${assignmentId}/results?learnerId=${childId}`);
       const data = await res.json();
       if (data.success) {
         setResultDetails(data.data);

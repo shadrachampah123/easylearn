@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface DepartmentRow {
   id: string;
@@ -31,10 +32,9 @@ export default function AdminDepartmentsPage() {
   }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch("/api/departments", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/departments");
       const data = await res.json();
       if (data.success) setDepartments(data.data);
     } catch (err) {
@@ -65,12 +65,11 @@ export default function AdminDepartmentsPage() {
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
 
     try {
       const response = await fetch(editing ? `/api/departments/${editing.id}` : "/api/departments", {
         method: editing ? "PUT" : "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: formData.name.trim(),
           description: formData.description.trim() || null,
@@ -98,13 +97,10 @@ export default function AdminDepartmentsPage() {
       ? ` Its ${department.subjectCount} subject${department.subjectCount === 1 ? "" : "s"} will be kept but moved out of the department.`
       : "";
     if (!confirm(`Delete ${department.name}?${subjectMessage}`)) return;
-
-    const token = localStorage.getItem("el_token");
     setSaving(true);
     try {
-      const response = await fetch(`/api/departments/${department.id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await apiFetch(`/api/departments/${department.id}`, {
+        method: "DELETE"
       });
       const data = await response.json();
       if (!data.success) {

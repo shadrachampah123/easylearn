@@ -8,6 +8,7 @@ import {
   selectSchoolForContext,
   toSchoolSummary,
 } from "@/lib/tenant";
+import { SESSION_COOKIE_NAME } from "@/lib/session-cookie";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -63,9 +64,10 @@ export async function POST(request: NextRequest) {
       user: context.user,
       school: toSchoolSummary(selected.school),
       schools: context.memberships.map((membership) => toSchoolSummary(membership)),
-      token,
+      // The re-issued session token is delivered as the `httpOnly` cookie below and is
+      // deliberately not echoed in the response body.
     });
-    response.cookies.set("el_token", token, {
+    response.cookies.set(SESSION_COOKIE_NAME, token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",

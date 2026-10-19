@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import { apiFetch } from "../../lib/api-client";
 
 interface UserRow {
   id: string;
@@ -48,17 +49,11 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
   const [newPhone, setNewPhone] = useState("");
   const [newGender, setNewGender] = useState("");
 
-  function getToken() {
-    return localStorage.getItem("el_token") || "";
-  }
-
   const fetchUsers = useCallback(async () => {
     setLoading(true);
     try {
       const url = `/api/users?role=${role}${search ? `&search=${encodeURIComponent(search)}` : ""}`;
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
+      const res = await fetch(url);
       const data = await res.json();
       if (data.success) {
         setUsersList(data.data.users || []);
@@ -94,11 +89,10 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
     setSaving(true);
 
     try {
-      const res = await fetch("/api/users", {
+      const res = await apiFetch("/api/users", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getToken()}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           firstName: newFirstName,
@@ -143,11 +137,10 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
     setFormError("");
 
     try {
-      const res = await fetch(`/api/users/${editingUser.id}`, {
+      const res = await apiFetch(`/api/users/${editingUser.id}`, {
         method: "PUT",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getToken()}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           firstName: editingUser.firstName,
@@ -178,11 +171,10 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
     setFormError("");
 
     try {
-      const res = await fetch(`/api/users/${resetUser.id}`, {
+      const res = await apiFetch(`/api/users/${resetUser.id}`, {
         method: "PATCH",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getToken()}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({ password: resetPwd }),
       });
@@ -207,9 +199,8 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
     if (!confirm(`Delete ${user.firstName} ${user.lastName}? This cannot be undone.`)) return;
 
     try {
-      const res = await fetch(`/api/users/${user.id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${getToken()}` },
+      const res = await apiFetch(`/api/users/${user.id}`, {
+        method: "DELETE"
       });
       const data = await res.json();
       if (data.success) {
@@ -224,11 +215,10 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
 
   async function handleToggleActive(user: UserRow) {
     try {
-      const res = await fetch(`/api/users/${user.id}`, {
+      const res = await apiFetch(`/api/users/${user.id}`, {
         method: "PUT",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getToken()}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({ isActive: !user.isActive }),
       });
