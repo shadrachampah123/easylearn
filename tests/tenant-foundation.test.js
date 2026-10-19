@@ -32,6 +32,23 @@ function listFiles(dir, ext) {
   return out;
 }
 
+/**
+ * Remove comments so a boundary check sees CODE, not prose.
+ *
+ * A route is allowed to EXPLAIN that a school context comes from `school_users`; it is
+ * not allowed to QUERY it. Without this, a route could write the membership table with
+ * raw SQL (`insert into "school_users" …`) and still pass a guard that only looked for
+ * the camelCase schema export.
+ *
+ * `//` is only treated as a comment when it is NOT preceded by `:` — that keeps URLs
+ * (`https://…`) intact.
+ */
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, '$1');
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -294,11 +311,18 @@ test('Boundary: no API route queries the tenant tables directly (Phase 2B: via s
   // Phase 2A asserted that no route touched the tenant tables at all. Phase 2B wires
   // membership into authentication, but through ONE module: routes must still never import
   // `schoolUsers`/`schools` from the schema or run their own membership query.
+  //
+  // The check looks at CODE, not at comments: a route may explain that a school context
+  // comes from `school_users`, but it may not query or WRITE it. The membership table is
+  // matched in both spellings — the camelCase schema export and the raw table name — so
+  // a route cannot bypass the tenant module with a hand-written `insert into
+  // "school_users" …`.
   const routeFiles = listFiles(path.join(__dirname, '..', 'src', 'app', 'api'), '.ts');
   for (const file of routeFiles) {
-    const content = fs.readFileSync(file, 'utf8');
+    const content = stripComments(fs.readFileSync(file, 'utf8'));
     assert(
       !/\bschoolUsers\b/.test(content) &&
+        !/\bschool_users\b/.test(content) &&
         !/\bimport\s*{[^}]*\bschools\b[^}]*}\s*from\s*"@\/db\/schema"/.test(content),
       `${path.relative(process.cwd(), file)} must not query tenant tables directly — use src/lib/tenant.ts`
     );
