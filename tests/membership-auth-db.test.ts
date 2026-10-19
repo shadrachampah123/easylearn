@@ -555,6 +555,18 @@ async function main() {
 
     const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
 
+    /**
+     * Reads the session token the way the browser gets it: from the `httpOnly` cookie
+     * the response sets. The response BODY deliberately carries no token, so a test that
+     * wants to act as the signed-in user must take the token from the cookie.
+     */
+    const sessionToken = (response: Response): string => {
+      const cookie = (response as { cookies?: { get(name: string): { value: string } | undefined } })
+        .cookies?.get("el_token");
+      assert(cookie && cookie.value, "the response must set a non-empty el_token cookie");
+      return cookie!.value;
+    };
+
     let learnerToken = "";
     let learnerMembershipId = "";
     let multiSchoolToken = "";
@@ -576,8 +588,8 @@ async function main() {
       assertEq(body.data.school.role, "learner", "membership role in response");
       assertEq(body.data.school.schoolId, cbismSchoolId, "resolved school id");
       assertEq(body.data.schools.length, 1, "one membership listed");
-      assert(body.data.token, "token issued");
-      learnerToken = body.data.token;
+      assertEq(body.data.token, undefined, "the response body must not carry the session token");
+      learnerToken = sessionToken(response);
       learnerMembershipId = body.data.school.membershipId;
 
       const claims = await auth.verifyToken(learnerToken);
@@ -607,7 +619,7 @@ async function main() {
       assertEq(body.data.school.schoolId, cbismSchoolId, "school cannot be chosen by the client");
       assertEq(body.data.school.membershipId, learnerMembershipId, "membership cannot be chosen by the client");
       assertEq(body.data.schools.length, 1, "no extra memberships appear");
-      const claims = await auth.verifyToken(body.data.token);
+      const claims = await auth.verifyToken(sessionToken(response));
       assertEq(claims!.schoolIdHint, cbismSchoolId, "token school claim is server-derived");
       assertEq(claims!.role, "learner", "token role claim is server-derived");
     });
@@ -624,7 +636,7 @@ async function main() {
       assertEq(body.data.user.role, "teacher", "global role remains in the identity profile");
       assertEq(body.data.schools.length, 2, "teacher belongs to two schools");
       assertEq(body.data.school, null, "multi-school login must not silently choose the first school");
-      multiSchoolToken = body.data.token;
+      multiSchoolToken = sessionToken(response);
       const claims = await auth.verifyToken(multiSchoolToken);
       assert(claims, "multi-school token verifies");
       assertEq(claims!.ver, 3, "new token selection schema");
@@ -652,7 +664,7 @@ async function main() {
       assertEq(body.data.school.schoolId, schoolBId, "selected school B");
       assertEq(body.data.school.role, "school_admin", "role comes from School B membership");
       assertEq(body.data.schools.length, 2, "available memberships returned");
-      const switchedToken = body.data.token;
+      const switchedToken = sessionToken(response);
       const switchedClaims = await auth.verifyToken(switchedToken);
       assertEq(switchedClaims!.schoolIdHint, schoolBId, "server-issued selected school hint");
       assertEq(switchedClaims!.membershipIdHint, body.data.school.membershipId, "server-issued membership hint");
@@ -701,15 +713,16 @@ async function main() {
       );
       assertEq(selected.status, 200, "own active school selection");
       const selectedBody: any = await selected.json();
-      selectedSchoolToken = selectedBody.data.token;
+      assertEq(selectedBody.data.token, undefined, "the selection body must not carry the session token");
+      selectedSchoolToken = sessionToken(selected);
       assertEq(selectedBody.data.school.schoolId, schoolBId, "selected school");
       assertEq(selectedBody.data.school.role, "school_admin", "role comes from School B membership");
-      const selectedClaims = await auth.verifyToken(selectedBody.data.token);
+      const selectedClaims = await auth.verifyToken(selectedSchoolToken);
       assertEq(selectedClaims!.schoolIdHint, schoolBId, "selected token school hint");
       assertEq(selectedClaims!.membershipIdHint, selectedBody.data.school.membershipId, "selected membership hint");
 
       const selectedContext = await tenant.resolveAuthContext(
-        new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(selectedBody.data.token) }) as never
+        new NextRequest("http://localhost:3000/api/auth/me", { headers: bearer(selectedSchoolToken) }) as never
       );
       assertEq(selectedContext.school?.schoolId, schoolBId, "selected context is revalidated from the database");
     });
@@ -722,7 +735,7 @@ async function main() {
         }) as never
       );
       assertEq(platformLogin.status, 200, "platform login for lifecycle check");
-      platformToken = (await platformLogin.json()).data.token;
+      platformToken = sessionToken(platformLogin);
 
       const beforeMemberships = await one(`SELECT count(*)::int AS n FROM school_users WHERE school_id = $1`, [schoolBId]);
       const originalStatuses = ["active", "provisioned", "suspended", "archived"];
@@ -795,7 +808,7 @@ async function main() {
         );
         assertEq(response.status, 200, `${key} login status`);
         const body: any = await response.json();
-        assert(body.data.token, `${key} token issued`);
+        assertEq(body.data.token, undefined, "the response body must not carry the session token");
         if (key === "teacher") {
           assertEq(body.data.school, null, "dual-school teacher must select a school");
           assertEq(body.data.schools.length, 2, "dual-school teacher memberships remain visible");
@@ -815,10 +828,10 @@ async function main() {
       assertEq(response.status, 200, "super_admin must NOT be locked out");
       const body: any = await response.json();
       assertEq(body.data.user.role, "super_admin", "role");
-      platformToken = body.data.token;
+      platformToken = sessionToken(response);
       assertEq(body.data.school, null, "no school context for a platform account");
       assertEq(body.data.schools.length, 0, "no memberships");
-      const claims = await auth.verifyToken(body.data.token);
+      const claims = await auth.verifyToken(platformToken);
       assertEq(claims!.schoolIdHint, undefined, "no school claim");
       assertEq(claims!.membershipIdHint, undefined, "no membership claim");
     });
@@ -974,7 +987,7 @@ async function main() {
       const login = await loginRoute.POST(
         postJson("/api/auth/login", { email, password: TEST_PASSWORD }) as never
       );
-      const token = (await login.json() as any).data.token;
+      const token = sessionToken(login);
 
       const rejected = await changePasswordRoute.POST(
         postJson("/api/auth/change-password", {

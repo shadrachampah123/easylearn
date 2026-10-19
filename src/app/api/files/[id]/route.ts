@@ -40,20 +40,18 @@ const ADMIN_ROLES = new Set<string>(SCHOOL_ADMIN_EXTENDED_ROLES);
  * Video/audio players (and PDF viewers) issue HTTP Range requests, so this
  * endpoint implements byte-range serving (206 Partial Content).
  *
- * The browser passes the token as a ?token= query parameter because <img>,
- * <video> and <a download> cannot set an Authorization header; plain fetch
- * callers may use the Bearer header or the el_token cookie as usual.
+ * The session is the `httpOnly` `el_token` cookie. The browser attaches it to a
+ * same-origin <img>, <video> and <a download> request by itself, so no credential
+ * has to be put in the URL. The earlier `?token=` query-parameter fallback has been
+ * removed: a token in a URL leaks into browser history, server access logs, and the
+ * `Referer` header of every outbound link on the page.
  */
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    /* Media elements cannot set an Authorization header, so the Phase 1 `?token=` fallback
-       is preserved. It changes where the token may come from, never what it grants. */
-    const queryToken = request.nextUrl.searchParams.get("token");
-
-    const auth = await guardSchoolContext(request, queryToken);
+    const auth = await guardSchoolContext(request);
     if (!auth.ok) {
       /* The gate owns the status: 401 for a missing/expired session, 403 for an
          authenticated account with no active membership. */

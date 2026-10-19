@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import LearnerProgressPanel from "@/components/dashboard/LearnerProgressPanel";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Reports {
   overview: {
@@ -23,8 +24,7 @@ export default function AdminReportsPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/reports", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/reports")
       .then((res) => res.json())
       .then((result) => { if (result.success) setData(result.data); })
       .catch(console.error)
@@ -32,10 +32,9 @@ export default function AdminReportsPage() {
   }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch("/api/reports", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/reports");
       const result = await res.json();
       if (result.success) setData(result.data);
     } catch (err) {

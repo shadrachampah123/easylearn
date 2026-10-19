@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import FileUploader, { type StoredAttachment } from "@/components/dashboard/FileUploader";
 import Link from "next/link";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Assignment {
   id: string;
@@ -61,14 +62,11 @@ export default function TeacherAssignmentsPage() {
   }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
-    if (!token) return;
-
     try {
       const [assignRes, classRes, subjectRes] = await Promise.all([
-        fetch("/api/assignments", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/classes", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/subjects", { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch("/api/assignments"),
+        apiFetch("/api/classes"),
+        apiFetch("/api/subjects"),
       ]);
 
       const assignData = await assignRes.json();
@@ -94,14 +92,11 @@ export default function TeacherAssignmentsPage() {
       setSaving(false);
       return;
     }
-
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/assignments", {
+      const res = await apiFetch("/api/assignments", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           ...formData,

@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { apiFetch } from "../../lib/api-client";
 
 export default function ChangePasswordPage() {
   const router = useRouter();
@@ -13,18 +14,35 @@ export default function ChangePasswordPage() {
   const [user, setUser] = useState<any>(null);
 
   useEffect(() => {
-    try {
-      const storedUser = localStorage.getItem("el_user");
-      if (storedUser) {
-        // The session profile is browser-only state; read it after hydration to keep SSR markup stable.
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        setUser(JSON.parse(storedUser));
-        return;
-      }
-    } catch {
-      // Malformed cached profile is treated like a missing session.
-    }
-    router.push("/login");
+    // The signed-in user is read back from the server, not from web storage: the
+    // session is the `httpOnly` cookie and the profile is re-derived from the
+    // database on every load.
+    let cancelled = false;
+
+    apiFetch("/api/auth/me")
+      .then(async (response) => {
+        if (response.status === 401) return null;
+        const result = await response.json().catch(() => null);
+        if (!response.ok || !result?.success) {
+          throw new Error(result?.error || "Session unavailable");
+        }
+        return result.data as { user: { id: string; role: string } };
+      })
+      .then((data) => {
+        if (cancelled) return;
+        if (!data) {
+          router.push("/login");
+          return;
+        }
+        setUser(data.user);
+      })
+      .catch(() => {
+        if (!cancelled) router.push("/login");
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
@@ -44,7 +62,7 @@ export default function ChangePasswordPage() {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/auth/change-password", {
+      const res = await apiFetch("/api/auth/change-password", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -61,10 +79,9 @@ export default function ChangePasswordPage() {
         return;
       }
 
-      const updatedUser = { ...user, mustChangePassword: false };
-      localStorage.setItem("el_user", JSON.stringify(updatedUser));
-
-      const role = updatedUser.role;
+      // Nothing is cached in the browser: the dashboard reads the fresh profile from
+      // `/api/auth/me` after the redirect.
+      const role = user.role;
       if (role === "super_admin" || role === "school_admin") router.push("/dashboard/admin");
       else if (role === "head_teacher" || role === "teacher") router.push("/dashboard/teacher");
       else if (role === "parent") router.push("/dashboard/parent");

@@ -11,6 +11,7 @@ import {
   formatBytes,
   type StoredAttachment,
 } from "@/lib/uploads";
+import { apiFetch } from "../../lib/api-client";
 
 export type { StoredAttachment };
 
@@ -85,8 +86,7 @@ export default function FileUploader({
   // Detect the upload backend once. On any failure we keep "local" (multipart)
   // so uploads still work on a plain disk-backed deployment.
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/uploads", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/uploads")
       .then((response) => response.json())
       .then((data: { success?: boolean; data?: { storage?: UploadMode } }) => {
         if (data?.success && data?.data?.storage === "object") setMode("object");
@@ -131,13 +131,11 @@ export default function FileUploader({
   /* ── Direct to cloud object storage via presigned PUT ── */
   function uploadOneDirect(file: File): Promise<StoredAttachment> {
     return new Promise((resolve, reject) => {
-      const token = localStorage.getItem("el_token");
 
-      fetch("/api/uploads/presign", {
+      apiFetch("/api/uploads/presign", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           purpose,
@@ -193,10 +191,8 @@ export default function FileUploader({
   /* ── Legacy multipart upload to local disk ── */
   function uploadOneMultipart(file: File): Promise<StoredAttachment> {
     return new Promise((resolve, reject) => {
-      const token = localStorage.getItem("el_token");
       const xhr = new XMLHttpRequest();
       xhr.open("POST", "/api/uploads");
-      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
 
       const form = new FormData();
       form.append("purpose", purpose);
@@ -268,14 +264,9 @@ export default function FileUploader({
   async function handleRemove(attachment: StoredAttachment) {
     const next = value.filter((entry) => entry.fileId !== attachment.fileId);
     onChange(next);
-
-    // Best-effort server-side cleanup so the file does not linger on disk
-    // (or in the object-storage bucket when that backend is enabled).
-    const token = localStorage.getItem("el_token");
     try {
-      await fetch(`/api/uploads/${attachment.fileId}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      await apiFetch(`/api/uploads/${attachment.fileId}`, {
+        method: "DELETE"
       });
     } catch {
       /* ignore cleanup failures */

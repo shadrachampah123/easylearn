@@ -8,6 +8,7 @@ import TimetableGrid, {
   type DayValue,
   type TimetableEntry,
 } from "@/components/dashboard/TimetableGrid";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Option {
   id: string;
@@ -49,14 +50,13 @@ export default function AdminTimetablePage() {
   const [formData, setFormData] = useState<FormState>(emptyForm);
 
   const loadOptions = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
-    const headers = { Authorization: `Bearer ${token}` };
+    const headers = { };
 
     try {
       const [classRes, subjectRes, teacherRes] = await Promise.all([
-        fetch("/api/classes", { headers }),
-        fetch("/api/subjects", { headers }),
-        fetch("/api/users?role=teacher&limit=100", { headers }),
+        apiFetch("/api/classes", { headers }),
+        apiFetch("/api/subjects", { headers }),
+        apiFetch("/api/users?role=teacher&limit=100", { headers }),
       ]);
 
       const [classData, subjectData, teacherData] = await Promise.all([
@@ -95,11 +95,10 @@ export default function AdminTimetablePage() {
 
   const loadTimetable = useCallback(async () => {
     setLoading(true);
-    const token = localStorage.getItem("el_token");
     const url = classFilter ? `/api/timetable?classId=${classFilter}` : "/api/timetable";
 
     try {
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch(url);
       const data = await res.json();
       if (data.success) setEntries(data.data);
     } catch (err) {
@@ -150,14 +149,11 @@ export default function AdminTimetablePage() {
     e.preventDefault();
     setSaving(true);
 
-    const token = localStorage.getItem("el_token");
-
     try {
       const res = await fetch(editing ? `/api/timetable/${editing.id}` : "/api/timetable", {
         method: editing ? "PUT" : "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           classId: formData.classId,
@@ -188,12 +184,9 @@ export default function AdminTimetablePage() {
 
   async function handleDelete(entry: TimetableEntry) {
     if (!confirm(`Delete ${entry.subjectName || "this period"} on ${entry.dayOfWeek}?`)) return;
-
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/timetable/${entry.id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await apiFetch(`/api/timetable/${entry.id}`, {
+        method: "DELETE"
       });
       const data = await res.json();
       if (data.success) {

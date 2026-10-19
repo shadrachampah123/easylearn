@@ -3,13 +3,18 @@
  * Login + explicit school selection.
  *
  * Merged behaviour: PR #30 supplies the complete session hand-off (username OR email,
- * `mustChangePassword` redirect, the school-scoped `el_user` session object) and PR #31
- * supplies the "that school is no longer available" wording for a selection that the server
+ * `mustChangePassword` redirect, the school-scoped session context) and PR #31 supplies
+ * the "that school is no longer available" wording for a selection that the server
  * refuses. The school list itself is server-validated — the client only ever asks for a
  * school the server already listed as one of the caller's active memberships.
+ *
+ * The session is the `httpOnly` cookie the server sets. Nothing about it is stored in
+ * web storage, and no token is returned to the page: the dashboard re-reads the user,
+ * the role and the school context from `/api/auth/me`.
  */
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { apiFetch } from "../../lib/api-client";
 
 type SchoolSummary = {
   schoolId: string;
@@ -43,25 +48,18 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
-  const [pendingToken, setPendingToken] = useState("");
   const [pendingUser, setPendingUser] = useState<SessionUser | null>(null);
   const [schools, setSchools] = useState<SchoolSummary[]>([]);
 
-  function continueToApp(user: SessionUser, school: SchoolSummary | null, token: string, memberships: SchoolSummary[]) {
-    const sessionUser = {
-      ...user,
-      globalRole: user.role,
-      role: school?.role ?? user.role,
-      school,
-      schools: memberships,
-    };
-    localStorage.setItem("el_token", token);
-    localStorage.setItem("el_user", JSON.stringify(sessionUser));
+  function continueToApp(user: SessionUser, school: SchoolSummary | null, memberships: SchoolSummary[]) {
+    // The session itself lives in the `httpOnly` cookie the server just set. Nothing
+    // about it is written to web storage: the dashboard reads the user, the role and
+    // the school context back from `/api/auth/me` on every load.
     if (user.mustChangePassword) {
       router.push("/change-password");
       return;
     }
-    router.push(dashboardPath(sessionUser.role));
+    router.push(dashboardPath(school?.role ?? user.role));
     router.refresh();
   }
 
@@ -76,7 +74,7 @@ export default function LoginPage() {
       if (value.includes("@")) loginPayload.email = value;
       else loginPayload.username = value;
 
-      const res = await fetch("/api/auth/login", {
+      const res = await apiFetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(loginPayload),
@@ -90,7 +88,6 @@ export default function LoginPage() {
 
       const user = data.data.user as SessionUser;
       const userSchools = (data.data.schools ?? []) as SchoolSummary[];
-      const token = data.data.token as string;
       if (user.isActive === false) {
         setError("Account disabled. Please contact your administrator.");
         return;
@@ -98,13 +95,14 @@ export default function LoginPage() {
 
       if (userSchools.length > 1) {
         // Do not navigate to any school dashboard until the user explicitly chooses one.
-        setPendingToken(token);
+        // The session cookie set by the login response authenticates the selection
+        // request that follows.
         setPendingUser(user);
         setSchools(userSchools);
         return;
       }
 
-      continueToApp(user, data.data.school ?? null, token, userSchools);
+      continueToApp(user, data.data.school ?? null, userSchools);
     } catch {
       setError("Network error. Check connection.");
     } finally {
@@ -113,15 +111,14 @@ export default function LoginPage() {
   }
 
   async function handleSchoolChoice(school: SchoolSummary) {
-    if (!pendingToken || !pendingUser) return;
+    if (!pendingUser) return;
     setError("");
     setLoading(true);
     try {
-      const res = await fetch("/api/auth/select-school", {
+      const res = await apiFetch("/api/auth/select-school", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${pendingToken}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({ schoolId: school.schoolId }),
       });
@@ -130,7 +127,7 @@ export default function LoginPage() {
         setError(data?.error || "That school is no longer available. Please sign in again.");
         return;
       }
-      continueToApp(pendingUser, data.data.school, data.data.token, data.data.schools);
+      continueToApp(pendingUser, data.data.school, data.data.schools);
     } catch {
       setError("Network error. Check connection.");
     } finally {
