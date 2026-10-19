@@ -67,7 +67,7 @@ export default function AdminDepartmentsPage() {
     setSaving(true);
 
     try {
-      const response = await fetch(editing ? `/api/departments/${editing.id}` : "/api/departments", {
+      const response = await apiFetch(editing ? `/api/departments/${editing.id}` : "/api/departments", {
         method: editing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

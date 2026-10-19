@@ -101,7 +101,7 @@ export default function AdminClassesPage() {
     setSaving(true);
 
     try {
-      const response = await fetch(editing ? `/api/classes/${editing.id}` : "/api/classes", {
+      const response = await apiFetch(editing ? `/api/classes/${editing.id}` : "/api/classes", {
         method: editing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

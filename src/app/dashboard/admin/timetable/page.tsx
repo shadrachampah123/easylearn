@@ -98,7 +98,7 @@ export default function AdminTimetablePage() {
     const url = classFilter ? `/api/timetable?classId=${classFilter}` : "/api/timetable";
 
     try {
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       const data = await res.json();
       if (data.success) setEntries(data.data);
     } catch (err) {
@@ -150,7 +150,7 @@ export default function AdminTimetablePage() {
     setSaving(true);
 
     try {
-      const res = await fetch(editing ? `/api/timetable/${editing.id}` : "/api/timetable", {
+      const res = await apiFetch(editing ? `/api/timetable/${editing.id}` : "/api/timetable", {
         method: editing ? "PUT" : "POST",
         headers: {
           "Content-Type": "application/json"

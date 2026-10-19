@@ -88,7 +88,7 @@ export default function AdminSubjectsPage() {
     setSaving(true);
 
     try {
-      const response = await fetch(editing ? `/api/subjects/${editing.id}` : "/api/subjects", {
+      const response = await apiFetch(editing ? `/api/subjects/${editing.id}` : "/api/subjects", {
         method: editing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

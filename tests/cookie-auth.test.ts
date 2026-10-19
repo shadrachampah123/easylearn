@@ -66,6 +66,34 @@ function apiRouteFiles(): string[] {
   return listFiles(path.join(REPO_ROOT, "src/app/api")).filter((f) => f.endsWith("route.ts"));
 }
 
+/** Parses a source file with the TypeScript compiler. */
+function parse(file: string, source: string): ts.SourceFile {
+  return ts.createSourceFile(
+    file,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+  );
+}
+
+/**
+ * True when the expression is a call of the global `fetch`.
+ *
+ * `fetch(...)`, `window.fetch(...)` and `globalThis.fetch(...)` all count. A
+ * call of a *different* function that happens to be named `fetch` does not.
+ */
+function isFetchCallee(expression: ts.Expression): boolean {
+  if (ts.isIdentifier(expression)) return expression.text === "fetch";
+  if (ts.isPropertyAccessExpression(expression) && expression.name.text === "fetch") {
+    return (
+      ts.isIdentifier(expression.expression) &&
+      ["window", "globalThis", "self"].includes(expression.expression.text)
+    );
+  }
+  return false;
+}
+
 async function main() {
   console.log("🍪 Running cookie-authentication regression tests\n");
 
@@ -161,8 +189,11 @@ async function main() {
   await test("Browser: no client file builds an Authorization: Bearer header", () => {
     for (const file of browserFiles()) {
       const source = read(file);
+      // The value of the header is irrelevant: the browser must not build an
+      // Authorization header at all, in any form. The parsed check below is the
+      // authoritative one; this is a cheap second net.
       assert.ok(
-        !/Bearer \$\{/.test(source),
+        !/["'`]\s*Bearer\s/i.test(source),
         `${file} must not send a bearer token from the browser`
       );
     }
@@ -193,15 +224,67 @@ async function main() {
   });
 
   await test("The client call path is used by the browser code", () => {
-    const files = browserFiles();
-    const usingFetch = files.filter((file) => {
+    // The check is on the PARSED call sites, not on the text of the file.
+    //
+    // A file-level text check that merely looks for `fetch(` cannot tell a real
+    // call from a mention, and a file that imports `apiFetch` while still
+    // calling `fetch()` directly would pass such a check. The browser has one
+    // audited call path, so every `fetch()` call site has to be in it.
+    const offenders: string[] = [];
+    for (const file of browserFiles()) {
       const source = read(file);
-      return /(^|[^.\w])fetch\s*\(/.test(source) && !source.includes("apiFetch");
-    });
+      const parsed = parse(file, source);
+      const visit = (node: ts.Node) => {
+        if (ts.isCallExpression(node) && isFetchCallee(node.expression)) {
+          offenders.push(file);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(parsed);
+    }
     assert.deepStrictEqual(
-      usingFetch,
+      offenders,
       [],
-      `these browser files still call fetch() directly: ${usingFetch.join(", ")}`
+      `these browser files call fetch() directly instead of apiFetch(): ${offenders.join(", ")}`
+    );
+  });
+
+  await test("No browser file builds an Authorization header", () => {
+    // Whatever the value, a browser must not build an Authorization header:
+    // `apiFetch()` is the only place allowed to send one, and it deletes it.
+    const offenders: string[] = [];
+    for (const file of browserFiles()) {
+      const source = read(file);
+      const parsed = parse(file, source);
+      const visit = (node: ts.Node) => {
+        if (ts.isPropertyAssignment(node)) {
+          const name = ts.isIdentifier(node.name)
+            ? node.name.text
+            : ts.isStringLiteral(node.name)
+              ? node.name.text
+              : "";
+          if (name.toLowerCase() === "authorization") {
+            offenders.push(`${file} (header property "${name}")`);
+          }
+        }
+        if (
+          ts.isCallExpression(node) &&
+          ts.isPropertyAccessExpression(node.expression) &&
+          node.expression.name.text === "set" &&
+          node.arguments.length > 0 &&
+          ts.isStringLiteral(node.arguments[0]) &&
+          node.arguments[0].text.toLowerCase() === "authorization"
+        ) {
+          offenders.push(`${file} (headers.set("authorization", …))`);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(parsed);
+    }
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `these browser files build an Authorization header: ${offenders.join(", ")}`
     );
   });
 

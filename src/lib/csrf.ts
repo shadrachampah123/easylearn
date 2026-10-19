@@ -45,6 +45,32 @@
  *    make "no Origin header" a way to bypass the check, which is precisely the
  *    case an attacker would try to construct.
  *
+ * ── How the request's own origin is reconstructed ─────────────────────────────
+ * The host and the scheme come from INDEPENDENT sources, so they are combined
+ * as a cross-product rather than being paired up by one header:
+ *
+ *   - the host is the `Host` header, plus `x-forwarded-host` when that header
+ *     carries exactly ONE value;
+ *   - the scheme is `x-forwarded-proto` when it is present, otherwise the
+ *     scheme of the request URL — plus `https` whenever a forwarded host was
+ *     supplied, because a proxy that terminated TLS leaves the last hop in
+ *     plain HTTP.
+ *
+ * Two rules matter here:
+ *
+ *   - A MULTI-VALUED `x-forwarded-host` is not trusted at all. RFC 7239 lets a
+ *     proxy append to a client-supplied value, and the client's value comes
+ *     FIRST. Trusting the first element of such a list would let a client
+ *     choose the origin its request is compared against.
+ *   - The cross-product is what keeps a deployment working. A reverse proxy
+ *     that publishes the public host but not the public scheme would otherwise
+ *     produce `http://public-host` while the browser sends
+ *     `https://public-host`, and every same-origin write would be refused.
+ *
+ * A browser cannot set `x-forwarded-host` or `x-forwarded-proto` on a cross-site
+ * request without a CORS preflight, and this application does not enable CORS,
+ * so these headers cannot be used to forge an origin from a foreign page.
+ *
  * `SameSite=Lax` on the session cookie is a second line of defence, not the
  * control itself: it blocks a cross-site `POST`, but it does not stop a
  * same-site attack from a sibling subdomain, and it is a browser default rather
@@ -72,10 +98,107 @@ export interface CsrfDecision {
   rule: "method" | "bearer" | "same-origin" | "missing-origin" | "cross-origin";
 }
 
-function firstValue(header: string | null): string | null {
-  if (!header) return null;
-  const value = header.split(",")[0]?.trim();
-  return value ? value : null;
+function allValues(header: string | null): string[] {
+  if (!header) return [];
+  return header
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The last value of a comma-separated header.
+ *
+ * RFC 7239 lets a proxy *append* to a forwarded header, in which case the
+ * client's own value comes first and the proxy's value comes last. The proxy's
+ * value is the trustworthy one, so it is the last element that is read.
+ */
+function lastValue(header: string | null): string | null {
+  const values = allValues(header);
+  return values.length ? values[values.length - 1] : null;
+}
+
+/**
+ * The forwarded host, but only when the header carries exactly one value.
+ *
+ * A multi-valued `x-forwarded-host` is the signature of a proxy that appended
+ * to a client-supplied value, and the *first* element of such a list is the one
+ * the client controls. Trusting it would let a client choose the origin the
+ * request is compared against, so a multi-valued header is not trusted at all
+ * and the `Host` header is used instead.
+ */
+function trustedForwardedHost(header: string | null): string | null {
+  const values = allValues(header);
+  return values.length === 1 ? values[0] : null;
+}
+
+/**
+ * The scheme the request was addressed with.
+ *
+ * `x-forwarded-proto` wins when it is present; otherwise the scheme of the
+ * request URL is used, which is the scheme of the last hop.
+ */
+function requestScheme(request: Request): string | null {
+  const forwarded = lastValue(request.headers.get("x-forwarded-proto"));
+  if (forwarded) return forwarded;
+  try {
+    return new URL(request.url).protocol.replace(/:$/, "");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every origin the request may legitimately have been addressed to.
+ *
+ * The host and the scheme are taken from *independent* sources, so they are
+ * combined as a cross-product rather than being paired up by one header. A
+ * reverse proxy that publishes the public host but not the public scheme (a
+ * common TLS-terminating configuration) would otherwise make the derived origin
+ * `http://public-host` while the browser sends `https://public-host`, and every
+ * same-origin write would be refused.
+ *
+ * The candidates are:
+ *   - the `Host` header, always;
+ *   - `x-forwarded-host`, when it carries a single value;
+ *   - the scheme of `x-forwarded-proto`, or the scheme of the request URL;
+ *   - plus `https` when a forwarded host was supplied without a forwarded
+ *     scheme, because a TLS-terminating edge is the usual reason for that.
+ */
+export function getRequestOrigins(request: Request): string[] {
+  const headers = request.headers;
+
+  const hosts = new Set<string>();
+  const hostHeader = lastValue(headers.get("host"));
+  if (hostHeader) hosts.add(hostHeader);
+  const forwardedHost = trustedForwardedHost(headers.get("x-forwarded-host"));
+  if (forwardedHost) hosts.add(forwardedHost);
+  if (hosts.size === 0) return [];
+
+  const schemes = new Set<string>();
+  const scheme = requestScheme(request);
+  if (scheme) schemes.add(scheme);
+  if (forwardedHost) {
+    // A forwarded host means the request came through a proxy, and the proxy may
+    // have terminated TLS. The scheme that reaches this application is then the
+    // scheme of the LAST hop, which is not necessarily the scheme the browser
+    // used: the server synthesises `x-forwarded-proto: http` for a plain
+    // internal hop even when the client spoke https to the edge. The public
+    // origin is therefore also a candidate.
+    //
+    // This does not widen the set of HOSTS — it only lets the public scheme be
+    // recognised for the host the proxy already published. A request for
+    // `http://public-host` still needs the host to be ours.
+    schemes.add("https");
+  }
+
+  const origins: string[] = [];
+  for (const s of schemes) {
+    for (const h of hosts) {
+      origins.push(`${s}://${h}`);
+    }
+  }
+  return origins;
 }
 
 /**
@@ -83,25 +206,13 @@ function firstValue(header: string | null): string | null {
  * headers. Behind a proxy the public scheme and host arrive in
  * `x-forwarded-proto` / `x-forwarded-host`; the `Host` header and the request URL
  * are the fallbacks.
+ *
+ * This is the first of `getRequestOrigins()`. Use `getRequestOrigins()` when the
+ * decision has to consider every origin the request could legitimately have come
+ * from.
  */
 export function getRequestOrigin(request: Request): string | null {
-  const headers = request.headers;
-  const host = firstValue(headers.get("x-forwarded-host")) || firstValue(headers.get("host"));
-  if (!host) return null;
-
-  let protocol: string;
-  const forwardedProto = firstValue(headers.get("x-forwarded-proto"));
-  if (forwardedProto) {
-    protocol = forwardedProto;
-  } else {
-    try {
-      protocol = new URL(request.url).protocol.replace(/:$/, "");
-    } catch {
-      protocol = process.env.NODE_ENV === "production" ? "https" : "http";
-    }
-  }
-
-  return `${protocol}://${host}`;
+  return getRequestOrigins(request)[0] ?? null;
 }
 
 /** The extra origins this deployment explicitly allows. */
@@ -142,6 +253,7 @@ export function evaluateCsrfRequest(options: {
   fetchSite: string | null;
   hasBearerAuthorization: boolean;
   requestOrigin?: string | null;
+  requestOrigins?: string[];
   allowedOrigins?: string[];
 }): CsrfDecision {
   if (!isStateChangingMethod(options.method)) {
@@ -153,9 +265,17 @@ export function evaluateCsrfRequest(options: {
     return { allowed: true, rule: "bearer" };
   }
 
-  const requestOrigin = options.requestOrigin ?? null;
+  // Every origin this request could legitimately have been addressed to. A
+  // request that reached a TLS-terminating proxy may present a different host
+  // and a different scheme than the pair the proxy published, so the two are
+  // combined as a cross-product rather than trusted as one value.
+  const requestOrigins = options.requestOrigins
+    ? [...options.requestOrigins]
+    : options.requestOrigin
+      ? [options.requestOrigin]
+      : [];
   const allowed = [
-    ...(requestOrigin ? [requestOrigin] : []),
+    ...requestOrigins,
     ...(options.allowedOrigins ?? getConfiguredAllowedOrigins()),
   ];
 
@@ -202,6 +322,6 @@ export function evaluateCsrfRequestForRequest(request: Request): CsrfDecision {
     origin: request.headers.get("origin"),
     fetchSite: request.headers.get("sec-fetch-site"),
     hasBearerAuthorization,
-    requestOrigin: getRequestOrigin(request),
+    requestOrigins: getRequestOrigins(request),
   });
 }

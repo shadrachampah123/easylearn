@@ -16,6 +16,7 @@ import {
   evaluateCsrfRequestForRequest,
   getConfiguredAllowedOrigins,
   getRequestOrigin,
+  getRequestOrigins,
   isSameOrigin,
   isStateChangingMethod,
   STATE_CHANGING_METHODS,
@@ -204,14 +205,106 @@ async function main() {
     assert.strictEqual(getRequestOrigin(request), "http://localhost:3000");
   });
 
-  await test("Request origin: a comma-separated forwarded header uses the first value", () => {
-    const request = new Request("https://internal.example.test/api/x", {
+  await test("Request origin: a multi-valued forwarded host is not trusted", () => {
+    // RFC 7239 lets a proxy append to a client-supplied value. The FIRST element
+    // of such a list is the one the client controls, so a multi-valued
+    // `x-forwarded-host` is ignored entirely and the `Host` header is used.
+    const request = new Request("http://internal.example.test/api/x", {
       headers: {
-        "x-forwarded-host": "app.example.test, internal.example.test",
-        "x-forwarded-proto": "https, http",
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test, internal.example.test",
+        "x-forwarded-proto": "https",
       },
     });
-    assert.strictEqual(getRequestOrigin(request), "https://app.example.test");
+    const origins = getRequestOrigins(request);
+    assert.ok(
+      !origins.some((origin) => origin.includes("evil.example.test")),
+      `a client-supplied forwarded host must not become a candidate origin: ${origins.join(", ")}`
+    );
+    assert.ok(
+      origins.includes("https://internal.example.test"),
+      `the Host header must still be a candidate: ${origins.join(", ")}`
+    );
+  });
+
+  await test("Request origin: a forwarded host is paired with the public https scheme", () => {
+    // The server synthesises `x-forwarded-proto: http` for a plain internal hop
+    // even when the client spoke https to the edge. The public scheme must
+    // therefore be a candidate whenever a forwarded host was published.
+    const request = new Request("http://internal.example.test/api/x", {
+      headers: {
+        host: "internal.example.test",
+        "x-forwarded-host": "app.example.test",
+        "x-forwarded-proto": "http",
+      },
+    });
+    const origins = getRequestOrigins(request);
+    assert.ok(
+      origins.includes("https://app.example.test"),
+      `the public https origin must be a candidate: ${origins.join(", ")}`
+    );
+  });
+
+  await test("Request origin: a forwarded host without a forwarded scheme is still a candidate", () => {
+    // A TLS-terminating edge usually publishes the public host. If it does not
+    // publish the scheme, the public origin is https even though the hop to this
+    // application is plain http — otherwise every same-origin write is refused.
+    const request = new Request("http://internal.example.test/api/x", {
+      headers: { host: "internal.example.test", "x-forwarded-host": "app.example.test" },
+    });
+    const origins = getRequestOrigins(request);
+    assert.ok(
+      origins.includes("https://app.example.test"),
+      `the public https origin must be a candidate: ${origins.join(", ")}`
+    );
+    assert.ok(
+      origins.includes("http://app.example.test"),
+      `the forwarded host must be a candidate: ${origins.join(", ")}`
+    );
+  });
+
+  await test("Policy: a forwarded host without a forwarded scheme is not refused", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.test",
+        host: "internal.example.test",
+        "x-forwarded-host": "app.example.test",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(decision.allowed, "a legitimate same-origin write must not be refused");
+  });
+
+  await test("Policy: a client-supplied forwarded host is refused", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://evil.example.test",
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test, internal.example.test",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(!decision.allowed, "a request that chooses its own forwarded host must be refused");
+  });
+
+  await test("Policy: a request that forges both forwarded headers is still origin-checked", () => {
+    // A non-browser client can set both headers, so the host it names becomes a
+    // candidate. It gains nothing it did not already have through the
+    // deliberately supported bearer path, and a browser cannot set these
+    // headers cross-site without a CORS preflight.
+    const request = new Request("http://internal.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://evil.example.test",
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(decision.allowed, "the forwarded headers are trusted only as a single-valued pair");
   });
 
   await test("Request wrapper: a real request is judged the same way", () => {

@@ -78,7 +78,7 @@ export default function AdminOverridesPage() {
     try {
       const url = editing ? `/api/dashboard/overrides/${editing.id}` : "/api/dashboard/overrides";
       const method = editing ? "PUT" : "POST";
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         method,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...form, scopeId: form.scopeId || null, sortOrder: Number(form.sortOrder) || 0 }),

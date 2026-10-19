@@ -123,7 +123,11 @@ the network panel, to a proxy log, to a browser extension and to any
 
 ### The client's call path
 
-All browser API calls go through `apiFetch()` in `src/lib/api-client.ts`:
+All browser API calls go through `apiFetch()` in `src/lib/api-client.ts`. This is
+enforced, not merely intended: `tests/cookie-auth.test.ts` parses every browser
+file with the TypeScript compiler and fails if any of them contains a `fetch()`
+call site or constructs an `Authorization` header. The check is on the parsed
+call sites, so a file cannot be exempted by mentioning `apiFetch` in an import.
 
 - `credentials: "same-origin"` — the cookie is attached to same-origin requests
   and is **never** sent to a cross-origin URL.
@@ -237,12 +241,55 @@ precisely the case rules 3–7 refuse.
 
 ### The request's own origin
 
-The request origin is derived from `X-Forwarded-Host` and `X-Forwarded-Proto`
-when they are present, and from the `Host` header and the URL otherwise. A
-comma-separated forwarded header uses its first value. The comparison ignores
-the path and the query, treats `https://host` and `https://host:443` as the
-same, and compares the **host**, not a suffix of it — `evil.app.example.test` is
-not `app.example.test`.
+The origin the request was addressed to is reconstructed from the request's own
+headers. The **host** and the **scheme** are taken from independent sources, so
+they are combined as a cross-product rather than being paired up by one header:
+
+- the **host** is the `Host` header, plus `X-Forwarded-Host` when that header
+  carries exactly **one** value;
+- the **scheme** is `X-Forwarded-Proto` when it is present, otherwise the scheme
+  of the request URL — plus `https` whenever a forwarded host was supplied.
+
+The extra `https` matters because the scheme that reaches the application is the
+scheme of the **last hop**: the server synthesises `X-Forwarded-Proto: http`
+for a plain internal hop even when the browser spoke `https` to the edge. The
+public scheme is therefore a candidate whenever a proxy published a host. This
+does not widen the set of **hosts** — it only lets the public scheme be
+recognised for the host the proxy already published.
+
+Two rules matter:
+
+- **A multi-valued `X-Forwarded-Host` is not trusted at all.** RFC 7239 lets a
+  proxy *append* to a client-supplied value, and the client's value comes
+  **first**. Trusting the first element of such a list would let a client choose
+  the origin its request is compared against, so the whole header is ignored and
+  the `Host` header is used instead.
+- **The cross-product is what keeps a deployment working.** A reverse proxy that
+  publishes the public host but not the public scheme would otherwise produce
+  `http://public-host` while the browser sends `https://public-host`, and every
+  same-origin write — sign-in, school selection, marking messages read, awarding
+  achievements, uploads — would be refused with `403`.
+
+A browser cannot set `X-Forwarded-Host` or `X-Forwarded-Proto` on a cross-site
+request without a CORS preflight, and this application does not enable CORS, so
+these headers cannot be used to forge an origin from a foreign page.
+
+The comparison ignores the path and the query, treats `https://host` and
+`https://host:443` as the same, and compares the **host**, not a suffix of it —
+`evil.app.example.test` is not `app.example.test`.
+
+### The reverse-proxy requirement
+
+If the application sits behind a reverse proxy, the proxy must forward the
+public host and scheme:
+
+```
+X-Forwarded-Host:   the public host, e.g. "easylearn.example.com"
+X-Forwarded-Proto: the public scheme, e.g. "https"
+```
+
+Send **both**, or send **neither**. A proxy that appends to a forwarded header
+must send a single value. This requirement is also stated in `.env.example`.
 
 ### The refusal
 
@@ -254,7 +301,11 @@ contains a token, a cookie value or a credential.
 
 `EASY_LEARN_ALLOWED_ORIGINS` is an optional comma-separated list of additional
 origins that may make state-changing requests. It is empty by default, and an
-empty list means "same origin only".
+empty list means "same origin only". It is documented in `.env.example`.
+
+Each entry is a full trust decision: anything running on that origin can make
+state-changing requests with the session cookie. Add an entry only if a
+separate, trusted origin genuinely has to make state-changing calls.
 
 ### The development seed endpoint
 
@@ -407,8 +458,8 @@ follow-up, with the plan recorded here.
 | Suite | File | What it proves |
 |---|---|---|
 | JWT secret policy | `tests/jwt-secret-policy.test.ts` | Weak, short, low-diversity, placeholder and periodic secrets are rejected; a 5000-sample random sweep produces no false rejections. |
-| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass. |
-| Cookie auth and safe methods | `tests/cookie-auth.test.ts` | The response bodies carry no token; no browser file stores, reads or sends a token; no route reads a token from a URL; no `GET` handler writes; the cookie name has one definition. |
+| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; the forwarded-header shapes — a forwarded host without a forwarded scheme, a multi-valued forwarded host, and a forged pair. |
+| Cookie auth and safe methods | `tests/cookie-auth.test.ts` | The response bodies carry no token; no browser file stores, reads or sends a token; no route reads a token from a URL; no `GET` handler writes; the cookie name has one definition; and, on the **parsed** call sites, no browser file calls `fetch()` or builds an `Authorization` header. |
 | Membership and session | `tests/membership-auth-db.test.ts` | The login flow, the school-selection flow and the session, read from the cookie the way a browser does, and asserting that the response body carries no token. |
 | The existing suites | `tests/security.test.js`, `tests/tenant-*.test.ts`, `tests/membership-*.test.ts`, … | The tenant isolation and authorization boundaries are unchanged. |
 

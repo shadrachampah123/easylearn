@@ -53,7 +53,7 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
     setLoading(true);
     try {
       const url = `/api/users?role=${role}${search ? `&search=${encodeURIComponent(search)}` : ""}`;
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       const data = await res.json();
       if (data.success) {
         setUsersList(data.data.users || []);
