@@ -4,6 +4,13 @@ import { evaluateCsrfRequestForRequest } from "@/lib/csrf";
 /**
  * Cross-site request forgery protection for the API.
  *
+ * This is the `proxy` file (formerly `middleware`): Next.js 16 renamed the
+ * convention and deprecated the old name. The file lives under the current
+ * convention so that a future Next.js upgrade cannot quietly stop running the
+ * cross-site check — the security control must not depend on a convention that
+ * is on its way out. The export is a default function, which is the contract
+ * Next.js 16 expects from a `proxy` file.
+ *
  * The browser session is an `httpOnly` cookie, and a cookie is attached to a
  * cross-site request as well as a same-origin one. A foreign page can therefore
  * make the browser perform a state-changing request against this API unless the
@@ -28,7 +35,7 @@ export const config = {
   matcher: ["/api/:path*"],
 };
 
-export function middleware(request: NextRequest) {
+export default function proxy(request: NextRequest) {
   const decision = evaluateCsrfRequestForRequest(request);
 
   if (decision.allowed) {

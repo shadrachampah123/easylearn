@@ -268,11 +268,11 @@ async function main() {
 
   // ── The CSRF enforcement point ─────────────────────────────────────────────
   await test("The CSRF policy is enforced in one place for every API route", () => {
-    const source = read("src/middleware.ts");
-    assert.ok(source.includes('matcher: ["/api/:path*"]'), "the middleware must cover the whole API");
+    const source = read("src/proxy.ts");
+    assert.ok(source.includes('matcher: ["/api/:path*"]'), "the proxy must cover the whole API");
     assert.ok(
       source.includes("evaluateCsrfRequestForRequest"),
-      "the middleware must use the shared policy"
+      "the proxy must use the shared policy"
     );
   });
 

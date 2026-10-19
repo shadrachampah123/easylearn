@@ -199,8 +199,9 @@ control is the origin check.
 
 ### The policy
 
-`src/lib/csrf.ts` evaluates every state-changing request. `src/middleware.ts`
-applies it to **every** `/api/*` route, so no route can opt out by accident.
+`src/lib/csrf.ts` evaluates every state-changing request. `src/proxy.ts` — the
+file Next.js 16 calls `proxy`, formerly `middleware` — applies it to **every**
+`/api/*` route, so no route can opt out by accident.
 
 A request is evaluated as follows, in order:
 
@@ -366,9 +367,9 @@ allow-list for scripts, and this document does not claim that it is.
 Removing it requires a **nonce-based** policy, which is a separate piece of work
 with a concrete plan:
 
-1. Generate a per-request nonce in `src/middleware.ts` (the middleware already
-   runs on every request) and set it on the forwarded request headers.
-2. Build the CSP in the middleware with `script-src 'self' 'nonce-<value>'
+1. Generate a per-request nonce in `src/proxy.ts` (it already runs on every
+   request) and set it on the forwarded request headers.
+2. Build the CSP there with `script-src 'self' 'nonce-<value>'
    'strict-dynamic'` and set it on the response. The `headers()` block in
    `next.config.ts` must stop emitting a competing `Content-Security-Policy`, or
    the response will carry two policies and the browser will enforce the
@@ -461,7 +462,7 @@ the CI workflow runs them as an explicit step in addition to `npm test`.
 | The cookie name and the cookie reader | `src/lib/session-cookie.ts` |
 | The browser call path | `src/lib/api-client.ts` |
 | The CSRF policy | `src/lib/csrf.ts` |
-| The CSRF enforcement point | `src/middleware.ts` |
+| The CSRF enforcement point | `src/proxy.ts` |
 | The session lifecycle routes | `src/app/api/auth/{login,select-school,me,logout}/route.ts` |
 | The security headers | `next.config.ts` |
 | The operator secret checker | `scripts/check-jwt-secret.mjs` |

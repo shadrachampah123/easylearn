@@ -12,7 +12,7 @@
  * `Authorization` header that a cross-site page cannot set, so cross-site
  * requests carried no authority at all. Moving to the cookie removes that
  * property, so the CSRF protection has to be added at the same time. This module
- * and `src/middleware.ts` are that protection.
+ * and `src/proxy.ts` are that protection.
  *
  * ── The policy ─────────────────────────────────────────────────────────────────
  * A request is allowed when it is not state-changing, or when it is a
