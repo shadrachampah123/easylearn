@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Announcement {
   id: string;
@@ -25,10 +26,9 @@ export default function AdminAnnouncementsPage() {
   useEffect(() => { loadData(); }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch("/api/announcements", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/announcements");
       const data = await res.json();
       if (data.success) setAnnouncements(data.data);
     } catch (err) {
@@ -41,11 +41,10 @@ export default function AdminAnnouncementsPage() {
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/announcements", {
+      const res = await apiFetch("/api/announcements", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(formData),
       });
       const data = await res.json();

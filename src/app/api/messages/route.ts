@@ -7,6 +7,14 @@ import { eq, or, and, desc, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { guardSchoolContext, isUserInSchool, sqlUserInSchool } from "@/lib/tenant";
 
+/**
+ * A `GET` must not change state.
+ *
+ * This handler used to mark a conversation as read while reading it. That is a
+ * write on a safe method: a cross-site request, a link prefetch or a crawler could
+ * mark a user's messages as read without the user doing anything. The write now
+ * lives in `POST /api/messages/read`, and this handler only reads.
+ */
 export async function GET(request: NextRequest) {
   try {
     const auth = await guardSchoolContext(request);
@@ -57,15 +65,8 @@ export async function GET(request: NextRequest) {
         .orderBy(desc(messages.createdAt))
         .limit(100);
 
-      // Mark messages as read
-      await db
-        .update(messages)
-        .set({ isRead: true })
-        .where(and(
-          eq(messages.schoolId, ctx.schoolId),
-          eq(messages.senderId, otherUserId),
-          eq(messages.receiverId, ctx.userId)
-        ));
+      /* Reading a conversation no longer marks it as read. The client calls
+         `POST /api/messages/read` when the user actually opens the conversation. */
     } else {
       // Get list of conversations (latest message per user)
       const latestMessages = await db

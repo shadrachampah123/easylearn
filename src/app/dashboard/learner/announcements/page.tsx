@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { learnerNav } from "@/lib/learner-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Announcement {
   id: string;
@@ -19,8 +20,7 @@ export default function LearnerAnnouncementsPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/announcements", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/announcements")
       .then((r) => r.json())
       .then((data) => { if (data.success) setAnnouncements(data.data); })
       .catch(console.error)

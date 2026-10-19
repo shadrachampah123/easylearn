@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import LearnerProgressPanel from "@/components/dashboard/LearnerProgressPanel";
 import { teacherNav } from "@/lib/teacher-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Reports {
   overview: {
@@ -22,8 +23,7 @@ export default function TeacherReportsPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/reports", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/reports")
       .then((r) => r.json())
       .then((result) => { if (result.success) setData(result.data); })
       .catch(console.error)

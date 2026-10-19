@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface SubjectRow {
   id: string;
@@ -41,12 +42,11 @@ export default function AdminSubjectsPage() {
   }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
       const [subjectResponse, departmentResponse] = await Promise.all([
-        fetch("/api/subjects", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/departments", { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch("/api/subjects"),
+        apiFetch("/api/departments"),
       ]);
       const subjectData = await subjectResponse.json();
       const departmentData = await departmentResponse.json();
@@ -86,12 +86,11 @@ export default function AdminSubjectsPage() {
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
 
     try {
-      const response = await fetch(editing ? `/api/subjects/${editing.id}` : "/api/subjects", {
+      const response = await apiFetch(editing ? `/api/subjects/${editing.id}` : "/api/subjects", {
         method: editing ? "PUT" : "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: formData.name.trim(),
           code: formData.code.trim() || null,
@@ -120,13 +119,10 @@ export default function AdminSubjectsPage() {
 
   async function handleDelete(subject: SubjectRow) {
     if (!confirm(`Delete ${subject.name}? Any assignments, quizzes, and teacher assignments using this subject will also be removed.`)) return;
-
-    const token = localStorage.getItem("el_token");
     setSaving(true);
     try {
-      const response = await fetch(`/api/subjects/${subject.id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await apiFetch(`/api/subjects/${subject.id}`, {
+        method: "DELETE"
       });
       const data = await response.json();
       if (!data.success) {

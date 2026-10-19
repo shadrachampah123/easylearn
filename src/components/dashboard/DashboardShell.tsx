@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
+import { apiFetch } from "../../lib/api-client";
 
 interface NavItem {
   name: string;
@@ -45,40 +46,67 @@ export default function DashboardShell({ children, navItems, roleLabel, roleColo
   const [switchingSchool, setSwitchingSchool] = useState(false);
 
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem("el_user");
-      if (stored) {
-        // localStorage is browser-only; defer session hydration to avoid SSR/client markup mismatch.
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        setUser(JSON.parse(stored));
-        return;
-      }
-    } catch {
-      // Invalid cached state is treated as a missing session.
-    }
-    router.push("/login");
+    // The session is identified by the `httpOnly` session cookie, which the browser
+    // cannot read. `/api/auth/me` re-derives the user, the role and the school context
+    // from the database on the server, so nothing about the session is cached in the
+    // page. A 401 means the session is gone or has expired: the user goes back to the
+    // sign-in page instead of seeing an empty dashboard.
+    let cancelled = false;
+
+    apiFetch("/api/auth/me")
+      .then(async (response) => {
+        if (response.status === 401) return null;
+        const result = await response.json().catch(() => null);
+        if (!response.ok || !result?.success) {
+          throw new Error(result?.error || "Session unavailable");
+        }
+        return result.data as {
+          user: { firstName: string; lastName: string; email: string; role: string };
+          school: SchoolSummary | null;
+          schools: SchoolSummary[];
+        };
+      })
+      .then((data) => {
+        if (cancelled) return;
+        if (!data) {
+          router.push("/login");
+          return;
+        }
+        setUser({
+          firstName: data.user.firstName,
+          lastName: data.user.lastName,
+          email: data.user.email,
+          role: data.school?.role ?? data.user.role,
+          globalRole: data.user.role,
+          school: data.school ?? null,
+          schools: data.schools ?? [],
+        });
+      })
+      .catch(() => {
+        if (!cancelled) router.push("/login");
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [router]);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    if (token) {
-      fetch("/api/notifications", { headers: { Authorization: `Bearer ${token}` } })
-        .then((r) => r.json())
-        .then((data) => { if (data.success) setUnreadCount(data.data.unread); })
-        .catch(console.error);
-    }
+    apiFetch("/api/notifications")
+      .then((r) => r.json())
+      .then((data) => { if (data.success) setUnreadCount(data.data.unread); })
+      .catch(console.error);
   }, [user?.school?.schoolId]);
 
   async function handleSchoolSwitch(schoolId: string) {
-    const token = localStorage.getItem("el_token");
-    if (!token || !user || schoolId === user.school?.schoolId) return;
+    if (!user || schoolId === user.school?.schoolId) return;
     setSchoolSwitchError("");
     setUnreadCount(0);
     setSwitchingSchool(true);
     try {
-      const response = await fetch("/api/auth/select-school", {
+      const response = await apiFetch("/api/auth/select-school", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ schoolId }),
       });
       const result = await response.json();
@@ -94,8 +122,8 @@ export default function DashboardShell({ children, navItems, roleLabel, roleColo
         school: selected,
         schools: result.data.schools,
       };
-      localStorage.setItem("el_token", result.data.token);
-      localStorage.setItem("el_user", JSON.stringify(updatedUser));
+      // The server re-issues the session cookie for the selected school and returns the
+      // membership list. Nothing is stored in the browser.
       setUser(updatedUser);
       router.push(dashboardPath(selected.role));
       router.refresh();
@@ -107,9 +135,21 @@ export default function DashboardShell({ children, navItems, roleLabel, roleColo
   }
 
   async function handleLogout() {
-    await fetch("/api/auth/logout", { method: "POST" });
-    localStorage.removeItem("el_token");
-    localStorage.removeItem("el_user");
+    try {
+      await apiFetch("/api/auth/logout", { method: "POST" });
+    } catch {
+      // Even if the request fails, the local session is cleared below, so the user is
+      // never left in a half-signed-in state.
+    }
+    // Remove the session token and user object that older versions of the application
+    // stored in web storage, so a credential cached by a previous release cannot
+    // survive the upgrade.
+    try {
+      localStorage.removeItem("el_token");
+      localStorage.removeItem("el_user");
+    } catch {
+      // Web storage can be unavailable (private mode); the cookie is the real session.
+    }
     router.push("/login");
   }
 

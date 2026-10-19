@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { learnerNav } from "@/lib/learner-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Message {
   id: string;
@@ -31,22 +32,20 @@ export default function LearnerMessagesPage() {
   const [sending, setSending] = useState(false);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/auth/me")
       .then((r) => r.json())
       .then((data) => { if (data.success) setCurrentUserId(data.data.user.id); });
 
     loadConversations();
-    fetch("/api/users?role=teacher", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/users?role=teacher")
       .then((r) => r.json())
       .then((data) => { if (data.success) setTeachers(data.data.users); })
       .catch(console.error);
   }, []);
 
   async function loadConversations() {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/messages", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/messages");
       const data = await res.json();
       if (data.success) setConversations(data.data);
     } catch (err) {
@@ -56,11 +55,18 @@ export default function LearnerMessagesPage() {
 
   async function openConversation(partnerId: string) {
     setSelectedPartner(partnerId);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/messages?userId=${partnerId}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/messages?userId=${partnerId}`);
       const data = await res.json();
       if (data.success) setMessages(data.data);
+      /* Marking the conversation as read is a write, so it is a separate POST rather
+         than a side effect of reading it. */
+      await apiFetch("/api/messages/read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: partnerId }),
+      });
+      loadConversations();
     } catch (err) {
       console.error(err);
     }
@@ -70,11 +76,10 @@ export default function LearnerMessagesPage() {
     e.preventDefault();
     if (!selectedPartner || !newMessage.trim()) return;
     setSending(true);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/messages", {
+      const res = await apiFetch("/api/messages", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ receiverId: selectedPartner, content: newMessage }),
       });
       if (res.ok) {

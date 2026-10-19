@@ -11,6 +11,7 @@ import {
   clearFailedLoginAttempts,
   getClientIp,
 } from "@/lib/rate-limit";
+import { SESSION_COOKIE_NAME } from "@/lib/session-cookie";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -131,10 +132,13 @@ export async function POST(request: NextRequest) {
       // `school`/`schoolId` back has no effect anywhere (see src/lib/tenant.ts).
       school: toSchoolSummary(school),
       schools: memberships.map((membership) => toSchoolSummary(membership)),
-      token,
+      // The session token is NOT returned in the body. The browser receives it as an
+      // `httpOnly` cookie below, which script on the page cannot read. Returning it
+      // here would put a long-lived credential back within reach of any injected
+      // script, which is exactly what the cookie prevents.
     });
 
-    response.cookies.set("el_token", token, {
+    response.cookies.set(SESSION_COOKIE_NAME, token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",

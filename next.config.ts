@@ -4,16 +4,43 @@ const nextConfig: NextConfig = {
   async headers() {
     const isProduction = process.env.NODE_ENV === "production";
 
-    // Content Security Policy - permissive enough to not break existing functionality
-    // but still provides protection against XSS
+    /*
+     * Content Security Policy.
+     *
+     * The development and production policies differ deliberately:
+     *
+     *   - `'unsafe-eval'` is needed by the Next.js development server (React Fast
+     *     Refresh compiles modules with `eval`). The PRODUCTION build does not use
+     *     `eval` anywhere, so the production policy does not allow it. `eval` is the
+     *     single most effective way to defeat a script-src policy, because it turns
+     *     a string into code.
+     *   - `ws:` / `wss:` are only needed by the development server's hot-reload
+     *     socket. The application opens no WebSocket of its own.
+     *
+     * KNOWN REMAINING EXPOSURE: `'unsafe-inline'` is still present in `script-src`,
+     * so an injected inline `<script>` would still execute. Removing it requires a
+     * nonce-based policy, which needs the root layout to pass a per-request nonce to
+     * every script and a review of every third-party script the app loads. That is
+     * tracked as a follow-up in docs/SECURITY_AUTHENTICATION.md rather than being
+     * half-done here: a policy that breaks the application is worse than a policy
+     * that is merely incomplete.
+     */
+    const scriptSrc = isProduction
+      ? "script-src 'self' 'unsafe-inline' blob:"
+      : "script-src 'self' 'unsafe-eval' 'unsafe-inline' blob:";
+
+    const connectSrc = isProduction
+      ? "connect-src 'self' https:"
+      : "connect-src 'self' https: wss: ws:";
+
     const csp = [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-eval' 'unsafe-inline' blob:",
+      scriptSrc,
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' data: https://fonts.gstatic.com",
       "img-src 'self' data: blob: https: http:",
       "media-src 'self' data: blob: https:",
-      "connect-src 'self' https: wss: ws:",
+      connectSrc,
       "frame-src 'self'",
       "object-src 'none'",
       "base-uri 'self'",

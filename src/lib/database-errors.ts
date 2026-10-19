@@ -1,3 +1,5 @@
+import { isJwtSecretConfigurationError } from "@/lib/jwt-policy";
+
 type DatabaseErrorLike = {
   code?: string;
   message?: string;
@@ -23,6 +25,16 @@ export function isUniqueViolation(error: unknown): boolean {
 }
 
 export function getDatabaseErrorMessage(error: unknown): string {
+  // A JWT secret configuration failure is not a database problem. Report it with the
+  // actionable message from the policy (which never contains the secret) instead of
+  // the generic "database is unavailable" text below.
+  if (isJwtSecretConfigurationError(error)) {
+    return (
+      (error as { message?: string }).message ||
+      "The authentication service is misconfigured: the JWT secret does not satisfy the secret policy."
+    );
+  }
+
   const dbError = asDatabaseError(error);
   const nested = asDatabaseError(dbError.cause);
   const code = dbError.code || nested.code;

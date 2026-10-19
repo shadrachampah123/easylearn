@@ -6,6 +6,7 @@ import AttachmentList from "@/components/dashboard/AttachmentList";
 import FileUploader, { type StoredAttachment } from "@/components/dashboard/FileUploader";
 import { storedAttachments } from "@/lib/uploads";
 import Link from "next/link";
+import { apiFetch } from "../../../../../lib/api-client";
 
 interface Question {
   id: string;
@@ -114,11 +115,8 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
   }, [resolvedParams.id]);
 
   async function loadAssignment() {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}`);
       const data = await res.json();
       if (data.success) {
         setAssignment(data.data);
@@ -158,14 +156,12 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
     }
 
     setSubmitting(true);
-    const token = localStorage.getItem("el_token");
 
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}/submit`, {
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}/submit`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           answers: hasQuestions ? answers : undefined,
