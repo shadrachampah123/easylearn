@@ -459,7 +459,7 @@ async function main() {
         [cbismSchoolId, userIds["platform"]]
       );
       assertEq(await tenant.resolveSchoolMembership(userIds["platform"]), null, "must stay unresolved");
-      const withInactive = await tenant.listSchoolMemberships(userIds["platform"], { includeInactive: true });
+      const withInactive = await tenant.listAllSchoolMembershipsForInspection(userIds["platform"]);
       assertEq(withInactive.length, 0, "platform role rows must be filtered out");
       await q(`DELETE FROM school_users WHERE user_id = $1`, [userIds["platform"]]);
     });
@@ -754,7 +754,7 @@ async function main() {
         );
 
         if (status === "archived") {
-          const historical = await tenant.listSchoolMemberships(userIds["teacher"], { includeInactive: true });
+          const historical = await tenant.listAllSchoolMembershipsForInspection(userIds["teacher"]);
           const archivedMembership = historical.find((membership) => membership.schoolId === schoolBId);
           assert(archivedMembership, "platform/lifecycle reads retain archived memberships");
           assertEq(archivedMembership!.schoolStatus, "archived", "historical school status remains visible to inspection");
