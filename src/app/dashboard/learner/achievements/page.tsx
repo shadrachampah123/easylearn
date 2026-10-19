@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Achievement {
   id: string;
@@ -51,13 +52,25 @@ export default function LearnerAchievementsPage() {
 
 
   const loadStats = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/learner/stats", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const result = await res.json();
-      if (result.success) setData(result.data);
+      /* The read and the award are separate: `GET` only reads, `POST` awards the
+         achievements the learner has earned. A `GET` that writes is reachable by a
+         cross-site request and by link prefetching. */
+      const [statsResponse, awardResponse] = await Promise.all([
+        apiFetch("/api/learner/stats"),
+        apiFetch("/api/learner/stats", { method: "POST" }),
+      ]);
+      const result = await statsResponse.json();
+      const award = await awardResponse.json();
+      if (result.success) {
+        setData({
+          ...result.data,
+          achievements: {
+            ...result.data.achievements,
+            new: award?.success ? award.data.new : result.data.achievements.new,
+          },
+        });
+      }
     } catch (err) {
       console.error(err);
     } finally {

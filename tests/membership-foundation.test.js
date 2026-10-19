@@ -479,7 +479,40 @@ test('Boundary: Phase 1 authorization helpers stay tenant-free (Phase 2C adds sc
 });
 
 test('Boundary: no middleware / hostname tenant resolution (Phase 2E)', () => {
-  assert(!fs.existsSync(path.join(__dirname, '..', 'src', 'middleware.ts')), 'src/middleware.ts must not exist yet');
+  // The original assertion was that `src/middleware.ts` must not exist, because a
+  // middleware that resolves a tenant from the hostname would let a request pick
+  // its own school. That property — not the absence of the file — is the boundary,
+  // so it is now asserted directly, against a middleware that does exist and does
+  // one thing only: enforce the cross-site request policy.
+  const middlewarePath = path.join(__dirname, '..', 'src', 'middleware.ts');
+  assert(
+    fs.existsSync(middlewarePath),
+    'the cross-site request policy is enforced in src/middleware.ts, which must exist'
+  );
+
+  const middleware = readFile('src/middleware.ts');
+
+  assert(
+    !/from\s+["']@\/lib\/tenant["']/.test(middleware),
+    'the middleware must not import the tenant module'
+  );
+  assert(
+    !/\b(schoolId|school_id|membershipId|membership_id)\b/.test(middleware),
+    'the middleware must not read or derive a school or membership id'
+  );
+  assert(
+    !/headers\.get\(\s*["'](x-forwarded-host|host|x-tenant|x-school)["']\s*\)/i.test(middleware),
+    'the middleware must not read a tenant from a request header'
+  );
+  assert(
+    !/(selectSchool|resolveSchool|requireSchoolContext|guardSchoolContext|isUserInSchool)/.test(middleware),
+    'the middleware must not resolve a school context'
+  );
+  assert(
+    /evaluateCsrfRequestForRequest/.test(middleware),
+    'the middleware must apply the cross-site request policy'
+  );
+
   assert(!tenant.includes('x-forwarded-host'), 'no host-based tenant resolution yet');
 });
 

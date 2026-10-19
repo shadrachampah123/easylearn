@@ -54,6 +54,8 @@ jobs:
         run: test -n "$TEST_DATABASE_URL"
       - name: Unit and source-security tests
         run: npm test
+      - name: Authentication security suites (JWT secret policy, CSRF, cookie auth)
+        run: npm run test:auth-security
       - name: End-to-end PostgreSQL TLS tests (TLS-enabled PostgreSQL 16 required)
         env:
           # A skip must fail this job: the end-to-end TLS assertions have to actually run.

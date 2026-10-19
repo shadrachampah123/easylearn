@@ -834,6 +834,22 @@ async function main() {
         assertEq(result.status, 200, "same-school participant can view conversation");
         assert(bodyText(result).includes("A-only-content"), "School A message remains accessible");
         assert(!bodyText(result).includes("B-secret-content"), "School B message is not exposed");
+
+        /* Reading a conversation must not change anything: a `GET` that marks
+           messages as read is reachable by a cross-site request, by a link prefetch
+           and by a crawler. The write is a separate POST. */
+        const afterRead = await one(`SELECT is_read FROM messages WHERE id=$1`, [a]);
+        assertEq(afterRead.is_read, false, "reading the conversation does not mark it as read");
+
+        /* The write is tenant-scoped: it marks the current school's conversation
+           and never another school's. */
+        const markRead = await call("messages/read", {
+          token: dualTeacher.token,
+          method: "POST",
+          body: { userId: dualPeer.id },
+        });
+        assertEq(markRead.status, 200, "the participant can mark the conversation as read");
+
         const aState = await one(`SELECT is_read FROM messages WHERE id=$1`, [a]);
         const bState = await one(`SELECT is_read FROM messages WHERE id=$1`, [b]);
         assertEq(aState.is_read, true, "School A incoming message is marked read");

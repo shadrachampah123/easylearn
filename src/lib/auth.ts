@@ -4,6 +4,7 @@ import { users } from "@/db/schema";
 import { eq, type SQL } from "drizzle-orm";
 import { getJwtSecret } from "@/lib/env";
 import { assertJwtSecretIsUsable, isJwtSecretConfigurationError } from "@/lib/jwt-policy";
+import { readSessionCookie } from "@/lib/session-cookie";
 
 const TOKEN_EXPIRY = "24h";
 
@@ -189,11 +190,8 @@ export function getTokenFromRequest(request: Request): string | null {
     if (bearerToken) return bearerToken;
   }
 
-  const cookieHeader = request.headers.get("cookie");
-  if (cookieHeader) {
-    const match = cookieHeader.match(/(?:^|;\s*)el_token=([^;]+)/);
-    if (match) return decodeURIComponent(match[1]);
-  }
+  const cookieToken = readSessionCookie(request.headers.get("cookie"));
+  if (cookieToken) return cookieToken;
 
   return null;
 }

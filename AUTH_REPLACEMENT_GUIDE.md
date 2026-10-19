@@ -132,7 +132,11 @@ Then test registration with a brand-new email. Test login with that same email a
 A new Neon database will not contain demo users until seeded. Run once:
 
 ```bash
-curl -X POST https://YOUR-DOMAIN.vercel.app/api/seed
+# The seed endpoint is disabled in production and requires a super_admin session in
+# development. A state-changing request must also identify its origin, so send the
+# session token as a bearer token (or add an `Origin:` header matching the host).
+curl -X POST https://YOUR-DOMAIN.vercel.app/api/seed \
+  -H "Authorization: Bearer $SUPER_ADMIN_TOKEN"
 ```
 
 Then the existing demo admin login is:
