@@ -1917,3 +1917,119 @@ none of its work may be represented as one, and the branch-protection state of `
 be read (API `403`) and remains UNKNOWN.
 
 **Stop here. Do not merge, deploy, or apply 0018 on the strength of this report.**
+
+---
+
+# Appendix A — Remediation status (2026-10-19)
+
+This appendix records what was changed **after** the audit above, on the branch
+`arena/7d4511bc-easylearn`. The audit text above is unchanged: it is the evidence, and it
+must not be edited to match the code. Everything below is a separate, later statement.
+
+Nothing here is a production-readiness statement. `BLOCKER-1` is still open, 0018 is still
+refused for production, and no production system, credential, setting or branch-protection
+rule was touched.
+
+## A.1 What was implemented, and the evidence for each
+
+| ID | Status | Change | Evidence |
+|---|---|---|---|
+| MEDIUM-4 | **IMPLEMENTED** | `src/app/api/seed/route.ts` now creates the `school_users` rows for the teacher, parent and learner demo accounts. The platform `super_admin` deliberately gets **none** (`super_admin` is a platform role; migration 0015 excludes it; `resolveAuthContext` never grants a platform account a school context). The rows are written through `addSchoolMembership()` in `src/lib/tenant.ts`, the one module that owns `school_users` — a route must not touch the membership table itself, and the tenant-foundation boundary test now enforces that for this route too. | `tests/seed-membership.test.ts` — **7 assertions, 0 failures, exit 0**. The suite proves the three memberships exist with the right roles and `status = 'active'`, that the platform administrator has none, that the three demo logins return a real school context, that a tenant-scoped API is reachable, and that the role is read from the database and not from the token claim. Mutation-tested twice: removing the membership write fails **3** of the 7; restoring the claim-based authorisation fails **1**. The source was restored byte-for-byte after each mutation. |
+| LOW-6 | **IMPLEMENTED** | The seed route now re-reads the caller's role **from the database** (`findAuthUser` + `isActive` + `role === 'super_admin'`) whenever the database is populated, because a signed claim can be up to 24 hours stale. The **empty-database bootstrap** case still trusts the signed claim: there is no account to read, and the only administrator the route creates is the one it is about to insert. That exception is stated in the code at the branch it applies to. | Same suite — the "role is not taken from the claim" assertion fails if the claim-trust is restored, and the "a real super_admin is still allowed" assertion fails if the database check is made too strict. |
+| LOW-7 | **IMPLEMENTED (corrected — see A.2)** | The public `includeInactive` option is **gone**. `listSchoolMemberships(userId)` now takes no options and returns only active memberships in active schools. The widening read is a separate, explicitly-named export, `listAllSchoolMembershipsForInspection(userId)`, and it is still scoped to one user — a membership is never looked up by school alone. | `tests/membership-foundation.test.js` — **37 assertions, 0 failures, exit 0**, including two new guards: the active read must take no options and no membership read may offer a widening switch; every membership read, the inspection one included, must start its WHERE clause from the caller's own user id. Mutation-tested: re-adding the option fails the new guard (**1** failure, exit 1); the source was restored byte-for-byte. |
+| LOW-8 | **IMPLEMENTED** | `src/lib/authorization.ts` now carries a header warning: the Phase 1 helpers filter a relationship table by a **person or a class**, never by a school, so a new caller that uses one of them without re-intersecting the result with the caller's own school would be cross-tenant. The four current call sites are named in the header, with the intersection each of them performs. | Source-level. The existing boundary test `Boundary: no tenant filtering added to authorization helpers` still passes, and still enforces that the helpers themselves stay tenant-free — the warning adds no filter and no school parameter. |
+| LOW-9 | **IMPLEMENTED** | (a) The F-6 refusal — "0018 found an incompatible constraint named … on public.…" — now has repository coverage: the test replaces `assignments_school_class_fk` with an incompatible `(school_id, subject_id)` foreign key, proves the repair clears the false 0018 claim, proves 0018 then **refuses** and writes **no** ledger row, drops the constraint by hand, and proves 0018 then applies and reaches 26/26. (b) `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md` §4.1 now tells the operator to read the constraint's definition first and drop it **by hand**, with the exact read-only inspection query, and states plainly that the automated repair will not drop it. | `tests/migration-tenant-constraint-integrity.test.ts` — **24 assertions, 0 failures, exit 0** (was 20 before this phase). |
+| LOW-10 | **IMPLEMENTED** | The unreachable "apply a migration after a skipped gated migration" guard is now a **pure, exported** function, `findOrderingViolation(toApply, skippedGated, orderedList)`, which the run loop calls. The order list is a parameter so the case can be exercised at all: with the real 19-file list, 0018 is last and nothing can follow it. | The same suite, now **24 assertions**. The new test proves: no violation for an empty apply list, no violation when no gate was skipped, no violation when the gated migration itself is applied, and a violation — naming both the blocked and the skipped migration — when a migration registered after the gate is applied while the gate is skipped. The suite also records the fact that 0018 is currently last, so the guard is defensive code. |
+
+## A.2 Two corrections to the audit above
+
+**1. LOW-7 was described as an "unused widening option". That was wrong.** The audit's
+grep covered `src/` only. `includeInactive: true` was used by **two** call sites in
+`tests/membership-auth-db.test.ts` (lines 462 and 757), which need to see a *historical*
+membership to assert that a revoked, disabled or archived membership really is absent from
+the active set. The remediation therefore did not delete the capability: it removed the
+**public switch** and gave the widening read its own explicitly-named export, and the two
+test call sites were updated. The hazard the finding described — a public boolean whose
+safety rested on a doc comment — is gone either way, but the audit understated the blast
+radius, and a reviewer reading only the audit would have been misled.
+
+**2. The audit's independent harnesses lived outside the repository.** `audit-bypass.js`
+(37 checks), `audit-failures.js` (47 checks), `index-gap-analysis.js`, `index-impact.js`,
+`proposed-index-migration.sql` and `run-ci-audit.sh` were written to the sandbox home
+directory, **not** into the repository. A reviewer could not re-run them from a clone, and
+their results are not reproducible from the commit that cites them. That is a real weakness
+in the evidence, and it is recorded here rather than glossed over.
+
+The sandbox that hosted them was reset during the remediation phase and they are **gone**;
+their results could therefore **not** be re-verified here and are not restated as if they
+had been. What was done instead is to move the coverage they provided **into the
+repository**, where it was actually missing:
+
+* the "both confirmation tokens present and the catalog still lacks the constraints" case —
+  the strongest form of the false-certification guard — was **not** covered and is now a
+  test in `tests/migration-tenant-constraint-integrity.test.ts`;
+* the **complete documented recovery** of §4.1 (damage → `--repair-tenant-integrity` →
+  `--baseline` of the verified prefix → re-apply 0018 under its gate → the ordinary run
+  verifies 26/26) had **no** end-to-end coverage — the repair test re-applied 0018
+  directly, and the baseline test ran on a database whose ledger had never been destroyed —
+  and is now a test as well;
+* the ordering guard (LOW-10) is now exercised directly instead of being reasoned about;
+* the CI-replication script was re-created and re-run (A.3).
+
+The harnesses themselves are still outside the repository. **Proposed, not implemented:**
+committing them under `tests/` or `scripts/`. They duplicate coverage the repository now
+has, and adding them is a separate decision with its own review.
+
+## A.3 Verification actually performed for this appendix
+
+All of it on a **disposable PostgreSQL 16.14** on `127.0.0.1:5432` with TLS enabled
+(`bash /home/user/setup-audit-pg.sh` recreates it from scratch). No production system,
+credential, setting or branch-protection rule was touched.
+
+| Suite | Result |
+|---|---|
+| `tests/seed-membership.test.ts` | **7 passed, 0 failed, exit 0** |
+| `tests/migration-tenant-constraint-integrity.test.ts` | **24 passed, 0 failed, exit 0** |
+| `tests/membership-auth-db.test.ts` | **48 passed, 0 failed, exit 0** |
+| `tests/tenant-authorization-mutation.test.ts` | **7 passed, 0 failed, exit 0** |
+| `tests/membership-foundation.test.js` | **37 passed, 0 failed, exit 0** |
+| `npm test` (4 source-security suites) | **28 / 15 / 23 / 35 passed, 0 failed** |
+| `npm run typecheck` | **exit 0** |
+| Local replication of the CI workflow (13 steps) | **13 of 13 exit 0** |
+
+Mutation evidence: the seed membership write removed → **3** seed assertions fail; the
+claim-based authorisation restored → **1** seed assertion fails; the public
+`includeInactive` option restored → **1** membership-foundation assertion fails. In each
+case the source was restored byte-for-byte afterwards.
+
+## A.4 Deliberately NOT changed, and why
+
+* **MEDIUM-5** (the 26 composite foreign keys cover no *user-side* link to
+  `school_users(school_id, user_id)`) — a new gated migration `0019` is required. **No
+  migration was created, no schema was altered, and no CI gate was weakened.**
+* **MEDIUM-3** (the 26 child-side `CREATE INDEX CONCURRENTLY` indexes) — a separate PR with
+  its own non-transactional path. **Not implemented.** The measurement in §2.4 stands; the
+  performance issue is **not** fixed.
+* **`BLOCKER-1`** — the production preflight evidence does not exist. It cannot be closed
+  by any code change, and no code in this phase changes that. **0018 must not be applied to
+  production.**
+* **Branch protection on `main`** — the read-only API call returns `403`; the state remains
+  **UNKNOWN** and was not modified.
+* **The seed route is still not transactional.** A failure part-way through the seed would
+  leave a partially seeded database, which is the same shape MEDIUM-4 describes. Making the
+  whole seed atomic is a larger refactor than this phase's scope, and it is **proposed
+  here rather than silently made**. The membership write is the one place this phase
+  introduced a new failure point, and it fails loudly with a 500 rather than silently
+  leaving the demo accounts without a school.
+
+## A.5 Status of the audit's own blocking items
+
+| Item | Status |
+|---|---|
+| `BLOCKER-1` — production preflight evidence | **BLOCKED** (no authorized operator checkpoint against a restored production copy) |
+| 0018 applied to production | **BLOCKED** |
+| Restored-production-copy rehearsal | **BLOCKED** |
+| Branch-protection confirmation on `main` | **BLOCKED** (API `403`, state UNKNOWN) |
+| `0019` user-side FK migration | **PROPOSED ONLY** |
+| 26 child-side indexes | **PROPOSED ONLY** |
+| Independent human review of the tenant and migration work | **NOT PERFORMED** — this work is not an independent review and must not be represented as one |
