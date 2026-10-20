@@ -833,11 +833,13 @@ binary; the instructions are in each file's header.
   forged-forwarded-header write, an ordinary write, a cross-site write, the
   real upload UI with legitimate and hostile files, the served response, the
   attempt to execute an uploaded payload, logout, and the console — and
-  reports **34 of 34 checks passed**. `tests/manual/browser-content-type-sniffing-probe.js`
+  reports **36 of 36 checks passed**. `tests/manual/browser-content-type-sniffing-probe.js`
   reports **0 of 9 header combinations executed script** and **0 preview
   failures**. `tests/manual/forwarded-header-configuration-matrix.js` runs the
-  same write against all three configurations. **Firefox and Safari were not
-  available** — see §7.
+  same write against all three configurations — **24 of 24** — and
+  `tests/manual/csrf-proxy-trust-probe.js` measures the cross-site policy
+  against a production build over HTTP — **9 of 9**. **Firefox and Safari were
+  not available** — see §7.
 - **Video decoding in a browser.** The element's request was confirmed; no
   sample video was available in the environment, so no frame was decoded (§7).
 - **The production CSP change could not be observed in a browser.** The

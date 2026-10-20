@@ -351,7 +351,12 @@ the disposable database only), and a throwaway upload directory under `/tmp`.
 
 **Nothing in production was read, written, deployed or migrated.**
 
-### 3.1 `tests/manual/browser-upload-verification.js` — **34 of 34 checks passed**
+### 3.1 `tests/manual/browser-upload-verification.js` — **36 of 36 checks passed**
+
+> Re-measured against the PR #44 code on 2026-10-20. The original run
+> (PR #40) reported 34 of 34; one check — #11 below — asserted the
+> self-inflicted denial that PR #44 removes, and it is now three
+> checks that say what actually matters.
 
 | # | Check | Result |
 |---|---|---|
@@ -365,39 +370,41 @@ the disposable database only), and a throwaway upload directory under `/tmp`.
 | 8 | The teacher assignments page loads | ✅ |
 | 9 | An account with **two** memberships is offered the school selection | ✅ |
 | 10 | Choosing a school opens the dashboard | ✅ |
-| 11 | A write with **forged** `X-Forwarded-Host` + `X-Forwarded-Proto` is refused by default (**403**) | ✅ |
-| 12 | An ordinary same-origin write still succeeds (**200**) | ✅ |
-| 13 | A cross-site write from another origin is refused (not 2xx) | ✅ |
-| 14 | The assignment form exposes a file input | ✅ |
-| 15 | A legitimate PNG is accepted by the **real UI** | ✅ |
-| 16 | **HTML bytes in a `.png`** are refused by the real UI (server **400**, not attached, error shown) | ✅ |
-| 17 | An **`.svg`** file is refused by the real UI (client refused it; no request made) | ✅ |
-| 18 | An **`.xhtml`** file is refused by the real UI (client refused it; no request made) | ✅ |
-| 19 | **ZIP bytes in a `.png`** are refused by the real UI (server **400**) | ✅ |
-| 20 | A legitimate `.txt` file is accepted by the real UI | ✅ |
-| 21 | The legacy row (`mime_type = 'text/html'`) is served (not a 404) | ✅ |
-| 22 | It is **not** served as `text/html` | ✅ |
-| 23 | It is served as `image/png` | ✅ |
-| 24 | It is served with `nosniff` | ✅ |
-| 25 | It is served with a sandboxing policy | ✅ |
-| 26 | It forbids cross-origin embedding (`CORP: same-origin`) | ✅ |
-| 27 | A legacy `.html` row is served as a download, not a document (`application/octet-stream` + `attachment`) | ✅ |
-| 28 | The legacy row served as `image/png` **does not execute script** | ✅ |
-| 29 | The legacy row served as a `.html` download **does not execute script** | ✅ |
-| 30 | Logout succeeds | ✅ |
-| 31 | The session cookie is cleared on logout | ✅ |
-| 32 | The API refuses the request after logout (**401**) | ✅ |
-| 33 | **No** Content-Security-Policy violation was reported in the console | ✅ |
-| 34 | **No** uncaught page error was raised | ✅ |
+| 11 | A write with a **forged** `X-Forwarded-Host` is still made against this application's own origin (**200**) — the default configuration does not trust the forwarded host | ✅ |
+| 12 | A write with a **forged** `X-Forwarded-Proto` is no longer refused (**200**) — the browser's own `Sec-Fetch-Site: same-origin` is proof about the real origins (PR #44) | ✅ |
+| 13 | A write with **both** forged forwarded headers is still made against this application's own origin (**200**) | ✅ |
+| 14 | An ordinary same-origin write still succeeds (**200**) | ✅ |
+| 15 | A cross-site write from another origin is refused (not 2xx) | ✅ |
+| 16 | The assignment form exposes a file input | ✅ |
+| 17 | A legitimate PNG is accepted by the **real UI** | ✅ |
+| 18 | **HTML bytes in a `.png`** are refused by the real UI (server **400**, not attached, error shown) | ✅ |
+| 19 | An **`.svg`** file is refused by the real UI (client refused it; no request made) | ✅ |
+| 20 | An **`.xhtml`** file is refused by the real UI (client refused it; no request made) | ✅ |
+| 21 | **ZIP bytes in a `.png`** are refused by the real UI (server **400**) | ✅ |
+| 22 | A legitimate `.txt` file is accepted by the real UI | ✅ |
+| 23 | The legacy row (`mime_type = 'text/html'`) is served (not a 404) | ✅ |
+| 24 | It is **not** served as `text/html` | ✅ |
+| 25 | It is served as `image/png` | ✅ |
+| 26 | It is served with `nosniff` | ✅ |
+| 27 | It is served with a sandboxing policy | ✅ |
+| 28 | It forbids cross-origin embedding (`CORP: same-origin`) | ✅ |
+| 29 | A legacy `.html` row is served as a download, not a document (`application/octet-stream` + `attachment`) | ✅ |
+| 30 | The legacy row served as `image/png` **does not execute script** | ✅ |
+| 31 | The legacy row served as a `.html` download **does not execute script** | ✅ |
+| 32 | Logout succeeds | ✅ |
+| 33 | The session cookie is cleared on logout | ✅ |
+| 34 | The API refuses the request after logout (**401**) | ✅ |
+| 35 | **No** Content-Security-Policy violation was reported in the console | ✅ |
+| 36 | **No** uncaught page error was raised | ✅ |
 
 Two notes on method:
 
-- The **cross-site** write (check 13) is driven from an attacker page served
+- The **cross-site** write (check 15) is driven from an attacker page served
   from its **own** origin (a second local HTTP server), not from the
   application, so the application's own CSP cannot mask the server's answer.
   The browser reports the request as `opaque`; the server's status was read
   from the DevTools network event and was **not** 2xx.
-- The upload refusals (checks 16–19) are asserted from the **network**, not
+- The upload refusals (checks 18–21) are asserted from the **network**, not
   from the DOM: the file must not be attached (the attachment list is read by
   its "Remove file" buttons) and the request must have been refused (4xx) or
   never made (client-side refusal).
