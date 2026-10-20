@@ -19,6 +19,7 @@
  *   M3  role check removed               → a learner is treated as an administrator
  *   M4  inactive-membership filter removed → a `disabled` membership grants access
  *   M5  uniqueness/fail-closed rule removed → cross-school-attributable content leaks
+ *   M6  the uploaded file's own school check removed → any school may read any file
  *
  * Runs the suite as a child process, so it needs the same database providers as
  * `tests/tenant-authorization-db.test.ts` (TEST_DATABASE_URL → embedded-postgres → SKIP).
@@ -156,6 +157,19 @@ const mutations: Mutation[] = [
   )\`;`,
     replace: `  // MUTANT M5: "reachable from my school" is enough — the "from nowhere else" half is gone.
   return sql\`(exists (select 1 from \${schoolSet} ss where ss."school_id" = \${schoolId}))\`;`,
+  },
+  {
+    id: "M6",
+    name: "the uploaded file's own school check removed (any school may read any file)",
+    find: `    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = \${fileRef} and f."school_id" = \${schoolId}
+    )`,
+    replace: `    // MUTANT M6: the file's own school is no longer checked.
+    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = \${fileRef}
+    )`,
   },
 ];
 

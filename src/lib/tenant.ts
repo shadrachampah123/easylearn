@@ -949,8 +949,55 @@ export function sqlTimetableInSchool(schoolId: string, entryRef: SQL | AnyColumn
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfTimetableEntry(entryRef));
 }
 
-/** Content predicate: the uploaded file belongs to this school's alone. */
+/**
+ * Content predicate for uploaded files. Migration 0016/0017 makes the direct school_id
+ * authoritative; the relational ownership check remains only for legacy rows whose
+ * school_id is still NULL.
+ *
+ * This preserves a legitimate multi-school member's OWN uploaded files instead of
+ * treating their other active membership as a second owner — the same treatment
+ * `sqlAssignmentInSchool` gives assignments (Phase 2D). Before this change the
+ * relational set of a uploader who belongs to two schools resolved to two schools, and
+ * `sqlOwnedBySchool` denied the file to BOTH: the uploader could upload a file and then
+ * receive 404 for it in the very school that had just accepted the upload.
+ *
+ * Tenant isolation is NOT weakened: a file is readable only in the school that wrote it
+ * (`uploaded_files.school_id`, NOT NULL since 0017, server-written from the caller's
+ * verified school). The uploader's other school is still denied, and the relational
+ * "reachable from two schools → deny both" rule still applies to legacy NULL-school_id
+ * rows, which remain unattributable and denied to everyone.
+ */
 export function sqlFileInSchool(schoolId: string, fileRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`(
+    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = ${fileRef} and f."school_id" = ${schoolId}
+    )
+    or (
+      not exists (
+        select 1 from "uploaded_files" f
+         where f."id" = ${fileRef} and f."school_id" is not null
+      )
+      and ${sqlOwnedBySchool(schoolId, sqlSchoolsOfFile(fileRef))}
+    )
+  )`;
+}
+
+/**
+ * PURELY RELATIONAL file ownership.
+ *
+ * This is the pre-0016 fallback: a database that has no `uploaded_files.school_id`
+ * column at all can only be attributed through the uploader/assignment membership chain.
+ * The row must be reachable from EXACTLY this school, so a file that two schools can
+ * reach is denied to both.
+ *
+ * It is deliberately NOT the same as `sqlFileInSchool`: on a migrated schema the direct
+ * `school_id` wins, because the relational set of an uploader who belongs to two schools
+ * resolves to two schools and would deny the uploader's own, legitimate file.
+ */
+export function sqlFileOwnedRelationally(schoolId: string, fileRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfFile(fileRef));
 }
 
