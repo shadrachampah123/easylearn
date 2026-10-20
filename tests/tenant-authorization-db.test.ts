@@ -1493,6 +1493,49 @@ async function main() {
       }
     });
 
+    await test("Relational attribution: a quiz belongs to exactly one school, and an ambiguous one is denied to both", async () => {
+      /* `sqlQuizInSchool` still attributes a quiz RELATIONALLY (its teacher, its
+         class and the enrolled learners), so the "reachable from exactly one
+         school" rule still applies to quizzes. These assertions keep that rule
+         load-bearing — the mutation suite proves it by removing it, and these
+         are the assertions that must then fail.
+         (Uploaded files are the opposite case: they are attributed by their own
+         `school_id`, like assignments, and the multi-school uploader's own file
+         is readable in the school that stored it.) */
+      const quizA = (
+        await one(
+          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+           VALUES ($1, 'Attribution Quiz A', $2, $3, $4, false) RETURNING id`,
+          [schoolA, classA, subjectA, ids["teacher-a"]]
+        )
+      ).id as string;
+
+      const dualQuiz = (
+        await one(
+          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+           VALUES ($1, 'Dual Quiz A', $2, $3, $4, false) RETURNING id`,
+          [schoolA, classA, subjectA, dualTeacher.id]
+        )
+      ).id as string;
+
+      try {
+        /* A quiz of one school is invisible in the other. */
+        const foreign = await call("quizzes/[id]", { token: tokens["admin-b"], params: { id: quizA } });
+        assertEq(foreign.status, 404, "another school's administrator must not read the quiz");
+        const own = await call("quizzes/[id]", { token: tokens["admin-a"], params: { id: quizA } });
+        assertEq(own.status, 200, "the owning school's administrator must read the quiz");
+
+        /* A quiz whose teacher belongs to TWO schools is reachable from both, so
+           the relational rule makes it unattributable and denies it to both. */
+        for (const key of ["admin-a", "admin-b"]) {
+          const result = await call("quizzes/[id]", { token: tokens[key], params: { id: dualQuiz } });
+          assertEq(result.status, 404, "a quiz two schools can reach must be denied to both");
+        }
+      } finally {
+        await q(`DELETE FROM quizzes WHERE id IN ($1, $2)`, [quizA, dualQuiz]);
+      }
+    });
+
     await test("Review F2: a learner never receives another school's dashboard overrides", async () => {
       const ownOverride = (
         await one(

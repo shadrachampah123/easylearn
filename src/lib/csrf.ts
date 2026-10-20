@@ -39,6 +39,15 @@
  *    state-changing request, and a foreign page cannot forge it, so a match is
  *    proof of same-origin.
  *
+ *    3b. THE BROWSER'S OWN ASSERTION. When the comparison above fails, and the
+ *    comparison origin was DERIVED (no `EASY_LEARN_PUBLIC_ORIGIN`), and the
+ *    `Origin` header's HOST is one of the hosts the request was addressed to,
+ *    and the browser reports `Sec-Fetch-Site: same-origin`, the request is
+ *    allowed. `same-origin` means the request's origin IS the initiator's
+ *    origin, so the browser has already answered the question the derived
+ *    origin was supposed to answer — about the REAL origins, not about a
+ *    header a client could send. See "THE DERIVED SCHEME" below.
+ *
  * 4. MISSING HEADERS. When `Origin` is absent the request is still checked
  *    against `Sec-Fetch-Site`, which a browser also sets. If neither header
  *    carries usable information the request is REFUSED. Failing open here would
@@ -94,6 +103,37 @@
  *     the derived origin would be the internal one and every state-changing
  *     request would be refused with 403. That is a safe failure — it refuses
  *     writes — but it is an outage, so the variable must be set.
+ *
+ * THE DERIVED SCHEME, AND WHY RULE 3b EXISTS
+ * The derived scheme is NOT fully trustworthy, and the application cannot make
+ * it so. Next.js builds the request URL's scheme from `x-forwarded-proto`:
+ *
+ *   next/dist/server/next-server.js
+ *     const protocol = req.headers["x-forwarded-proto"]?.includes("https")
+ *       ? "https" : "http";
+ *
+ * and it KEEPS a client-supplied value instead of overwriting it — it only
+ * fills the header in when it is absent:
+ *
+ *   next/dist/server/base-server.js
+ *     req.headers["x-forwarded-proto"] ??= isHttps ? "https" : "http";
+ *
+ * (the synthesised value reflects the socket's TLS state, so it is the truth
+ * when the client sent nothing). A client that sends
+ * `X-Forwarded-Proto: https` therefore changes the scheme the application
+ * derives, and a legitimate same-origin write from a browser on `http://host`
+ * used to be REFUSED — a self-inflicted denial. It could never make a FOREIGN
+ * origin acceptable, because the host still comes from the `Host` header,
+ * which is the host the request was addressed to.
+ *
+ * Rule 3b removes that denial without weakening anything: the browser's own
+ * `Sec-Fetch-Site: same-origin` is proof about the real origins, and it is
+ * not forgeable by a page on another origin (`Sec-Fetch-Site` is a forbidden
+ * header name, so only the browser sets it). A foreign origin still fails the
+ * host comparison; a same-host, different-scheme browser request still fails,
+ * because the browser reports `same-site` for it; and with
+ * `EASY_LEARN_PUBLIC_ORIGIN` configured, rule 3b does not apply at all,
+ * because the configured origin is the exact answer.
  *
  * `SameSite=Lax` on the session cookie is a second line of defence, not the
  * control itself: it blocks a cross-site `POST`, but it does not stop a
@@ -252,6 +292,29 @@ export function trustsProxyHeaders(): boolean {
 }
 
 /**
+ * Every host this request may legitimately have been addressed to.
+ *
+ * The `Host` header is always included: the server routes on it, so it is the
+ * host this request was actually addressed to. `x-forwarded-host` is included
+ * ONLY when the deployment has opted in to trusting the forwarded headers, and
+ * only when it carries exactly one value.
+ */
+export function getRequestHosts(request: Request): string[] {
+  const headers = request.headers;
+  const hosts = new Set<string>();
+
+  const hostHeader = lastValue(headers.get("host"));
+  if (hostHeader) hosts.add(hostHeader);
+
+  if (trustsProxyHeaders()) {
+    const forwardedHost = trustedForwardedHost(headers.get("x-forwarded-host"));
+    if (forwardedHost) hosts.add(forwardedHost);
+  }
+
+  return [...hosts];
+}
+
+/**
  * Every origin the request may legitimately have been addressed to.
  *
  * The host and the scheme are taken from *independent* sources, so they are
@@ -357,6 +420,26 @@ export function isStateChangingMethod(method: string): boolean {
 }
 
 /**
+ * Does the `Origin` header name one of the hosts this request was addressed
+ * to?
+ *
+ * The comparison is on the HOST (host and port) and ignores the scheme. The
+ * host is the part the server routes on, so it is the part that identifies
+ * "this request is for us"; the scheme is compared separately, by the caller.
+ */
+function originHostMatches(origin: string, hosts: string[]): boolean {
+  let originHost: string;
+  try {
+    // `URL.host` drops the default port, so `https://h:443` and `https://h`
+    // compare equal — the same normalisation a browser applies.
+    originHost = new URL(origin).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  return hosts.some((host) => host.trim().toLowerCase() === originHost);
+}
+
+/**
  * Decides whether a request may proceed.
  *
  * `origin` and `fetchSite` are parameters so the policy can be exercised directly
@@ -369,6 +452,21 @@ export function evaluateCsrfRequest(options: {
   hasBearerAuthorization: boolean;
   requestOrigin?: string | null;
   requestOrigins?: string[];
+  /**
+   * The hosts this request was addressed to (the `Host` header, plus the
+   * forwarded host only under the trusted-proxy opt-in).
+   */
+  requestHosts?: string[];
+  /**
+   * True when the comparison origin was DERIVED from the request rather than
+   * taken from `EASY_LEARN_PUBLIC_ORIGIN`.
+   *
+   * It matters because the derived SCHEME is not fully trustworthy: Next.js
+   * builds the request URL from `x-forwarded-proto`, and a client can send
+   * that header itself. A configured public origin has no such problem, so
+   * with one configured the comparison stays exact.
+   */
+  originIsDerived?: boolean;
   allowedOrigins?: string[];
 }): CsrfDecision {
   if (!isStateChangingMethod(options.method)) {
@@ -397,6 +495,40 @@ export function evaluateCsrfRequest(options: {
   if (options.origin) {
     const matches = allowed.some((candidate) => isSameOrigin(candidate, options.origin!));
     if (matches) return { allowed: true, rule: "same-origin" };
+
+    /* ── The browser's own assertion ──────────────────────────────────────
+       `Sec-Fetch-Site: same-origin` means the request's origin IS the
+       initiator's origin. When the `Origin` header's HOST is one of the hosts
+       this request was addressed to, that assertion is the browser's own proof
+       of same-origin — and it is about the REAL origins, not about whatever a
+       client-supplied `x-forwarded-proto` made this server derive.
+
+       It exists for one measured reason. Next.js builds the request URL's
+       scheme from `x-forwarded-proto` (next/dist/server/next-server.js), and
+       it KEEPS a client-supplied value rather than overwriting it
+       (next/dist/server/base-server.js: `req.headers['x-forwarded-proto'] ??=
+       …`). So in the default configuration a client can make the derived
+       origin `https://<host>` while the browser is on `http://<host>`, and the
+       legitimate write used to be refused. This assertion restores it.
+
+       What it does NOT weaken:
+         - a foreign origin still fails: its HOST is not one of ours;
+         - a same-host, different-scheme browser request still fails: the
+           browser reports `Sec-Fetch-Site: same-site` for it, not
+           `same-origin`;
+         - with `EASY_LEARN_PUBLIC_ORIGIN` configured, this rule does not
+           apply at all — the configured origin is the exact answer.
+       A page on another origin cannot set `Sec-Fetch-Site`: it is a
+       forbidden header name, so only the browser sets it. */
+    if (
+      options.originIsDerived === true &&
+      options.fetchSite &&
+      options.fetchSite.trim().toLowerCase() === "same-origin" &&
+      originHostMatches(options.origin, options.requestHosts ?? [])
+    ) {
+      return { allowed: true, rule: "same-origin" };
+    }
+
     return {
       allowed: false,
       rule: "cross-origin",
@@ -438,5 +570,9 @@ export function evaluateCsrfRequestForRequest(request: Request): CsrfDecision {
     fetchSite: request.headers.get("sec-fetch-site"),
     hasBearerAuthorization,
     requestOrigins: getRequestOrigins(request),
+    requestHosts: getRequestHosts(request),
+    /* A configured public origin is exact, so the derived-origin rule below
+       does not apply to it. */
+    originIsDerived: getConfiguredPublicOrigin() === null,
   });
 }
