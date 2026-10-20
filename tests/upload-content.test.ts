@@ -393,13 +393,32 @@ async function main() {
       source.includes("servedContentTypeFor"),
       "the file route must derive the content type from the server allow-list"
     );
+    /* The headers that are actually sent with the FILE are asserted, not the
+       whole file: the route also sets headers on the object-storage redirect,
+       so a whole-file search would pass even if the served response had
+       lost them. */
+    const baseHeadersAt = source.indexOf("const baseHeaders");
+    assert.ok(baseHeadersAt > 0, "the file route must build the served headers");
+    const baseHeaders = source.slice(baseHeadersAt, baseHeadersAt + 900);
     assert.ok(
-      source.includes("X-Content-Type-Options"),
-      "the file route must send nosniff"
+      baseHeaders.includes("X-Content-Type-Options"),
+      "the served file response must send nosniff"
     );
     assert.ok(
-      source.includes("Content-Security-Policy"),
-      "the file route must send a Content-Security-Policy"
+      baseHeaders.includes("nosniff"),
+      "the served file response must send nosniff"
+    );
+    assert.ok(
+      baseHeaders.includes("Content-Security-Policy"),
+      "the served file response must send a Content-Security-Policy"
+    );
+    assert.ok(
+      baseHeaders.includes("FILE_RESPONSE_CSP"),
+      "the served file response must send the shared file policy"
+    );
+    assert.ok(
+      baseHeaders.includes("Cross-Origin-Resource-Policy"),
+      "the served file response must forbid cross-origin embedding"
     );
   });
 
@@ -412,6 +431,16 @@ async function main() {
     assert.ok(
       /presignedUploadUrl\(config, key, contentType\)/.test(source),
       "the presigned PUT must be bound to the server's content type"
+    );
+    /* The binding above is only as good as where `contentType` comes from:
+       it must be the allow-list's type, never the client's declaration. */
+    assert.ok(
+      /const contentType = rule\.contentType;/.test(source),
+      "the content type bound into the signed PUT must be the allow-list's"
+    );
+    assert.ok(
+      !/const contentType = mimeType/.test(source),
+      "the content type bound into the signed PUT must not come from the client"
     );
   });
 
