@@ -302,6 +302,40 @@ The comparison ignores the path and the query, treats `https://host` and
 `https://host:443` as the same, and compares the **host**, not a suffix of it —
 `evil.app.example.test` is not `app.example.test`.
 
+#### The scheme is still forwarded-header-derived — this matters for availability
+
+The **host** is taken from the `Host` header, and the **scheme** from the
+request URL. In Next.js those two are not independent of the forwarded
+headers:
+
+```js
+// next/dist/server/next-server.js
+const protocol = req.headers["x-forwarded-proto"]?.includes("https") ? "https" : "http";
+```
+
+and the header is **synthesised** when it is absent
+(`next/dist/server/base-server.js`). So in the default configuration:
+
+- `X-Forwarded-Host` is genuinely ignored — the host comes from `Host`;
+- `X-Forwarded-Proto` still reaches the derived scheme, indirectly, through
+  the request URL.
+
+What that can and cannot do:
+
+| | |
+|---|---|
+| Can it make a **foreign** origin acceptable? | **No.** The host still comes from `Host`, so a client that names another host in `Origin` is refused. |
+| Can it **refuse** a write? | **Yes.** A client that sends `X-Forwarded-Proto: https` to a deployment the browser reaches over plain HTTP makes the application compare the request against `https://<host>` while the browser sent `http://<host>`. The write is refused — a self-inflicted denial, not a cross-origin hole. |
+
+A browser cannot set `X-Forwarded-Host` or `X-Forwarded-Proto` on a cross-site
+request without a CORS preflight, and this application does not enable CORS, so
+these headers cannot be used to forge an origin from a foreign page.
+
+The consequence for deployment is the same as for the host: **set
+`EASY_LEARN_PUBLIC_ORIGIN`** whenever an edge is in front of the application.
+It is the only configuration in which neither half of the compared origin
+depends on a forwarded header.
+
 #### Deployment assumptions
 
 | Deployment | What to set |
@@ -566,14 +600,69 @@ that fetches the head of the object and compares it with the extension — or
 configuring the bucket to serve with a fixed `Content-Disposition` and
 `nosniff`.
 
+**Measured in Chromium 153** (`tests/manual/browser-content-type-sniffing-probe.js`,
+nine header combinations): serving HTML bytes with `Content-Type: image/png`
+and `Content-Disposition: inline`, **without** `nosniff` and **without** the
+sandbox policy, does **not** execute the script — the browser treats
+`image/png` as a known image type and does not sniff it into a document.
+`application/octet-stream` is downloaded rather than rendered, and
+`text/plain` is rendered as literal text. **0 of the 9 combinations executed
+script.** That is an observation about Chromium, not a guarantee of the
+platform: the served types are never scriptable, which is the property that
+holds everywhere, and the object store's response cannot be given `nosniff` or
+a CSP — only `response-content-type`, `response-content-disposition` and
+`response-cache-control` — so the object-store path has one fewer layer than
+the local-disk path.
+
+### Who can open a file, and a known limitation for shared identities
+
+`GET /api/files/<id>` resolves the file's owning school **relationally** — the
+schools of its uploader and of its assignment — and then requires that set to
+resolve to exactly one school, so a file that two schools can reach is denied
+to both (`sqlSchoolsOfFile` / `sqlOwnedBySchool` in `src/lib/tenant.ts`).
+
+That rule is deliberate and is covered by an existing regression test. Its
+consequence is that a user who is an **active member of two schools** produces
+a file that neither school can resolve: the uploader's own attachment is
+`404` to them, so the preview and the download do not work. This is
+**pre-existing** — the predicate is byte-for-byte identical in `main`, PR #38,
+PR #39 and PR #40 — and it is **not** a regression introduced by the uploaded
+file work. It is recorded here because the uploaded-file requirements
+("preserve legitimate assignment submissions, previews and downloads") are
+only met for single-school accounts; the live probe in
+`tests/manual/live-upload-content-probe.js` uses a single-school account and
+does not exercise it.
+
+Changing the predicate to read the file's own tenant-attributed
+`uploaded_files.school_id` (NOT NULL since migration 0017, written server-side
+at upload time) would fix it, but that is a **tenant-isolation** change and
+it contradicts an existing deliberate test. It is therefore **not** made here;
+it is recorded as a finding for an independently reviewed change.
+
 ### What is NOT verified here
 
-**No browser was used.** The claim that the sandbox does not break the inline
-previews of images, video and audio, and that it does not break the download
-path, is a reading of the CSP specification and the `Content-Disposition`
-rules — not an observation. A reviewer should open an uploaded image, a video
-and a document in a browser and confirm that the preview still renders and
-that the download still starts. This is the same limitation as §8.
+The sandbox does not break the inline previews of images, video and audio:
+this has now been **measured** in Chromium 153
+(`tests/manual/browser-content-type-sniffing-probe.js` — the image decodes
+(`naturalWidth > 0`), the audio element reaches `readyState 4`, the video
+element fetches the resource, and the preview page logs **no**
+Content-Security-Policy violation).
+
+Two things are still **not** verified, and are stated as such:
+
+- **Video decoding.** The sandbox in this environment has no sample video
+  file and no media tooling, so the video *element's* request was confirmed
+  (200, the application's file headers, no CSP violation) but the frame was
+  never decoded. A reviewer with a real video should confirm the seek bar and
+  the first frame.
+- **Other browsers.** Only Chromium 153 was available. Firefox and Safari
+  have their own sniffing rules; the property that holds everywhere is the
+  one the policy guarantees — the served content type is never scriptable.
+
+Directly navigating to an uploaded image URL makes Chromium's own image-viewer
+chrome log a `default-src 'none'` violation, because the sandbox policy
+applies to the viewer's inline styles. The image still renders. It is console
+noise on direct navigation only, not on an `<img>` in a page.
 
 ---
 
@@ -589,28 +678,40 @@ that the download still starts. This is the same limitation as §8.
 | CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; and the four forwarded-header cases the review asked for — **forged headers, chained proxies, HTTPS termination and ordinary legitimate writes** — under each of the three configurations (default, `EASY_LEARN_TRUST_PROXY_HEADERS`, `EASY_LEARN_PUBLIC_ORIGIN`). |
 | Cookie auth and safe methods | `tests/cookie-auth.test.ts` | The response bodies carry no token; no browser file stores, reads or sends a token; no route reads a token from a URL; no `GET` handler writes; the cookie name has one definition; and, on the **parsed** call sites, no browser file calls `fetch()` or builds an `Authorization` header. The call-path guard covers the **aliased** `fetch` (`const f = fetch`), the **destructured** `fetch` (`const { fetch } = window`), **bracket-notation** access (`window["fetch"]`) and `navigator.sendBeacon`, and pins the one justified `XMLHttpRequest` exception. |
 | Uploaded file content | `tests/upload-content.test.ts` | The served content type is server-determined for every allow-listed extension; a mismatched declared MIME type, an HTML/SVG/XHTML payload, an extension-spoofed file and an inline-rendered unknown file are all refused; the routes store and serve the server's type rather than the client's; and the forbidden extensions are refused outright. |
+| Object-storage content policy | `tests/object-storage-content-policy.test.ts` | The download URL forces the server-determined type and the safe disposition onto the object store's response **and signs them**, so they cannot be swapped out by whoever holds the URL; the signed PUT binds the server's content type; the presign route derives the type from the allow-list and refuses a scriptable declared type. |
 | Membership and session | `tests/membership-auth-db.test.ts` | The login flow, the school-selection flow and the session, read from the cookie the way a browser does, and asserting that the response body carries no token. |
 | The existing suites | `tests/security.test.js`, `tests/tenant-*.test.ts`, `tests/membership-*.test.ts`, … | The tenant isolation and authorization boundaries are unchanged. |
 
 The `test:auth-security` script runs the first four suites on their own, and
 the CI workflow runs them as an explicit step in addition to `npm test`.
 
-There is also a **manual** live probe, `tests/manual/live-upload-content-probe.js`.
-It runs against a production build and a disposable database, and it checks the
-**actual served response** — including a row written directly into the database
-to simulate a file uploaded before the fix. It is not run by CI, because it
-needs a running server and a seeded database; the instructions are in the
-file's header.
+There are also **manual** probes. They are not run by CI, because they need a
+running server, a seeded database and (for the browser ones) a Chromium
+binary; the instructions are in each file's header.
+
+| Probe | What it proves |
+|---|---|
+| `tests/manual/live-upload-content-probe.js` | The **actual served response** against a production build — including a row written directly into the database to simulate a file uploaded before the fix. |
+| `tests/manual/browser-upload-verification.js` | The same flow in a **real browser**: login, session cookie, school selection, navigation, the forged-forwarded-header write, an ordinary write, a cross-site write, the real upload UI with legitimate and hostile files, the served response, the attempt to execute an uploaded payload, logout, and the console. |
+| `tests/manual/browser-content-type-sniffing-probe.js` | What Chromium **does** with each header combination the object store could return, and whether the sandbox CSP breaks the image / audio / video previews. |
+| `tests/manual/forwarded-header-configuration-matrix.js` | The same state-changing request against all three origin configurations. |
 
 ### Not verified here — and stated as such
 
-- **No browser-level test.** This environment has no browser, no Playwright and
-  no Puppeteer. The cookie behaviour, the CSP enforcement and the
-  `SameSite` behaviour are therefore verified at the HTTP level and by source
-  analysis, not by a real browser. A reviewer should open the application in a
-  browser and confirm that: signing in works; the dashboard loads; the file
-  preview loads; a cross-origin `POST` to an API route is refused with `403`;
-  the browser console shows no CSP violation.
+- **Browser-level verification: DONE, with one browser.** A real headless
+  Chromium (153.0.8010.0) was driven against a production build on a
+  disposable database. `tests/manual/browser-upload-verification.js` runs the
+  whole flow — login, session cookie, school selection, navigation, the
+  forged-forwarded-header write, an ordinary write, a cross-site write, the
+  real upload UI with legitimate and hostile files, the served response, the
+  attempt to execute an uploaded payload, logout, and the console — and
+  reports **34 of 34 checks passed**. `tests/manual/browser-content-type-sniffing-probe.js`
+  reports **0 of 9 header combinations executed script** and **0 preview
+  failures**. `tests/manual/forwarded-header-configuration-matrix.js` runs the
+  same write against all three configurations. **Firefox and Safari were not
+  available** — see §7.
+- **Video decoding in a browser.** The element's request was confirmed; no
+  sample video was available in the environment, so no frame was decoded (§7).
 - **The production CSP change could not be observed in a browser.** The
   reasoning for removing `'unsafe-eval'` is that the production build does not
   use `eval` — which was checked by searching the application source — but the
@@ -630,15 +731,16 @@ file's header.
 |---|---|---|
 | 1 | A copied JWT is usable until it expires; logout does not revoke it. | **Open.** Documented in §5. Needs a token-version column or a session store. |
 | 2 | `'unsafe-inline'` remains in the production `script-src`. | **Open.** The follow-up plan is in §6. |
-| 3 | No browser-level verification of the cookie or CSP behaviour. | **Open.** Blocked by the environment, not by the design. |
+| 3 | Browser-level verification of the cookie, the CSP and the upload flows. | **Closed for Chromium 153** — 34/34 browser checks, 0/9 sniffing combinations, 0 preview failures (§8). **Still open for Firefox and Safari**, which were not available. |
 | 4 | The bearer path lets a non-browser client act without an origin check. | **Accepted.** Deliberately supported; it is the only way a script or a service authenticates. It cannot be exercised by a browser cross-site (§4). |
 | 5 | `EASY_LEARN_ALLOWED_ORIGINS` widens the set of origins that may make state-changing requests. | **Accepted.** Empty by default. It must be set deliberately, and each entry is a full trust decision. |
 | 6 | The rate limit on the login route is in-process. | **Open.** A multi-instance deployment does not share it. Out of scope for this change. |
 | 7 | No MFA, and no account lockout beyond the login rate limit. | **Open.** Out of scope. |
 | 8 | No database-level row security (RLS). | **Open.** Out of scope; tenant isolation is enforced in the application layer and covered by the tenant test suites. |
-| 9 | In the object-storage path the bytes never reach the application, so they are not content-validated. | **Open.** Mitigated by forcing the server-determined type and disposition onto the object store's response (§7). Closing it properly needs a post-upload validation step. |
+| 9 | In the object-storage path the bytes never reach the application, so they are not content-validated. | **Open.** Mitigated by forcing the server-determined type and disposition onto the object store's response, and measured to not execute in Chromium (§7). Closing it properly needs a post-upload validation step. |
 | 10 | `EASY_LEARN_TRUST_PROXY_HEADERS=true` lets a client-supplied `X-Forwarded-Host` choose the comparison origin. | **Accepted, and off by default.** It is an explicit operator decision that the edge overwrites the header (§4). A browser still cannot set it cross-site without a CORS preflight. |
-| 11 | The sandbox CSP on file responses is not verified in a browser. | **Open.** Blocked by the environment, not by the design (§7). |
+| 11 | In the **default** configuration the derived scheme still comes from `x-forwarded-proto`, because Next.js builds the request URL from it. | **Open, availability only.** It cannot make a foreign origin acceptable — the host still comes from `Host` — but it can refuse a write. `EASY_LEARN_PUBLIC_ORIGIN` removes the dependency entirely (§4). |
+| 12 | A user who is an active member of **two** schools cannot open their own uploaded files: the file's owning-school set resolves to two schools and is denied to both. | **Open. Pre-existing, not a regression** — the predicate is identical in `main`, PR #38, PR #39 and PR #40, and an existing deliberate test asserts it. Changing it is a tenant-isolation change and needs an independently reviewed change of its own (§7). |
 
 ---
 
