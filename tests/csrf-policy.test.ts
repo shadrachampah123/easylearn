@@ -21,6 +21,8 @@ import {
   isStateChangingMethod,
   STATE_CHANGING_METHODS,
   ALLOWED_ORIGINS_ENV,
+  PUBLIC_ORIGIN_ENV,
+  TRUST_PROXY_HEADERS_ENV,
 } from "@/lib/csrf";
 
 let passed = 0;
@@ -53,6 +55,24 @@ function decide(overrides: Partial<Parameters<typeof evaluateCsrfRequest>[0]> = 
     allowedOrigins: [],
     ...overrides,
   });
+}
+
+/** Runs `fn` with the given environment variables set, then restores them. */
+function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+  const previous: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(vars)) {
+    previous[key] = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
 
 async function main() {
@@ -188,27 +208,74 @@ async function main() {
     assert.ok(!isSameOrigin("https://evil.app.example.test", "https://app.example.test"));
   });
 
-  await test("Request origin: the forwarded host and protocol are used", () => {
-    const request = new Request("https://internal.example.test/api/x", {
+  /* ── The forwarded-header trust policy ───────────────────────────────────────
+     The application cannot tell a client-supplied `X-Forwarded-Host` from one
+     the edge set: RFC 7239 lets a proxy append to a client-supplied value,
+     and an edge that does not set the header leaves the client's value in
+     place with nothing to mark it. The default is therefore to NOT trust
+     them. A deployment configures the trust explicitly. */
+
+  await test("Default: the forwarded headers are not consulted at all", () => {
+    const request = new Request("http://internal.example.test/api/x", {
       headers: {
+        host: "internal.example.test",
         "x-forwarded-host": "app.example.test",
         "x-forwarded-proto": "https",
       },
     });
-    assert.strictEqual(getRequestOrigin(request), "https://app.example.test");
+    const origins = getRequestOrigins(request);
+    assert.ok(
+      !origins.includes("https://app.example.test"),
+      `a forwarded host must not become a candidate without the opt-in: ${origins.join(", ")}`
+    );
+    assert.ok(
+      origins.includes("http://internal.example.test"),
+      `the Host header must be the candidate: ${origins.join(", ")}`
+    );
   });
 
-  await test("Request origin: the Host header is the fallback", () => {
-    const request = new Request("http://localhost:3000/api/x", {
-      headers: { host: "localhost:3000" },
+  await test("Default: an ordinary legitimate write is allowed", () => {
+    // The deployment's own page writes to the deployment's own origin.
+    const request = new Request("https://app.example.test/api/x", {
+      method: "POST",
+      headers: { host: "app.example.test", origin: "https://app.example.test" },
     });
-    assert.strictEqual(getRequestOrigin(request), "http://localhost:3000");
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(decision.allowed, "a same-origin write must be allowed");
+    assert.strictEqual(decision.rule, "same-origin");
   });
 
-  await test("Request origin: a multi-valued forwarded host is not trusted", () => {
-    // RFC 7239 lets a proxy append to a client-supplied value. The FIRST element
-    // of such a list is the one the client controls, so a multi-valued
-    // `x-forwarded-host` is ignored entirely and the `Host` header is used.
+  await test("Default: a forged forwarded host cannot make a foreign origin acceptable", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://evil.example.test",
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(!decision.allowed, "a client must not be able to choose the comparison origin");
+  });
+
+  await test("Default: a forged forwarded host does not break a legitimate write", () => {
+    const request = new Request("https://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.test",
+        host: "app.example.test",
+        "x-forwarded-host": "evil.example.test",
+        "x-forwarded-proto": "http",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(decision.allowed, "a forged header must not refuse a legitimate write");
+  });
+
+  await test("Default: a multi-valued forwarded host is ignored", () => {
+    // RFC 7239 lets a proxy append to a client-supplied value. The FIRST
+    // element of such a list is the one the client controls.
     const request = new Request("http://internal.example.test/api/x", {
       headers: {
         host: "internal.example.test",
@@ -221,16 +288,57 @@ async function main() {
       !origins.some((origin) => origin.includes("evil.example.test")),
       `a client-supplied forwarded host must not become a candidate origin: ${origins.join(", ")}`
     );
+  });
+
+  await test("Default: the Host header is the fallback", () => {
+    const request = new Request("http://localhost:3000/api/x", {
+      headers: { host: "localhost:3000" },
+    });
+    assert.strictEqual(getRequestOrigin(request), "http://localhost:3000");
+  });
+
+  await test("Opt-in: a single-valued forwarded host is used", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      headers: {
+        host: "internal.example.test",
+        "x-forwarded-host": "app.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const origins = withEnv({ [TRUST_PROXY_HEADERS_ENV]: "true" }, () => getRequestOrigins(request));
+    assert.ok(
+      origins.includes("https://app.example.test"),
+      `the forwarded host must be a candidate with the opt-in: ${origins.join(", ")}`
+    );
+  });
+
+  await test("Opt-in: a multi-valued forwarded host is distrusted entirely", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      headers: {
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test, app.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const origins = withEnv({ [TRUST_PROXY_HEADERS_ENV]: "true" }, () => getRequestOrigins(request));
+    assert.ok(
+      !origins.some((origin) => origin.includes("evil.example.test")),
+      `the client-controlled first element must not be trusted: ${origins.join(", ")}`
+    );
+    assert.ok(
+      !origins.some((origin) => origin.includes("app.example.test")),
+      `a multi-valued forwarded host must be distrusted entirely: ${origins.join(", ")}`
+    );
     assert.ok(
       origins.includes("https://internal.example.test"),
       `the Host header must still be a candidate: ${origins.join(", ")}`
     );
   });
 
-  await test("Request origin: a forwarded host is paired with the public https scheme", () => {
+  await test("Opt-in: a forwarded host is paired with the public https scheme", () => {
     // The server synthesises `x-forwarded-proto: http` for a plain internal hop
-    // even when the client spoke https to the edge. The public scheme must
-    // therefore be a candidate whenever a forwarded host was published.
+    // even when the client spoke https to the edge, so the public scheme must
+    // be a candidate whenever a forwarded host was published.
     const request = new Request("http://internal.example.test/api/x", {
       headers: {
         host: "internal.example.test",
@@ -238,62 +346,44 @@ async function main() {
         "x-forwarded-proto": "http",
       },
     });
-    const origins = getRequestOrigins(request);
+    const origins = withEnv({ [TRUST_PROXY_HEADERS_ENV]: "true" }, () => getRequestOrigins(request));
     assert.ok(
       origins.includes("https://app.example.test"),
       `the public https origin must be a candidate: ${origins.join(", ")}`
     );
   });
 
-  await test("Request origin: a forwarded host without a forwarded scheme is still a candidate", () => {
-    // A TLS-terminating edge usually publishes the public host. If it does not
-    // publish the scheme, the public origin is https even though the hop to this
-    // application is plain http — otherwise every same-origin write is refused.
+  await test("Opt-in: a chained proxy's forwarded host list is distrusted", () => {
+    // Two proxies in a chain: the edge appends its own value to whatever it
+    // received. The result is a multi-valued header, which is distrusted
+    // entirely, so the `Host` header governs.
     const request = new Request("http://internal.example.test/api/x", {
-      headers: { host: "internal.example.test", "x-forwarded-host": "app.example.test" },
-    });
-    const origins = getRequestOrigins(request);
-    assert.ok(
-      origins.includes("https://app.example.test"),
-      `the public https origin must be a candidate: ${origins.join(", ")}`
-    );
-    assert.ok(
-      origins.includes("http://app.example.test"),
-      `the forwarded host must be a candidate: ${origins.join(", ")}`
-    );
-  });
-
-  await test("Policy: a forwarded host without a forwarded scheme is not refused", () => {
-    const request = new Request("http://internal.example.test/api/x", {
-      method: "POST",
       headers: {
-        origin: "https://app.example.test",
         host: "internal.example.test",
-        "x-forwarded-host": "app.example.test",
+        "x-forwarded-host": "attacker.example.test, edge.example.test",
+        "x-forwarded-proto": "https, http",
       },
     });
-    const decision = evaluateCsrfRequestForRequest(request);
-    assert.ok(decision.allowed, "a legitimate same-origin write must not be refused");
+    const origins = withEnv({ [TRUST_PROXY_HEADERS_ENV]: "true" }, () => getRequestOrigins(request));
+    assert.ok(
+      !origins.some((origin) => origin.includes("attacker.example.test")),
+      `no element of a chained list may be trusted: ${origins.join(", ")}`
+    );
+    assert.ok(
+      !origins.some((origin) => origin.includes("edge.example.test")),
+      `a chained list must be distrusted entirely: ${origins.join(", ")}`
+    );
   });
 
-  await test("Policy: a client-supplied forwarded host is refused", () => {
-    const request = new Request("http://internal.example.test/api/x", {
-      method: "POST",
-      headers: {
-        origin: "https://evil.example.test",
-        host: "internal.example.test",
-        "x-forwarded-host": "evil.example.test, internal.example.test",
-      },
-    });
-    const decision = evaluateCsrfRequestForRequest(request);
-    assert.ok(!decision.allowed, "a request that chooses its own forwarded host must be refused");
-  });
-
-  await test("Policy: a request that forges both forwarded headers is still origin-checked", () => {
-    // A non-browser client can set both headers, so the host it names becomes a
-    // candidate. It gains nothing it did not already have through the
-    // deliberately supported bearer path, and a browser cannot set these
-    // headers cross-site without a CORS preflight.
+  await test("Opt-in: a client that forges both forwarded headers reaches the origin it names", () => {
+    // This is the documented consequence of the opt-in. A non-browser client
+    // can set both headers, so the host it names becomes a candidate. It
+    // gains nothing it did not already have through the deliberately
+    // supported bearer path, and a browser cannot set these headers
+    // cross-site without a CORS preflight.
+    //
+    // The name of this test used to say the request "is still origin-checked",
+    // which is the opposite of what it asserts. The assertion is unchanged.
     const request = new Request("http://internal.example.test/api/x", {
       method: "POST",
       headers: {
@@ -303,8 +393,125 @@ async function main() {
         "x-forwarded-proto": "https",
       },
     });
-    const decision = evaluateCsrfRequestForRequest(request);
+    const decision = withEnv(
+      { [TRUST_PROXY_HEADERS_ENV]: "true" },
+      () => evaluateCsrfRequestForRequest(request)
+    );
     assert.ok(decision.allowed, "the forwarded headers are trusted only as a single-valued pair");
+  });
+
+  await test("Opt-in: a client-supplied forwarded host list is refused", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://evil.example.test",
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test, internal.example.test",
+      },
+    });
+    const decision = withEnv(
+      { [TRUST_PROXY_HEADERS_ENV]: "true" },
+      () => evaluateCsrfRequestForRequest(request)
+    );
+    assert.ok(!decision.allowed, "a request that appends to its own forwarded host must be refused");
+  });
+
+  await test("Public origin: it is the only origin that is compared against", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      headers: {
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const origins = withEnv(
+      { [PUBLIC_ORIGIN_ENV]: "https://app.example.test" },
+      () => getRequestOrigins(request)
+    );
+    assert.deepStrictEqual(origins, ["https://app.example.test"]);
+  });
+
+  await test("Public origin: a legitimate write is allowed through a rewriting proxy", () => {
+    // The deployment shape that needs the explicit configuration: the edge
+    // rewrites the Host header to an internal name, so the derived origin
+    // would be the internal one and every write would be refused.
+    const request = new Request("http://internal.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.test",
+        host: "internal.example.test",
+        "x-forwarded-host": "app.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const decision = withEnv(
+      { [PUBLIC_ORIGIN_ENV]: "https://app.example.test" },
+      () => evaluateCsrfRequestForRequest(request)
+    );
+    assert.ok(decision.allowed, "a legitimate same-origin write must not be refused");
+  });
+
+  await test("Public origin: a foreign origin is refused", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://evil.example.test",
+        host: "internal.example.test",
+      },
+    });
+    const decision = withEnv(
+      { [PUBLIC_ORIGIN_ENV]: "https://app.example.test" },
+      () => evaluateCsrfRequestForRequest(request)
+    );
+    assert.ok(!decision.allowed, "a foreign origin must be refused");
+  });
+
+  await test("Public origin: it takes precedence over the trusted-proxy opt-in", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      headers: {
+        host: "internal.example.test",
+        "x-forwarded-host": "evil.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const origins = withEnv(
+      { [PUBLIC_ORIGIN_ENV]: "https://app.example.test", [TRUST_PROXY_HEADERS_ENV]: "true" },
+      () => getRequestOrigins(request)
+    );
+    assert.deepStrictEqual(origins, ["https://app.example.test"]);
+  });
+
+  await test("Public origin: an unusable value is ignored rather than throwing", () => {
+    const request = new Request("http://internal.example.test/api/x", {
+      headers: { host: "internal.example.test" },
+    });
+    const origins = withEnv({ [PUBLIC_ORIGIN_ENV]: "not a url" }, () => getRequestOrigins(request));
+    assert.deepStrictEqual(origins, ["http://internal.example.test"]);
+  });
+
+  await test("HTTPS termination: the request URL already carries the public scheme", () => {
+    // Next.js derives the request URL's scheme from `x-forwarded-proto`, so a
+    // TLS-terminating edge presents an https URL and the default policy
+    // compares against the public origin without any extra configuration.
+    const request = new Request("https://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.test",
+        host: "app.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(decision.allowed, "a write behind a TLS-terminating edge must be allowed");
+  });
+
+  await test("HTTPS termination: an http request URL is not treated as the public origin", () => {
+    const request = new Request("http://app.example.test/api/x", {
+      method: "POST",
+      headers: { origin: "https://app.example.test", host: "app.example.test" },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(!decision.allowed, "the scheme must match");
   });
 
   await test("Request wrapper: a real request is judged the same way", () => {

@@ -241,55 +241,77 @@ precisely the case rules 3–7 refuse.
 
 ### The request's own origin
 
-The origin the request was addressed to is reconstructed from the request's own
-headers. The **host** and the **scheme** are taken from independent sources, so
-they are combined as a cross-product rather than being paired up by one header:
+The comparison origin is **not guessed**. It is resolved in this order.
 
-- the **host** is the `Host` header, plus `X-Forwarded-Host` when that header
-  carries exactly **one** value;
-- the **scheme** is `X-Forwarded-Proto` when it is present, otherwise the scheme
-  of the request URL — plus `https` whenever a forwarded host was supplied.
+**1. `EASY_LEARN_PUBLIC_ORIGIN` — the deployment's canonical public origin.**
 
-The extra `https` matters because the scheme that reaches the application is the
-scheme of the **last hop**: the server synthesises `X-Forwarded-Proto: http`
-for a plain internal hop even when the browser spoke `https` to the edge. The
-public scheme is therefore a candidate whenever a proxy published a host. This
-does not widen the set of **hosts** — it only lets the public scheme be
-recognised for the host the proxy already published.
+```
+EASY_LEARN_PUBLIC_ORIGIN="https://easylearn.example.com"
+```
 
-Two rules matter:
+When it is set, it **is** the origin: the request is compared against that
+value and the forwarded headers are ignored completely. This is the
+recommended configuration for any deployment behind a reverse proxy, a CDN or
+a platform edge, because it removes every question about what the edge does
+with the headers it forwards.
 
-- **A multi-valued `X-Forwarded-Host` is not trusted at all.** RFC 7239 lets a
-  proxy *append* to a client-supplied value, and the client's value comes
-  **first**. Trusting the first element of such a list would let a client choose
-  the origin its request is compared against, so the whole header is ignored and
-  the `Host` header is used instead.
-- **The cross-product is what keeps a deployment working.** A reverse proxy that
-  publishes the public host but not the public scheme would otherwise produce
-  `http://public-host` while the browser sends `https://public-host`, and every
-  same-origin write — sign-in, school selection, marking messages read, awarding
-  achievements, uploads — would be refused with `403`.
+**2. Otherwise the origin comes from the request itself** — the `Host` header
+and the scheme of the request URL. The forwarded headers are **not** consulted.
+
+**3. `EASY_LEARN_TRUST_PROXY_HEADERS=true` opts in to the forwarded headers.**
+
+```
+EASY_LEARN_TRUST_PROXY_HEADERS="true"
+```
+
+With the opt-in, the **host** is the `Host` header plus a single-valued
+`X-Forwarded-Host`, and the **scheme** is `X-Forwarded-Proto` or the scheme of
+the request URL, with `https` also a candidate.
+
+#### Why the forwarded headers are not trusted by default
+
+The application **cannot tell a client-supplied `X-Forwarded-Host` from one the
+edge set**:
+
+- RFC 7239 lets a proxy *append* to a client-supplied value, and the client's
+  value comes **first** in the list;
+- an edge that does not set the header at all leaves the client's value in
+  place, with nothing to mark it.
+
+Trusting it by default would let a client choose the origin its own request is
+compared against — it would only have to name the origin it wanted to reach.
+The `Host` header does not have that problem: the server routes on it, so it is
+the host the request was actually addressed to.
+
+The multi-valued rule still applies with the opt-in: a multi-valued
+`X-Forwarded-Host` is distrusted **entirely**, because the first element of
+such a list is the one the client controls.
+
+The extra `https` candidate matters because the scheme that reaches the
+application is the scheme of the **last hop**: the server synthesises
+`X-Forwarded-Proto: http` for a plain internal hop even when the browser spoke
+`https` to the edge. It does not widen the set of **hosts** — it only lets the
+public scheme be recognised for the host the proxy already published.
 
 A browser cannot set `X-Forwarded-Host` or `X-Forwarded-Proto` on a cross-site
 request without a CORS preflight, and this application does not enable CORS, so
-these headers cannot be used to forge an origin from a foreign page.
+these headers cannot be used to forge an origin from a foreign page even with
+the opt-in on.
 
 The comparison ignores the path and the query, treats `https://host` and
 `https://host:443` as the same, and compares the **host**, not a suffix of it —
 `evil.app.example.test` is not `app.example.test`.
 
-### The reverse-proxy requirement
+#### Deployment assumptions
 
-If the application sits behind a reverse proxy, the proxy must forward the
-public host and scheme:
+| Deployment | What to set |
+|---|---|
+| Direct, no proxy | Nothing. The `Host` header is the public host and the request URL's scheme is the public scheme. |
+| Behind an edge that **preserves** the `Host` header | Nothing. Next.js derives the request URL's scheme from `X-Forwarded-Proto`, so a TLS-terminating edge already presents an `https` URL. |
+| Behind an edge that **rewrites** the `Host` header to an internal name, or that rewrites the scheme | `EASY_LEARN_PUBLIC_ORIGIN`. Without it the derived origin is the internal one and every state-changing request is refused with `403`. That is a safe failure — it refuses writes — but it is an outage. |
+| Behind an edge known to **overwrite** (never append to) the forwarded headers, and the operator accepts the trade-off | `EASY_LEARN_TRUST_PROXY_HEADERS=true`. |
 
-```
-X-Forwarded-Host:   the public host, e.g. "easylearn.example.com"
-X-Forwarded-Proto: the public scheme, e.g. "https"
-```
-
-Send **both**, or send **neither**. A proxy that appends to a forwarded header
-must send a single value. This requirement is also stated in `.env.example`.
+The same assumptions are stated in `.env.example`.
 
 ### The refusal
 
@@ -451,20 +473,134 @@ follow-up, with the plan recorded here.
 
 ---
 
-## 7. What is tested, and what is not
+## 7. Uploaded files
+
+### The rule
+
+**The server decides what an uploaded file is.** The client never does.
+
+Before this rule, `POST /api/uploads` stored the MIME type the *client*
+declared in `uploaded_files.mime_type`, and `GET /api/files/<id>` served that
+column back as the `Content-Type`. A client could therefore upload a file
+called `photo.png`, declare `Content-Type: text/html`, and have the
+application's own origin serve the uploaded bytes as an HTML document — a
+stored cross-site scripting hole in the **authenticated** origin, with the
+session cookie attached. The same hole applied to `image/svg+xml`, and to any
+file whose extension was on the allow-list but whose bytes were something else.
+
+Now, in order:
+
+1. **The extension must be on the server's allow-list.** The extension is the
+   only part of the request the server stores, so it is the anchor. `html`,
+   `htm`, `xhtml`, `svg`, `xml` and friends are not on it, and there is no
+   configuration that adds them.
+2. **The bytes must match that extension's signature.** The server reads the
+   file's own header — the PNG signature, the ZIP header, the OLE2 header, the
+   `ftyp` box — and refuses the file if it does not match. A ZIP renamed to
+   `.png` is refused; so is HTML renamed to `.txt`.
+3. **The bytes must not look like HTML, SVG or XHTML**, whatever the extension
+   claims. The check looks for the *document* markers — a doctype, an `<html>`
+   root, an `<svg>` root, an XML prologue followed by SVG — and not for the
+   word `<script>`, because a plain-text assignment that contains a code
+   sample is a legitimate upload.
+4. **The content type that is served is the server's**, taken from the
+   allow-list. It is never `text/html`, `image/svg+xml`,
+   `application/xhtml+xml` or any other type a browser can execute. The
+   client's declared type is used for one thing only: to produce a clearer
+   error when the client asked for something dangerous.
+
+The policy lives in `src/lib/upload-content.ts` and is applied in
+`src/app/api/uploads/route.ts` (local disk), `src/app/api/uploads/presign/route.ts`
+(object storage) and `src/app/api/files/[id]/route.ts` (serving).
+
+### How a file is served
+
+| | |
+|---|---|
+| `Content-Type` | The server's type for the stored file's extension — **not** the stored `mime_type` column. |
+| `Content-Disposition` | `inline` for images, video and audio; `attachment` for documents and archives. |
+| `X-Content-Type-Options` | `nosniff`, so the browser never guesses a different type. |
+| `Content-Security-Policy` | `sandbox; default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` — a response the browser treats as a document is put into an opaque origin with scripting disabled. |
+| `Cross-Origin-Resource-Policy` | `same-origin`. |
+
+The sandbox is the second layer. The first is that the served type is never
+scriptable and an unknown file is never rendered inline.
+
+**Files uploaded before this rule are covered too.** The serve route derives
+the type from the stored file name, not from the stored column, so a row
+written by the old code — with `mime_type = 'text/html'` and a `.png` stored
+name — is served as `image/png`. A stored name whose extension is not on the
+allow-list is served as `application/octet-stream` with a download
+disposition.
+
+### What is deliberately NOT allowed
+
+`html`, `htm`, `xhtml`, `xht`, `svg`, `svgz`, `xml`, `mhtml`, `mht`, `js`,
+`mjs`, `swf`, `jar`, `hta`, `vtt`, `shtml` and `php` are refused outright.
+
+HTML and SVG are **document** formats: the browser renders them and they can
+carry script. Serving them safely needs an origin that cannot reach the
+session — a separate, cookieless file origin, with the application talking to
+it over a server-side channel. That is a real piece of architecture and it is
+**not** implemented here. Until it is, the formats are refused, and the
+refusal is a refusal rather than a warning.
+
+### The object-storage path, and its one weakness
+
+When `OBJECT_STORAGE_*` is configured, the browser PUTs the bytes straight to
+the bucket and the application never sees them. Two consequences:
+
+- The **content type** the object is stored with is the server's, not the
+  client's: the signed PUT requires exactly the type the allow-list names.
+- The **bytes** are not content-validated, because they never reach the
+  application. The download therefore forces the response headers onto the
+  object store's own response (`response-content-type` and
+  `response-content-disposition`), so the object is served with the
+  server-determined type and the safe disposition.
+
+The residual risk is that an object whose bytes are not what its extension
+claims can exist in the bucket. It is served as a non-scriptable type, so it
+cannot execute, but it is not the same guarantee the local-disk path gives.
+Closing it means validating the object after the upload — a server-side step
+that fetches the head of the object and compares it with the extension — or
+configuring the bucket to serve with a fixed `Content-Disposition` and
+`nosniff`.
+
+### What is NOT verified here
+
+**No browser was used.** The claim that the sandbox does not break the inline
+previews of images, video and audio, and that it does not break the download
+path, is a reading of the CSP specification and the `Content-Disposition`
+rules — not an observation. A reviewer should open an uploaded image, a video
+and a document in a browser and confirm that the preview still renders and
+that the download still starts. This is the same limitation as §8.
+
+---
+
+---
+
+## 8. What is tested, and what is not
 
 ### Automated tests
 
 | Suite | File | What it proves |
 |---|---|---|
 | JWT secret policy | `tests/jwt-secret-policy.test.ts` | Weak, short, low-diversity, placeholder and periodic secrets are rejected; a 5000-sample random sweep produces no false rejections. |
-| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; the forwarded-header shapes — a forwarded host without a forwarded scheme, a multi-valued forwarded host, and a forged pair. |
-| Cookie auth and safe methods | `tests/cookie-auth.test.ts` | The response bodies carry no token; no browser file stores, reads or sends a token; no route reads a token from a URL; no `GET` handler writes; the cookie name has one definition; and, on the **parsed** call sites, no browser file calls `fetch()` or builds an `Authorization` header. |
+| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; and the four forwarded-header cases the review asked for — **forged headers, chained proxies, HTTPS termination and ordinary legitimate writes** — under each of the three configurations (default, `EASY_LEARN_TRUST_PROXY_HEADERS`, `EASY_LEARN_PUBLIC_ORIGIN`). |
+| Cookie auth and safe methods | `tests/cookie-auth.test.ts` | The response bodies carry no token; no browser file stores, reads or sends a token; no route reads a token from a URL; no `GET` handler writes; the cookie name has one definition; and, on the **parsed** call sites, no browser file calls `fetch()` or builds an `Authorization` header. The call-path guard covers the **aliased** `fetch` (`const f = fetch`), the **destructured** `fetch` (`const { fetch } = window`), **bracket-notation** access (`window["fetch"]`) and `navigator.sendBeacon`, and pins the one justified `XMLHttpRequest` exception. |
+| Uploaded file content | `tests/upload-content.test.ts` | The served content type is server-determined for every allow-listed extension; a mismatched declared MIME type, an HTML/SVG/XHTML payload, an extension-spoofed file and an inline-rendered unknown file are all refused; the routes store and serve the server's type rather than the client's; and the forbidden extensions are refused outright. |
 | Membership and session | `tests/membership-auth-db.test.ts` | The login flow, the school-selection flow and the session, read from the cookie the way a browser does, and asserting that the response body carries no token. |
 | The existing suites | `tests/security.test.js`, `tests/tenant-*.test.ts`, `tests/membership-*.test.ts`, … | The tenant isolation and authorization boundaries are unchanged. |
 
-The `test:auth-security` script runs the first three suites on their own, and
+The `test:auth-security` script runs the first four suites on their own, and
 the CI workflow runs them as an explicit step in addition to `npm test`.
+
+There is also a **manual** live probe, `tests/manual/live-upload-content-probe.js`.
+It runs against a production build and a disposable database, and it checks the
+**actual served response** — including a row written directly into the database
+to simulate a file uploaded before the fix. It is not run by CI, because it
+needs a running server and a seeded database; the instructions are in the
+file's header.
 
 ### Not verified here — and stated as such
 
@@ -488,7 +624,7 @@ the CI workflow runs them as an explicit step in addition to `npm test`.
 
 ---
 
-## 8. Remaining risks, ranked
+## 9. Remaining risks, ranked
 
 | # | Risk | Status |
 |---|---|---|
@@ -500,10 +636,13 @@ the CI workflow runs them as an explicit step in addition to `npm test`.
 | 6 | The rate limit on the login route is in-process. | **Open.** A multi-instance deployment does not share it. Out of scope for this change. |
 | 7 | No MFA, and no account lockout beyond the login rate limit. | **Open.** Out of scope. |
 | 8 | No database-level row security (RLS). | **Open.** Out of scope; tenant isolation is enforced in the application layer and covered by the tenant test suites. |
+| 9 | In the object-storage path the bytes never reach the application, so they are not content-validated. | **Open.** Mitigated by forcing the server-determined type and disposition onto the object store's response (§7). Closing it properly needs a post-upload validation step. |
+| 10 | `EASY_LEARN_TRUST_PROXY_HEADERS=true` lets a client-supplied `X-Forwarded-Host` choose the comparison origin. | **Accepted, and off by default.** It is an explicit operator decision that the edge overwrites the header (§4). A browser still cannot set it cross-site without a CORS preflight. |
+| 11 | The sandbox CSP on file responses is not verified in a browser. | **Open.** Blocked by the environment, not by the design (§7). |
 
 ---
 
-## 9. Where to look in the code
+## 10. Where to look in the code
 
 | Concern | File |
 |---|---|
@@ -516,4 +655,6 @@ the CI workflow runs them as an explicit step in addition to `npm test`.
 | The CSRF enforcement point | `src/proxy.ts` |
 | The session lifecycle routes | `src/app/api/auth/{login,select-school,me,logout}/route.ts` |
 | The security headers | `next.config.ts` |
+| The uploaded-file content policy | `src/lib/upload-content.ts` |
+| The upload and file-serving routes | `src/app/api/uploads/route.ts`, `src/app/api/uploads/presign/route.ts`, `src/app/api/files/[id]/route.ts` |
 | The operator secret checker | `scripts/check-jwt-secret.mjs` |

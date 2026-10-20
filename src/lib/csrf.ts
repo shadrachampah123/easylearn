@@ -46,30 +46,54 @@
  *    case an attacker would try to construct.
  *
  * ── How the request's own origin is reconstructed ─────────────────────────────
- * The host and the scheme come from INDEPENDENT sources, so they are combined
- * as a cross-product rather than being paired up by one header:
+ * The comparison origin is NOT guessed. It is resolved in this order:
  *
- *   - the host is the `Host` header, plus `x-forwarded-host` when that header
- *     carries exactly ONE value;
- *   - the scheme is `x-forwarded-proto` when it is present, otherwise the
- *     scheme of the request URL — plus `https` whenever a forwarded host was
- *     supplied, because a proxy that terminated TLS leaves the last hop in
- *     plain HTTP.
+ * 1. `EASY_LEARN_PUBLIC_ORIGIN` — the deployment's canonical public origin,
+ *    for example `https://app.example.com`. When it is set, it is THE origin:
+ *    forwarded headers are ignored completely, and the request is compared
+ *    against the configured value. This is the recommended configuration for
+ *    any deployment behind a reverse proxy, a CDN or a platform edge, because
+ *    it removes every question about what the edge does with the headers it
+ *    forwards.
  *
- * Two rules matter here:
+ * 2. Otherwise the origin is derived from the request itself: the `Host`
+ *    header and the scheme of the request URL. Forwarded headers are NOT
+ *    consulted.
  *
- *   - A MULTI-VALUED `x-forwarded-host` is not trusted at all. RFC 7239 lets a
- *     proxy append to a client-supplied value, and the client's value comes
- *     FIRST. Trusting the first element of such a list would let a client
- *     choose the origin its request is compared against.
- *   - The cross-product is what keeps a deployment working. A reverse proxy
- *     that publishes the public host but not the public scheme would otherwise
- *     produce `http://public-host` while the browser sends
- *     `https://public-host`, and every same-origin write would be refused.
+ * 3. `EASY_LEARN_TRUST_PROXY_HEADERS=true` opts in to the forwarded headers
+ *    for deployments whose edge is known to OVERWRITE (never append to)
+ *    `X-Forwarded-Host` and `X-Forwarded-Proto`. With the opt-in, the host is
+ *    the `Host` header plus a single-valued `x-forwarded-host`, and the
+ *    scheme is `x-forwarded-proto` or the request URL's scheme, with `https`
+ *    added as a candidate because a TLS-terminating edge leaves the last hop
+ *    in plain HTTP.
+ *
+ * WHY THE DEFAULT DOES NOT TRUST THE FORWARDED HEADERS
+ * The application cannot tell a client-supplied `X-Forwarded-Host` from one
+ * the edge set. RFC 7239 lets a proxy APPEND to a client-supplied value, so
+ * the first element of such a list is the client's; and an edge that does not
+ * set the header at all leaves the client's value in place, with nothing to
+ * mark it. Trusting it by default would let a client choose the origin its
+ * own request is compared against — it would only have to name the origin it
+ * wanted to reach. The `Host` header has no such problem: the server routes
+ * on it, so it is the host this request was actually addressed to.
  *
  * A browser cannot set `x-forwarded-host` or `x-forwarded-proto` on a cross-site
  * request without a CORS preflight, and this application does not enable CORS,
- * so these headers cannot be used to forge an origin from a foreign page.
+ * so these headers cannot be used to forge an origin from a foreign page even
+ * when the opt-in is on.
+ *
+ * DEPLOYMENT ASSUMPTIONS
+ *   - Direct deployment (no proxy): the default works. The `Host` header is
+ *     the public host and the request URL's scheme is the public scheme.
+ *   - Behind an edge that preserves the `Host` header: the default works.
+ *     Next.js derives the request URL's scheme from `x-forwarded-proto`, so a
+ *     TLS-terminating edge already presents an `https` URL.
+ *   - Behind an edge that REWRITES the `Host` header to an internal name, or
+ *     that rewrites the scheme: set `EASY_LEARN_PUBLIC_ORIGIN`. Without it,
+ *     the derived origin would be the internal one and every state-changing
+ *     request would be refused with 403. That is a safe failure — it refuses
+ *     writes — but it is an outage, so the variable must be set.
  *
  * `SameSite=Lax` on the session cookie is a second line of defence, not the
  * control itself: it blocks a cross-site `POST`, but it does not stop a
@@ -88,6 +112,26 @@ export const STATE_CHANGING_METHODS: ReadonlySet<string> = new Set([
 
 /** The environment variable holding extra origins that are allowed to call the API. */
 export const ALLOWED_ORIGINS_ENV = "EASY_LEARN_ALLOWED_ORIGINS";
+
+/**
+ * The environment variable holding the deployment's canonical public origin.
+ *
+ * When it is set, it is the origin every state-changing request is compared
+ * against, and the forwarded headers are ignored completely. See the module
+ * documentation for the deployment assumptions.
+ */
+export const PUBLIC_ORIGIN_ENV = "EASY_LEARN_PUBLIC_ORIGIN";
+
+/**
+ * The environment variable that opts in to trusting `X-Forwarded-Host` and
+ * `X-Forwarded-Proto`.
+ *
+ * It is OFF by default. Turn it on only when the edge in front of this
+ * application is known to OVERWRITE those headers rather than append to them,
+ * because the application cannot tell a client-supplied value from one the
+ * edge set.
+ */
+export const TRUST_PROXY_HEADERS_ENV = "EASY_LEARN_TRUST_PROXY_HEADERS";
 
 export interface CsrfDecision {
   /** True when the request may proceed. */
@@ -135,17 +179,54 @@ function trustedForwardedHost(header: string | null): string | null {
 /**
  * The scheme the request was addressed with.
  *
- * `x-forwarded-proto` wins when it is present; otherwise the scheme of the
- * request URL is used, which is the scheme of the last hop.
+ * The scheme of the request URL is used, which is the scheme of the last hop
+ * and — in Next.js — is already derived from `x-forwarded-proto`.
+ *
+ * `x-forwarded-proto` is consulted directly only when the deployment has
+ * opted in to trusting the forwarded headers. It cannot widen the accepted
+ * HOST set, so trusting it is a question of availability rather than of
+ * whether a foreign origin is accepted.
  */
-function requestScheme(request: Request): string | null {
-  const forwarded = lastValue(request.headers.get("x-forwarded-proto"));
-  if (forwarded) return forwarded;
+function requestScheme(request: Request, trustProxy: boolean): string | null {
+  if (trustProxy) {
+    const forwarded = lastValue(request.headers.get("x-forwarded-proto"));
+    if (forwarded) return forwarded;
+  }
   try {
     return new URL(request.url).protocol.replace(/:$/, "");
   } catch {
     return null;
   }
+}
+
+/**
+ * The deployment's configured public origin, or null when it is not set.
+ *
+ * An unusable value is ignored rather than throwing: the consequence of a
+ * misconfigured variable is that the request is compared against the derived
+ * origin, which refuses a write rather than accepting a foreign one.
+ */
+export function getConfiguredPublicOrigin(): string | null {
+  const raw = (process.env[PUBLIC_ORIGIN_ENV] || "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the deployment has opted in to trusting the forwarded headers.
+ *
+ * OFF unless `EASY_LEARN_TRUST_PROXY_HEADERS` is explicitly set to a true
+ * value. See the module documentation for why this is not the default.
+ */
+export function trustsProxyHeaders(): boolean {
+  const raw = (process.env[TRUST_PROXY_HEADERS_ENV] || "").trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "yes";
 }
 
 /**
@@ -168,29 +249,41 @@ function requestScheme(request: Request): string | null {
 export function getRequestOrigins(request: Request): string[] {
   const headers = request.headers;
 
+  /* 1. The configured public origin wins outright. Forwarded headers are not
+        consulted at all, so nothing a client sends can influence which origin
+        a request is compared against. */
+  const configured = getConfiguredPublicOrigin();
+  if (configured) return [configured];
+
+  const trustProxy = trustsProxyHeaders();
+
   const hosts = new Set<string>();
   const hostHeader = lastValue(headers.get("host"));
   if (hostHeader) hosts.add(hostHeader);
-  const forwardedHost = trustedForwardedHost(headers.get("x-forwarded-host"));
-  if (forwardedHost) hosts.add(forwardedHost);
-  if (hosts.size === 0) return [];
 
   const schemes = new Set<string>();
-  const scheme = requestScheme(request);
+  const scheme = requestScheme(request, trustProxy);
   if (scheme) schemes.add(scheme);
-  if (forwardedHost) {
-    // A forwarded host means the request came through a proxy, and the proxy may
-    // have terminated TLS. The scheme that reaches this application is then the
-    // scheme of the LAST hop, which is not necessarily the scheme the browser
-    // used: the server synthesises `x-forwarded-proto: http` for a plain
-    // internal hop even when the client spoke https to the edge. The public
-    // origin is therefore also a candidate.
-    //
-    // This does not widen the set of HOSTS — it only lets the public scheme be
-    // recognised for the host the proxy already published. A request for
-    // `http://public-host` still needs the host to be ours.
-    schemes.add("https");
+
+  if (trustProxy) {
+    const forwardedHost = trustedForwardedHost(headers.get("x-forwarded-host"));
+    if (forwardedHost) {
+      hosts.add(forwardedHost);
+      // A forwarded host means the request came through a proxy, and the proxy
+      // may have terminated TLS. The scheme that reaches this application is
+      // then the scheme of the LAST hop, which is not necessarily the scheme
+      // the browser used: the server synthesises `x-forwarded-proto: http` for
+      // a plain internal hop even when the client spoke https to the edge.
+      // The public origin is therefore also a candidate.
+      //
+      // This does not widen the set of HOSTS — it only lets the public scheme
+      // be recognised for the host the proxy already published. A request for
+      // `http://public-host` still needs the host to be ours.
+      schemes.add("https");
+    }
   }
+
+  if (hosts.size === 0) return [];
 
   const origins: string[] = [];
   for (const s of schemes) {

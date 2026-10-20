@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { FILE_RESPONSE_CSP } from "./src/lib/upload-content";
 
 const nextConfig: NextConfig = {
   async headers() {
@@ -101,6 +102,34 @@ const nextConfig: NextConfig = {
             value: "no-store, no-cache, must-revalidate, proxy-revalidate",
           },
           ...securityHeaders,
+        ],
+      },
+      /*
+       * Uploaded files are user-supplied content. They are served with a
+       * server-determined content type that is never scriptable, and this
+       * rule adds the second layer: a response the browser treats as a
+       * document is put into an opaque origin with scripting disabled, so it
+       * cannot reach this application's session or DOM.
+       *
+       * This rule comes LAST so that it replaces the general policy above for
+       * file responses. The route handler sets the same value, so the header
+       * is the same whichever of the two is applied.
+       */
+      {
+        source: "/api/files/:path*",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: FILE_RESPONSE_CSP,
+          },
+          {
+            key: "X-Content-Type-Options",
+            value: "nosniff",
+          },
+          {
+            key: "Cross-Origin-Resource-Policy",
+            value: "same-origin",
+          },
         ],
       },
     ];

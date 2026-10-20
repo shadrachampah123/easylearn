@@ -77,21 +77,69 @@ function parse(file: string, source: string): ts.SourceFile {
   );
 }
 
+/** The global objects a `fetch` may hang off. */
+const GLOBAL_OBJECTS = ["window", "globalThis", "self"];
+
 /**
- * True when the expression is a call of the global `fetch`.
+ * True when the expression is a reference to the global `fetch`, in every
+ * shape it can take:
  *
- * `fetch(...)`, `window.fetch(...)` and `globalThis.fetch(...)` all count. A
- * call of a *different* function that happens to be named `fetch` does not.
+ *   fetch(...)              — the bare identifier
+ *   window.fetch(...)       — a property access on a global object
+ *   globalThis.fetch(...)   — likewise
+ *   self.fetch(...)         — likewise
+ *   window["fetch"](...)    — bracket notation on a global object
+ *
+ * A call of a *different* function that happens to be named `fetch` — such as
+ * the `fetchUsers()` helper the admin pages define — does not count, because
+ * the name is compared as a whole.
  */
-function isFetchCallee(expression: ts.Expression): boolean {
+function isGlobalFetchReference(expression: ts.Expression): boolean {
   if (ts.isIdentifier(expression)) return expression.text === "fetch";
-  if (ts.isPropertyAccessExpression(expression) && expression.name.text === "fetch") {
+  if (ts.isPropertyAccessExpression(expression)) {
     return (
+      expression.name.text === "fetch" &&
       ts.isIdentifier(expression.expression) &&
-      ["window", "globalThis", "self"].includes(expression.expression.text)
+      GLOBAL_OBJECTS.includes(expression.expression.text)
+    );
+  }
+  if (ts.isElementAccessExpression(expression)) {
+    const argument = expression.argumentExpression;
+    const literal =
+      ts.isStringLiteral(argument) || ts.isNoSubstitutionTemplateLiteral(argument)
+        ? argument.text
+        : null;
+    return (
+      literal === "fetch" &&
+      ts.isIdentifier(expression.expression) &&
+      GLOBAL_OBJECTS.includes(expression.expression.text)
     );
   }
   return false;
+}
+
+/** True when the node is the callee of a call expression. */
+function isCallCallee(node: ts.Node): boolean {
+  const parent = node.parent;
+  return Boolean(parent && ts.isCallExpression(parent) && parent.expression === node);
+}
+
+/**
+ * True when the node is the operand of a `typeof` expression.
+ *
+ * `typeof fetch === "undefined"` is a feature-detection idiom, not a way to
+ * obtain the function, so it is the one documented exception to the rule that
+ * the global `fetch` may only appear as the callee of a call.
+ */
+function isTypeofOperand(node: ts.Node): boolean {
+  const parent = node.parent;
+  return Boolean(parent && ts.isTypeOfExpression(parent) && parent.expression === node);
+}
+
+/** True when the node is the bound name of a destructuring pattern. */
+function isBindingName(node: ts.Node): boolean {
+  const parent = node.parent;
+  return Boolean(parent && ts.isBindingElement(parent) && parent.name === node);
 }
 
 async function main() {
@@ -235,7 +283,7 @@ async function main() {
       const source = read(file);
       const parsed = parse(file, source);
       const visit = (node: ts.Node) => {
-        if (ts.isCallExpression(node) && isFetchCallee(node.expression)) {
+        if (ts.isCallExpression(node) && isGlobalFetchReference(node.expression)) {
           offenders.push(file);
         }
         ts.forEachChild(node, visit);
@@ -246,6 +294,201 @@ async function main() {
       offenders,
       [],
       `these browser files call fetch() directly instead of apiFetch(): ${offenders.join(", ")}`
+    );
+  });
+
+  await test("The browser code does not alias the global fetch", () => {
+    // Catching the CALL SITE is not enough. `const f = fetch;` followed by
+    // `f(url)` never mentions `fetch` at the call, so it would slip past a
+    // call-site check. The rule is therefore stronger: in browser code the
+    // global `fetch` may only appear as the callee of a call.
+    //
+    // The one documented exception is `typeof fetch`, which is feature
+    // detection and cannot obtain the function.
+    const offenders: string[] = [];
+    for (const file of browserFiles()) {
+      const source = read(file);
+      const parsed = parse(file, source);
+      const visit = (node: ts.Node) => {
+        if (ts.isIdentifier(node) && node.text === "fetch") {
+          if (!isCallCallee(node) && !isTypeofOperand(node) && !isBindingName(node)) {
+            offenders.push(`${file} (the global fetch is used as a value)`);
+          }
+        }
+        if (
+          ts.isPropertyAccessExpression(node) &&
+          node.name.text === "fetch" &&
+          ts.isIdentifier(node.expression) &&
+          GLOBAL_OBJECTS.includes(node.expression.text) &&
+          !isCallCallee(node)
+        ) {
+          offenders.push(`${file} (window.fetch is used as a value)`);
+        }
+        if (
+          ts.isElementAccessExpression(node) &&
+          (ts.isStringLiteral(node.argumentExpression) ||
+            ts.isNoSubstitutionTemplateLiteral(node.argumentExpression)) &&
+          node.argumentExpression.text === "fetch" &&
+          ts.isIdentifier(node.expression) &&
+          GLOBAL_OBJECTS.includes(node.expression.text) &&
+          !isCallCallee(node)
+        ) {
+          offenders.push(`${file} (window["fetch"] is used as a value)`);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(parsed);
+    }
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `the global fetch must not be aliased in browser code: ${offenders.join(", ")}`
+    );
+  });
+
+  await test("The browser code does not destructure fetch off a global object", () => {
+    // `const { fetch } = window;` and `const { fetch: myFetch } = window;`
+    // both obtain the function without ever naming it at a call site.
+    const offenders: string[] = [];
+    for (const file of browserFiles()) {
+      const source = read(file);
+      const parsed = parse(file, source);
+      const visit = (node: ts.Node) => {
+        if (ts.isBindingElement(node)) {
+          const candidates = [node.propertyName, node.name];
+          if (
+            candidates.some(
+              (candidate) =>
+                candidate !== undefined &&
+                ts.isIdentifier(candidate) &&
+                candidate.text === "fetch"
+            )
+          ) {
+            offenders.push(`${file} (fetch is destructured)`);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(parsed);
+    }
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `fetch must not be destructured in browser code: ${offenders.join(", ")}`
+    );
+  });
+
+  await test("The browser code does not reach fetch through bracket notation", () => {
+    // `window["fetch"](url)` is a call of the global fetch that a text-based
+    // check for `fetch(` would miss, because of the bracket.
+    const offenders: string[] = [];
+    for (const file of browserFiles()) {
+      const source = read(file);
+      const parsed = parse(file, source);
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isElementAccessExpression(node.expression) &&
+          (ts.isStringLiteral(node.expression.argumentExpression) ||
+            ts.isNoSubstitutionTemplateLiteral(node.expression.argumentExpression)) &&
+          node.expression.argumentExpression.text === "fetch" &&
+          ts.isIdentifier(node.expression.expression) &&
+          GLOBAL_OBJECTS.includes(node.expression.expression.text)
+        ) {
+          offenders.push(file);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(parsed);
+    }
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `these browser files call fetch() through bracket notation: ${offenders.join(", ")}`
+    );
+  });
+
+  await test("The browser code does not use navigator.sendBeacon", () => {
+    // `navigator.sendBeacon(url, body)` issues a request with the session
+    // cookie attached, and it cannot be routed through `apiFetch()`, so the
+    // single audited call path would be bypassed.
+    const offenders: string[] = [];
+    for (const file of browserFiles()) {
+      const source = read(file);
+      const parsed = parse(file, source);
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isPropertyAccessExpression(node) &&
+          node.name.text === "sendBeacon" &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === "navigator"
+        ) {
+          offenders.push(file);
+        }
+        if (
+          ts.isElementAccessExpression(node) &&
+          (ts.isStringLiteral(node.argumentExpression) ||
+            ts.isNoSubstitutionTemplateLiteral(node.argumentExpression)) &&
+          node.argumentExpression.text === "sendBeacon"
+        ) {
+          offenders.push(file);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(parsed);
+    }
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `these browser files use navigator.sendBeacon: ${offenders.join(", ")}`
+    );
+  });
+
+  await test("XMLHttpRequest is used only in the audited upload component", () => {
+    // The one justified exception, pinned by this test.
+    //
+    // `src/components/dashboard/FileUploader.tsx` uploads straight to the
+    // object store with a presigned PUT, and to the legacy multipart endpoint
+    // with a POST, because it needs upload progress events that `fetch` does
+    // not provide. It is the ONLY file in the browser tree allowed to build
+    // an XMLHttpRequest, and it never sends the session cookie to another
+    // origin: the presigned URL points at the object store, and the multipart
+    // POST is same-origin.
+    //
+    // Every other browser file must use `apiFetch()`.
+    const allowed = "src/components/dashboard/FileUploader.tsx";
+    const offenders: string[] = [];
+    for (const file of browserFiles()) {
+      if (file === allowed) continue;
+      const source = read(file);
+      const parsed = parse(file, source);
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isNewExpression(node) &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === "XMLHttpRequest"
+        ) {
+          offenders.push(file);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(parsed);
+    }
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `these browser files build an XMLHttpRequest outside ${allowed}: ${offenders.join(", ")}`
+    );
+  });
+
+  await test("The audited upload component really is the XMLHttpRequest user", () => {
+    // If the exception above ever stops applying, the exception must stop
+    // being granted: this test fails when the upload component no longer uses
+    // XMLHttpRequest, so the pin cannot silently become a blanket allowance.
+    const source = read("src/components/dashboard/FileUploader.tsx");
+    assert.ok(
+      source.includes("new XMLHttpRequest()"),
+      "the upload component must still be the one place XMLHttpRequest is used"
     );
   });
 
