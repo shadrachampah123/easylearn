@@ -12,8 +12,9 @@ import {
  * Renders stored attachment metadata as a friendly list:
  *  - images / videos / audio preview inline
  *  - everything else as a download link
- * File URLs are /api/files/<id> which require a token, so links carry
- * ?token= (the <video>/<a> elements cannot set an Authorization header).
+ * File URLs are /api/files/<id>, which require a session. The session is the
+ * `httpOnly` cookie, and the browser attaches it to a same-origin <img>, <video>,
+ * <audio> and <a> request by itself, so no credential is put in the URL.
  */
 export default function AttachmentList({
   attachments,
@@ -25,10 +26,8 @@ export default function AttachmentList({
   const items = storedAttachments(attachments);
   if (items.length === 0) return null;
 
-  const token = typeof window !== "undefined" ? localStorage.getItem("el_token") || "" : "";
-
   function fileUrl(attachment: StoredAttachment): string {
-    return `${attachment.url}?token=${encodeURIComponent(token)}`;
+    return attachment.url;
   }
 
   return (

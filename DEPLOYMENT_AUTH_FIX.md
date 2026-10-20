@@ -86,13 +86,18 @@ After the schema is ready, send one POST request to the deployed seed endpoint:
 ### macOS/Linux
 
 ```bash
-curl -X POST https://YOUR-APP.vercel.app/api/seed
+# The seed endpoint is disabled in production and requires a super_admin session in
+# development. A state-changing request must also identify its origin, so send the
+# session token as a bearer token (or add an `Origin:` header matching the host).
+curl -X POST https://YOUR-APP.vercel.app/api/seed \
+  -H "Authorization: Bearer $SUPER_ADMIN_TOKEN"
 ```
 
 ### Windows PowerShell
 
 ```powershell
-Invoke-RestMethod -Method POST -Uri 'https://YOUR-APP.vercel.app/api/seed'
+Invoke-RestMethod -Method POST -Uri 'https://YOUR-APP.vercel.app/api/seed' `
+  -Headers @{ Authorization = "Bearer $env:SUPER_ADMIN_TOKEN" }
 ```
 
 Then test:

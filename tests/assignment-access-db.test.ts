@@ -14,6 +14,7 @@ import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
 import { NextRequest } from "next/server";
+import { createTestJwtSecret } from "./helpers/test-secret";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
@@ -23,7 +24,7 @@ const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
 );
 const DB_NAME = `easylearn_assignment_auth_${crypto.randomBytes(4).toString("hex")}`;
 const PASSWORD = "Assignment-Auth-Test-Password!";
-const JWT_SECRET = "assignment-auth-test-secret-0123456789";
+const JWT_SECRET = createTestJwtSecret();
 
 let passed = 0;
 let failed = 0;

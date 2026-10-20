@@ -23,6 +23,7 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 import { createRequire } from "module";
+import { createTestJwtSecret } from "./helpers/test-secret";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
@@ -30,7 +31,7 @@ const { createScratchDatabase, dropScratchDatabase, assertCleanupSucceeded } =
   requireFromRepo("./tests/helpers/scratch-db.js");
 
 const RUN_ID = crypto.randomBytes(4).toString("hex");
-const JWT_SECRET = "scratch-db-lifecycle-test-secret-0123456789";
+const JWT_SECRET = createTestJwtSecret();
 const REQUIRE_ENV = "EASY_LEARN_REQUIRE_SCRATCH_DB_LIFECYCLE";
 
 let passed = 0;

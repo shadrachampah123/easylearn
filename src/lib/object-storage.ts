@@ -126,14 +126,26 @@ function objectUrlParts(config: ObjectStorageConfig, key: string): UrlParts {
 }
 
 /** Public or signed URL used to read an object (the /api/files/<id> redirect target). */
-export function objectDownloadUrl(config: ObjectStorageConfig, key: string): string {
+export function objectDownloadUrl(
+  config: ObjectStorageConfig,
+  key: string,
+  options?: { contentType?: string; disposition?: string }
+): string {
+  const query = new URLSearchParams();
+  if (options?.contentType) query.set("response-content-type", options.contentType);
+  if (options?.disposition) query.set("response-content-disposition", options.disposition);
+  const suffix = query.toString();
+
   if (config.publicBaseUrl) {
-    return `${config.publicBaseUrl.replace(/\/+$/, "")}/${canonicalUri(key)}`;
+    const base = `${config.publicBaseUrl.replace(/\/+$/, "")}/${canonicalUri(key)}`;
+    return suffix ? `${base}?${suffix}` : base;
   }
   return presignUrl(config, {
     method: "GET",
     key,
     expiresSeconds: config.downloadExpirySeconds,
+    responseContentType: options?.contentType,
+    responseContentDisposition: options?.disposition,
   }).url;
 }
 
@@ -145,6 +157,15 @@ interface PresignRequest {
   expiresSeconds: number;
   /** Optional extra header to sign (PUT content type). */
   contentType?: string;
+  /**
+   * Response-header overrides for a GET. S3-compatible stores accept
+   * `response-content-type` and `response-content-disposition` as query
+   * parameters and apply them to the response, which is how an uploaded
+   * object can be served with a server-determined type and a download
+   * disposition even though the bytes were uploaded straight to the bucket.
+   */
+  responseContentType?: string;
+  responseContentDisposition?: string;
   now?: Date;
 }
 
@@ -192,6 +213,15 @@ export function presignUrl(config: ObjectStorageConfig, request: PresignRequest)
     "X-Amz-Expires": String(request.expiresSeconds),
     "X-Amz-SignedHeaders": signedHeadersString,
   };
+
+  /* Response-header overrides are part of the canonical query string, so they
+     are signed together with everything else. */
+  if (request.responseContentType) {
+    query["response-content-type"] = request.responseContentType;
+  }
+  if (request.responseContentDisposition) {
+    query["response-content-disposition"] = request.responseContentDisposition;
+  }
 
   const canonicalQueryString = Object.keys(query)
     .sort()

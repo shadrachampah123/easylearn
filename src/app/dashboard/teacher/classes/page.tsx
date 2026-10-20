@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
 import { teacherNav } from "@/lib/teacher-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface TeacherClass {
   id: string;
@@ -30,10 +31,9 @@ export default function TeacherClassesPage() {
 
 
   const loadData = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch("/api/teacher-classes", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/teacher-classes");
       const data = await res.json();
       if (data.success) setClasses(data.data);
     } catch (err) {
@@ -51,9 +51,8 @@ export default function TeacherClassesPage() {
 
   async function loadEnrollments(classId: string) {
     setSelectedClass(classId);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/enrollments?classId=${classId}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/enrollments?classId=${classId}`);
       const data = await res.json();
       if (data.success) setEnrollments(data.data);
     } catch (err) {

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface AttendanceRow {
   id: string;
@@ -19,8 +20,7 @@ export default function ParentAttendancePage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/auth/me")
       .then((r) => r.json())
       .then((data) => {
         if (data.success) loadChildren(data.data.user.id);
@@ -28,13 +28,12 @@ export default function ParentAttendancePage() {
   }, []);
 
   async function loadChildren(parentId: string) {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/parent-learners?parentId=${parentId}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
       const data = await res.json();
       if (data.success) {
         const learnerIds = data.data.map((c: { learnerId: string }) => c.learnerId);
-        const userRes = await fetch("/api/users?role=learner&limit=100", { headers: { Authorization: `Bearer ${token}` } });
+        const userRes = await apiFetch("/api/users?role=learner&limit=100");
         const userData = await userRes.json();
         if (userData.success) {
           const kids = userData.data.users.filter((l: { id: string }) => learnerIds.includes(l.id));
@@ -49,10 +48,9 @@ export default function ParentAttendancePage() {
 
   async function loadAttendance(learnerId: string) {
     setChildId(learnerId);
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch(`/api/attendance?learnerId=${learnerId}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/attendance?learnerId=${learnerId}`);
       const data = await res.json();
       if (data.success) setRecords(data.data);
     } catch (err) {

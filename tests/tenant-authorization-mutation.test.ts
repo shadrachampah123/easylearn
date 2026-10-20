@@ -81,14 +81,14 @@ const mutations: Mutation[] = [
   {
     id: "M1",
     name: "membership check removed (no membership → fabricated school context)",
-    find: `  const context = await resolveAuthContext(request, tokenOverride);
+    find: `  const context = await resolveAuthContext(request);
   if (!context.school) {
     const message = context.memberships.length > 1
       ? "Select one of your schools before continuing"
       : "You do not have an active school membership in an active school";
     throw new AuthContextError(message, 403);
   }`,
-    replace: `  const context = await resolveAuthContext(request, tokenOverride);
+    replace: `  const context = await resolveAuthContext(request);
   if (!context.school) {
     // MUTANT M1: permissive fallback instead of failing closed.
     const { schools } = await import("@/db/schema");
