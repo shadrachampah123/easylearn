@@ -26,11 +26,15 @@ const ADMIN_ROLES = new Set<string>(SCHOOL_ADMIN_EXTENDED_ROLES);
 /**
  * Serve an uploaded file with authentication, TENANT and per-file access control.
  *
- *  - Phase 2C: the file must belong to the caller's school. Ownership is resolved through
- *    the relational chain (uploader membership + the assignment it belongs to) inside the
- *    SQL predicate, so another school's file is "not found" — it is never fetched, never
- *    counted and never distinguishable from a file that does not exist. A file whose
- *    ownership cannot be resolved (no membership anywhere) is denied to everyone.
+ *  - Phase 2C: the file must belong to the caller's school. On a migrated schema
+ *    (0016/0017) that means the file's own `school_id` — the school that wrote it — so
+ *    another school's file is "not found": it is never fetched, never counted and never
+ *    distinguishable from a file that does not exist. A legacy row whose `school_id` is
+ *    still NULL is attributed through the relational chain (uploader membership + the
+ *    assignment it belongs to) and is denied to everyone when that chain is ambiguous.
+ *  - A user who belongs to more than one school therefore sees the files they uploaded
+ *    to each of those schools in the school that stored them, and NEVER in their other
+ *    school.
  *  - Submission files: only the learner who uploaded them, the teacher who
  *    owns the assignment, and school administrators may read them.
  *  - Assignment materials: any authenticated member of the file's school may read them.

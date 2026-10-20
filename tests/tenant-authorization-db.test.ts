@@ -901,15 +901,21 @@ async function main() {
       assertEq(result.status, 404, "cross-school submission file");
     });
 
-    await test("Files: an unattributable file (no resolvable school) is denied", async () => {
+    await test("Files: a file stored in School A is invisible to School B and to a platform account", async () => {
       // A platform account has no school context at all → 403 before the file is even read.
       const platform = await call("files/[id]", { token: tokens["platform"], params: { id: orphanFile } });
       assertEq(platform.status, 403, "platform account must not receive a school context");
-      // A school member must not be able to learn that somebody else's file exists → 404.
-      for (const key of ["admin-a", "admin-b"]) {
-        const result = await call("files/[id]", { token: tokens[key], params: { id: orphanFile } });
-        assertEq(result.status, 404, `${key} must not be able to resolve an unattributable file`);
-      }
+      // A school member must not be able to learn that another school's file exists → 404.
+      const foreign = await call("files/[id]", { token: tokens["admin-b"], params: { id: orphanFile } });
+      assertEq(foreign.status, 404, "admin-b must not be able to resolve another school's file");
+      /* The storing school owns the file. On a migrated schema (0016/0017) a file is
+         attributed by its own `school_id` — the same rule Phase 2D applies to classes and
+         assignments — so the uploader's membership is irrelevant to attribution. This
+         cannot be forged: BOTH write paths (POST /api/uploads and POST /api/uploads/presign)
+         set `school_id` from the caller's VERIFIED school context, never from client input,
+         so a file can only ever be stored in a school the uploader was a member of. */
+      const own = await call("files/[id]", { token: tokens["admin-a"], params: { id: orphanFile } });
+      assertEq(own.status, 200, "the school that stored the file owns it");
     });
 
     await test("Files: the same-school owner can download their own file (legitimate access)", async () => {
@@ -1272,8 +1278,7 @@ async function main() {
          OWN school_id rather than by which schools can "reach" it through memberships. A
          dual-membership learner enrolling in School A's class therefore no longer makes the
          class belong to neither school: School A keeps it (direct school_id) and School B is
-         still denied. The relational "reachable from two schools → deny both" rule still
-         applies to routes that attribute via membership (e.g. files), asserted below. */
+         still denied. Uploaded files follow the same rule (Phase 2D), asserted below. */
       const dual = (
         await one(
           `INSERT INTO users (email, username, password_hash, role, first_name, last_name, is_active)
@@ -1309,8 +1314,15 @@ async function main() {
         const foreignSchool = await call("attendance", { token: tokens["admin-b"], query: { classId: classA } });
         assertEq(foreignSchool.status, 404, "School B must still be denied the class");
 
-        /* A file that is reachable from School A (its assignment) and from School B (its
-           uploader) is still unattributable under the relational file predicate. */
+        /* A file is attributed by the school that STORED it (`uploaded_files.school_id`,
+           NOT NULL since 0017) — the same treatment assignments got in Phase 2D. The
+           uploader's second membership no longer makes the file unattributable, so
+           School A keeps the file it stored.
+           The isolation property the old relational rule protected is UNCHANGED: the
+           file stays invisible in School B, the uploader's other school, and to School B's
+           administrator. The relational "reachable from two schools → deny both" rule
+           survives as the fallback for legacy rows whose `school_id` is still NULL —
+           see tests/tenant-file-attribution-db.test.ts (case F1). */
         const dualFile = (
           await one(
             `INSERT INTO uploaded_files (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
@@ -1319,10 +1331,10 @@ async function main() {
           )
         ).id as string;
         fs.writeFileSync(path.join(UPLOAD_DIR, "stored-dual.pdf"), "%PDF-1.4 dual");
-        for (const token of [tokens["admin-a"], tokens["admin-b"]]) {
-          const result = await call("files/[id]", { token, params: { id: dualFile } });
-          assertEq(result.status, 404, "a file two schools can reach must be denied to both");
-        }
+        const fileOwnSchool = await call("files/[id]", { token: tokens["admin-a"], params: { id: dualFile } });
+        assertEq(fileOwnSchool.status, 200, "the file stays readable in the school that stored it");
+        const fileOtherSchool = await call("files/[id]", { token: tokens["admin-b"], params: { id: dualFile } });
+        assertEq(fileOtherSchool.status, 404, "the file must stay invisible in the uploader's other school");
 
         /* The dual member must choose; only the signed, selected school token carries context. */
         const noSelection = await call("attendance", { token: unselectedDualToken, query: { learnerId: dual } });
