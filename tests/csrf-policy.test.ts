@@ -290,6 +290,63 @@ async function main() {
     );
   });
 
+  await test("Default: the scheme still comes from the request URL, not from the forwarded host", () => {
+    // The HOST is taken from the `Host` header and the SCHEME from the
+    // request URL. This test pins the half of the pair that the forwarded
+    // host cannot reach: a client that forges `X-Forwarded-Host` cannot
+    // change the scheme, and therefore cannot turn `https://app` into
+    // `http://evil`.
+    const request = new Request("https://app.example.test/api/x", {
+      headers: {
+        host: "app.example.test",
+        "x-forwarded-host": "evil.example.test",
+      },
+    });
+    assert.deepStrictEqual(getRequestOrigins(request), ["https://app.example.test"]);
+  });
+
+  await test("Default: a forged forwarded PROTO can only refuse a write, never widen it", () => {
+    // Next.js builds the request URL's scheme from `x-forwarded-proto`
+    // (next/dist/server/next-server.js), so that header still reaches the
+    // derived scheme even in the default configuration. Two properties are
+    // pinned here:
+    //
+    //   1. it cannot make a FOREIGN origin acceptable — the host still comes
+    //      from the `Host` header;
+    //   2. it can refuse a write whose browser-side scheme no longer matches
+    //      (the deployment-shape consequence, documented in §4 of
+    //      docs/SECURITY_AUTHENTICATION.md).
+    const forged = new Request("http://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "http://app.example.test",
+        host: "app.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const origins = getRequestOrigins(forged);
+    assert.ok(
+      !origins.some((origin) => origin.includes("evil")),
+      `the forwarded proto must not introduce a foreign host: ${origins.join(", ")}`
+    );
+    assert.ok(
+      origins.every((origin) => origin.endsWith("app.example.test")),
+      `the host must still come from the Host header: ${origins.join(", ")}`
+    );
+
+    // The request URL is built by Next.js from the same header, so the
+    // derived scheme follows it — this is the behaviour that makes
+    // EASY_LEARN_PUBLIC_ORIGIN the recommended configuration.
+    const nextJsUrl = new Request("https://app.example.test/api/x", {
+      headers: { host: "app.example.test", "x-forwarded-proto": "https" },
+    });
+    assert.deepStrictEqual(
+      getRequestOrigins(nextJsUrl),
+      ["https://app.example.test"],
+      "the scheme follows the request URL, which Next.js derives from x-forwarded-proto"
+    );
+  });
+
   await test("Default: the Host header is the fallback", () => {
     const request = new Request("http://localhost:3000/api/x", {
       headers: { host: "localhost:3000" },
