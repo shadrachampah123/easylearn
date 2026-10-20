@@ -6,8 +6,8 @@
  * question unanswered: what does the store ACTUALLY do with those URLs?
  *
  * This suite runs a real S3 API server (s3rver — a from-scratch implementation
- * of the S3 REST API, including the SigV4 query-string authentication and the
- * `response-*` override handling) and drives the application's real route
+ * of the S3 REST API, including the query-string authentication parameters and
+ * the `response-*` override handling) and drives the application's real route
  * handlers against it and against a real PostgreSQL.
  *
  * What it proves:

@@ -369,9 +369,42 @@ async function main() {
     /* ── 2. CSRF-protected writes with the supported proxy configuration ───── */
     console.log("\n── 2. CSRF-protected writes ──");
 
-    /* A forged forwarded header must not change the origin the request is
-       compared against (the default configuration does not trust them). */
-    const forged = await browserWrite(page, "/api/auth/select-school", {
+    /* A forged forwarded HOST must not change where the request is sent. The
+       default configuration does not trust the forwarded headers at all: the
+       request is compared against the `Host` header and the browser's own
+       origin, so a forged `X-Forwarded-Host` cannot move the request to
+       another origin — it is simply ignored. */
+    const forgedHost = await browserWrite(page, "/api/auth/select-school", {
+      method: "POST",
+      headers: { "X-Forwarded-Host": "evil.test" },
+      body: { schoolId: SCHOOL_ID },
+    });
+    check(
+      "a write with a forged forwarded host is still made against this application's own origin",
+      forgedHost.status >= 200 && forgedHost.status < 400,
+      `status ${forgedHost.status}: ${JSON.stringify(forgedHost.body)}`
+    );
+
+    /* A forged forwarded PROTO used to REFUSE a legitimate same-origin write.
+       Next.js derives the request URL's scheme from that header, so the
+       comparison was made against `https://<host>` while the browser was on
+       `http://<host>`, and the write was refused. The browser's own
+       `Sec-Fetch-Site: same-origin` is proof about the real origins, so the
+       write is no longer refused. */
+    const forgedProto = await browserWrite(page, "/api/auth/select-school", {
+      method: "POST",
+      headers: { "X-Forwarded-Proto": "https" },
+      body: { schoolId: SCHOOL_ID },
+    });
+    check(
+      "a write with a forged forwarded proto is no longer refused",
+      forgedProto.status >= 200 && forgedProto.status < 400,
+      `status ${forgedProto.status}: ${JSON.stringify(forgedProto.body)}`
+    );
+
+    /* Both headers together must not move the request to another origin
+       either. */
+    const forgedBoth = await browserWrite(page, "/api/auth/select-school", {
       method: "POST",
       headers: {
         "X-Forwarded-Host": "evil.test",
@@ -380,9 +413,9 @@ async function main() {
       body: { schoolId: SCHOOL_ID },
     });
     check(
-      "a write with forged forwarded headers is refused by default",
-      forged.status === 403,
-      `status ${forged.status}: ${JSON.stringify(forged.body)}`
+      "a write with both forged forwarded headers is still made against this application's own origin",
+      forgedBoth.status >= 200 && forgedBoth.status < 400,
+      `status ${forgedBoth.status}: ${JSON.stringify(forgedBoth.body)}`
     );
 
     /* The same write without the forged headers must work: the fix must not
