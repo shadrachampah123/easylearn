@@ -786,7 +786,11 @@ function sqlSchoolsOfAssignment(assignmentRef: SQL | AnyColumn): SQL {
   )`;
 }
 
-/** Every school reachable from a quiz: its teacher plus its class's members. */
+/**
+ * Legacy quiz attribution: memberships plus any persisted quiz/parent school IDs.
+ * A membership transfer must not re-home legacy content whose class/subject still belongs
+ * to the old school. to_jsonb also permits the pre-0016 schema (no school_id column).
+ */
 function sqlSchoolsOfQuiz(quizRef: SQL | AnyColumn): SQL {
   return sql`(
     select su."school_id" as "school_id"
@@ -795,6 +799,19 @@ function sqlSchoolsOfQuiz(quizRef: SQL | AnyColumn): SQL {
      where q."id" = ${quizRef}
     union
     select ss."school_id" from ${sqlSchoolsOfClass(sql`(select q."class_id" from "quizzes" q where q."id" = ${quizRef})`)} ss
+    union
+    select attributed."school_id"
+      from "quizzes" q
+      left join "classes" c on c."id" = q."class_id"
+      left join "subjects" s on s."id" = q."subject_id"
+      left join "terms" t on t."id" = q."term_id"
+      cross join lateral (values
+        ((to_jsonb(q)->>'school_id')::uuid),
+        ((to_jsonb(c)->>'school_id')::uuid),
+        ((to_jsonb(s)->>'school_id')::uuid),
+        ((to_jsonb(t)->>'school_id')::uuid)
+      ) as attributed("school_id")
+     where q."id" = ${quizRef} and attributed."school_id" is not null
   )`;
 }
 
@@ -896,8 +913,31 @@ export function sqlAssignmentOwnedRelationally(
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfAssignment(assignmentRef));
 }
 
-/** Content predicate: the quiz belongs to this school's alone. */
+/**
+ * Persisted quiz attribution wins over changing memberships, exactly as for assignments.
+ * The selected school is freshly verified by guardSchoolContext; an explicit different
+ * school can NEVER fall back to relational ownership. NULL legacy rows remain fail-closed
+ * unless their complete ownership set resolves to this school alone.
+ */
 export function sqlQuizInSchool(schoolId: string, quizRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`(
+    exists (
+      select 1 from "quizzes" q
+       where q."id" = ${quizRef} and q."school_id" = ${schoolId}
+    )
+    or (
+      not exists (
+        select 1 from "quizzes" q
+         where q."id" = ${quizRef} and q."school_id" is not null
+      )
+      and ${sqlQuizOwnedRelationally(schoolId, quizRef)}
+    )
+  )`;
+}
+
+/** Only for legacy NULL attribution or a schema with no quiz school_id column. */
+export function sqlQuizOwnedRelationally(schoolId: string, quizRef: SQL | AnyColumn): SQL {
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfQuiz(quizRef));
 }
 

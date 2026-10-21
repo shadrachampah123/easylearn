@@ -6,10 +6,11 @@ import {
   hasSchoolStaffRole,
   isClassInSchool,
   sqlQuizInSchool,
+  sqlQuizOwnedRelationally,
 } from "@/lib/tenant";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
-import { ensureQuizImageColumn, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
-import { eq, desc, and, sql, inArray, or, isNull } from "drizzle-orm";
+import { ensureQuizImageColumn, isMissingColumn, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
+import { eq, desc, and, sql, inArray } from "drizzle-orm";
 
 type QuestionInput = {
   questionType: string;
@@ -60,17 +61,14 @@ export async function GET(request: NextRequest) {
       const { db: dbProbe } = await import("@/db");
       const { sql: sqlProbe } = await import("drizzle-orm");
       await dbProbe.execute(sqlProbe`select "school_id" from "quizzes" limit 0`);
-    } catch {
+    } catch (error) {
+      if (!isMissingColumn(error, "school_id")) throw error;
       useDirectQuiz = false;
     }
-    const conditions = useDirectQuiz
-      ? [
-          or(
-            eq(quizzes.schoolId, ctx.schoolId),
-            and(isNull(quizzes.schoolId), sqlQuizInSchool(ctx.schoolId, quizzes.id))
-          ),
-        ]
-      : [sqlQuizInSchool(ctx.schoolId, quizzes.id)];
+    // Use the same policy as detail, feedback, mutation and attempt routes.
+    const conditions = [useDirectQuiz
+      ? sqlQuizInSchool(ctx.schoolId, quizzes.id)
+      : sqlQuizOwnedRelationally(ctx.schoolId, quizzes.id)];
 
     if (ctx.school.role === "teacher") {
       conditions.push(eq(quizzes.teacherId, ctx.userId));
