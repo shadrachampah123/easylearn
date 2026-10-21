@@ -72,7 +72,7 @@ jobs:
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth
-      - name: PR #45 reviewer regressions (PostgreSQL required)
+      - name: "PR #45 reviewer regressions (PostgreSQL required)"
         # Independent reproductions of the PR #45 review findings R1-R7, authored by the
         # reviewer rather than by the remediation author. Kept as a separate step so a
         # failure points straight at the reviewer oracle. test:review-pr45 sets

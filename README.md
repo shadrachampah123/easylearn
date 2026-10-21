@@ -233,8 +233,9 @@ in `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`.
 - **Repeating a submission.** `PUT /api/quizzes/[id]/attempt` is **idempotent** once the
   attempt is complete. A second submission of the same attempt — a double-click, a
   client retry after a timeout, or a duplicate request that lost a race — answers **HTTP 200**
-  with the *persisted* grade and never re-grades, re-awards XP or re-notifies. The response
-  body is identical to the original one except for `alreadySubmitted`:
+  with the *persisted* grade and never re-grades, re-awards XP or re-notifies. The stored
+  result is **replayed** rather than recomputed: `alreadySubmitted` flips to `true` and the
+  grading fields are exactly the values the completing request saved.
 
   | Field | Completing request | Repeat request |
   |---|---|---|
@@ -242,6 +243,10 @@ in `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`.
   | `data.results.score` / `maxScore` / `percentage` / `pointsEarned` | computed now | the stored values, unchanged |
   | `data.attempt.answers` | written now | the stored answers (the repeat body is ignored) |
   | `data.results.answers` | present only when `showResults` | same rule; stored keys are `null` when withheld |
+  | `data.results.podium` / `data.results.rank` | computed now | **recomputed on every request** — they can differ if the leaderboard has moved since the attempt completed |
+
+  The replay is therefore not byte-identical to the original response: the *grade* is frozen,
+  but the class podium and the caller's rank are live reads of the current leaderboard.
 
   This replaced an earlier `400 "This attempt has already been submitted"`. That 400 was
   undocumented and untested, and it was the wrong answer for a retry: the answers had already

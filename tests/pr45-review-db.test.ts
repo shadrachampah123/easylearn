@@ -329,6 +329,12 @@ async function main() {
     await admin.end();
     assertCleanupSucceeded(cleanup,primaryError);
   }
+  /* A run that executed nothing must never look like a pass. `PR45_REVIEW_FILTER` exists so
+     an inherited finding can be isolated, and a filter that matches no test at all used to
+     print "0 passed, 0 failed" and exit 0 — the same false green that finding R5 was about,
+     one level up. `passed + failed` counts tests that actually ran, so a filter that selects
+     at least one test still works, and a legitimate empty selection now fails loudly. */
+  assert.ok(passed + failed > 0, "no PR #45 reviewer tests executed — check PR45_REVIEW_FILTER and the database setup");
   console.log(`PR45 additional DB review: ${passed} passed, ${failed} failed`);
   if (failed) process.exitCode=1;
 }
