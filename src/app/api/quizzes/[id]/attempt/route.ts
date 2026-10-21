@@ -14,10 +14,14 @@ import {
   isQuizInSchool,
   sqlQuizInSchool,
 } from "@/lib/tenant";
-import { isLearnerEnrolledInClass } from "@/lib/quiz-access";
+import {
+  calculateQuizRewardPoints,
+  gradeQuizQuestionAnswer,
+  isLearnerEnrolledInClass,
+} from "@/lib/quiz-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
-import { eq, and, sql, desc } from "drizzle-orm";
+import { eq, and, sql, desc, isNull } from "drizzle-orm";
 
 // Start a quiz attempt
 export async function POST(
@@ -133,25 +137,11 @@ export async function PUT(
     const body = await request.json();
     const { attemptId, answers } = body;
 
-    if (!attemptId || !answers) {
+    if (!attemptId || !answers || typeof answers !== "object" || Array.isArray(answers)) {
       return errorResponse("Attempt ID and answers are required");
     }
 
-    // Get attempt
-    const [attempt] = await db
-      .select()
-      .from(quizAttempts)
-      .where(and(
-        eq(quizAttempts.id, attemptId),
-        eq(quizAttempts.quizId, id),
-        eq(quizAttempts.learnerId, ctx.userId)
-      ))
-      .limit(1);
-
-    if (!attempt) return notFoundResponse("Quiz attempt");
-    if (attempt.completedAt) return errorResponse("This attempt has already been submitted");
-
-    // Get quiz and questions for grading
+    // Get quiz and verify active publication + selected-school enrollment first
     const [quiz] = await db
       .select()
       .from(quizzes)
@@ -179,99 +169,157 @@ export async function PUT(
       .from(quizQuestions)
       .where(eq(quizQuestions.quizId, id));
 
-    // Auto-grade the quiz
-    let totalScore = 0;
-    let maxScore = 0;
-    const gradedAnswers: Record<string, { answer: string; correct: boolean; points: number; correctAnswer: string | null }> = {};
+    const maxScore = questions.reduce((sum, question) => sum + (question.points || 1), 0);
 
-    for (const question of questions) {
-      const questionPoints = question.points || 1;
-      maxScore += questionPoints;
+    type GradedAnswerEntry = {
+      answer: string;
+      correct: boolean;
+      points: number;
+      correctAnswer: string | null;
+    };
 
-      const learnerAnswer = answers[question.id];
-      let isCorrect = false;
+    const outcome = await db.transaction(async (tx) => {
+      // Lock the attempt row exclusively so concurrent PUT submissions serialize cleanly:
+      // exactly one transaction transitions `completed_at` from NULL and emits rewards,
+      // while concurrent/repeated requests return the persisted result idempotently.
+      const lockedResult = await tx.execute(sql`
+        SELECT id
+        FROM quiz_attempts
+        WHERE id = ${attemptId}::uuid
+          AND quiz_id = ${id}::uuid
+          AND learner_id = ${ctx.userId}::uuid
+          AND (school_id IS NULL OR school_id = ${ctx.schoolId}::uuid)
+        FOR UPDATE
+      `);
+      const lockedRows = Array.isArray(lockedResult)
+        ? lockedResult
+        : (lockedResult as { rows?: unknown[] }).rows ?? [];
+      if (lockedRows.length === 0) {
+        return null;
+      }
 
-      if (learnerAnswer && question.correctAnswer) {
-        // Normalize answers for comparison
-        const normalizedLearnerAnswer = String(learnerAnswer).trim().toLowerCase();
-        const normalizedCorrectAnswer = String(question.correctAnswer).trim().toLowerCase();
+      const [lockedAttempt] = await tx
+        .select()
+        .from(quizAttempts)
+        .where(
+          and(
+            eq(quizAttempts.id, attemptId),
+            eq(quizAttempts.quizId, id),
+            eq(quizAttempts.learnerId, ctx.userId)
+          )
+        )
+        .limit(1);
 
-        switch (question.questionType) {
-          case "mcq":
-          case "true_false":
-            isCorrect = normalizedLearnerAnswer === normalizedCorrectAnswer;
-            break;
-          case "fill_blank":
-            // Allow some flexibility for fill in the blank
-            isCorrect = normalizedLearnerAnswer === normalizedCorrectAnswer ||
-                        normalizedCorrectAnswer.includes(normalizedLearnerAnswer);
-            break;
-          case "short_answer":
-            // For short answer, check if key words match
-            isCorrect = normalizedLearnerAnswer === normalizedCorrectAnswer;
-            break;
-          case "essay":
-          case "matching":
-            // These require manual grading, give 0 for now
-            isCorrect = false;
-            break;
-          default:
-            isCorrect = normalizedLearnerAnswer === normalizedCorrectAnswer;
+      if (!lockedAttempt) {
+        return null;
+      }
+
+      if (lockedAttempt.completedAt !== null) {
+        const persistedScore = lockedAttempt.score ?? 0;
+        const persistedPercentage = maxScore > 0 ? Math.round((persistedScore / maxScore) * 100) : 0;
+        const persistedPoints = calculateQuizRewardPoints(persistedPercentage);
+        const storedMap =
+          lockedAttempt.answers && typeof lockedAttempt.answers === "object" && !Array.isArray(lockedAttempt.answers)
+            ? (lockedAttempt.answers as Record<string, GradedAnswerEntry>)
+            : {};
+        const sanitizedStoredAnswers: Record<string, GradedAnswerEntry> = {};
+        for (const question of questions) {
+          const prev = storedMap[question.id];
+          sanitizedStoredAnswers[question.id] = {
+            answer: prev?.answer ?? "",
+            correct: Boolean(prev?.correct),
+            points: prev?.points ?? 0,
+            correctAnswer: quiz.showResults ? question.correctAnswer : null,
+          };
         }
+        return {
+          attempt: lockedAttempt,
+          totalScore: persistedScore,
+          percentage: persistedPercentage,
+          points: persistedPoints,
+          gradedAnswers: sanitizedStoredAnswers,
+          alreadySubmitted: true,
+        };
       }
 
-      if (isCorrect) {
-        totalScore += questionPoints;
+      let totalScore = 0;
+      const gradedAnswers: Record<string, GradedAnswerEntry> = {};
+
+      for (const question of questions) {
+        const graded = gradeQuizQuestionAnswer({
+          questionType: question.questionType,
+          learnerAnswer: (answers as Record<string, unknown>)[question.id],
+          correctAnswer: question.correctAnswer,
+          points: question.points,
+        });
+
+        totalScore += graded.pointsAwarded;
+        gradedAnswers[question.id] = {
+          answer: graded.storedAnswer,
+          correct: graded.isCorrect,
+          points: graded.pointsAwarded,
+          correctAnswer: quiz.showResults ? question.correctAnswer : null,
+        };
       }
 
-      gradedAnswers[question.id] = {
-        answer: learnerAnswer || "",
-        correct: isCorrect,
-        points: isCorrect ? questionPoints : 0,
-        correctAnswer: quiz.showResults ? question.correctAnswer : null,
+      const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+      const points = calculateQuizRewardPoints(percentage);
+
+      const [updatedAttempt] = await tx
+        .update(quizAttempts)
+        .set({
+          answers: gradedAnswers,
+          score: totalScore,
+          completedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(quizAttempts.id, attemptId),
+            eq(quizAttempts.quizId, id),
+            eq(quizAttempts.learnerId, ctx.userId),
+            isNull(quizAttempts.completedAt)
+          )
+        )
+        .returning();
+
+      await tx.insert(notifications).values({
+        // Phase 2E (Step 1): the notification is tenant-attributed to the caller's school.
+        schoolId: ctx.schoolId,
+        userId: ctx.userId,
+        type: "quiz",
+        title: "Quiz Completed",
+        message: `You scored ${totalScore}/${maxScore} (${percentage}%) on "${quiz.title}"`,
+        link: `/dashboard/learner/quizzes/${id}`,
+      });
+
+      if (points > 0) {
+        await tx.insert(learnerPoints).values({
+          learnerId: ctx.userId,
+          points,
+          reason: `Scored ${percentage}% on quiz "${quiz.title}"`,
+        });
+      }
+
+      return {
+        attempt: updatedAttempt,
+        totalScore,
+        percentage,
+        points,
+        gradedAnswers,
+        alreadySubmitted: false,
       };
-    }
-
-    // Calculate percentage
-    const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
-
-    // Update attempt with results
-    const [updatedAttempt] = await db
-      .update(quizAttempts)
-      .set({
-        answers: gradedAnswers,
-        score: totalScore,
-        completedAt: new Date(),
-      })
-      .where(eq(quizAttempts.id, attemptId))
-      .returning();
-
-    // Create notification
-    await db.insert(notifications).values({
-      // Phase 2E (Step 1): the notification is tenant-attributed to the caller's school.
-      schoolId: ctx.schoolId,
-      userId: ctx.userId,
-      type: "quiz",
-      title: "Quiz Completed",
-      message: `You scored ${totalScore}/${maxScore} (${percentage}%) on "${quiz.title}"`,
-      link: `/dashboard/learner/quizzes/${id}`,
     });
 
-    // Award points based on performance
-    let points = 0;
-    if (percentage >= 90) points = 100;
-    else if (percentage >= 80) points = 80;
-    else if (percentage >= 70) points = 60;
-    else if (percentage >= 60) points = 40;
-    else if (percentage >= 50) points = 20;
+    if (!outcome) return notFoundResponse("Quiz attempt");
 
-    if (points > 0) {
-      await db.insert(learnerPoints).values({
-        learnerId: ctx.userId,
-        points,
-        reason: `Scored ${percentage}% on quiz "${quiz.title}"`,
-      });
-    }
+    const {
+      attempt: updatedAttempt,
+      totalScore,
+      percentage,
+      points,
+      gradedAnswers,
+      alreadySubmitted,
+    } = outcome;
 
     // Kahoot-style podium: the best scores on this quiz, with the learner's own row flagged.
     const leaderboard = await db
@@ -310,6 +358,7 @@ export async function PUT(
 
     return successResponse({
       attempt: updatedAttempt,
+      alreadySubmitted,
       results: {
         score: totalScore,
         maxScore,

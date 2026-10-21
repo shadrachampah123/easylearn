@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "pg";
 import { NextRequest } from "next/server";
 import { createTestJwtSecret } from "./helpers/test-secret";
@@ -429,6 +430,135 @@ async function main() {
       assert.equal((await callId(detailRoute.PUT, ownerTeacher.token, quizA.id, "PUT", { isPublished: true })).status, 200);
       assert.equal((await callId(detailRoute.PUT, schoolAdminA.token, quizA.id, "PUT", { description: "Approved" })).status, 200);
       assert.equal((await callId(detailRoute.DELETE, schoolAdminA.token, quizA.id, "DELETE")).status, 200);
+    });
+
+    await test("R3: concurrent and repeated submissions are atomic and idempotent with single reward/notification", async () => {
+      const owner = await createUser("teacher", schoolA.id);
+      const learner = await createUser("learner", schoolA.id);
+      const quizItem = await createQuiz(owner.id, {
+        school: schoolA,
+        published: true,
+        answerKey: "photosynthesis",
+      });
+      await enroll(learner.id, quizItem);
+
+      const started = await callId(attemptRoute.POST, learner.token, quizItem.id, "POST");
+      assert.equal(started.status, 201);
+      const attemptId = started.json.data.attempt.id as string;
+
+      // Real PostgreSQL row lock synchronizes two concurrent in-flight PUT handlers without mocks.
+      const locker = new Client({ connectionString: scratchUrl.toString() });
+      await locker.connect();
+      await locker.query("BEGIN");
+      await locker.query("SELECT id FROM quiz_attempts WHERE id = $1 FOR UPDATE", [attemptId]);
+
+      const inFlight = [0, 1].map(() =>
+        callId(attemptRoute.PUT, learner.token, quizItem.id, "PUT", {
+          attemptId,
+          answers: { [quizItem.questionId]: "  PHOTOSYNTHESIS  " },
+        })
+      );
+
+      let lockWaiters = 0;
+      try {
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline) {
+          const row = await one(
+            "SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = $1 AND wait_event_type = 'Lock' AND query ILIKE '%quiz_attempts%'",
+            [dbName]
+          );
+          lockWaiters = row.n as number;
+          if (lockWaiters >= 2) break;
+          await delay(15);
+        }
+      } finally {
+        await locker.query("COMMIT");
+        await locker.end();
+      }
+
+      const [res1, res2] = await Promise.all(inFlight);
+      assert.equal(lockWaiters, 2, "both concurrent submissions reached the PostgreSQL row-lock barrier");
+      assert.equal(res1.status, 200);
+      assert.equal(res2.status, 200);
+      assert.equal(res1.json.data.results.score, 1);
+      assert.equal(res2.json.data.results.score, 1);
+      assert.equal(res1.json.data.results.pointsEarned, 100);
+      assert.equal(res2.json.data.results.pointsEarned, 100);
+
+      // Subsequent sequential retry — even with tampered wrong answers — must remain idempotent and immutable.
+      const retry = await callId(attemptRoute.PUT, learner.token, quizItem.id, "PUT", {
+        attemptId,
+        answers: { [quizItem.questionId]: "wrong-answer" },
+      });
+      assert.equal(retry.status, 200);
+      assert.equal(retry.json.data.results.score, 1, "completed attempt score must remain immutable on retry");
+
+      const counts = await one(
+        `SELECT
+           (SELECT count(*)::int FROM learner_points WHERE learner_id = $1) AS points_rows,
+           (SELECT COALESCE(sum(points), 0)::int FROM learner_points WHERE learner_id = $1) AS total_points,
+           (SELECT count(*)::int FROM notifications WHERE user_id = $1) AS notice_rows,
+           (SELECT count(*)::int FROM quiz_attempts WHERE learner_id = $1 AND completed_at IS NOT NULL) AS completed_rows`,
+        [learner.id]
+      );
+      assert.equal(counts.points_rows, 1, "must award learner_points once");
+      assert.equal(counts.total_points, 100, "must award 100 XP total, never 200 XP");
+      assert.equal(counts.notice_rows, 1, "must create notification once");
+      assert.equal(counts.completed_rows, 1);
+    });
+
+    await test("R4: check and submit enforce identical answer normalization and reject whitespace/empty answers", async () => {
+      const owner = await createUser("teacher", schoolA.id);
+      const learner = await createUser("learner", schoolA.id);
+      const fillQuiz = await createQuiz(owner.id, {
+        school: schoolA,
+        published: true,
+        showResults: false,
+        maxAttempts: 5,
+        questionType: "fill_blank",
+        answerKey: "Mitochondria",
+      });
+      await enroll(learner.id, fillQuiz);
+
+      for (const blankCandidate of ["   ", "\t\n ", "", []] as unknown[]) {
+        const started = await callId(attemptRoute.POST, learner.token, fillQuiz.id, "POST");
+        assert.equal(started.status, 201);
+        const attemptId = started.json.data.attempt.id as string;
+
+        const checked = await callId(checkRoute.POST, learner.token, fillQuiz.id, "POST", {
+          attemptId,
+          questionId: fillQuiz.questionId,
+          answer: blankCandidate,
+        });
+        assert.equal(checked.status, 200);
+        assert.equal(checked.json.data.correct, false, "check must reject blank/non-scalar answer");
+
+        const submitted = await callId(attemptRoute.PUT, learner.token, fillQuiz.id, "PUT", {
+          attemptId,
+          answers: { [fillQuiz.questionId]: blankCandidate },
+        });
+        assert.equal(submitted.status, 200);
+        assert.equal(submitted.json.data.results.score, 0, "submit must reject blank/non-scalar answer");
+        assert.equal(submitted.json.data.results.pointsEarned, 0);
+      }
+
+      // Retrying a 0-score completed attempt with the real answer must NOT retroactively award points.
+      const [existingZeroAttempt] = await q(
+        "SELECT id FROM quiz_attempts WHERE learner_id = $1 AND quiz_id = $2 ORDER BY started_at LIMIT 1",
+        [learner.id, fillQuiz.id]
+      );
+      const lateTamper = await callId(attemptRoute.PUT, learner.token, fillQuiz.id, "PUT", {
+        attemptId: existingZeroAttempt.id,
+        answers: { [fillQuiz.questionId]: "Mitochondria" },
+      });
+      assert.equal(lateTamper.status, 200);
+      assert.equal(lateTamper.json.data.results.score, 0, "retry cannot upgrade a 0-score submission");
+
+      const pointsAfterBlank = await one(
+        "SELECT count(*)::int AS n FROM learner_points WHERE learner_id = $1",
+        [learner.id]
+      );
+      assert.equal(pointsAfterBlank.n, 0, "blank answers and post-submit tampering must award 0 points");
     });
   } catch (error) {
     primaryError = error;

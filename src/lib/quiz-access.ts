@@ -187,6 +187,79 @@ export function evaluateQuizReadAccess(input: {
 }
 
 /**
+ * Canonical answer normalization shared across instant question checks, final quiz
+ * submissions, and auto-graded assignment questions.
+ *
+ * Non-scalar inputs (`null`, `undefined`, arrays, objects) and whitespace-only strings
+ * normalize to `""` and never match any answer key (preventing `expected.includes("")`).
+ */
+export function normalizeQuizAnswer(raw: unknown): string {
+  if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") {
+    return "";
+  }
+  return String(raw).trim().toLowerCase();
+}
+
+export function calculateQuizRewardPoints(percentage: number): number {
+  if (percentage >= 90) return 100;
+  if (percentage >= 80) return 80;
+  if (percentage >= 70) return 60;
+  if (percentage >= 60) return 40;
+  if (percentage >= 50) return 20;
+  return 0;
+}
+
+export function gradeQuizQuestionAnswer(input: {
+  questionType: string;
+  learnerAnswer: unknown;
+  correctAnswer: string | null | undefined;
+  points: number | null | undefined;
+}): {
+  isCorrect: boolean;
+  pointsAwarded: number;
+  questionPoints: number;
+  storedAnswer: string;
+} {
+  const questionPoints = input.points || 1;
+  const storedAnswer =
+    typeof input.learnerAnswer === "string"
+      ? input.learnerAnswer
+      : typeof input.learnerAnswer === "number" || typeof input.learnerAnswer === "boolean"
+        ? String(input.learnerAnswer)
+        : "";
+  const normalizedLearner = normalizeQuizAnswer(input.learnerAnswer);
+  const normalizedCorrect = normalizeQuizAnswer(input.correctAnswer);
+
+  let isCorrect = false;
+  if (normalizedLearner.length > 0 && normalizedCorrect.length > 0) {
+    switch (input.questionType) {
+      case "essay":
+      case "matching":
+        isCorrect = false;
+        break;
+      case "fill_blank":
+        isCorrect =
+          normalizedLearner === normalizedCorrect ||
+          normalizedCorrect.includes(normalizedLearner);
+        break;
+      case "mcq":
+      case "true_false":
+      case "short_answer":
+      default:
+        isCorrect = normalizedLearner === normalizedCorrect;
+        break;
+    }
+  }
+
+  return {
+    isCorrect,
+    pointsAwarded: isCorrect ? questionPoints : 0,
+    questionPoints,
+    storedAnswer,
+  };
+}
+
+/**
  * Is the learner enrolled in this class, in this school?
  *
  * The enrollment is looked up through `learner_classes.school_id`, so an enrollment that

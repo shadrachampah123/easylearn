@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { quizzes, quizQuestions, quizAttempts } from "@/db/schema";
 import { guardSchoolContext, isQuizInSchool, sqlQuizInSchool } from "@/lib/tenant";
-import { isLearnerEnrolledInClass } from "@/lib/quiz-access";
+import { gradeQuizQuestionAnswer, isLearnerEnrolledInClass } from "@/lib/quiz-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, sql } from "drizzle-orm";
@@ -103,26 +103,12 @@ export async function POST(
 
     if (!question) return notFoundResponse("Question");
 
-    const questionPoints = question.points || 1;
-    const given = answer === undefined || answer === null ? "" : String(answer).trim().toLowerCase();
-    const expected = question.correctAnswer ? String(question.correctAnswer).trim().toLowerCase() : "";
-
-    let correct = false;
-    if (given && expected) {
-      switch (question.questionType) {
-        case "mcq":
-        case "true_false":
-        case "short_answer":
-        case "matching":
-          correct = given === expected;
-          break;
-        case "fill_blank":
-          correct = given === expected || expected.includes(given);
-          break;
-        default:
-          correct = given === expected;
-      }
-    }
+    const { isCorrect: correct, pointsAwarded, questionPoints } = gradeQuizQuestionAnswer({
+      questionType: question.questionType,
+      learnerAnswer: answer,
+      correctAnswer: question.correctAnswer,
+      points: question.points,
+    });
 
     // Kahoot speed bonus: full 1000 in the first half of the clock, tapering to 500.
     // The client tells us how long its own countdown was so the bonus matches what the
@@ -138,7 +124,7 @@ export async function POST(
 
     return successResponse({
       correct,
-      pointsAwarded: correct ? questionPoints : 0,
+      pointsAwarded,
       pointsPossible: questionPoints,
       // Kahoot animates this number; it is not the grade.
       kahootPoints,
