@@ -81,6 +81,54 @@ const REFUSED_LEARNER_DRAFT = "This quiz has not been published by your teacher 
 const REFUSED_WRONG_CLASS = "This quiz was set for a different class";
 const REFUSED_NOT_OWN_QUIZ = "You can only view your own quizzes";
 const REFUSED_UNKNOWN_ROLE = "You may not view this quiz";
+const REFUSED_CREATE_NOT_STAFF = "Only teachers can create quizzes";
+const REFUSED_EDIT_NOT_AUTHORIZED = "You can only edit your own quizzes";
+const REFUSED_DELETE_NOT_AUTHORIZED = "You can only delete your own quizzes";
+
+export type QuizMutationAction = "create" | "edit" | "delete";
+
+export type QuizMutationAccess = {
+  allowed: boolean;
+  status: number;
+  reason: string;
+};
+
+/**
+ * Decides whether a caller with a verified current school membership role (`ctx.school.role`)
+ * may create, edit/publish, or delete a quiz in that selected school.
+ *
+ * Historical ownership (`quiz.teacherId === ctx.userId`) never authorizes a caller whose
+ * current membership role in the selected school is no longer staff.
+ */
+export function evaluateQuizMutationAccess(input: {
+  role: unknown;
+  isOwner: boolean;
+  action: QuizMutationAction;
+}): QuizMutationAccess {
+  if (quizAudienceForRole(input.role) !== "staff") {
+    const reason =
+      input.action === "create"
+        ? REFUSED_CREATE_NOT_STAFF
+        : input.action === "edit"
+          ? REFUSED_EDIT_NOT_AUTHORIZED
+          : REFUSED_DELETE_NOT_AUTHORIZED;
+    return { allowed: false, status: 403, reason };
+  }
+
+  if (input.action === "create") {
+    return { allowed: true, status: 200, reason: "" };
+  }
+
+  if (input.isOwner || input.role === "school_admin") {
+    return { allowed: true, status: 200, reason: "" };
+  }
+
+  return {
+    allowed: false,
+    status: 403,
+    reason: input.action === "edit" ? REFUSED_EDIT_NOT_AUTHORIZED : REFUSED_DELETE_NOT_AUTHORIZED,
+  };
+}
 
 /**
  * Decides whether the caller may open the quiz, and whether the answer key may be
@@ -136,6 +184,79 @@ export function evaluateQuizReadAccess(input: {
     return { allowed: false, status: 403, reason: REFUSED_NOT_OWN_QUIZ, revealAnswerKeys: false };
   }
   return { allowed: true, status: 200, reason: "", revealAnswerKeys: true };
+}
+
+/**
+ * Canonical answer normalization shared across instant question checks, final quiz
+ * submissions, and auto-graded assignment questions.
+ *
+ * Non-scalar inputs (`null`, `undefined`, arrays, objects) and whitespace-only strings
+ * normalize to `""` and never match any answer key (preventing `expected.includes("")`).
+ */
+export function normalizeQuizAnswer(raw: unknown): string {
+  if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") {
+    return "";
+  }
+  return String(raw).trim().toLowerCase();
+}
+
+export function calculateQuizRewardPoints(percentage: number): number {
+  if (percentage >= 90) return 100;
+  if (percentage >= 80) return 80;
+  if (percentage >= 70) return 60;
+  if (percentage >= 60) return 40;
+  if (percentage >= 50) return 20;
+  return 0;
+}
+
+export function gradeQuizQuestionAnswer(input: {
+  questionType: string;
+  learnerAnswer: unknown;
+  correctAnswer: string | null | undefined;
+  points: number | null | undefined;
+}): {
+  isCorrect: boolean;
+  pointsAwarded: number;
+  questionPoints: number;
+  storedAnswer: string;
+} {
+  const questionPoints = input.points || 1;
+  const storedAnswer =
+    typeof input.learnerAnswer === "string"
+      ? input.learnerAnswer
+      : typeof input.learnerAnswer === "number" || typeof input.learnerAnswer === "boolean"
+        ? String(input.learnerAnswer)
+        : "";
+  const normalizedLearner = normalizeQuizAnswer(input.learnerAnswer);
+  const normalizedCorrect = normalizeQuizAnswer(input.correctAnswer);
+
+  let isCorrect = false;
+  if (normalizedLearner.length > 0 && normalizedCorrect.length > 0) {
+    switch (input.questionType) {
+      case "essay":
+      case "matching":
+        isCorrect = false;
+        break;
+      case "fill_blank":
+        isCorrect =
+          normalizedLearner === normalizedCorrect ||
+          normalizedCorrect.includes(normalizedLearner);
+        break;
+      case "mcq":
+      case "true_false":
+      case "short_answer":
+      default:
+        isCorrect = normalizedLearner === normalizedCorrect;
+        break;
+    }
+  }
+
+  return {
+    isCorrect,
+    pointsAwarded: isCorrect ? questionPoints : 0,
+    questionPoints,
+    storedAnswer,
+  };
 }
 
 /**

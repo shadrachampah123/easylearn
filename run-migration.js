@@ -175,6 +175,32 @@ function assertSequentialPrefix(files) {
   }
 }
 
+/**
+ * The order must stay exact: nothing may be applied after a gated migration that was
+ * skipped, because the skipped migration may change the shape of the later ones.
+ *
+ * This is a PURE function, extracted from the run loop so it can be tested directly.
+ * With the migration list as it stands (0018 is the last registered migration) no
+ * end-to-end run can reach the guard — an untested branch is a branch that eventually gets
+ * deleted, and this one becomes load-bearing the moment a migration is registered after
+ * 0018. See tests/migration-tenant-constraint-integrity.test.ts.
+ *
+ * @param {string[]} toApply      the migrations that are about to be applied
+ * @param {string[]} skippedGated  the gated migrations that were skipped on purpose
+ * @param {string[]} [orderedList] the registered order; the real runner always uses
+ *                                 MIGRATIONS, and a test may pass a synthetic list that
+ *                                 contains a migration registered after the gated one
+ * @returns {{blocked: string, skipped: string}|null} the violation, or null when the order is fine
+ */
+function findOrderingViolation(toApply, skippedGated, orderedList = MIGRATIONS) {
+  if (!Array.isArray(skippedGated) || skippedGated.length === 0) return null;
+  const order = Array.isArray(orderedList) ? orderedList : MIGRATIONS;
+  const skippedIndex = Math.min(...skippedGated.map((fileName) => order.indexOf(fileName)));
+  const afterSkipped = toApply.filter((fileName) => order.indexOf(fileName) > skippedIndex);
+  if (afterSkipped.length === 0) return null;
+  return { blocked: afterSkipped[0], skipped: skippedGated[0] };
+}
+
 async function hasPublicApplicationObjects(client) {
   const result = await client.query(`
     SELECT EXISTS (
@@ -631,15 +657,12 @@ async function main() {
 
     /* The order must stay exact: nothing may be applied after a gated migration that was
        skipped, because the skipped migration may change the shape of the later ones. */
-    if (skippedGated.length > 0) {
-      const skippedIndex = Math.min(...skippedGated.map((fileName) => MIGRATIONS.indexOf(fileName)));
-      const afterSkipped = toApply.filter((fileName) => MIGRATIONS.indexOf(fileName) > skippedIndex);
-      if (afterSkipped.length > 0) {
-        throw new Error(
-          `Cannot apply ${afterSkipped[0]} because the gated migration ${skippedGated[0]} was skipped; ` +
-            "apply the gated migration first, in order."
-        );
-      }
+    const orderingViolation = findOrderingViolation(toApply, skippedGated);
+    if (orderingViolation) {
+      throw new Error(
+        `Cannot apply ${orderingViolation.blocked} because the gated migration ${orderingViolation.skipped} was skipped; ` +
+          "apply the gated migration first, in order."
+      );
     }
 
     if (pending.length === 0) {
@@ -696,4 +719,5 @@ module.exports = {
   HISTORY_TABLE,
   MIGRATIONS,
   REPAIR_CONFIRMATION,
+  findOrderingViolation,
 };

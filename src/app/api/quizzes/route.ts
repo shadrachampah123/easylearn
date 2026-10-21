@@ -3,13 +3,16 @@ import { db } from "@/db";
 import { quizzes, quizQuestions, classes, subjects, users, quizAttempts, learnerClasses } from "@/db/schema";
 import {
   guardSchoolContext,
-  hasSchoolStaffRole,
   isClassInSchool,
+  isSubjectInSchool,
+  isTermInSchool,
   sqlQuizInSchool,
+  sqlQuizOwnedRelationally,
 } from "@/lib/tenant";
+import { evaluateQuizMutationAccess } from "@/lib/quiz-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
-import { ensureQuizImageColumn, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
-import { eq, desc, and, sql, inArray, or, isNull } from "drizzle-orm";
+import { ensureQuizImageColumn, isMissingColumn, isSchemaOutOfDate, schemaAwareErrorMessage, legacyInsert } from "@/lib/schema-resilience";
+import { eq, desc, and, sql, inArray } from "drizzle-orm";
 
 type QuestionInput = {
   questionType: string;
@@ -60,17 +63,14 @@ export async function GET(request: NextRequest) {
       const { db: dbProbe } = await import("@/db");
       const { sql: sqlProbe } = await import("drizzle-orm");
       await dbProbe.execute(sqlProbe`select "school_id" from "quizzes" limit 0`);
-    } catch {
+    } catch (error) {
+      if (!isMissingColumn(error)) throw error;
       useDirectQuiz = false;
     }
-    const conditions = useDirectQuiz
-      ? [
-          or(
-            eq(quizzes.schoolId, ctx.schoolId),
-            and(isNull(quizzes.schoolId), sqlQuizInSchool(ctx.schoolId, quizzes.id))
-          ),
-        ]
-      : [sqlQuizInSchool(ctx.schoolId, quizzes.id)];
+    // Use the same policy as detail, feedback, mutation and attempt routes.
+    const conditions = [useDirectQuiz
+      ? sqlQuizInSchool(ctx.schoolId, quizzes.id)
+      : sqlQuizOwnedRelationally(ctx.schoolId, quizzes.id)];
 
     if (ctx.school.role === "teacher") {
       conditions.push(eq(quizzes.teacherId, ctx.userId));
@@ -158,8 +158,9 @@ export async function GET(request: NextRequest) {
             .where(and(
               eq(quizAttempts.quizId, quiz.id),
               eq(quizAttempts.learnerId, ctx.userId)
-            ));
-          attemptsUsed = learnerAttempts.length;
+            ))
+            .orderBy(desc(quizAttempts.startedAt));
+          attemptsUsed = learnerAttempts.filter((a) => a.completedAt !== null).length;
           attempt = learnerAttempts[0] || null;
         }
 
@@ -189,8 +190,13 @@ export async function POST(request: NextRequest) {
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
 
-    if (!hasSchoolStaffRole(ctx)) {
-      return errorResponse("Only teachers can create quizzes", 403);
+    const mutationAccess = evaluateQuizMutationAccess({
+      role: ctx.school.role,
+      isOwner: true,
+      action: "create",
+    });
+    if (!mutationAccess.allowed) {
+      return errorResponse(mutationAccess.reason, mutationAccess.status);
     }
 
     // Without this, every quiz insert fails on `column "image_url" ... does not exist`
@@ -218,9 +224,15 @@ export async function POST(request: NextRequest) {
       return errorResponse("Title, class, and subject are required");
     }
 
-    /* Phase 2C: quizzes may only be created for a class of the caller's school. */
+    /* Phase 2C: quizzes may only reference catalog records in the caller's selected school. */
     if (!(await isClassInSchool(ctx.schoolId, classId))) {
       return notFoundResponse("Class");
+    }
+    if (!(await isSubjectInSchool(ctx.schoolId, subjectId))) {
+      return notFoundResponse("Subject");
+    }
+    if (termId && !(await isTermInSchool(ctx.schoolId, termId))) {
+      return notFoundResponse("Term");
     }
 
     const questionRows = Array.isArray(questions) ? toQuestionRows("", questions) : [];
