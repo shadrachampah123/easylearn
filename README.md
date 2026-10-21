@@ -230,6 +230,30 @@ in `docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md`.
   `POST /api/quizzes/[id]/check` (correct answers are never sent to the learner up front), a speed
   bonus, a streak counter and a class podium. The graded score is still written by
   `PUT /api/quizzes/[id]/attempt`.
+- **Repeating a submission.** `PUT /api/quizzes/[id]/attempt` is **idempotent** once the
+  attempt is complete. A second submission of the same attempt — a double-click, a
+  client retry after a timeout, or a duplicate request that lost a race — answers **HTTP 200**
+  with the *persisted* grade and never re-grades, re-awards XP or re-notifies. The response
+  body is identical to the original one except for `alreadySubmitted`:
+
+  | Field | Completing request | Repeat request |
+  |---|---|---|
+  | `data.alreadySubmitted` | `false` | `true` |
+  | `data.results.score` / `maxScore` / `percentage` / `pointsEarned` | computed now | the stored values, unchanged |
+  | `data.attempt.answers` | written now | the stored answers (the repeat body is ignored) |
+  | `data.results.answers` | present only when `showResults` | same rule; stored keys are `null` when withheld |
+
+  This replaced an earlier `400 "This attempt has already been submitted"`. That 400 was
+  undocumented and untested, and it was the wrong answer for a retry: the answers had already
+  been graded and persisted, so refusing the request left the client showing "your answers could
+  not be submitted" for work the server had in fact accepted. The single-award property is
+  enforced a different way — the completion is claimed inside a transaction with
+  `SELECT … FOR UPDATE` plus a conditional `completed_at IS NULL` update, so exactly one
+  transaction transitions the attempt and only that one writes XP and the notification
+  (`tests/pr45-review-db.test.ts`, `tests/quiz-remediation-db.test.ts`). Authorization is still
+  re-checked on every request: a repeat still requires a published quiz and an enrollment in the
+  caller's school, so the replay is not a bypass. See also
+  `docs/reviews/pr45/SECURITY_REVIEW.md` (finding R3).
 - **Grading assignments.** On `/dashboard/teacher/assignments/[id]`, *Grade* opens a panel that
   shows what the learner actually wrote, awards marks per question (or a single score for written
   work), and saves feedback. `POST /api/submissions/[id]/grade` always records `score`, `max_score`
