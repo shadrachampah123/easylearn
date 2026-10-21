@@ -24,14 +24,24 @@
  *    the two routes that did have been converted to `POST`; see
  *    `src/app/api/messages/route.ts` and `src/app/api/learner/stats/route.ts`.)
  *
- * 2. BEARER CLIENTS. A request that carries an `Authorization: Bearer` header is
- *    allowed without an origin check. A browser cannot attach that header to a
- *    cross-site request without a CORS preflight, and this application does not
- *    enable CORS, so this path is not reachable from a foreign origin. It exists
- *    for the deliberately supported non-browser integrations (scripts, the
- *    migration runner, the development seed). It does NOT weaken the
- *    cookie-authenticated path: a request that presents the session cookie has no
- *    `Authorization` header and is always checked.
+ * 2. BEARER CLIENTS. A request that carries an `Authorization: Bearer` header AND
+ *    no session cookie is allowed without an origin check. A browser cannot attach
+ *    that header to a cross-site request without a CORS preflight, and this
+ *    application does not enable CORS, so this path is not reachable from a foreign
+ *    origin. It exists for the deliberately supported non-browser integrations
+ *    (scripts, the migration runner, the development seed).
+ *
+ *    The carve-out is granted only when the bearer is the ONLY credential on the
+ *    request. A request that also presents the session cookie is a browser request —
+ *    the browser attaches that cookie to cross-site requests as well — so it is
+ *    ALWAYS origin-checked, whatever else it carries. This matters because the auth
+ *    layer (`getTokenFromRequest` in `@/lib/auth`) selects the session identity from
+ *    the bearer token FIRST and the cookie second, so a request can carry both; the
+ *    cookie is then ambient authority riding along with the identity, and skipping
+ *    the origin check would hand that request the one control that protects the
+ *    cookie-authenticated path. Enforcing the rule here — rather than assuming that
+ *    "a request that presents the session cookie has no `Authorization` header" —
+ *    also keeps the policy correct if the deployment ever enables CORS.
  *
  * 3. SAME-ORIGIN BROWSER REQUEST. The `Origin` header is compared against the
  *    origin the request was made to, plus any explicitly configured extra
@@ -141,6 +151,8 @@
  * than something this application can reason about. It is deliberately left at
  * `Lax` — see `docs/SECURITY_AUTHENTICATION.md`.
  */
+
+import { hasSessionCookie as hasSessionCookieHeader } from "@/lib/session-cookie";
 
 /** Methods that may change state and therefore need the origin check. */
 export const STATE_CHANGING_METHODS: ReadonlySet<string> = new Set([
@@ -450,6 +462,15 @@ export function evaluateCsrfRequest(options: {
   origin: string | null;
   fetchSite: string | null;
   hasBearerAuthorization: boolean;
+  /**
+   * Whether the request ALSO carries the session cookie.
+   *
+   * A request that carries the session cookie holds ambient authority — the browser
+   * attaches that cookie to cross-site requests too — so it is always origin-checked.
+   * The bearer carve-out is therefore granted only when the bearer is the only
+   * credential on the request. See rule 2 in the module comment.
+   */
+  hasSessionCookie: boolean;
   requestOrigin?: string | null;
   requestOrigins?: string[];
   /**
@@ -473,8 +494,10 @@ export function evaluateCsrfRequest(options: {
     return { allowed: true, rule: "method" };
   }
 
-  if (options.hasBearerAuthorization) {
-    // A deliberately supported non-browser client. See rule 2 in the module comment.
+  if (options.hasBearerAuthorization && !options.hasSessionCookie) {
+    // A deliberately supported non-browser client, and nothing else: a request that
+    // ALSO carries the session cookie holds ambient authority and has to prove its
+    // origin. See rule 2 in the module comment.
     return { allowed: true, rule: "bearer" };
   }
 
@@ -563,12 +586,16 @@ export function evaluateCsrfRequest(options: {
 export function evaluateCsrfRequestForRequest(request: Request): CsrfDecision {
   const authorization = request.headers.get("authorization");
   const hasBearerAuthorization = Boolean(authorization && /^bearer\s+/i.test(authorization));
+  /* The session cookie is read through the ONE definition of its name, so the policy can
+     never disagree with the auth layer about which cookie is the session. */
+  const hasSessionCookie = hasSessionCookieHeader(request.headers.get("cookie"));
 
   return evaluateCsrfRequest({
     method: request.method,
     origin: request.headers.get("origin"),
     fetchSite: request.headers.get("sec-fetch-site"),
     hasBearerAuthorization,
+    hasSessionCookie,
     requestOrigins: getRequestOrigins(request),
     requestHosts: getRequestHosts(request),
     /* A configured public origin is exact, so the derived-origin rule below

@@ -1,7 +1,8 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
-import { quizzes, quizQuestions, quizAttempts, learnerClasses } from "@/db/schema";
+import { quizzes, quizQuestions, quizAttempts } from "@/db/schema";
 import { guardSchoolContext, isQuizInSchool, sqlQuizInSchool } from "@/lib/tenant";
+import { isLearnerEnrolledInClass } from "@/lib/quiz-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, sql } from "drizzle-orm";
@@ -77,11 +78,12 @@ export async function POST(
 
     if (!attempt) return errorResponse("Start the quiz before answering questions");
 
-    const enrolled = await db
-      .select({ classId: learnerClasses.classId })
-      .from(learnerClasses)
-      .where(eq(learnerClasses.learnerId, ctx.userId));
-    if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
+    /* The enrollment is re-read here, in the caller's school: a learner with no
+       enrollment row is not enrolled, and an enrollment that belongs to another school
+       never satisfies the check. The previous rule (`enrolled.length > 0 && …`) let a
+       learner with no enrollments at all grade an answer against the answer key. */
+    const enrolled = await isLearnerEnrolledInClass(ctx.schoolId, ctx.userId, quiz.classId);
+    if (!enrolled) {
       return errorResponse("This quiz was set for a different class", 403);
     }
 

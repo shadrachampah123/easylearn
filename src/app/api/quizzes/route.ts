@@ -86,13 +86,24 @@ export async function GET(request: NextRequest) {
       const enrolled = await db
         .select({ classId: learnerClasses.classId })
         .from(learnerClasses)
-        .where(eq(learnerClasses.learnerId, ctx.userId));
+        .where(
+          and(
+            eq(learnerClasses.learnerId, ctx.userId),
+            eq(learnerClasses.schoolId, ctx.schoolId)
+          )
+        );
 
       conditions.push(
         enrolled.length > 0
           ? inArray(quizzes.classId, enrolled.map((row) => row.classId))
           : sql`false`
       );
+    }
+
+    if (ctx.school.role === "parent") {
+      /* A parent is not a learner and not staff: an unpublished draft is the teacher's
+         working material and is not published to the school. */
+      conditions.push(eq(quizzes.isPublished, true));
     }
 
     if (classId) conditions.push(eq(quizzes.classId, classId));
