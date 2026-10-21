@@ -64,7 +64,7 @@ export async function GET(request: NextRequest) {
       const { sql: sqlProbe } = await import("drizzle-orm");
       await dbProbe.execute(sqlProbe`select "school_id" from "quizzes" limit 0`);
     } catch (error) {
-      if (!isMissingColumn(error, "school_id")) throw error;
+      if (!isMissingColumn(error)) throw error;
       useDirectQuiz = false;
     }
     // Use the same policy as detail, feedback, mutation and attempt routes.
