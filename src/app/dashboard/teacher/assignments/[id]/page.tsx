@@ -5,6 +5,7 @@ import DashboardShell from "@/components/dashboard/DashboardShell";
 import AttachmentList from "@/components/dashboard/AttachmentList";
 import { storedAttachments } from "@/lib/uploads";
 import Link from "next/link";
+import { apiFetch } from "../../../../../lib/api-client";
 
 interface Question {
   id: string;
@@ -110,11 +111,8 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
   }, [resolvedParams.id]);
 
   async function loadAssignment() {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}`);
       const data = await res.json();
       if (data.success) setAssignment(data.data);
     } catch (err) {
@@ -129,9 +127,8 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
     setGradeError(null);
     setGradeLoading(true);
     setGrading({ ...sub, answers: [], assignmentTitle: assignment?.title || "" } as SubmissionDetail);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/submissions/${sub.id}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/submissions/${sub.id}`);
       const data = await res.json();
       if (data.success) {
         const detail = data.data as SubmissionDetail;
@@ -168,8 +165,6 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
     if (!grading) return;
     setGradeSaving(true);
     setGradeError(null);
-
-    const token = localStorage.getItem("el_token");
     // Question-by-question when the assignment has questions, otherwise a single mark.
     const payload = grading.answers.length > 0
       ? {
@@ -182,9 +177,9 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
       : { score: Number(gradeForm.score), maxScore: Number(gradeForm.maxScore), feedback: gradeForm.feedback };
 
     try {
-      const res = await fetch(`/api/submissions/${grading.id}/grade`, {
+      const res = await apiFetch(`/api/submissions/${grading.id}/grade`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
@@ -213,18 +208,15 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
       alert("Question text is required");
       return;
     }
-
-    const token = localStorage.getItem("el_token");
     const options = questionForm.questionType === "mcq" || questionForm.questionType === "true_false"
       ? questionForm.options.filter((o) => o.trim())
       : null;
 
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}/questions`, {
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}/questions`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           questionType: questionForm.questionType,
@@ -259,11 +251,9 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
 
   async function handleDeleteQuestion(questionId: string) {
     if (!confirm("Delete this question?")) return;
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}/questions?questionId=${questionId}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}/questions?questionId=${questionId}`, {
+        method: "DELETE"
       });
       const data = await res.json();
       if (data.success) loadAssignment();
@@ -273,11 +263,8 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
   }
 
   async function handleViewResults(learnerId: string) {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}/results?learnerId=${learnerId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}/results?learnerId=${learnerId}`);
       const data = await res.json();
       if (data.success) {
         setResults(data.data);
@@ -294,14 +281,11 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
       alert("Correction text is required");
       return;
     }
-
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}/corrections`, {
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}/corrections`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify(correctionForm),
       });
@@ -320,14 +304,12 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
   }
 
   async function toggleStatus() {
-    const token = localStorage.getItem("el_token");
     const newStatus = assignment?.status === "published" ? "closed" : "published";
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}`, {
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}`, {
         method: "PUT",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({ ...assignment, status: newStatus }),
       });
@@ -341,14 +323,12 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
 
   /** Teacher-controlled gate: learners may upload files only when enabled. */
   async function toggleFileUploads() {
-    const token = localStorage.getItem("el_token");
     const enabled = !assignment?.allowFileUploads;
     try {
-      const res = await fetch(`/api/assignments/${resolvedParams.id}`, {
+      const res = await apiFetch(`/api/assignments/${resolvedParams.id}`, {
         method: "PUT",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({ ...assignment, allowFileUploads: enabled }),
       });

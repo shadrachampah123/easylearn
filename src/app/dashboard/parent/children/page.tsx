@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Child {
   id: string;
@@ -27,20 +28,15 @@ export default function ParentChildrenPage() {
   const [loading, setLoading] = useState(true);
 
   const loadChildren = useCallback(async (parentId: string) => {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch(`/api/parent-learners?parentId=${parentId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
       const data = await res.json();
       if (data.success) {
         setChildren(data.data);
         // Load learner info for each
         const learners: Record<string, Learner> = {};
-        const learnerRes = await fetch("/api/users?role=learner&limit=100", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const learnerRes = await apiFetch("/api/users?role=learner&limit=100");
         const learnerData = await learnerRes.json();
         if (learnerData.success) {
           learnerData.data.users.forEach((l: Learner) => { learners[l.id] = l; });
@@ -55,8 +51,7 @@ export default function ParentChildrenPage() {
   }, []);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/auth/me")
       .then((r) => r.json())
       .then((data) => {
         if (data.success) {

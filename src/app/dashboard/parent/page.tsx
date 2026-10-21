@@ -1,4 +1,3 @@
-/* eslint-disable react-hooks/set-state-in-effect */
 "use client";
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
@@ -7,6 +6,7 @@ import TodaysSchedule from "@/components/dashboard/TodaysSchedule";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { parentNav } from "@/lib/parent-nav";
+import { apiFetch } from "@/lib/api-client";
 
 interface DashboardData {
   children: { id: string; firstName: string; lastName: string; className: string; relationship: string }[];
@@ -30,18 +30,11 @@ export default function ParentDashboard() {
   }, [selectedChildId]);
 
   async function loadData(childId?: string) {
-    const token = localStorage.getItem("el_token");
-    if (!token) {
-      setLoading(false);
-      setError("Not authenticated");
-      return;
-    }
-
     const idToUse = childId || selectedChildId;
     const url = idToUse ? `/api/dashboard/parent?learnerId=${idToUse}` : "/api/dashboard/parent";
 
     try {
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(url);
       const result = await res.json();
       if (result.success) {
         setData(result.data);

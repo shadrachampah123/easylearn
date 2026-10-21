@@ -6,7 +6,6 @@ import {
   quizAttempts,
   notifications,
   learnerPoints,
-  learnerClasses,
   users,
 } from "@/db/schema";
 import {
@@ -15,6 +14,7 @@ import {
   isQuizInSchool,
   sqlQuizInSchool,
 } from "@/lib/tenant";
+import { isLearnerEnrolledInClass } from "@/lib/quiz-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, and, sql, desc } from "drizzle-orm";
@@ -50,12 +50,12 @@ export async function POST(
     if (!quiz) return notFoundResponse("Quiz");
     if (!quiz.isPublished) return errorResponse("This quiz is not available");
 
-    // Only learners enrolled in the quiz's class may sit it.
-    const enrolled = await db
-      .select({ classId: learnerClasses.classId })
-      .from(learnerClasses)
-      .where(eq(learnerClasses.learnerId, ctx.userId));
-    if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
+    /* Only learners enrolled in the quiz's class may sit it.
+       The enrollment is read with the caller's school, and a learner with NO enrollment
+       row is not enrolled: the previous rule (`enrolled.length > 0 && …`) let a learner
+       with no enrollments at all start any published quiz in their school. */
+    const enrolled = await isLearnerEnrolledInClass(ctx.schoolId, ctx.userId, quiz.classId);
+    if (!enrolled) {
       return errorResponse("This quiz was set for a different class", 403);
     }
 
@@ -159,6 +159,20 @@ export async function PUT(
       .limit(1);
 
     if (!quiz) return notFoundResponse("Quiz");
+
+    /* ── The submit is authorized too ───────────────────────────────────────────
+       Starting an attempt was not enough: the learner could have been removed from
+       the class, and the teacher could have unpublished the quiz, while the attempt
+       was still open. Submitting in that state graded the work and awarded the
+       points. Both facts are re-read here, in the caller's school. */
+    if (!quiz.isPublished) {
+      return errorResponse("This quiz is no longer available", 403);
+    }
+
+    const enrolled = await isLearnerEnrolledInClass(ctx.schoolId, ctx.userId, quiz.classId);
+    if (!enrolled) {
+      return errorResponse("This quiz was set for a different class", 403);
+    }
 
     const questions = await db
       .select()

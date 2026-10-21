@@ -355,16 +355,8 @@ export type SchoolAuthContext = AuthContext & {
  * the token claim, which is what makes this the Phase 2C replacement for the stale
  * `payload.role` checks.
  */
-export async function resolveAuthContext(
-  request: Request,
-  /**
-   * Phase 1 compatibility hook: `/api/files/[id]` also accepts `?token=` because <img>,
-   * <video> and <a download> cannot set an `Authorization` header. This only widens WHERE a
-   * token may be read from — never what it grants, and never a school.
-   */
-  tokenOverride?: string | null
-): Promise<AuthContext> {
-  const token = tokenOverride || getTokenFromRequest(request);
+export async function resolveAuthContext(request: Request): Promise<AuthContext> {
+  const token = getTokenFromRequest(request);
   if (!token) throw new AuthContextError("Authentication required", 401);
 
   const claims = await verifyToken(token);
@@ -419,11 +411,8 @@ export async function resolveAuthContext(
  * every request, so an existing token loses ordinary tenant access as soon as its school is no
  * longer active. Multi-school users must first use the server-side selection route.
  */
-export async function requireSchoolContext(
-  request: Request,
-  tokenOverride?: string | null
-): Promise<SchoolAuthContext> {
-  const context = await resolveAuthContext(request, tokenOverride);
+export async function requireSchoolContext(request: Request): Promise<SchoolAuthContext> {
+  const context = await resolveAuthContext(request);
   if (!context.school) {
     const message = context.memberships.length > 1
       ? "Select one of your schools before continuing"
@@ -567,11 +556,10 @@ export function tenantErrorResponse(error: unknown, fallbackMessage = "Request f
  * is read for a school, so a forged `schoolId` has nothing to attach to.
  */
 export async function guardSchoolContext(
-  request: Request,
-  tokenOverride?: string | null
+  request: Request
 ): Promise<TenantGuard<SchoolAuthContext>> {
   try {
-    return { ok: true, context: await requireSchoolContext(request, tokenOverride) };
+    return { ok: true, context: await requireSchoolContext(request) };
   } catch (error) {
     if (error instanceof AuthContextError) return guardDenied(error.status, error.message);
     throw error;
@@ -589,11 +577,10 @@ export async function guardSchoolContext(
  * school data. Never use this to skip a school predicate.
  */
 export async function guardPlatformAdmin(
-  request: Request,
-  tokenOverride?: string | null
+  request: Request
 ): Promise<TenantGuard<AuthContext>> {
   try {
-    const context = await resolveAuthContext(request, tokenOverride);
+    const context = await resolveAuthContext(request);
     if (!isPlatformAdminContext(context)) {
       throw new AuthContextError("Only platform administrators may perform this action", 403);
     }
@@ -1004,8 +991,55 @@ export function sqlTimetableInSchool(schoolId: string, entryRef: SQL | AnyColumn
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfTimetableEntry(entryRef));
 }
 
-/** Content predicate: the uploaded file belongs to this school's alone. */
+/**
+ * Content predicate for uploaded files. Migration 0016/0017 makes the direct school_id
+ * authoritative; the relational ownership check remains only for legacy rows whose
+ * school_id is still NULL.
+ *
+ * This preserves a legitimate multi-school member's OWN uploaded files instead of
+ * treating their other active membership as a second owner — the same treatment
+ * `sqlAssignmentInSchool` gives assignments (Phase 2D). Before this change the
+ * relational set of a uploader who belongs to two schools resolved to two schools, and
+ * `sqlOwnedBySchool` denied the file to BOTH: the uploader could upload a file and then
+ * receive 404 for it in the very school that had just accepted the upload.
+ *
+ * Tenant isolation is NOT weakened: a file is readable only in the school that wrote it
+ * (`uploaded_files.school_id`, NOT NULL since 0017, server-written from the caller's
+ * verified school). The uploader's other school is still denied, and the relational
+ * "reachable from two schools → deny both" rule still applies to legacy NULL-school_id
+ * rows, which remain unattributable and denied to everyone.
+ */
 export function sqlFileInSchool(schoolId: string, fileRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`(
+    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = ${fileRef} and f."school_id" = ${schoolId}
+    )
+    or (
+      not exists (
+        select 1 from "uploaded_files" f
+         where f."id" = ${fileRef} and f."school_id" is not null
+      )
+      and ${sqlOwnedBySchool(schoolId, sqlSchoolsOfFile(fileRef))}
+    )
+  )`;
+}
+
+/**
+ * PURELY RELATIONAL file ownership.
+ *
+ * This is the pre-0016 fallback: a database that has no `uploaded_files.school_id`
+ * column at all can only be attributed through the uploader/assignment membership chain.
+ * The row must be reachable from EXACTLY this school, so a file that two schools can
+ * reach is denied to both.
+ *
+ * It is deliberately NOT the same as `sqlFileInSchool`: on a migrated schema the direct
+ * `school_id` wins, because the relational set of an uploader who belongs to two schools
+ * resolves to two schools and would deny the uploader's own, legitimate file.
+ */
+export function sqlFileOwnedRelationally(schoolId: string, fileRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfFile(fileRef));
 }
 

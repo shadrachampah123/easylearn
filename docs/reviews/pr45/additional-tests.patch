@@ -1,0 +1,576 @@
+diff --git a/tests/pr45-review-db.test.ts b/tests/pr45-review-db.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/pr45-review-db.test.ts
+@@ -0,0 +1,311 @@
++/**
++ * Additional PR #45 review regressions, run against a4fbc401 without application changes.
++ * These cases fill gaps in the committed suite; failed expectations are findings, not
++ * expected-success vulnerability demonstrations. No original test/assertion is changed.
++ * Requires an explicitly disposable LOCAL PostgreSQL server. Never uses production data.
++ */
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import { setTimeout as delay } from "node:timers/promises";
++import { Client } from "pg";
++import { NextRequest } from "next/server";
++import { createTestJwtSecret } from "./helpers/test-secret";
++
++const { createScratchDatabase, assertCleanupSucceeded } = require("./helpers/scratch-db.js");
++const { runMigrations } = require("./helpers/migrations.js");
++let passed = 0;
++let failed = 0;
++async function test(name: string, fn: () => Promise<void>) {
++  // Optional selection is only for comparing the inherited findings with the base;
++  // the full PR-head review is always run without this variable.
++  if (process.env.PR45_REVIEW_FILTER && !new RegExp(process.env.PR45_REVIEW_FILTER).test(name)) {
++    console.log(`NOT SELECTED ${name}`); return;
++  }
++  try { await fn(); passed++; console.log(`PASS ${name}`); }
++  catch (error) { failed++; console.error(`FAIL ${name}: ${(error as Error).message}`); }
++}
++async function main() {
++  const adminUrl = process.env.TEST_DATABASE_URL;
++  assert.ok(adminUrl && process.env.EASY_LEARN_TEST_DATABASE === "true", "explicit disposable DB configuration required");
++  assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(new URL(adminUrl).hostname), "local disposable database only");
++  const dbName = `easylearn_pr45_review_${crypto.randomBytes(6).toString("hex")}`;
++  const admin = new Client({ connectionString: adminUrl });
++  await admin.connect();
++  const scratch = await createScratchDatabase({ admin, adminUrl, dbName, label: "pr45-review" });
++  const url = new URL(adminUrl); url.pathname = `/${dbName}`;
++  process.env.DATABASE_URL = url.toString();
++  process.env.JWT_SECRET = createTestJwtSecret();
++  let primaryError: unknown = null;
++  try {
++    const migration = runMigrations({ databaseUrl: url.toString() });
++    assert.equal(migration.status, 0, `migration failure: ${migration.stderr}`);
++    const auth = await import("@/lib/auth");
++    const detail = await import("@/app/api/quizzes/[id]/route");
++    const list = await import("@/app/api/quizzes/route");
++    const attempt = await import("@/app/api/quizzes/[id]/attempt/route");
++    const check = await import("@/app/api/quizzes/[id]/check/route");
++    const q = async (text: string, values: unknown[] = []) => (await scratch.db.query(text, values)).rows;
++    const one = async (text: string, values: unknown[] = []) => (await q(text, values))[0];
++    let sequence = 0;
++    async function school() {
++      const n = ++sequence;
++      return (await one("INSERT INTO schools (name, short_name, slug) VALUES ($1,$1,$2) RETURNING id", [`Review ${n}`, `review-${n}`])).id as string;
++    }
++    const schoolA = await school();
++    const schoolB = await school();
++    const subjectA = (await one("INSERT INTO subjects (school_id,name,code) VALUES ($1,'Review maths','RMA') RETURNING id", [schoolA])).id as string;
++    const subjectB = (await one("INSERT INTO subjects (school_id,name,code) VALUES ($1,'Review maths','RMB') RETURNING id", [schoolB])).id as string;
++    async function user(role: string, schoolId = schoolA) {
++      const n = ++sequence;
++      const id = (await one("INSERT INTO users (email,password_hash,role,first_name,last_name,is_active) VALUES ($1,'not-a-login-password',$2,'Review',$3,true) RETURNING id", [`review-${n}@example.test`, role, String(n)])).id as string;
++      await q("INSERT INTO school_users (school_id,user_id,role,status) VALUES ($1,$2,$3,'active')", [schoolId,id,role]);
++      return { id, token: await tokenFor(id, schoolId) };
++    }
++    async function tokenFor(userId: string, schoolId: string) {
++      const membership = await one("SELECT id,role FROM school_users WHERE school_id=$1 AND user_id=$2 AND status='active'", [schoolId,userId]);
++      assert.ok(membership);
++      return auth.createToken({ userId, role: membership.role, schoolId, membershipId: membership.id });
++    }
++    async function quiz(teacherId: string, options: { schoolId?: string; published?: boolean; showResults?: boolean; maxAttempts?: number } = {}) {
++      const schoolId = options.schoolId ?? schoolA;
++      const classId = (await one("INSERT INTO classes (school_id,name,level,class_teacher_id) VALUES ($1,$2,'primary',$3) RETURNING id", [schoolId,`Review class ${++sequence}`,teacherId])).id as string;
++      const id = (await one("INSERT INTO quizzes (school_id,title,class_id,subject_id,teacher_id,is_published,show_results,max_attempts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id", [schoolId,`Review quiz ${++sequence}`,classId,schoolId === schoolA ? subjectA : subjectB,teacherId,options.published ?? true,options.showResults ?? false,options.maxAttempts ?? 3])).id as string;
++      const questionId = (await one("INSERT INTO quiz_questions (quiz_id,question_type,question_text,correct_answer,points,order_index) VALUES ($1,'mcq','Review question','review-secret-answer',1,0) RETURNING id", [id])).id as string;
++      return { id, classId, questionId, schoolId };
++    }
++    async function enroll(learnerId: string, target: { classId: string; schoolId: string }) {
++      await q("INSERT INTO learner_classes (school_id,learner_id,class_id) VALUES ($1,$2,$3)", [target.schoolId,learnerId,target.classId]);
++    }
++    type Handler = (req: NextRequest, ctx: { params: Promise<{id: string}> }) => Promise<Response>;
++    async function call(handler: Handler, token: string, id: string, method = "GET", body?: unknown) {
++      const request = new NextRequest(`http://review.example.test/api/quizzes/${id}`, {
++        method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
++        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
++      });
++      const response = await handler(request, { params: Promise.resolve({id}) });
++      return { status: response.status, json: await response.json() as any };
++    }
++    async function start(token: string, id: string) {
++      const response = await call(attempt.POST,token,id,"POST");
++      assert.equal(response.status,201,JSON.stringify(response.json));
++      return response.json.data.attempt.id as string;
++    }
++    async function effects(learnerId: string) {
++      return one("SELECT (SELECT count(*)::int FROM learner_points WHERE learner_id=$1) AS points, (SELECT count(*)::int FROM notifications WHERE user_id=$1) AS notices, (SELECT count(*)::int FROM quiz_attempts WHERE learner_id=$1 AND completed_at IS NOT NULL) AS completed", [learnerId]);
++    }
++    const teacher = await user("teacher");
++
++    await test("same-school non-owner teacher cannot read either published quiz or draft", async () => {
++      const other = await user("teacher");
++      for (const published of [true,false]) {
++        const item = await quiz(teacher.id,{published});
++        const response = await call(detail.GET,other.token,item.id);
++        assert.equal(response.status,403);
++        assert.ok(!JSON.stringify(response.json).includes("review-secret-answer"));
++      }
++    });
++    await test("head teacher and administrator can read drafts and keys; non-owner head teacher cannot edit", async () => {
++      const item = await quiz(teacher.id,{published:false});
++      for (const role of ["head_teacher","school_admin"]) {
++        const staff = await user(role);
++        const response = await call(detail.GET,staff.token,item.id);
++        assert.equal(response.status,200);
++        assert.equal(response.json.data.questions[0].correctAnswer,"review-secret-answer");
++        const write = await call(detail.PUT,staff.token,item.id,"PUT",{description:"Staff policy control"});
++        assert.equal(write.status,role === "school_admin" ? 200 : 403);
++      }
++    });
++    await test("parent list hides drafts and all parent grading paths deny without effects", async () => {
++      const parent = await user("parent");
++      const item = await quiz(teacher.id,{published:false});
++      const listed = await call(list.GET,parent.token,"");
++      assert.equal(listed.status,200);
++      assert.ok(!listed.json.data.some((r: any)=>r.id===item.id));
++      const before = await effects(parent.id);
++      for (const [handler,method] of [[attempt.POST,"POST"],[attempt.PUT,"PUT"],[check.POST,"POST"]] as const) {
++        const response = await call(handler,parent.token,item.id,method,{attemptId:crypto.randomUUID(),questionId:item.questionId,answers:{[item.questionId]:"review-secret-answer"},answer:"review-secret-answer"});
++        assert.equal(response.status,403);
++        assert.ok(!JSON.stringify(response.json).includes("review-secret-answer"));
++      }
++      assert.deepEqual(await effects(parent.id),before);
++    });
++    await test("wrong attempt owner and wrong question IDs cannot expose keys or award points", async () => {
++      const learner = await user("learner");
++      const other = await user("learner");
++      const item = await quiz(teacher.id,{showResults:true});
++      const unrelated = await quiz(teacher.id);
++      await enroll(learner.id,item); await enroll(other.id,item);
++      const attemptId = await start(learner.token,item.id);
++      const before = await effects(other.id);
++      const submission = await call(attempt.PUT,other.token,item.id,"PUT",{attemptId,answers:{[item.questionId]:"review-secret-answer"}});
++      const feedback = await call(check.POST,other.token,item.id,"POST",{attemptId,questionId:item.questionId,answer:"review-secret-answer"});
++      const wrongQuestion = await call(check.POST,learner.token,item.id,"POST",{attemptId,questionId:unrelated.questionId,answer:"review-secret-answer"});
++      assert.equal(submission.status,404); assert.equal(feedback.status,400); assert.equal(wrongQuestion.status,404);
++      for (const response of [submission,feedback,wrongQuestion]) assert.ok(!JSON.stringify(response.json).includes("review-secret-answer"));
++      assert.deepEqual(await effects(other.id),before);
++      assert.equal((await one("SELECT completed_at FROM quiz_attempts WHERE id=$1",[attemptId])).completed_at,null);
++    });
++    await test("unpublishing and de-enrollment deny check and submit without mutation or disclosure", async () => {
++      const learner = await user("learner");
++      const item = await quiz(teacher.id,{showResults:true});
++      await enroll(learner.id,item);
++      const attemptId = await start(learner.token,item.id);
++      const before = await effects(learner.id);
++      await q("UPDATE quizzes SET is_published=false WHERE id=$1",[item.id]);
++      for (const state of ["unpublished","unenrolled"]) {
++        if (state === "unenrolled") {
++          await q("UPDATE quizzes SET is_published=true WHERE id=$1",[item.id]);
++          await q("DELETE FROM learner_classes WHERE learner_id=$1 AND class_id=$2",[learner.id,item.classId]);
++        }
++        for (const [handler,method] of [[attempt.POST,"POST"],[attempt.PUT,"PUT"],[check.POST,"POST"]] as const) {
++          const response = await call(handler,learner.token,item.id,method,{attemptId,questionId:item.questionId,answers:{[item.questionId]:"review-secret-answer"},answer:"review-secret-answer"});
++          assert.ok(response.status >= 400 && response.status < 500,`${state}: ${response.status}`);
++          assert.ok(!JSON.stringify(response.json).includes("review-secret-answer"));
++        }
++        assert.deepEqual(await effects(learner.id),before);
++        assert.equal((await one("SELECT completed_at FROM quiz_attempts WHERE id=$1",[attemptId])).completed_at,null);
++      }
++    });
++    await test("hidden-results feedback and successful submission withhold answer keys", async () => {
++      const learner = await user("learner");
++      const item = await quiz(teacher.id,{showResults:false});
++      await enroll(learner.id,item);
++      const attemptId = await start(learner.token,item.id);
++      const feedback = await call(check.POST,learner.token,item.id,"POST",{attemptId,questionId:item.questionId,answer:"wrong"});
++      assert.equal(feedback.status,200); assert.equal(feedback.json.data.correctAnswer,null);
++      const response = await call(attempt.PUT,learner.token,item.id,"PUT",{attemptId,answers:{[item.questionId]:"wrong"}});
++      assert.equal(response.status,200);
++      assert.ok(!JSON.stringify(response.json).includes("review-secret-answer"));
++      assert.equal((await effects(learner.id)).points,0);
++    });
++    await test("enrollment helper uses selected school; a second-school enrollment is not enough", async () => {
++      const access = await import("@/lib/quiz-access");
++      const learner = await user("learner");
++      const secondTeacher = await user("teacher",schoolB);
++      const a = await quiz(teacher.id);
++      const b = await quiz(secondTeacher.id,{schoolId:schoolB});
++      await q("INSERT INTO school_users (school_id,user_id,role,status) VALUES ($1,$2,'learner','active')",[schoolB,learner.id]);
++      await enroll(learner.id,b);
++      assert.equal(await access.isLearnerEnrolledInClass(schoolA,learner.id,a.classId),false);
++      assert.equal(await access.isLearnerEnrolledInClass(schoolA,learner.id,b.classId),false);
++      assert.equal(await access.isLearnerEnrolledInClass(schoolB,learner.id,b.classId),true);
++      const read = await call(detail.GET,learner.token,a.id);
++      assert.equal(read.status,403);
++      await enroll(learner.id,a);
++      assert.equal(await access.isLearnerEnrolledInClass(schoolA,learner.id,a.classId),true);
++    });
++    await test("multi-school enrolled learner can open the quiz listed in their selected school", async () => {
++      const localTeacher = await user("teacher");
++      const learner = await user("learner");
++      const item = await quiz(localTeacher.id);
++      await enroll(learner.id,item);
++      assert.equal((await call(detail.GET,learner.token,item.id)).status,200);
++      await q("INSERT INTO school_users (school_id,user_id,role,status) VALUES ($1,$2,'learner','active')",[schoolB,learner.id]);
++      const listed = await call(list.GET,learner.token,"");
++      assert.ok(listed.json.data.some((r: any)=>r.id===item.id));
++      const read = await call(detail.GET,learner.token,item.id);
++      const begun = await call(attempt.POST,learner.token,item.id,"POST");
++      console.log(`  OBSERVED dual-school learner: listed=true, detail=${read.status}, start=${begun.status}`);
++      assert.equal(read.status,200,"a second active membership must not invalidate valid selected-school enrollment");
++      assert.equal(begun.status,201);
++    });
++    await test("multi-school teacher can open their own directly attributed quiz", async () => {
++      const localTeacher = await user("teacher");
++      const item = await quiz(localTeacher.id);
++      await q("INSERT INTO school_users (school_id,user_id,role,status) VALUES ($1,$2,'teacher','active')",[schoolB,localTeacher.id]);
++      const listed = await call(list.GET,localTeacher.token,"");
++      assert.ok(listed.json.data.some((r: any)=>r.id===item.id));
++      const response = await call(detail.GET,localTeacher.token,item.id);
++      console.log(`  OBSERVED dual-school teacher: listed=true, detail=${response.status}`);
++      assert.equal(response.status,200);
++    });
++    await test("moving a teacher membership must not move an old school A draft/key into school B", async () => {
++      const movingTeacher = await user("teacher");
++      const item = await quiz(movingTeacher.id,{published:false});
++      const bAdmin = await user("school_admin",schoolB);
++      assert.equal((await call(detail.GET,bAdmin.token,item.id)).status,404);
++      await q("UPDATE school_users SET status='disabled' WHERE user_id=$1 AND school_id=$2",[movingTeacher.id,schoolA]);
++      await q("INSERT INTO school_users (school_id,user_id,role,status) VALUES ($1,$2,'teacher','active')",[schoolB,movingTeacher.id]);
++      const response = await call(detail.GET,bAdmin.token,item.id);
++      const leaked = JSON.stringify(response.json).includes("review-secret-answer");
++      assert.equal((await one("SELECT school_id FROM quizzes WHERE id=$1",[item.id])).school_id,schoolA);
++      console.log(`  OBSERVED transferred teacher: B-admin detail=${response.status}, A-draft answer key exposed=${leaked}`);
++      assert.equal(response.status,404,"school B must not read a quiz still attributed to school A");
++      assert.equal(leaked,false);
++    });
++    await test("demoted quiz owner cannot edit/publish or delete as a parent", async () => {
++      const formerTeacher = await user("teacher");
++      const item = await quiz(formerTeacher.id,{published:false});
++      await q("UPDATE school_users SET role='parent' WHERE user_id=$1 AND school_id=$2",[formerTeacher.id,schoolA]);
++      const read = await call(detail.GET,formerTeacher.token,item.id);
++      const edit = await call(detail.PUT,formerTeacher.token,item.id,"PUT",{isPublished:true,description:"Unauthorized mutation"});
++      const changed = (await one("SELECT is_published FROM quizzes WHERE id=$1",[item.id])).is_published;
++      const deleted = await call(detail.DELETE,formerTeacher.token,item.id,"DELETE");
++      console.log(`  OBSERVED demoted owner: draft GET=${read.status}, PUT=${edit.status}, published=${changed}, DELETE=${deleted.status}`);
++      assert.equal(read.status,403,"the read gate must see the new membership role, not token.role");
++      assert.equal(edit.status,403,"historical ownership is not a current staff role");
++      assert.equal(deleted.status,403);
++    });
++    await test("a default one-attempt quiz can resume an already-open attempt", async () => {
++      const learner = await user("learner");
++      const item = await quiz(teacher.id,{maxAttempts:1});
++      await enroll(learner.id,item);
++      const id = await start(learner.token,item.id);
++      const resumed = await call(attempt.POST,learner.token,item.id,"POST");
++      console.log(`  OBSERVED maxAttempts=1: first=201, resume=${resumed.status}`);
++      assert.equal(resumed.status,200,"incomplete attempt is not a new attempt");
++      assert.equal(resumed.json.data.attempt.id,id);
++    });
++    await test("blank fill-in answer cannot fail the check but earn full credit on submit", async () => {
++      const learner = await user("learner");
++      const item = await quiz(teacher.id,{showResults:false});
++      await q("UPDATE quiz_questions SET question_type='fill_blank' WHERE id=$1",[item.questionId]);
++      await enroll(learner.id,item);
++      const attemptId = await start(learner.token,item.id);
++      const feedback = await call(check.POST,learner.token,item.id,"POST",{attemptId,questionId:item.questionId,answer:"   "});
++      const submitted = await call(attempt.PUT,learner.token,item.id,"PUT",{attemptId,answers:{[item.questionId]:"   "}});
++      const state = await effects(learner.id);
++      console.log(`  OBSERVED blank fill-in: check.correct=${feedback.json.data?.correct}, submit.score=${submitted.json.data?.results?.score}, pointsEarned=${submitted.json.data?.results?.pointsEarned}, points rows=${state.points}`);
++      assert.equal(feedback.status,200); assert.equal(feedback.json.data.correct,false);
++      assert.equal(submitted.status,200);
++      assert.equal(submitted.json.data.results.score,0,"a whitespace-only answer is not correct");
++      assert.equal(submitted.json.data.results.pointsEarned,0); assert.equal(state.points,0);
++    });
++    await test("concurrent submissions of one attempt award points and notify exactly once", async () => {
++      const learner = await user("learner");
++      const item = await quiz(teacher.id);
++      await enroll(learner.id,item);
++      const attemptId = await start(learner.token,item.id);
++      // A real database lock is a deterministic scheduling barrier, not an application
++      // mock: both handlers must wait until the old incomplete row has been observed.
++      const locker = new Client({connectionString:url.toString()});
++      await locker.connect(); await locker.query("BEGIN");
++      await locker.query("SELECT id FROM quiz_attempts WHERE id=$1 FOR UPDATE",[attemptId]);
++      const submissions = [0,1].map(()=>call(attempt.PUT,learner.token,item.id,"PUT",{attemptId,answers:{[item.questionId]:"review-secret-answer"}}));
++      let waiting = 0;
++      try {
++        const deadline = Date.now()+8000;
++        while (Date.now()<deadline) {
++          waiting = Number((await one("SELECT count(*) AS n FROM pg_stat_activity WHERE datname=$1 AND wait_event_type='Lock' AND query ILIKE '%quiz_attempts%'",[dbName])).n);
++          if (waiting >= 2) break;
++          await delay(15);
++        }
++      } finally { await locker.query("COMMIT"); await locker.end(); }
++      const results = await Promise.all(submissions);
++      const state = await effects(learner.id);
++      console.log(`  OBSERVED concurrent submit: lock waiters=${waiting}, statuses=${results.map(r=>r.status)}, points rows=${state.points}, notifications=${state.notices}`);
++      assert.equal(waiting,2,"both requests reached the real DB barrier");
++      assert.equal(results.filter(r=>r.status===200).length,1,"only one request may complete the attempt");
++      assert.equal(state.points,1); assert.equal(state.notices,1); assert.equal(state.completed,1);
++    });
++  } catch (error) { primaryError = error; throw error; }
++  finally {
++    try { const {pool} = await import("@/db"); await pool.end(); } catch { /* primary setup failure is reported above */ }
++    const cleanup = await scratch.dispose();
++    await admin.end();
++    assertCleanupSucceeded(cleanup,primaryError);
++  }
++  console.log(`PR45 additional DB review: ${passed} passed, ${failed} failed`);
++  if (failed) process.exitCode=1;
++}
++main().catch(error=>{console.error(error); process.exitCode=1;});
+diff --git a/tests/pr45-review-csrf.test.ts b/tests/pr45-review-csrf.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/pr45-review-csrf.test.ts
+@@ -0,0 +1,102 @@
++/** Supplemental credential edge cases absent from the committed PR #45 suite. */
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { NextRequest } from "next/server";
++import { getTokenFromRequest } from "@/lib/auth";
++import { hasSessionCookie, readSessionCookie } from "@/lib/session-cookie";
++import { evaluateCsrfRequestForRequest } from "@/lib/csrf";
++import proxy from "@/proxy";
++
++const origin = "https://review.example.test";
++const foreign = "https://other.example.test";
++function request(headers: Record<string,string> = {}, method = "POST") {
++  return new NextRequest(`${origin}/api/quizzes`,{method,headers:{host:"review.example.test",...headers}});
++}
++// Tests pin the default policy without altering any deployment configuration.
++for (const name of ["EASY_LEARN_PUBLIC_ORIGIN","EASY_LEARN_ALLOWED_ORIGINS","EASY_LEARN_TRUST_PROXY_HEADERS"]) delete process.env[name];
++
++for (const [label,cookie,selected] of [
++  ["two values; first wins","el_token=first; el_token=second","first"],
++  ["empty first value cannot fall through","el_token=; el_token=second",null],
++  ["malformed percent encoding first cannot fall through","el_token=%ZZ; el_token=second",null],
++  ["malformed last value cannot shadow the first","el_token=first; el_token=%ZZ","first"],
++  ["empty cookie","el_token=",null],
++  ["encoded cookie","theme=dark; el_token=first%2Esecond","first.second"],
++] as const) {
++  test(`cookie ambiguity: ${label}`,async()=>{
++    assert.equal(readSessionCookie(cookie),selected);
++    assert.equal(hasSessionCookie(cookie),true);
++    const req=request({cookie,authorization:"Bearer explicit",origin:foreign});
++    assert.equal(getTokenFromRequest(req),"explicit");
++    assert.equal(evaluateCsrfRequestForRequest(req).allowed,false);
++    const response=proxy(req);
++    assert.equal(response.status,403);
++    assert.equal(response.headers.get("cache-control"),"no-store");
++    const payload=await response.text();
++    assert.ok(!payload.includes("explicit") && !payload.includes("first%2Esecond"));
++  });
++}
++test("whenever the auth cookie parser selects a token, the CSRF presence parser detects it",()=>{
++  for (const prefix of ["","theme=x;","theme=x; ","theme=x;\t", "other_el_token=z; "])
++    for (const value of ["signed.token.example","","%ZZ","%20","%3B",'"quoted"']) {
++      const cookie=`${prefix}el_token=${value}; other=x`;
++      if (readSessionCookie(cookie)) assert.equal(hasSessionCookie(cookie),true,cookie);
++    }
++  for (const cookie of ["other_el_token=x","el_token_other=x","EL_TOKEN=x","el_token =x","el_token"]) {
++    assert.equal(hasSessionCookie(cookie),false);
++    assert.equal(readSessionCookie(cookie),null);
++  }
++});
++for (const [label,authorization] of [
++  ["lowercase scheme","bearer token"],
++  ["uppercase scheme","BEARER token"],
++  ["tab separator","Bearer\ttoken"],
++  ["empty bearer","Bearer "],
++  ["Basic scheme","Basic token"],
++  ["multiple schemes","Basic x, Bearer token"],
++] as const) {
++  test(`malformed or differently cased Authorization plus cookie: ${label}`,()=>{
++    const req=request({authorization,cookie:"el_token=cookie-identity",origin:foreign});
++    assert.equal(getTokenFromRequest(req),"cookie-identity");
++    assert.equal(evaluateCsrfRequestForRequest(req).allowed,false);
++    assert.equal(proxy(req).status,403);
++  });
++}
++test("parser mismatch is fail-closed for auth: lowercase/tab bearer without cookie selects no credential",()=>{
++  for (const authorization of ["bearer token","BEARER token","Bearer\ttoken"]) {
++    const req=request({authorization});
++    assert.equal(evaluateCsrfRequestForRequest(req).rule,"bearer");
++    assert.equal(getTokenFromRequest(req),null);
++  }
++});
++test("a canonical invalid bearer is selected instead of falling back to the cookie",()=>{
++  const req=request({authorization:"Bearer invalid",cookie:"el_token=cookie-identity",origin});
++  assert.equal(getTokenFromRequest(req),"invalid");
++  assert.equal(evaluateCsrfRequestForRequest(req).rule,"same-origin");
++});
++for (const [fetchSite,allowed] of [["same-origin",true],["none",true],["same-site",false],["cross-site",false],["invalid",false],["",false]] as const) {
++  test(`cookie + bearer with missing Origin and Fetch Metadata=${fetchSite || "absent"}`,()=>{
++    const req=request({cookie:"el_token=ambient",authorization:"Bearer explicit",...(fetchSite ? {"sec-fetch-site":fetchSite} : {})});
++    const decision=evaluateCsrfRequestForRequest(req);
++    assert.equal(decision.allowed,allowed);
++    assert.notEqual(decision.rule,"bearer");
++    assert.equal(proxy(req).status,allowed ? 200 : 403);
++  });
++}
++test("null/foreign Origin is not overridden by a same-origin Fetch Metadata assertion",()=>{
++  for (const hostileOrigin of ["null",foreign,"not an origin"]) {
++    const req=request({cookie:"el_token=ambient",authorization:"Bearer explicit",origin:hostileOrigin,"sec-fetch-site":"same-origin"});
++    assert.equal(evaluateCsrfRequestForRequest(req).allowed,false);
++  }
++});
++test("forged forwarded host/proto cannot bypass cookie + bearer protection in the default mode",()=>{
++  const req=request({cookie:"el_token=ambient",authorization:"Bearer explicit",origin:foreign,"x-forwarded-host":"other.example.test","x-forwarded-proto":"https","sec-fetch-site":"cross-site"});
++  assert.equal(proxy(req).status,403);
++});
++test("configured canonical origin remains exact for cookie + bearer requests",()=>{
++  process.env.EASY_LEARN_PUBLIC_ORIGIN=origin;
++  try {
++    const req=request({cookie:"el_token=ambient",authorization:"Bearer explicit",origin:"http://review.example.test","sec-fetch-site":"same-origin","x-forwarded-host":"review.example.test"});
++    assert.equal(proxy(req).status,403);
++  } finally { delete process.env.EASY_LEARN_PUBLIC_ORIGIN; }
++});
+diff --git a/tests/pr45-review-harness.test.cjs b/tests/pr45-review-harness.test.cjs
+new file mode 100644
+--- /dev/null
++++ b/tests/pr45-review-harness.test.cjs
+@@ -0,0 +1,42 @@
++/**
++ * Regression for PR #45's quiz-access test runner swallowing a setup failure.
++ * Fault injection is confined to a child process: only its migration subprocess
++ * reports a controlled error. No application/test source or SQL is replaced.
++ * Requires a disposable localhost server because the original suite creates and drops
++ * its scratch database before/after the injected migration failure.
++ */
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const os = require("node:os");
++const path = require("node:path");
++const { spawnSync } = require("node:child_process");
++const { test } = require("node:test");
++
++test("quiz-access runner must exit nonzero when its migrations fail before assertions",()=>{
++  assert.equal(process.env.EASY_LEARN_TEST_DATABASE,"true");
++  const adminUrl=new URL(process.env.TEST_DATABASE_URL);
++  assert.ok(["127.0.0.1","localhost","[::1]"].includes(adminUrl.hostname));
++  const directory=fs.mkdtempSync(path.join(os.tmpdir(),"pr45-harness-review-"));
++  const preload=path.join(directory,"fail-migration.cjs");
++  fs.writeFileSync(preload,`
++    const cp=require('node:child_process');
++    const original=cp.spawnSync;
++    cp.spawnSync=function(command,args,options) {
++      if (Array.isArray(args) && args[0]==='run-migration.js') {
++        return {status:42,stdout:'',stderr:'PR45 controlled migration failure',pid:0,signal:null};
++      }
++      return original.apply(this,arguments);
++    };
++  `);
++  try {
++    const result=spawnSync(process.execPath,["--require",preload,"--import","tsx","tests/quiz-access-db.test.ts"],{
++      cwd:path.resolve(__dirname,".."),env:process.env,encoding:"utf8",timeout:30000,
++    });
++    const output=`${result.stdout || ""}${result.stderr || ""}`;
++    assert.ok(!result.error,result.error?.message);
++    assert.match(output,/PR45 controlled migration failure/);
++    assert.ok(!/quiz access: \d+ passed/.test(output),"no assertions should have executed after failed setup");
++    console.log(`Observed child exit=${result.status} after controlled migration failure; zero test assertions executed.`);
++    assert.notEqual(result.status,0,"setup errors must fail CI, not just print an error and exit 0");
++  } finally { fs.rmSync(directory,{recursive:true,force:true}); }
++});
+diff --git a/tests/pr45-review-http.test.cjs b/tests/pr45-review-http.test.cjs
+new file mode 100644
+--- /dev/null
++++ b/tests/pr45-review-http.test.cjs
+@@ -0,0 +1,49 @@
++/** Probe the actual Next production proxy, not just an imported proxy function.
++ * Start the reviewed build locally on port 3015, with a disposable/unused DB URL.
++ * Only invalid synthetic credentials are used: 401 proves the request reached auth;
++ * 403 proves it was rejected by the CSRF proxy before auth.
++ */
++const assert=require('node:assert/strict');
++const http=require('node:http');
++const {test}=require('node:test');
++const localPort=Number(process.env.PR45_REVIEW_PORT || 3015);
++function post(headers={}) {
++  return new Promise((resolve,reject)=>{
++    const req=http.request({host:'127.0.0.1',port:localPort,path:'/api/quizzes',method:'POST',headers:{host:'review.example.test','content-type':'application/json',...headers}},res=>{
++      let body=''; res.setEncoding('utf8'); res.on('data',chunk=>body+=chunk);
++      res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body}));
++    });
++    req.on('error',reject); req.end('{}');
++  });
++}
++const cookie='el_token=invalid-cookie';
++const bearer='Bearer invalid-bearer';
++for (const [name,headers,status] of [
++  ['foreign cookie+bearer',{cookie,authorization:bearer,origin:'http://foreign.example.test'},403],
++  ['same-origin cookie+bearer',{cookie,authorization:bearer,origin:'http://review.example.test'},401],
++  ['missing metadata cookie+bearer',{cookie,authorization:bearer},403],
++  ['missing Origin cross-site metadata',{cookie,authorization:bearer,'sec-fetch-site':'cross-site'},403],
++  ['missing Origin same-site metadata',{cookie,authorization:bearer,'sec-fetch-site':'same-site'},403],
++  ['missing Origin same-origin metadata',{cookie,authorization:bearer,'sec-fetch-site':'same-origin'},401],
++  ['missing Origin none metadata',{cookie,authorization:bearer,'sec-fetch-site':'none'},401],
++  ['duplicate cookie first empty',{cookie:'el_token=; el_token=second',authorization:bearer,origin:'http://foreign.example.test'},403],
++  ['duplicate Cookie header fields',{cookie:['el_token=%ZZ','el_token=second'],authorization:bearer,origin:'http://foreign.example.test'},403],
++  ['lowercase bearer with cookie',{cookie,authorization:'bearer invalid',origin:'http://foreign.example.test'},403],
++  ['tab-separated bearer with cookie',{cookie,authorization:'Bearer\tinvalid',origin:'http://foreign.example.test'},403],
++  ['empty bearer with cookie',{cookie,authorization:'Bearer ',origin:'http://foreign.example.test'},403],
++  ['canonical bearer only',{authorization:bearer},401],
++  ['lowercase bearer only',{authorization:'bearer invalid'},401],
++  ['tab-separated bearer only',{authorization:'Bearer\tinvalid'},401],
++  ['empty bearer only',{authorization:'Bearer '},403],
++  ['null Origin and claimed same-origin',{cookie,authorization:bearer,origin:'null','sec-fetch-site':'same-origin'},403],
++  ['forged forwarding headers do not change foreign host',{cookie,authorization:bearer,origin:'http://foreign.example.test','x-forwarded-host':'foreign.example.test','x-forwarded-proto':'http'},403],
++  ['derived-scheme legitimate same-origin metadata',{cookie,authorization:bearer,origin:'http://review.example.test','x-forwarded-proto':'https','sec-fetch-site':'same-origin'},401],
++  ['derived-scheme correction not granted to cross-site metadata',{cookie,authorization:bearer,origin:'http://review.example.test','x-forwarded-proto':'https','sec-fetch-site':'cross-site'},403],
++]) {
++  test(`real HTTP: ${name}`,async()=>{
++    const result=await post(headers);
++    assert.equal(result.status,status,result.body);
++    assert.ok(!result.body.includes('invalid-cookie')&&!result.body.includes('invalid-bearer'));
++    if (status===403) assert.equal(result.headers['cache-control'],'no-store');
++  });
++}
+diff --git a/tests/pr45-review-mutation.test.cjs b/tests/pr45-review-mutation.test.cjs
+new file mode 100644
+--- /dev/null
++++ b/tests/pr45-review-mutation.test.cjs
+@@ -0,0 +1,47 @@
++/** Ensure the committed M6 mutation removes a guard rather than breaking SQL syntax.
++ * This adds a check; it does not modify the existing mutation harness or assertions.
++ * The SQL uses a temporary table on the explicitly local, disposable test server.
++ */
++const assert=require('node:assert/strict');
++const fs=require('node:fs');
++const path=require('node:path');
++const crypto=require('node:crypto');
++const {test}=require('node:test');
++const {Client}=require('pg');
++const ts=require('typescript');
++
++function getM6() {
++  const filename=path.join(__dirname,'tenant-authorization-mutation.test.ts');
++  const source=ts.createSourceFile(filename,fs.readFileSync(filename,'utf8'),ts.ScriptTarget.Latest,true);
++  const declaration=source.statements.filter(ts.isVariableStatement)
++    .flatMap(s=>Array.from(s.declarationList.declarations))
++    .find(d=>d.name.getText(source)==='mutations');
++  assert.ok(declaration && ts.isArrayLiteralExpression(declaration.initializer));
++  const field=(node,key)=>node.properties.find(p=>p.name?.getText(source)===key)?.initializer?.text;
++  const item=declaration.initializer.elements.find(e=>field(e,'id')==='M6');
++  assert.ok(item,'M6 must remain present');
++  return {find:field(item,'find'),replace:field(item,'replace')};
++}
++module.exports={getM6};
++
++if (require.main===module) test('committed M6 replacement is executable SQL, not a syntax-error mutant',async()=>{
++  assert.equal(process.env.EASY_LEARN_TEST_DATABASE,'true');
++  const url=new URL(process.env.TEST_DATABASE_URL);
++  assert.ok(['127.0.0.1','localhost','[::1]'].includes(url.hostname));
++  const mutation=getM6();
++  assert.ok(mutation.replace.includes('${fileRef}'));
++  assert.ok(!mutation.replace.includes('${schoolId}'),'the intended guard must actually be removed');
++  const client=new Client({connectionString:url.toString()});
++  await client.connect();
++  try {
++    await client.query('CREATE TEMP TABLE uploaded_files (id uuid, school_id uuid)');
++    const id=crypto.randomUUID();
++    await client.query('INSERT INTO uploaded_files VALUES ($1,$2)',[id,crypto.randomUUID()]);
++    const expression=mutation.replace.replaceAll('${fileRef}','$1::uuid');
++    // Positive control: the same guard removal with a SQL comment is executable.
++    const control=await client.query(`SELECT (${expression.replace('// MUTANT M6:','-- MUTANT M6:')}) AS matched`,[id]);
++    assert.equal(control.rows[0].matched,true);
++    const result=await client.query(`SELECT (${expression}) AS matched`,[id]);
++    assert.equal(result.rows[0].matched,true);
++  } finally {await client.end();}
++});

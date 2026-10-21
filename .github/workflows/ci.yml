@@ -31,7 +31,6 @@ jobs:
       TEST_DATABASE_URL: postgres://easylearn_test:easylearn_test@127.0.0.1:5432/postgres
       # Pure tests/build must not inherit the PostgreSQL service as the application DB.
       DATABASE_URL: postgres://test:test@127.0.0.1:1/testdb
-      JWT_SECRET: ci-only-not-a-production-secret-at-least-32-characters
     steps:
       - name: Check out
         uses: actions/checkout@v5
@@ -42,12 +41,21 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Generate a random JWT secret for this run
+        # The JWT secret policy rejects placeholder and low-entropy values, so CI uses a
+        # freshly generated random secret instead of a published example. This also
+        # proves the application works with a real random secret.
+        run: echo "JWT_SECRET=$(openssl rand -base64 48)" >> "$GITHUB_ENV"
+      - name: Verify the generated JWT secret satisfies the secret policy
+        run: npm run security:check-secret
       - name: Audit production dependencies
         run: npm audit --omit=dev
       - name: Require disposable PostgreSQL configuration
         run: test -n "$TEST_DATABASE_URL"
       - name: Unit and source-security tests
         run: npm test
+      - name: Authentication security suites (JWT secret policy, CSRF, cookie auth)
+        run: npm run test:auth-security
       - name: End-to-end PostgreSQL TLS tests (TLS-enabled PostgreSQL 16 required)
         env:
           # A skip must fail this job: the end-to-end TLS assertions have to actually run.

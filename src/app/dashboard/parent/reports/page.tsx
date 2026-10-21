@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 export default function ParentReportsPage() {
   const [children, setChildren] = useState<{ id: string; firstName: string; lastName: string }[]>([]);
@@ -11,20 +12,18 @@ export default function ParentReportsPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
+    apiFetch("/api/auth/me")
       .then((r) => r.json())
       .then((data) => { if (data.success) loadChildren(data.data.user.id); });
   }, []);
 
   async function loadChildren(parentId: string) {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/parent-learners?parentId=${parentId}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
       const rel = await res.json();
       if (rel.success) {
         const learnerIds = rel.data.map((c: { learnerId: string }) => c.learnerId);
-        const userRes = await fetch("/api/users?role=learner&limit=100", { headers: { Authorization: `Bearer ${token}` } });
+        const userRes = await apiFetch("/api/users?role=learner&limit=100");
         const userData = await userRes.json();
         if (userData.success) {
           const kids = userData.data.users.filter((l: { id: string }) => learnerIds.includes(l.id));
@@ -39,12 +38,11 @@ export default function ParentReportsPage() {
 
   async function loadReport(learnerId: string) {
     setChildId(learnerId);
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
       const [gradeRes, attRes] = await Promise.all([
-        fetch(`/api/grades?learnerId=${learnerId}`, { headers: { Authorization: `Bearer ${token}` } }),
-        fetch(`/api/attendance?learnerId=${learnerId}`, { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch(`/api/grades?learnerId=${learnerId}`),
+        apiFetch(`/api/attendance?learnerId=${learnerId}`),
       ]);
       const gradeData = await gradeRes.json();
       const attData = await attRes.json();

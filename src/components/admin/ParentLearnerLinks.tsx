@@ -6,6 +6,7 @@ import {
   RELATIONSHIP_OPTIONS,
   relationshipLabel,
 } from "@/lib/relationships";
+import { apiFetch } from "@/lib/api-client";
 
 interface Person {
   id: string;
@@ -29,12 +30,10 @@ interface ParentLink {
 }
 
 async function api(path: string, init?: RequestInit) {
-  const token = typeof window === "undefined" ? "" : window.localStorage.getItem("el_token") || "";
   const headers: Record<string, string> = {};
   if (init?.body) headers["Content-Type"] = "application/json";
-  if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(path, { ...init, headers: { ...headers, ...(init?.headers || {}) } });
+  const res = await apiFetch(path, { ...init, headers: { ...headers, ...(init?.headers || {}) } });
   const json = await res.json().catch(() => null);
 
   if (!res.ok || !json?.success) {

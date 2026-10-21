@@ -6,6 +6,7 @@ import DashboardShell from "@/components/dashboard/DashboardShell";
 import QuestionImagePicker from "@/components/dashboard/QuestionImagePicker";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { apiFetch } from "../../../../../lib/api-client";
 
 const QUESTION_TYPES = ["mcq", "true_false", "fill_blank", "matching", "short_answer", "essay"] as const;
 type QuestionType = (typeof QUESTION_TYPES)[number];
@@ -133,19 +134,11 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
 
   async function loadQuiz(showSpinner = true) {
     if (showSpinner) setLoading(true);
-    const token = localStorage.getItem("el_token");
-    if (!token) {
-      setLoading(false);
-      return;
-    }
-
     try {
       const [quizRes, classRes, subjectRes] = await Promise.all([
-        fetch(`/api/quizzes/${resolvedParams.id}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        }),
-        fetch("/api/classes", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/subjects", { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch(`/api/quizzes/${resolvedParams.id}`),
+        apiFetch("/api/classes"),
+        apiFetch("/api/subjects"),
       ]);
       const [quizData, classData, subjectData] = await Promise.all([
         quizRes.json(),
@@ -236,7 +229,6 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
 
     setSaving(true);
     setEditError("");
-    const token = localStorage.getItem("el_token");
 
     try {
       const body: Record<string, unknown> = {
@@ -263,11 +255,10 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
         }));
       }
 
-      const response = await fetch(`/api/quizzes/${quiz.id}`, {
+      const response = await apiFetch(`/api/quizzes/${quiz.id}`, {
         method: "PUT",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify(body),
       });
@@ -291,13 +282,11 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
   async function togglePublish() {
     if (!quiz) return;
     setSaving(true);
-    const token = localStorage.getItem("el_token");
     try {
-      const response = await fetch(`/api/quizzes/${quiz.id}`, {
+      const response = await apiFetch(`/api/quizzes/${quiz.id}`, {
         method: "PUT",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         // Send only the flag so a quick publish toggle cannot overwrite quiz content.
         body: JSON.stringify({ isPublished: !quiz.isPublished }),
@@ -317,11 +306,9 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
 
   async function deleteQuiz() {
     if (!confirm("Are you sure you want to delete this quiz?")) return;
-    const token = localStorage.getItem("el_token");
     try {
-      const response = await fetch(`/api/quizzes/${resolvedParams.id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await apiFetch(`/api/quizzes/${resolvedParams.id}`, {
+        method: "DELETE"
       });
       const data = await response.json();
       if (data.success) {

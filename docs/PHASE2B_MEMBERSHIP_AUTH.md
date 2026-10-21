@@ -81,7 +81,10 @@ distinguish a "technical" account from a real one other than `role` and `is_acti
 
 ### 1.6 Where the trust actually sits (the important finding)
 
-- **No `src/middleware.ts` exists.** Authorization is per-route.
+- **No request-handler file resolves a tenant.** Authorization is per-route. A
+  `src/proxy.ts` now exists (Next.js 16's name for the former `middleware`), but it
+  enforces the cross-site request policy only — it never derives a school from the
+  hostname. See `docs/SECURITY_AUTHENTICATION.md`.
 - **54 of 59** route files run their own `getTokenFromRequest` + `verifyToken` preamble and
   read `payload.role` (**119** occurrences).
 - Consequently the JWT `role` claim is the authorization input for almost the whole API:

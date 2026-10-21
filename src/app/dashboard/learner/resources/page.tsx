@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Resource {
   id: string;
@@ -46,11 +47,8 @@ export default function LearnerResourcesPage() {
 
 
   const loadResources = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/resources", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch("/api/resources");
       const data = await res.json();
       if (data.success) setResources(data.data);
     } catch (err) {

@@ -43,6 +43,8 @@ import os from "os";
 import crypto from "crypto";
 import { createRequire } from "module";
 import { NextRequest } from "next/server";
+import { readSessionCookie } from "@/lib/session-cookie";
+import { createTestJwtSecret } from "./helpers/test-secret";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
@@ -52,7 +54,7 @@ const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
 );
 
 const DB_NAME = `easylearn_seed_${crypto.randomBytes(4).toString("hex")}`;
-const JWT_SECRET = "seed-membership-test-secret-0123456789abc";
+const JWT_SECRET = createTestJwtSecret();
 
 let passed = 0;
 let failed = 0;
@@ -190,7 +192,14 @@ async function main() {
         })
       );
       const body = await response.json();
-      return { status: response.status, body };
+      const setCookie = response.headers.get("set-cookie");
+      const token = readSessionCookie(setCookie);
+      if (response.status === 200) {
+        assertEq(body?.data?.token, undefined, "login must not expose the cookie credential in JSON");
+        assert(/;\s*HttpOnly/i.test(setCookie || ""), "login must issue an httpOnly session cookie");
+        assert(token, "login must issue a usable session cookie");
+      }
+      return { status: response.status, body, token: token || undefined };
     };
 
     /* The bootstrap token: the database has no users yet, so there is no account to read
@@ -272,9 +281,8 @@ async function main() {
     });
 
     await test("a seeded demo account can actually reach a tenant-scoped API", async () => {
-      const { body } = await loginAs("teacher@cbism.edu", "teacher123");
-      const token = body?.data?.token;
-      assert(typeof token === "string" && token.length > 0, "the login must return a token");
+      const { token } = await loginAs("teacher@cbism.edu", "teacher123");
+      assert(typeof token === "string" && token.length > 0, "the login must issue a session cookie");
 
       const response = await assignmentsRoute.GET(
         new NextRequest("http://127.0.0.1/api/assignments", {
@@ -316,9 +324,8 @@ async function main() {
     });
 
     await test("a real super administrator may still call the seed route on a populated database", async () => {
-      const { status, body } = await loginAs("admin@cbism.edu", "admin123");
+      const { status, body, token } = await loginAs("admin@cbism.edu", "admin123");
       assertEq(status, 200, `the platform admin must be able to log in: ${JSON.stringify(body)}`);
-      const token = body?.data?.token;
       const response = await post(seedRoute, "http://127.0.0.1/api/seed", token);
       assertEq(response.status, 200);
       const seeded = await response.json();

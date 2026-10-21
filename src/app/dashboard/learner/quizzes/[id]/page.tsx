@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, use } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
+import { apiFetch } from "../../../../../lib/api-client";
 
 interface Question {
   id: string;
@@ -113,13 +114,12 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
   const question = quiz?.questions[index];
 
   const authHeaders = useCallback(() => {
-    const token = typeof window === "undefined" ? null : localStorage.getItem("el_token");
-    return { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
+    return { "Content-Type": "application/json" };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/quizzes/${resolvedParams.id}`, { headers: authHeaders() })
+    apiFetch(`/api/quizzes/${resolvedParams.id}`, { headers: authHeaders() })
       .then((res) => res.json())
       .then((data) => {
         if (cancelled) return;
@@ -136,7 +136,7 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
     finishedRef.current = true;
     setSubmitting(true);
     try {
-      const res = await fetch(`/api/quizzes/${resolvedParams.id}/attempt`, {
+      const res = await apiFetch(`/api/quizzes/${resolvedParams.id}/attempt`, {
         method: "PUT",
         headers: authHeaders(),
         body: JSON.stringify({ attemptId, answers: answersRef.current }),
@@ -167,7 +167,7 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
 
     const elapsedMs = Math.max(0, Math.round(Date.now() - startedAtRef.current));
     try {
-      const res = await fetch(`/api/quizzes/${resolvedParams.id}/check`, {
+      const res = await apiFetch(`/api/quizzes/${resolvedParams.id}/check`, {
         method: "POST",
         headers: authHeaders(),
         body: JSON.stringify({
@@ -235,7 +235,7 @@ export default function TakeQuizPage({ params }: { params: Promise<{ id: string 
   }, [phase, index, quiz, perQuestion, submitAttempt]);
 
   async function startQuiz() {
-    const res = await fetch(`/api/quizzes/${resolvedParams.id}/attempt`, {
+    const res = await apiFetch(`/api/quizzes/${resolvedParams.id}/attempt`, {
       method: "POST",
       headers: authHeaders(),
     });

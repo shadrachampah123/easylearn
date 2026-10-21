@@ -19,6 +19,7 @@
  *   M3  role check removed               → a learner is treated as an administrator
  *   M4  inactive-membership filter removed → a `disabled` membership grants access
  *   M5  uniqueness/fail-closed rule removed → cross-school-attributable content leaks
+ *   M6  the uploaded file's own school check removed → any school may read any file
  *
  * Runs the suite as a child process, so it needs the same database providers as
  * `tests/tenant-authorization-db.test.ts` (TEST_DATABASE_URL → embedded-postgres → SKIP).
@@ -81,14 +82,14 @@ const mutations: Mutation[] = [
   {
     id: "M1",
     name: "membership check removed (no membership → fabricated school context)",
-    find: `  const context = await resolveAuthContext(request, tokenOverride);
+    find: `  const context = await resolveAuthContext(request);
   if (!context.school) {
     const message = context.memberships.length > 1
       ? "Select one of your schools before continuing"
       : "You do not have an active school membership in an active school";
     throw new AuthContextError(message, 403);
   }`,
-    replace: `  const context = await resolveAuthContext(request, tokenOverride);
+    replace: `  const context = await resolveAuthContext(request);
   if (!context.school) {
     // MUTANT M1: permissive fallback instead of failing closed.
     const { schools } = await import("@/db/schema");
@@ -154,6 +155,19 @@ const mutations: Mutation[] = [
   )\`;`,
     replace: `  // MUTANT M5: "reachable from my school" is enough — the "from nowhere else" half is gone.
   return sql\`(exists (select 1 from \${schoolSet} ss where ss."school_id" = \${schoolId}))\`;`,
+  },
+  {
+    id: "M6",
+    name: "the uploaded file's own school check removed (any school may read any file)",
+    find: `    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = \${fileRef} and f."school_id" = \${schoolId}
+    )`,
+    replace: `    // MUTANT M6: the file's own school is no longer checked.
+    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = \${fileRef}
+    )`,
   },
 ];
 
