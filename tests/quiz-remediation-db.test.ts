@@ -351,6 +351,85 @@ async function main() {
         await q("ALTER TABLE quizzes ALTER COLUMN school_id SET NOT NULL");
       }
     });
+
+    await test("R2: demoted quiz owner (parent or learner) cannot edit, publish, replace questions, or delete", async () => {
+      for (const demotedRole of ["parent", "learner"] as const) {
+        const formerStaff = await createUser("teacher", schoolA.id);
+        const draft = await createQuiz(formerStaff.id, {
+          school: schoolA,
+          published: false,
+          answerKey: `demoted-${demotedRole}-key`,
+        });
+
+        // Token still carries stale role="teacher", while live school_users role is changed.
+        await q("UPDATE school_users SET role = $1 WHERE user_id = $2 AND school_id = $3", [
+          demotedRole,
+          formerStaff.id,
+          schoolA.id,
+        ]);
+
+        const read = await callId(detailRoute.GET, formerStaff.token, draft.id);
+        assert.equal(read.status, 403, `demoted ${demotedRole} cannot read unpublished draft`);
+
+        const publishAttempt = await callId(detailRoute.PUT, formerStaff.token, draft.id, "PUT", {
+          isPublished: true,
+          title: "Tampered by demoted owner",
+          questions: [{ questionType: "mcq", questionText: "Tampered?", correctAnswer: "leaked", points: 1 }],
+        });
+        assert.equal(publishAttempt.status, 403, `demoted ${demotedRole} owner must be refused on PUT/publish`);
+
+        const afterPut = await one("SELECT title, is_published FROM quizzes WHERE id = $1", [draft.id]);
+        assert.equal(afterPut.is_published, false, "draft must remain unpublished");
+        assert.notEqual(afterPut.title, "Tampered by demoted owner");
+
+        const deleteAttempt = await callId(detailRoute.DELETE, formerStaff.token, draft.id, "DELETE");
+        assert.equal(deleteAttempt.status, 403, `demoted ${demotedRole} owner must be refused on DELETE`);
+        assert.ok(await one("SELECT id FROM quizzes WHERE id = $1", [draft.id]), "quiz row must survive refused DELETE");
+
+        const createAttempt = await callRoot(listRoute.POST, formerStaff.token, "POST", {
+          title: "Unauthorized quiz",
+          classId: draft.classId,
+          subjectId: schoolA.subjectId,
+          isPublished: false,
+        });
+        assert.equal(createAttempt.status, 403, `demoted ${demotedRole} cannot create quizzes`);
+      }
+    });
+
+    await test("R2: quiz mutations enforce staff ownership/admin permissions and selected-school references", async () => {
+      const ownerTeacher = await createUser("teacher", schoolA.id);
+      const otherTeacher = await createUser("teacher", schoolA.id);
+      const nonOwnerHead = await createUser("head_teacher", schoolA.id);
+      const schoolAdminA = await createUser("school_admin", schoolA.id);
+      const quizA = await createQuiz(ownerTeacher.id, { school: schoolA, published: false });
+
+      for (const nonAuthorizedStaff of [otherTeacher, nonOwnerHead]) {
+        assert.equal(
+          (await callId(detailRoute.PUT, nonAuthorizedStaff.token, quizA.id, "PUT", { isPublished: true })).status,
+          403
+        );
+        assert.equal((await callId(detailRoute.DELETE, nonAuthorizedStaff.token, quizA.id, "DELETE")).status, 403);
+      }
+
+      // Cross-school subjectId on POST and PUT must fail closed with 404 rather than mutating or throwing 503.
+      const badCreate = await callRoot(listRoute.POST, ownerTeacher.token, "POST", {
+        title: "Cross-school subject quiz",
+        classId: quizA.classId,
+        subjectId: schoolB.subjectId,
+        isPublished: false,
+      });
+      assert.equal(badCreate.status, 404, "POST must reject another school's subjectId with 404");
+
+      const badPutSubject = await callId(detailRoute.PUT, ownerTeacher.token, quizA.id, "PUT", {
+        subjectId: schoolB.subjectId,
+      });
+      assert.equal(badPutSubject.status, 404, "PUT must reject another school's subjectId with 404");
+
+      // Active owner can publish, and school_admin in the same school can edit and delete.
+      assert.equal((await callId(detailRoute.PUT, ownerTeacher.token, quizA.id, "PUT", { isPublished: true })).status, 200);
+      assert.equal((await callId(detailRoute.PUT, schoolAdminA.token, quizA.id, "PUT", { description: "Approved" })).status, 200);
+      assert.equal((await callId(detailRoute.DELETE, schoolAdminA.token, quizA.id, "DELETE")).status, 200);
+    });
   } catch (error) {
     primaryError = error;
     throw error;
