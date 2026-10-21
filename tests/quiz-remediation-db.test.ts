@@ -560,6 +560,84 @@ async function main() {
       );
       assert.equal(pointsAfterBlank.n, 0, "blank answers and post-submit tampering must award 0 points");
     });
+
+    await test("R6: default one-attempt quizzes resume incomplete attempts cleanly without duplicate attempts or rewards", async () => {
+      const owner = await createUser("teacher", schoolA.id);
+      const learner = await createUser("learner", schoolA.id);
+      const oneShotQuiz = await createQuiz(owner.id, {
+        school: schoolA,
+        published: true,
+        maxAttempts: 1,
+        answerKey: "accra",
+      });
+      await enroll(learner.id, oneShotQuiz);
+
+      // Simultaneous first starts (Synchronized via PostgreSQL advisory lock) must never create two rows.
+      const barrier = new Client({ connectionString: scratchUrl.toString() });
+      await barrier.connect();
+      await barrier.query("BEGIN");
+      await barrier.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+        oneShotQuiz.id,
+        learner.id,
+      ]);
+
+      const concurrentStarts = [0, 1].map(() =>
+        callId(attemptRoute.POST, learner.token, oneShotQuiz.id, "POST")
+      );
+      await delay(80);
+      await barrier.query("COMMIT");
+      await barrier.end();
+
+      const startOutcomes = await Promise.all(concurrentStarts);
+      const statuses = startOutcomes.map((o) => o.status).sort();
+      assert.deepEqual(statuses, [200, 201], "concurrent starts must create one attempt (201) and resume it (200)");
+      assert.equal(
+        startOutcomes[0].json.data.attempt.id,
+        startOutcomes[1].json.data.attempt.id,
+        "concurrent starts must return the same open attempt ID"
+      );
+      const attemptId = startOutcomes[0].json.data.attempt.id as string;
+
+      // List and detail keep attemptsLeft = 1 / attemptsUsed = 0 while the single attempt is still incomplete.
+      const listedOpen = await callRoot(listRoute.GET, learner.token);
+      const listedQuizOpen = listedOpen.json.data.find((r: any) => r.id === oneShotQuiz.id);
+      assert.equal(listedQuizOpen.attemptsUsed, 0);
+      assert.equal(listedQuizOpen.attemptsLeft, 1);
+
+      const detailOpen = await callId(detailRoute.GET, learner.token, oneShotQuiz.id);
+      assert.equal(detailOpen.json.data.attemptsUsed, 0);
+
+      // Explicit subsequent resume also returns 200 with the exact same open attempt ID.
+      const resumed = await callId(attemptRoute.POST, learner.token, oneShotQuiz.id, "POST");
+      assert.equal(resumed.status, 200);
+      assert.equal(resumed.json.data.attempt.id, attemptId);
+
+      // Complete the single attempt -> 100 points once.
+      const submitted = await callId(attemptRoute.PUT, learner.token, oneShotQuiz.id, "PUT", {
+        attemptId,
+        answers: { [oneShotQuiz.questionId]: "Accra" },
+      });
+      assert.equal(submitted.status, 200);
+      assert.equal(submitted.json.data.results.pointsEarned, 100);
+
+      // After completion, list/detail report attemptsUsed = 1 / attemptsLeft = 0 and a new start is refused with 400.
+      const listedDone = await callRoot(listRoute.GET, learner.token);
+      const listedQuizDone = listedDone.json.data.find((r: any) => r.id === oneShotQuiz.id);
+      assert.equal(listedQuizDone.attemptsUsed, 1);
+      assert.equal(listedQuizDone.attemptsLeft, 0);
+
+      const secondAttempt = await callId(attemptRoute.POST, learner.token, oneShotQuiz.id, "POST");
+      assert.equal(secondAttempt.status, 400, "completed one-attempt quiz must refuse starting a second attempt");
+
+      const totals = await one(
+        `SELECT
+           (SELECT count(*)::int FROM quiz_attempts WHERE quiz_id = $1 AND learner_id = $2) AS attempts,
+           (SELECT count(*)::int FROM learner_points WHERE learner_id = $2) AS point_rows`,
+        [oneShotQuiz.id, learner.id]
+      );
+      assert.equal(totals.attempts, 1, "must never create more than one attempt row");
+      assert.equal(totals.point_rows, 1, "must never award duplicate points");
+    });
   } catch (error) {
     primaryError = error;
     throw error;

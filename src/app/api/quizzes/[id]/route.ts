@@ -126,7 +126,9 @@ export async function GET(
       .from(quizAttempts)
       .where(and(
         eq(quizAttempts.quizId, id),
-        isStaff ? sql`true` : eq(quizAttempts.learnerId, ctx.userId)
+        isStaff
+          ? sql`true`
+          : and(eq(quizAttempts.learnerId, ctx.userId), sql`${quizAttempts.completedAt} IS NOT NULL`)
       ));
 
     return successResponse({

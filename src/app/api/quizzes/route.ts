@@ -158,8 +158,9 @@ export async function GET(request: NextRequest) {
             .where(and(
               eq(quizAttempts.quizId, quiz.id),
               eq(quizAttempts.learnerId, ctx.userId)
-            ));
-          attemptsUsed = learnerAttempts.length;
+            ))
+            .orderBy(desc(quizAttempts.startedAt));
+          attemptsUsed = learnerAttempts.filter((a) => a.completedAt !== null).length;
           attempt = learnerAttempts[0] || null;
         }
 

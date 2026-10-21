@@ -63,49 +63,70 @@ export async function POST(
       return errorResponse("This quiz was set for a different class", 403);
     }
 
-    // Check existing attempts
-    const [{ count }] = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(quizAttempts)
-      .where(and(
-        eq(quizAttempts.quizId, id),
-        eq(quizAttempts.learnerId, ctx.userId)
-      ));
+    // Serialize per (quizId, learnerId) so resuming an open attempt works under default
+    // maxAttempts = 1 AND concurrent first starts can never create duplicate attempt rows.
+    const startOutcome = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${id}), hashtext(${ctx.userId}))`);
 
-    if (quiz.maxAttempts && Number(count) >= quiz.maxAttempts) {
+      const [incompleteAttempt] = await tx
+        .select()
+        .from(quizAttempts)
+        .where(
+          and(
+            eq(quizAttempts.quizId, id),
+            eq(quizAttempts.learnerId, ctx.userId),
+            isNull(quizAttempts.completedAt)
+          )
+        )
+        .limit(1);
+
+      if (incompleteAttempt) {
+        return { kind: "resumed" as const, attempt: incompleteAttempt };
+      }
+
+      const [{ count }] = await tx
+        .select({ count: sql<number>`count(*)` })
+        .from(quizAttempts)
+        .where(
+          and(
+            eq(quizAttempts.quizId, id),
+            eq(quizAttempts.learnerId, ctx.userId),
+            sql`${quizAttempts.completedAt} IS NOT NULL`
+          )
+        );
+
+      if (quiz.maxAttempts && Number(count) >= quiz.maxAttempts) {
+        return { kind: "exhausted" as const };
+      }
+
+      const [created] = await tx
+        .insert(quizAttempts)
+        .values({
+          // Phase 2E (Step 1): the quiz was proven to belong to the caller's school
+          // (isQuizInSchool + sqlQuizInSchool above), so the attempt carries that school.
+          schoolId: ctx.schoolId,
+          quizId: id,
+          learnerId: ctx.userId,
+          answers: {},
+          startedAt: new Date(),
+        })
+        .returning();
+
+      return { kind: "created" as const, attempt: created };
+    });
+
+    if (startOutcome.kind === "exhausted") {
       return errorResponse(`Maximum attempts (${quiz.maxAttempts}) reached for this quiz`);
     }
 
-    // Check for incomplete attempt
-    const [incompleteAttempt] = await db
-      .select()
-      .from(quizAttempts)
-      .where(and(
-        eq(quizAttempts.quizId, id),
-        eq(quizAttempts.learnerId, ctx.userId),
-        sql`${quizAttempts.completedAt} IS NULL`
-      ))
-      .limit(1);
-
-    if (incompleteAttempt) {
+    if (startOutcome.kind === "resumed") {
       return successResponse({
-        attempt: incompleteAttempt,
+        attempt: startOutcome.attempt,
         message: "Resuming existing attempt",
       });
     }
 
-    // Create new attempt
-    const [newAttempt] = await db.insert(quizAttempts).values({
-      // Phase 2E (Step 1): the quiz was proven to belong to the caller's school
-      // (isQuizInSchool + sqlQuizInSchool above), so the attempt carries that school.
-      schoolId: ctx.schoolId,
-      quizId: id,
-      learnerId: ctx.userId,
-      answers: {},
-      startedAt: new Date(),
-    }).returning();
-
-    return successResponse({ attempt: newAttempt }, 201);
+    return successResponse({ attempt: startOutcome.attempt }, 201);
   } catch (error) {
     console.error("Start quiz attempt error:", error);
     return errorResponse(
