@@ -439,45 +439,47 @@ async function main() {
       const attemptId = await startAttempt(tokens["learner-enrolled"], quizA);
 
       await q(`DELETE FROM learner_classes WHERE learner_id = $1 AND class_id = $2`, [ids["learner-enrolled"], classA]);
+      try {
+        const submit = await call("quizzes/[id]/attempt", {
+          method: "PUT",
+          token: tokens["learner-enrolled"],
+          params: { id: quizA },
+          body: { attemptId, answers: { [questionA]: "4" } },
+        });
+        assertEq(submit.status, 403, "a de-enrolled learner must not be able to submit");
 
-      const submit = await call("quizzes/[id]/attempt", {
-        method: "PUT",
-        token: tokens["learner-enrolled"],
-        params: { id: quizA },
-        body: { attemptId, answers: { [questionA]: "4" } },
-      });
-      assertEq(submit.status, 403, "a de-enrolled learner must not be able to submit");
-
-      const points = await q(`SELECT count(*)::int AS n FROM learner_points WHERE learner_id = $1`, [
-        ids["learner-enrolled"],
-      ]);
-      assertEq(points[0].n, 0, "a refused submit must not award points");
-
-      // Restore the enrollment for the remaining tests.
-      await q(`INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
-        schoolA, ids["learner-enrolled"], classA, yearA,
-      ]);
+        const points = await q(`SELECT count(*)::int AS n FROM learner_points WHERE learner_id = $1`, [
+          ids["learner-enrolled"],
+        ]);
+        assertEq(points[0].n, 0, "a refused submit must not award points");
+      } finally {
+        // Restore the enrollment for the remaining tests even if an assertion throws.
+        await q(`INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id) VALUES ($1,$2,$3,$4)`, [
+          schoolA, ids["learner-enrolled"], classA, yearA,
+        ]);
+      }
     });
 
     await test("F1b regression: a learner cannot submit after the quiz was unpublished", async () => {
       const attemptId = await startAttempt(tokens["learner-enrolled"], quizA);
 
       await q(`UPDATE quizzes SET is_published = false WHERE id = $1`, [quizA]);
+      try {
+        const submit = await call("quizzes/[id]/attempt", {
+          method: "PUT",
+          token: tokens["learner-enrolled"],
+          params: { id: quizA },
+          body: { attemptId, answers: { [questionA]: "4" } },
+        });
+        assertEq(submit.status, 403, "an unpublished quiz must not accept submissions");
 
-      const submit = await call("quizzes/[id]/attempt", {
-        method: "PUT",
-        token: tokens["learner-enrolled"],
-        params: { id: quizA },
-        body: { attemptId, answers: { [questionA]: "4" } },
-      });
-      assertEq(submit.status, 403, "an unpublished quiz must not accept submissions");
-
-      const points = await q(`SELECT count(*)::int AS n FROM learner_points WHERE learner_id = $1`, [
-        ids["learner-enrolled"],
-      ]);
-      assertEq(points[0].n, 0, "a refused submit must not award points");
-
-      await q(`UPDATE quizzes SET is_published = true WHERE id = $1`, [quizA]);
+        const points = await q(`SELECT count(*)::int AS n FROM learner_points WHERE learner_id = $1`, [
+          ids["learner-enrolled"],
+        ]);
+        assertEq(points[0].n, 0, "a refused submit must not award points");
+      } finally {
+        await q(`UPDATE quizzes SET is_published = true WHERE id = $1`, [quizA]);
+      }
     });
 
     await test("F1b: an enrolled learner CAN submit a published quiz", async () => {
@@ -596,8 +598,13 @@ async function main() {
     assertCleanupSucceeded(cleanup, primaryError);
   }
 
-  /* Exit explicitly: the embedded-postgres shutdown hook must not turn a red suite green. */
-  process.exit(failed > 0 ? 1 : 0);
+  /* Exit explicitly: preserve setup/cleanup failures and never allow zero executed assertions. */
+  const shouldFail =
+    primaryError !== null ||
+    failed > 0 ||
+    passed + failed === 0 ||
+    (process.exitCode !== undefined && process.exitCode !== 0);
+  process.exit(shouldFail ? 1 : 0);
 }
 
 main().catch((error) => {
