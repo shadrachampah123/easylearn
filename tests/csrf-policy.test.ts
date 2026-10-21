@@ -51,6 +51,10 @@ function decide(overrides: Partial<Parameters<typeof evaluateCsrfRequest>[0]> = 
     origin: ORIGIN,
     fetchSite: "same-origin",
     hasBearerAuthorization: false,
+    /* These cases are about the bearer client path, which by definition carries no
+       session cookie. The cookie+bearer combination has its own suite
+       (tests/csrf-credential-consistency.test.ts). */
+    hasSessionCookie: false,
     requestOrigin: REQUEST_ORIGIN,
     allowedOrigins: [],
     ...overrides,

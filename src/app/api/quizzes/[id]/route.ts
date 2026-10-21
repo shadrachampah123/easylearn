@@ -7,7 +7,6 @@ import {
   classes,
   subjects,
   users,
-  learnerClasses,
 } from "@/db/schema";
 import {
   guardSchoolContext,
@@ -16,6 +15,7 @@ import {
   isClassInSchool,
   sqlQuizInSchool,
 } from "@/lib/tenant";
+import { evaluateQuizReadAccess, isLearnerEnrolledInClass, quizAudienceForRole } from "@/lib/quiz-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, asc, and, sql } from "drizzle-orm";
@@ -68,26 +68,33 @@ export async function GET(
       return notFoundResponse("Quiz");
     }
 
-    // Teachers can only inspect quizzes they manage; administrators can inspect all
-    // school quizzes. This also protects the attempt count returned below.
-    if (ctx.school.role === "teacher" && quiz.teacherId !== ctx.userId) {
-      return errorResponse("You can only view your own quizzes", 403);
+    /* ── Who may open this quiz, and what may they see? ────────────────────────
+       The rules live in `@/lib/quiz-access` so that the list route, this route and
+       the attempt routes cannot drift apart again. In short:
+         - a learner needs a PUBLISHED quiz and an enrollment in its class;
+         - a parent needs a PUBLISHED quiz and never sees the answer key;
+         - a teacher may open their own quizzes (drafts included);
+         - the other staff roles may open every quiz of their school.
+       The enrollment is read with the caller's school, so an enrollment that belongs
+       to another school never satisfies it. */
+    const audience = quizAudienceForRole(ctx.school.role);
+    const isEnrolled =
+      audience === "learner"
+        ? await isLearnerEnrolledInClass(ctx.schoolId, ctx.userId, quiz.classId)
+        : false;
+
+    const access = evaluateQuizReadAccess({
+      role: ctx.school.role,
+      isOwner: quiz.teacherId === ctx.userId,
+      isPublished: quiz.isPublished === true,
+      isEnrolled,
+    });
+
+    if (!access.allowed) {
+      return errorResponse(access.reason, access.status);
     }
 
     const isStaff = hasSchoolStaffRole(ctx);
-
-    if (ctx.school.role === "learner") {
-      if (!quiz.isPublished) {
-        return errorResponse("This quiz has not been published by your teacher yet", 403);
-      }
-      const enrolled = await db
-        .select({ classId: learnerClasses.classId })
-        .from(learnerClasses)
-        .where(eq(learnerClasses.learnerId, ctx.userId));
-      if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
-        return errorResponse("This quiz was set for a different class", 403);
-      }
-    }
 
     // Get questions
     let questions = await db
@@ -96,11 +103,11 @@ export async function GET(
       .where(eq(quizQuestions.quizId, id))
       .orderBy(asc(quizQuestions.orderIndex));
 
-    // For learners taking the quiz, hide correct answers
-    if (ctx.school.role === "learner") {
+    // Anyone who is not staff (a learner, a parent) never receives the answer key.
+    if (!access.revealAnswerKeys) {
       questions = questions.map((q) => ({
         ...q,
-        correctAnswer: null, // Hide correct answer from learners
+        correctAnswer: null, // Hide correct answer from learners and parents
       }));
 
       // Shuffle if enabled
