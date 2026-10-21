@@ -58,6 +58,10 @@ DATABASE_URL="your-neon-connection-string" npm run db:schema-sync
 > `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md`.
 
 Then open your deployed app and go to `/api/seed` (POST request) to create demo data.
+The endpoint is disabled in production and requires a super_admin session in development;
+a state-changing request must also identify its origin, so send the session token as a
+bearer token (`Authorization: Bearer $SUPER_ADMIN_TOKEN`) or add a matching `Origin:`
+header. See `docs/SECURITY_AUTHENTICATION.md`.
 
 #### Step 4b: Apply reviewed migrations safely
 

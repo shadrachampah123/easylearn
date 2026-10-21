@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface UserItem {
   id: string;
@@ -40,7 +41,7 @@ export default function AdminUsersPage() {
 
   async function fetchUsers() {
     try {
-      const res = await fetch("/api/admin/users");
+      const res = await apiFetch("/api/admin/users");
       const data = await res.json();
       if (data.success) {
         setUserList(data.data);
@@ -59,7 +60,7 @@ export default function AdminUsersPage() {
     setFormSubmitting(true);
 
     try {
-      const res = await fetch("/api/admin/users", {
+      const res = await apiFetch("/api/admin/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form),
@@ -88,7 +89,7 @@ export default function AdminUsersPage() {
   // Handle Toggle Active/Deactive Status
   async function toggleStatus(userId: string, currentStatus: boolean) {
     try {
-      await fetch(`/api/admin/users/${userId}`, {
+      await apiFetch(`/api/admin/users/${userId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ isActive: !currentStatus }),
@@ -104,7 +105,7 @@ export default function AdminUsersPage() {
     if (!confirm(`Are you sure you want to reset credentials for ${userName}?`)) return;
 
     try {
-      const res = await fetch(`/api/admin/users/${userId}`, {
+      const res = await apiFetch(`/api/admin/users/${userId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "reset_password" }),

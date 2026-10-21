@@ -32,6 +32,23 @@ function listFiles(dir, ext) {
   return out;
 }
 
+/**
+ * Remove comments so a boundary check sees CODE, not prose.
+ *
+ * A route is allowed to EXPLAIN that a school context comes from `school_users`; it is
+ * not allowed to QUERY it. Without this, a route could write the membership table with
+ * raw SQL (`insert into "school_users" …`) and still pass a guard that only looked for
+ * the camelCase schema export.
+ *
+ * `//` is only treated as a comment when it is NOT preceded by `:` — that keeps URLs
+ * (`https://…`) intact.
+ */
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, '$1');
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -294,11 +311,18 @@ test('Boundary: no API route queries the tenant tables directly (Phase 2B: via s
   // Phase 2A asserted that no route touched the tenant tables at all. Phase 2B wires
   // membership into authentication, but through ONE module: routes must still never import
   // `schoolUsers`/`schools` from the schema or run their own membership query.
+  //
+  // The check looks at CODE, not at comments: a route may explain that a school context
+  // comes from `school_users`, but it may not query or WRITE it. The membership table is
+  // matched in both spellings — the camelCase schema export and the raw table name — so
+  // a route cannot bypass the tenant module with a hand-written `insert into
+  // "school_users" …`.
   const routeFiles = listFiles(path.join(__dirname, '..', 'src', 'app', 'api'), '.ts');
   for (const file of routeFiles) {
-    const content = fs.readFileSync(file, 'utf8');
+    const content = stripComments(fs.readFileSync(file, 'utf8'));
     assert(
       !/\bschoolUsers\b/.test(content) &&
+        !/\bschool_users\b/.test(content) &&
         !/\bimport\s*{[^}]*\bschools\b[^}]*}\s*from\s*"@\/db\/schema"/.test(content),
       `${path.relative(process.cwd(), file)} must not query tenant tables directly — use src/lib/tenant.ts`
     );
@@ -326,8 +350,41 @@ test('Boundary: no tenant filtering added to authorization helpers', () => {
 });
 
 test('Boundary: no middleware/hostname tenant resolution', () => {
-  const middlewarePath = path.join(__dirname, '..', 'src', 'middleware.ts');
-  assert(!fs.existsSync(middlewarePath), 'src/middleware.ts must not exist yet (Phase 2E)');
+  // The original assertion was that the request-handler file must not exist, because a
+  // middleware that resolves a tenant from the hostname would let a request pick
+  // its own school. That property — not the absence of the file — is the boundary,
+  // so it is now asserted directly and against a file that does exist.
+  //
+  // The middleware that now exists performs the cross-site request policy and
+  // nothing else. It must never derive, select or influence a tenant.
+  const middlewarePath = path.join(__dirname, '..', 'src', 'proxy.ts');
+  assert(
+    fs.existsSync(middlewarePath),
+    'the cross-site request policy is enforced in src/proxy.ts, which must exist'
+  );
+
+  const middleware = readFile('src/proxy.ts');
+
+  assert(
+    !/from\s+["']@\/lib\/tenant["']/.test(middleware),
+    'the proxy must not import the tenant module'
+  );
+  assert(
+    !/\b(schoolId|school_id|membershipId|membership_id)\b/.test(middleware),
+    'the proxy must not read or derive a school or membership id'
+  );
+  assert(
+    !/headers\.get\(\s*["'](x-forwarded-host|host|x-tenant|x-school)["']\s*\)/i.test(middleware),
+    'the proxy must not read a tenant from a request header'
+  );
+  assert(
+    !/(selectSchool|resolveSchool|requireSchoolContext|guardSchoolContext|isUserInSchool)/.test(middleware),
+    'the proxy must not resolve a school context'
+  );
+  assert(
+    /evaluateCsrfRequestForRequest/.test(middleware),
+    'the proxy must apply the cross-site request policy'
+  );
 });
 
 test('Docs: README documents the 0013 migration', () => {

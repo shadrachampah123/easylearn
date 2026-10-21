@@ -257,6 +257,57 @@ test('Tenant module: membership queries are always scoped to the authenticated u
   );
 });
 
+test('Tenant module: the public membership read cannot be widened by a flag', () => {
+  // LOW-7: `listSchoolMemberships` used to take a public `includeInactive` option. A
+  // public boolean that widens a membership read is a trap — the only thing that kept a
+  // caller from treating a disabled or archived membership as school context was a
+  // sentence in a doc comment. The widening read now has its own, explicitly-named
+  // export, and the active read takes no options at all.
+  assert(
+    !/listSchoolMemberships\s*\([^)]*options/.test(tenant),
+    'the active membership read must not take an options object'
+  );
+  assert(
+    !/options:\s*\{\s*includeInactive/.test(tenant),
+    'no membership read may offer a widening includeInactive switch'
+  );
+  assert(
+    tenant.includes('export async function listAllSchoolMembershipsForInspection'),
+    'the widening read must have its own, explicitly-named export'
+  );
+  assert(
+    tenant.includes('export async function listActiveSchoolMemberships'),
+    'the active membership read must keep its named export'
+  );
+});
+
+test('Tenant module: every membership read is scoped to ONE user, the inspection read too', () => {
+  const reads = [
+    ['listSchoolMemberships', 'export async function listSchoolMemberships', '/** Only `status = '],
+    [
+      'listAllSchoolMembershipsForInspection',
+      'export async function listAllSchoolMembershipsForInspection',
+      'export async function resolveSchoolMembership',
+    ],
+  ];
+  for (const [name, start, end] of reads) {
+    const body = tenant.slice(tenant.indexOf(start), tenant.indexOf(end));
+    assert(body.length > 0, `${name} must exist in tenant.ts`);
+    assert(
+      /const conditions = \[eq\(schoolUsers\.userId, userId\)\]/.test(body),
+      `${name} must start its WHERE clause from the caller's own user id`
+    );
+    assert(
+      body.includes('.where(and(...conditions))'),
+      `${name} must actually apply those conditions`
+    );
+    assert(
+      !/\.where\(\s*eq\(schoolUsers\.schoolId/.test(body),
+      `${name} must never look a membership up by school alone`
+    );
+  }
+});
+
 test('Tenant module: narrowing by schoolId can only reduce the caller\'s own memberships', () => {
   const resolveBody = tenant.slice(
     tenant.indexOf('export async function resolveSchoolMembership'),
@@ -479,7 +530,40 @@ test('Boundary: Phase 1 authorization helpers stay tenant-free (Phase 2C adds sc
 });
 
 test('Boundary: no middleware / hostname tenant resolution (Phase 2E)', () => {
-  assert(!fs.existsSync(path.join(__dirname, '..', 'src', 'middleware.ts')), 'src/middleware.ts must not exist yet');
+  // The original assertion was that the middleware file must not exist, because a
+  // request handler at that layer that resolves a tenant from the hostname would
+  // let a request pick its own school. That property — not the absence of the
+  // file — is the boundary, so it is now asserted directly, against the file that
+  // does exist and does one thing only: enforce the cross-site request policy.
+  const middlewarePath = path.join(__dirname, '..', 'src', 'proxy.ts');
+  assert(
+    fs.existsSync(middlewarePath),
+    'the cross-site request policy is enforced in src/proxy.ts, which must exist'
+  );
+
+  const middleware = readFile('src/proxy.ts');
+
+  assert(
+    !/from\s+["']@\/lib\/tenant["']/.test(middleware),
+    'the proxy must not import the tenant module'
+  );
+  assert(
+    !/\b(schoolId|school_id|membershipId|membership_id)\b/.test(middleware),
+    'the proxy must not read or derive a school or membership id'
+  );
+  assert(
+    !/headers\.get\(\s*["'](x-forwarded-host|host|x-tenant|x-school)["']\s*\)/i.test(middleware),
+    'the proxy must not read a tenant from a request header'
+  );
+  assert(
+    !/(selectSchool|resolveSchool|requireSchoolContext|guardSchoolContext|isUserInSchool)/.test(middleware),
+    'the proxy must not resolve a school context'
+  );
+  assert(
+    /evaluateCsrfRequestForRequest/.test(middleware),
+    'the proxy must apply the cross-site request policy'
+  );
+
   assert(!tenant.includes('x-forwarded-host'), 'no host-based tenant resolution yet');
 });
 

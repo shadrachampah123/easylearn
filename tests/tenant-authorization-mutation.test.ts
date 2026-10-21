@@ -19,6 +19,7 @@
  *   M3  role check removed               → a learner is treated as an administrator
  *   M4  inactive-membership filter removed → a `disabled` membership grants access
  *   M5  uniqueness/fail-closed rule removed → cross-school-attributable content leaks
+ *   M6  the uploaded file's own school check removed → any school may read any file
  *
  * Runs the suite as a child process, so it needs the same database providers as
  * `tests/tenant-authorization-db.test.ts` (TEST_DATABASE_URL → embedded-postgres → SKIP).
@@ -81,14 +82,14 @@ const mutations: Mutation[] = [
   {
     id: "M1",
     name: "membership check removed (no membership → fabricated school context)",
-    find: `  const context = await resolveAuthContext(request, tokenOverride);
+    find: `  const context = await resolveAuthContext(request);
   if (!context.school) {
     const message = context.memberships.length > 1
       ? "Select one of your schools before continuing"
       : "You do not have an active school membership in an active school";
     throw new AuthContextError(message, 403);
   }`,
-    replace: `  const context = await resolveAuthContext(request, tokenOverride);
+    replace: `  const context = await resolveAuthContext(request);
   if (!context.school) {
     // MUTANT M1: permissive fallback instead of failing closed.
     const { schools } = await import("@/db/schema");
@@ -138,12 +139,10 @@ const mutations: Mutation[] = [
     id: "M4",
     name: "inactive-membership filter removed (disabled membership grants access)",
     find: `  const conditions = [eq(schoolUsers.userId, userId)];
-  if (!options.includeInactive) {
-    conditions.push(
-      eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS),
-      eq(schools.status, ACTIVE_SCHOOL_LIFECYCLE_STATUS)
-    );
-  }`,
+  conditions.push(
+    eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS),
+    eq(schools.status, ACTIVE_SCHOOL_LIFECYCLE_STATUS)
+  );`,
     replace: `  // MUTANT M4: membership and school lifecycle status ignored.
   const conditions = [eq(schoolUsers.userId, userId)];`,
   },
@@ -157,7 +156,65 @@ const mutations: Mutation[] = [
     replace: `  // MUTANT M5: "reachable from my school" is enough — the "from nowhere else" half is gone.
   return sql\`(exists (select 1 from \${schoolSet} ss where ss."school_id" = \${schoolId}))\`;`,
   },
+  {
+    id: "M6",
+    name: "the uploaded file's own school check removed (any school may read any file)",
+    find: `    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = \${fileRef} and f."school_id" = \${schoolId}
+    )`,
+    replace: `    -- MUTANT M6: the file's own school is no longer checked.
+    exists (
+      select 1 from "uploaded_files" f
+       where f."id" = \${fileRef}
+    )`,
+  },
+  {
+    id: "M7",
+    name: "the quiz's own school check removed (any school may read a quiz)",
+    find: `    exists (
+      select 1 from "quizzes" q
+       where q."id" = \${quizRef} and q."school_id" = \${schoolId}
+    )`,
+    replace: `    -- MUTANT M7: the quiz's own school is no longer checked.
+    exists (
+      select 1 from "quizzes" q
+       where q."id" = \${quizRef}
+    )`,
+  },
 ];
+
+const SYNTAX_ERROR_PATTERN =
+  /syntax error at or near|code:\s*['"]42601['"]|\bSyntaxError:|\bTransformError\b/i;
+
+export function isValidMutationKill(result: { code: number | null; output: string }): {
+  killed: boolean;
+  reason: string;
+} {
+  const output = result.output || "";
+  if (SYNTAX_ERROR_PATTERN.test(output)) {
+    return {
+      killed: false,
+      reason: `mutant caused a SQL/JS syntax error instead of a valid authorization failure:\n${output.slice(-800)}`,
+    };
+  }
+  const summary = /📊 Results: \d+ passed, (\d+) failed/.exec(output);
+  const suiteFailed = result.code !== 0 || (summary ? Number(summary[1]) > 0 : false);
+  const sawFailureLine = /❌ FAIL:/.test(output);
+  if (!suiteFailed) {
+    return {
+      killed: false,
+      reason: "mutation was applied cleanly but the authorization suite still passed — mutation SURVIVED",
+    };
+  }
+  if (!sawFailureLine) {
+    return {
+      killed: false,
+      reason: `suite exited ${result.code} without an authorization ❌ FAIL assertion:\n${output.slice(-800)}`,
+    };
+  }
+  return { killed: true, reason: "" };
+}
 
 async function main() {
   restoreTenantFile();
@@ -197,15 +254,11 @@ async function main() {
       fs.writeFileSync(TENANT_FILE, original, "utf8");
     }
 
-    const summary = /📊 Results: \d+ passed, (\d+) failed/.exec(result.output);
-    const suiteFailed = result.code !== 0 || (summary ? Number(summary[1]) > 0 : false);
-    const sawFailureLine = /❌ FAIL:/.test(result.output);
+    const verdict = isValidMutationKill(result);
     record(
       `${mutation.id}: ${mutation.name}`,
-      suiteFailed && sawFailureLine,
-      suiteFailed
-        ? `${mutation.id} was applied but the suite still passed — mutation SURVIVED (the protection is not covered by tests)`
-        : `${mutation.id} killed the suite (exit ${result.code}) but no ❌ line was found:\n${result.output.slice(-800)}`
+      verdict.killed,
+      `${mutation.id}: ${verdict.reason}`
     );
   }
 
@@ -222,8 +275,10 @@ async function main() {
   if (failed > 0) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  restoreTenantFile();
-  console.error(error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    restoreTenantFile();
+    console.error(error);
+    process.exit(1);
+  });
+}

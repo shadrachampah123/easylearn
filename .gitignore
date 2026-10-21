@@ -36,3 +36,6 @@ Thumbs.db
 
 # TypeScript
 tsconfig.tsbuildinfo
+
+# Local HTTP-level verification scratch workspace (not part of the app)
+tmp-verify/

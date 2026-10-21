@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface AttendanceRow {
   id: string;
@@ -20,10 +21,9 @@ export default function AdminAttendancePage() {
   const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
 
   const loadData = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
-      const res = await fetch(`/api/attendance?date=${date}`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch(`/api/attendance?date=${date}`);
       const data = await res.json();
       if (data.success) setRecords(data.data);
     } catch (err) {

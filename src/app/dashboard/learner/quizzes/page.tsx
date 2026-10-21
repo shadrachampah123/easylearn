@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import Link from "next/link";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Quiz {
   id: string;
@@ -40,11 +41,8 @@ export default function LearnerQuizzesPage() {
 
 
   const loadQuizzes = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/quizzes", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch("/api/quizzes");
       const data = await res.json();
       if (data.success) setQuizzes(data.data);
     } catch (err) {

@@ -1349,3 +1349,687 @@ verifiable. Once they are applied and the migration suite and CI are re-run gree
 work is the operator evidence in Part 3, which only a human with production access can produce.
 
 **NOT READY — ACTIONS REQUIRED**
+
+---
+
+# Independent re-audit of the MERGED PR #32 state (2026-10-18/19)
+
+**Subject:** `shadrachampah123/easylearn` — the state of `main` at `016d229` (PR #32 merged as
+`90ec043`, PR #33 as `851156ca`, PR #34 as `016d229`).
+**Scope:** an independent re-audit of the schema-sync bypass remediation, requested after PR #32
+had already been merged. This is **not** a continuation of the original review; it re-derives
+every claim from the current tree and from execution.
+**Environment:** a disposable PostgreSQL 16.14 (SSL enabled, self-signed) on `127.0.0.1:5432`,
+plus a disposable database per scenario. **No production system, credential, or database was
+contacted, read, or modified.** No migration was applied anywhere except to disposable
+databases created for this audit.
+**Repository changes made by this audit:** this report section only. **No product code, test,
+migration, schema, workflow, or configuration was modified.** The mutation experiments of §3
+were applied and then reverted byte-for-byte (§3.4).
+
+---
+
+## 1. Verified repository state
+
+Verified live at the time of writing, not taken from the prior checkpoint.
+
+| Item | Verified value | How |
+|---|---|---|
+| Session branch | `arena/7d4511bc-easylearn` | `git rev-parse --abbrev-ref HEAD` |
+| `HEAD` | `016d229183cb615980992178869bb5b17e42962f` | `git rev-parse HEAD` |
+| `origin/main` | `016d229183cb615980992178869bb5b17e42962f` (identical to `HEAD`) | `git fetch origin` + `git rev-parse origin/main` |
+| Worktree | clean — no modified, staged, or untracked files | `git status --porcelain` → empty |
+| Remotes | `origin` only | `git branch -r` → `origin/HEAD`, `origin/main` |
+| PR #32 | **MERGED**, `isDraft=false`, merge commit `90ec04363cbec3222232c6f912fcad69ab038dba`, head `dff2d8b39a1032f1793be15a067bd5f1b818bcbf`, merged `2026-10-18T22:45:56Z` | `gh pr view 32` |
+| PR #32 head branch | deleted on GitHub | `gh pr view 32 --json headRefName`; push to it is impossible |
+| PR #33 / #34 | MERGED (`851156ca` / `016d229`), both `isDraft=false` | `gh pr view 33/34` |
+| Open pull requests | none | `gh pr list --state open` → `[]` |
+| CI on `main` | `39176807988` success, `39176617079` success, `39173649856` success | `gh run list --branch main` |
+| Commit `9da7333…` | exists on GitHub but is **not** an ancestor of `main` | `git merge-base --is-ancestor` → false |
+| Branch protection on `main` | **UNKNOWN** — the API returns `403 Resource not accessible by integration` | `gh api …/branches/main/protection` |
+| Repository rulesets | `[]` (none) | `gh api …/rulesets` |
+
+**Two consequences the earlier checkpoints did not carry, and which change the framing of this
+report:**
+
+1. **PR #32 is merged, not a draft.** The original review's "keep PR #32 a draft" and
+   "BLOCKER-2 — no independent review" conditions are historical. They are recorded here as
+   *closed by the requester*, not as findings that are still open.
+2. **The branch protection state of `main` could not be read.** It is recorded as UNKNOWN.
+   "403" is not evidence that protection is absent, and nothing in this report should be read
+   as a claim that `main` is unprotected.
+
+---
+
+## 2. Findings and evidence
+
+### 2.0 What was independently re-derived (no defect)
+
+These are re-verified claims, reproduced from the current tree, not restatements.
+
+| Claim | Result | Evidence |
+|---|---|---|
+| The 26 composite tenant foreign keys exist, are validated and correctly shaped | **PASS** | 26/26 present, all `convalidated`, definitions match `src/lib/tenant-constraints.js` exactly (audit harness §3.1) |
+| `drizzle-kit push --force` really destroys them | **PASS (the bypass is real)** | exit 0; 0 composite FKs, 7 of 24 unique targets left, ledger table dropped |
+| The runner fails closed on a damaged database | **PASS** | exit 1 with the ledger/catalog disagreement, the exact count, the missing constraint names, the anti-`drizzle-kit push` warning and both recovery commands |
+| A `--baseline` cannot certify a damaged schema | **PASS** | refused with and without the token; refused **with both tokens** when the catalog lacks the constraints; no ledger written |
+| `npm run db:schema-sync` refuses a managed database | **PASS** | exit 1, "Schema sync refused", points at `node run-migration.js`, never runs push |
+| `--repair-tenant-integrity` is a one-way (truthful-only) repair | **PASS** | restores 24/24 unique targets, creates **no** composite FKs, clears the false 0018 ledger claim |
+| The documented recovery works end to end | **PASS** | repair → baseline the real 18-file prefix `0000_wet_legion.sql … 0017_school_id_not_null.sql` → `0018` under its gate → 26/26 present, validated and correct; 19-row ledger; "🎉 Migration complete!" exit 0 |
+| The operator runbook matches the executable recovery | **PASS** | `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md` §4.1–4.2 states exactly that order, including "if the ledger itself was dropped, record the verified prefix **without** 0018 first" |
+
+> A note on method, because it changed a conclusion once: the very first recovery attempt failed
+> with *"Migration history must be a sequential prefix of the registered migration list"* — that
+> was **my own error** (guessed migration filenames), not a product defect. The registered list
+> in `run-migration.js` is the only source of truth. A second early reading of "0 composite
+> FKs" on a healthy database was a shell-quoting artefact in an ad-hoc `LIKE` filter, not a
+> defect. Both were re-derived from `src/lib/tenant-constraints.js` and the runner's own
+> inventory query before any finding was recorded.
+
+### 2.1 BLOCKER-1 — Production preflight evidence is still absent *(unchanged, by design)*
+
+**Severity: BLOCKER. Status: open. Closable only by a human operator, not by code.**
+
+0018 installs 26 `NOT VALID` composite foreign keys and then validates them. Whether that is
+safe depends on facts that exist only in production: the engine and version, the actual
+migration history, the number of cross-school or orphan rows, the validation duration, the lock
+behaviour, and the certificate chain. None of them can be produced from this repository, and
+this audit did not attempt to obtain production access.
+
+**Evidence required to close it** — exactly the instrument that already exists,
+`docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md`, executed by an authorized operator against a
+**restored production copy**:
+
+1. engine, version, and the applied-migration history (read-only);
+2. the 26-relationship check output with the **count** of offending rows, and confirmation that
+   the check is non-vacuous;
+3. explicit confirmation that **no** row was reassigned, repaired, or deleted;
+4. backup and restore verification;
+5. the measured lock and validation duration, with a recovery plan;
+6. the TLS certificate-chain and hostname verification result.
+
+**This audit did not and must not be read as having produced any of it.** No production
+credential was requested, and none was used.
+
+### 2.2 MEDIUM-4 — The development seed creates users with no school membership *(new)*
+
+**Severity: MEDIUM. Status: open. Not a tenant-isolation leak — it fails closed. It makes the
+seeded environment unusable.**
+
+`src/app/api/seed/route.ts` creates four `users` rows (`admin@cbism.edu`, `teacher@cbism.edu`,
+`parent@cbism.edu`, `learner@cbism.edu`) and a full set of school-owned content — classes,
+subjects, departments, `teacher_classes` (L193), `learner_classes` (L199), `parent_learners`
+(L207), timetable entries, announcements, FAQs — each stamped with a `schoolId`. It **never
+creates a `school_users` row**: the import block (L3–17) does not import `schoolUsers` at all,
+and `grep -n "school_users\|schoolUsers" src/app/api/seed/route.ts` returns nothing.
+
+Since migration 0013/0015, the school context of an account comes **only** from `school_users`.
+`src/lib/tenant.ts:194` filters the membership list to `status = 'active'` rows whose school is
+`status = 'active'`, and `resolveAuthContext` (`src/lib/tenant.ts:350-360`) resolves the school
+from that list — a `users.role` value is a platform role, never a school role. A seeded account
+with no membership therefore has **no** school context, and every tenant-scoped route rejects it.
+
+**Reproduced locally** (disposable database, real route handler, real login route, real
+assignment route — no mocking):
+
+```
+migration chain exit: 0
+seed route status: 201
+seed response: {"success":true,"data":{"message":"Database seeded successfully",
+                 "users":{"admin":"admin@cbism.edu","teacher":"teacher@cbism.edu",
+                          "parent":"parent@cbism.edu","learner":"learner@cbism.edu"}}}
+
+school_users rows after seed: 0
+
+teacher login status: 200
+teacher login school:  null
+teacher login schools: []
+token issued: true
+
+GET /api/assignments as the seeded teacher -> 403
+body: {"success":false,"error":"You do not have an active school membership in an active school"}
+```
+
+**Why MEDIUM and not LOW:** the route returns `201 "Database seeded successfully"` and hands
+back three demo credentials that cannot open a single tenant-scoped screen. Anyone following the
+documented development setup concludes the tenancy model is broken. The direction of failure is
+safe (403, not a leak), and the route is `404` in production (`src/app/api/seed/route.ts:33`),
+which bounds the blast radius to development and CI fixtures.
+
+**Exact next action (proposed, not applied — see §7):** add the four `school_users` rows in the
+same transaction as the user inserts, with `status = 'active'` and the school role matching the
+`users.role` the seed already assigns, then extend the seed to be idempotent on re-run. A
+regression test belongs in `tests/tenant-integration-regression.test.ts` asserting that a seeded
+non-platform account obtains a school context.
+
+### 2.3 MEDIUM-5 — The 26 composite foreign keys do not cover the *user-side* links *(new)*
+
+**Severity: MEDIUM. Status: open, and deliberately **not** fixed here — the remedy is a separate
+gated migration, and expanding 0018's scope is out of scope for this audit.**
+
+The 26 composite foreign keys in `src/lib/tenant-constraints.js` reference only **seven** parent
+tables:
+
+```
+academic_years, assignments, classes, departments, quizzes, subjects, terms
+```
+
+`school_users` is **not** among them. The database therefore enforces that a content row
+belongs to the same school as its *content* parent, but it does **not** enforce that the
+membership-style links point at a user who is actually a member of that school. The
+uncovered child columns are:
+
+| child table | uncovered column | would-be parent |
+|---|---|---|
+| `parent_learners` | `parent_id` | `school_users(school_id, user_id)` |
+| `parent_learners` | `learner_id` | `school_users(school_id, user_id)` |
+| `learner_classes` | `learner_id` | `school_users(school_id, user_id)` |
+| `teacher_classes` | `teacher_id` | `school_users(school_id, user_id)` |
+| `classes` | `class_teacher_id` | `school_users(school_id, user_id)` |
+
+**No live cross-tenant path exists today.** Every read that relies on these links joins
+`school_users` with `status = 'active'` and the school's lifecycle status — for example
+`parentApprovedContentPredicate` (`src/lib/assignment-access.ts:211-238`),
+`parentAssignmentListPredicate` (`src/lib/assignment-access.ts:159-184`) and
+`learnerEnrollmentPredicate` (`src/lib/assignment-access.ts:194-209`) all join
+`school_users` on `school_id` with `status = 'active'` and join `schools` with
+`status = 'active'`. Every write path validates the foreign id against the caller's school
+before inserting (`isClassInSchool`, `isUserInSchool`, `getLearnerIdsInSchool`), and no route
+accepts a `schoolId` from the request body, the query string, or the path — the school is
+always `ctx.schoolId`, server-derived.
+
+**Why it is still a MEDIUM:** the product's thesis is that the *database* enforces tenant
+ownership, not only the application. A future writer that is not the application — a data
+migration, a support script, an admin tool, a restored dump edited by hand — could create a
+`parent_learners` row whose `school_id` does not match the parent's membership, and the
+database would accept it. The read layer would still refuse to return it, so this is
+defence-in-depth, not an exploitable hole. It is also exactly the kind of gap that the
+composite-FK work was created to close, so leaving it undocumented would misrepresent the
+state of the tenant boundary.
+
+**Exact next action (proposed, not applied — see §7):** raise a **separate** migration
+(`0019`) that adds the user-side composite foreign keys to `school_users(school_id, user_id)`.
+No new unique index is required: `school_users_school_user_unique` already provides
+`UNIQUE (school_id, user_id)`. Like 0018 it must be gated, must pre-flight for offending rows,
+and must be applied under its own confirmation token — **not** bundled into 0018 or into any
+database-safety PR.
+
+### 2.4 MEDIUM-3 — The 26 missing child-side indexes *(re-measured; still open, still not fixed)*
+
+**Severity: MEDIUM. Status: open, recorded, deliberately not fixed in this audit.**
+
+The gap itself is unchanged and was re-derived independently: **0 of 26** composite foreign
+keys have a conforming child-side index — an index whose leading column is `school_id` and
+whose second column is the foreign key's own column (or which carries it as an `INCLUDE`
+column). What exists on every affected child table is `<table>_school_idx` (on `school_id`
+alone) and `<table>_school_id_id_unique` (on `(school_id, id)`) — neither covers the foreign
+key's `(school_id, <column>)` pair.
+
+**Re-measured impact.** The audit harness populated a disposable database and ran `EXPLAIN
+(ANALYZE, BUFFERS)` on the exact referential-integrity probe PostgreSQL issues when a parent
+row is deleted or updated:
+
+```sql
+select 1 from only public."<child>" x
+ where x.school_id OPERATOR(pg_catalog.=) $1 and x."<col>" OPERATOR(pg_catalog.=) $2
+ for key share of x;
+```
+
+| scenario | before | after applying the proposed indexes |
+|---|---|---|
+| **1 school, 20 000 rows/table, 2 000 parents** (the single-school shape this product actually has) | **23 of 26 probes use a sequential scan**; 20 973 buffers; **46.87 ms** total | **0 of 26** sequential scans; 4 639 buffers; **2.38 ms** total |
+| 1 school, 20 000 rows/table, 20 parents (≈1 000 children per parent) | 23 of 26 sequential scans; 65 388 buffers; **100.29 ms** total | 3 of 26 (only the 20-row parent tables, where a scan is correct); **25.06 ms** total |
+| **20 schools, 2 000 rows/table** (a genuinely multi-tenant shape) | 0 sequential scans; 437 buffers; 1.05 ms | 0 sequential scans; 443 buffers; 0.92 ms |
+
+The honest reading: the gap is a **structural** one, and its runtime cost depends entirely on
+the data distribution. With many tenants the existing `(school_id)` index is selective enough
+and the probe is already cheap. With **one dominant school** — CBISM's own deployment shape,
+and the shape the product is built for — the probe degrades to a sequential scan of the child
+table, and the cost grows linearly with the size of that table. The append-heavy tables
+(`submissions`, `attendance`, `timetable_entries`, `quiz_attempts`) are the ones that grow
+without bound, and they are the ones whose parent `DELETE`/`UPDATE` would scan the whole table
+while holding the parent row lock.
+
+**Operational trade-offs, stated honestly:**
+
+* `CREATE INDEX CONCURRENTLY` **cannot run inside the runner's per-file transaction**. An
+  index migration therefore needs a **non-transactional path** in `run-migration.js` — a real
+  change to the runner's contract, and a new failure mode (a failed CONCURRENTLY build leaves
+  an invalid index that must be dropped and rebuilt). It must not be smuggled in as an ordinary
+  migration file.
+* Each index adds write amplification on `INSERT`/`UPDATE`/`DELETE` of the child table and
+  consumes disk. 26 indexes across 14 tables is a modest but non-zero cost.
+* `CONCURRENTLY` takes a `SHARE UPDATE EXCLUSIVE` lock (it does **not** block reads or writes),
+  but it cannot run inside a transaction block and it takes two table scans.
+* Building them changes query plans, so the change must be measured on a restored production
+  copy before it is applied to production.
+
+**The proposed statements are recorded, not applied**: `/home/user/proposed-index-migration.sql`
+(26 × `CREATE INDEX CONCURRENTLY IF NOT EXISTS "<table>_school_id_<column>_idx" ON public."<table>"
+USING btree (school_id, <column>);`). They are **not** in any migration in this repository, and
+this report does not claim the performance issue is fixed.
+
+### 2.5 LOW-6 — The seed route authorizes on the token claim, not the database role *(new)*
+
+`src/app/api/seed/route.ts:43` checks `payload.role !== "super_admin"` — the **JWT claim**,
+which is signed but can be up to 24 hours stale. `src/lib/tenant.ts:340` deliberately
+re-reads `users.role` from the database on every request precisely because a claim can be
+stale. The seed route is the one place that still trusts the claim. Impact is bounded: the
+route is `404` in production (L33) and is a super-admin-only development tool, so the exposure
+is "a demoted platform admin can still seed a development database until the token expires".
+Recorded for consistency, not as a security incident.
+
+### 2.6 LOW-7 — `includeInactive` is an unused widening option *(new)*
+
+`src/lib/tenant.ts:189` gives `listSchoolMemberships` an `includeInactive` flag that, when set,
+returns disabled memberships and non-active schools. Its own doc comment (L180-182) says it
+"never grants tenant context", but **nothing enforces that** — the flag only widens the
+*query*. It has **no caller** in the repository (`grep -rn "includeInactive" src/` returns only
+the definition and the two comment lines). Dead code that widens access the moment somebody
+wires it is worth removing or, at minimum, making the "never grants context" guarantee
+structural rather than documentary.
+
+### 2.7 LOW-8 — `src/lib/authorization.ts` is not school-scoped, and is a trap for the next caller *(new)*
+
+The Phase-1 helpers query relationship tables **without a school filter**:
+
+| helper | line | query |
+|---|---|---|
+| `isParentLinkedToLearner` | `src/lib/authorization.ts:27` | `parent_learners` by `parent_id` + `learner_id` |
+| `getParentLinkedLearnerIds` | `src/lib/authorization.ts:36` | `parent_learners` by `parent_id` |
+| `getTeacherAccessibleClassIds` | `src/lib/authorization.ts:44` | `teacher_classes` by `teacher_id`; `classes` by `class_teacher_id` |
+| `canTeacherAccessClass` | `src/lib/authorization.ts:59` | `teacher_classes` / `classes` by teacher |
+| `getTeacherAccessibleLearnerIds` | `src/lib/authorization.ts:86` | `learner_classes` by class id |
+
+**No live cross-tenant path exists today.** Every current caller intersects the helper's
+result with an explicit school scope — `src/app/api/attendance/route.ts:90-92` and
+`src/app/api/enrollments/route.ts:99-105` intersect with `getLearnerIdsInSchool(ctx.schoolId, …)`,
+and the base `attendance.school_id = ctx.schoolId` condition always remains in force. Every
+caller also passes the **database-derived** role (`ctx.school.role`), never the token claim
+(`src/app/api/attendance/route.ts:51`, `src/app/api/enrollments/route.ts:40`,
+`src/app/api/grades/route.ts:33`, `src/app/api/learner/stats/route.ts:14`).
+
+The finding is therefore about the module, not about a leak: a new route that calls
+`canTeacherAccessClass` **without** re-intersecting the result with `ctx.schoolId` would be
+cross-tenant, and nothing in the module's own documentation warns the author. The underlying
+rows are only school-consistent because of MEDIUM-5 (or, after 0018, because of the composite
+foreign keys) — not because of this module.
+
+### 2.8 LOW-9 — The incompatible-constraint refusal (F-6) has no test in the repository *(new)*
+
+`drizzle/0018_composite_school_foreign_keys.sql:121` refuses to proceed when a constraint of
+the same name already exists with a different definition:
+
+```
+0018 found an incompatible constraint named assignments_school_class_fk on public.assignments
+```
+
+The behaviour is documented (F-6, this report L944-958 and L1238) but `grep -rn "incompatible"
+tests/` returns **nothing** — it is unprotected against regression. This audit exercised it
+explicitly (S5a of the failure matrix: exit 1, the constraint and its table named, and **no
+ledger row written**), but that harness lives outside the repository.
+
+**A related operational gap, unchanged:** the documented recovery (`--repair-tenant-integrity`
+→ baseline → re-apply) **cannot clear** an incompatible same-named constraint, because the
+repair is deliberately one-way and never drops a constraint. The operator must remove it by
+hand. That is correct behaviour, but the runbook does not say so.
+
+### 2.9 LOW-10 — The "apply a later migration while a gated one is skipped" guard is unreachable *(new)*
+
+`run-migration.js:634-643` refuses to apply a migration that comes *after* a gated migration
+that was skipped. With 19 registered migrations and 0018 last, no such pair exists, so the
+branch is defensive code that cannot be exercised end to end. It is correct, harmless, and
+should be kept — but it is **not** covered by a test, and it must be re-checked whenever a
+migration is added after 0018.
+
+### 2.10 A positive finding worth recording — the pre-apply check is not redundant *(new)*
+
+`run-migration.js:601-603` (pre-apply, fail closed) and `run-migration.js:656-663` (post-apply,
+verify) call the same `assertTenantConstraintIntegrity`. Mutation **M3** (removing only the
+pre-apply call) still produced exit 1 — the post-apply check catches the same state — **but the
+runner first printed "✅ All requested migrations are already recorded with matching checksums"**
+on a database that enforced no tenant boundary at all. The pre-apply check is therefore not
+redundant: it is what prevents a *false success line* from being printed. The regression suite
+catches this (M3 killed the test "the runner fails closed when the ledger claims 0018 but the
+constraints are gone"). Recorded because a future refactor could reasonably conclude the two
+checks are duplicates and delete the wrong one.
+
+---
+
+## 3. Tests run and results
+
+### 3.1 Locally reproduced evidence — disposable PostgreSQL only
+
+| # | Command | Exit | Result |
+|---|---|---|---|
+| L1 | `NODE_PATH=/home/user/easylearn/node_modules node /home/user/audit-bypass.js` | **0** | **37/37 checks passed** — healthy build (26 composite FKs, all validated; 24/24 unique targets; 19-row ledger) → `drizzle-kit push --force` (exit 0; 0 composite FKs, 7 unique targets, ledger gone — the bypass is real) → runner fails closed → baseline refused with and without both tokens → `db:schema-sync` refused → `--repair-tenant-integrity` (24 targets restored, **no** composite FKs created, false 0018 claim removed) → full documented recovery → 26/26 present, validated and correct, 19-row ledger, "26/26 present, validated and correct", runner exit 0 |
+| L2 | `NODE_PATH=/home/user/easylearn/node_modules node /home/user/audit-failures.js` | **0** | **47/47 checks passed** — S1 all 26 dropped · S2 partial 23/26 · S3 NOT VALIDATED · S4 wrong parent · S5 wrong child columns · S5a incompatible-constraint refusal (names the constraint and its table; **no ledger row written**) · S6a baseline without the token · S6b baseline with the token when a ledger exists · S6c baseline including 0018 needs the 0018 token · S6d baseline with **both** tokens still refused when the catalog lacks the constraints (no ledger row added) · S6e non-sequential prefix · S7 an ordinary run skips the gated migration, says so loudly, and applies nothing |
+| L3 | `NODE_PATH=/home/user/easylearn/node_modules node /home/user/index-gap-analysis.js` | **0** | 0 of 26 composite FKs have a conforming child-side index; the 26 proposed `CREATE INDEX CONCURRENTLY` statements written to `/home/user/proposed-index-migration.sql` (**not applied to any migration**) |
+| L4 | `SCHOOLS=1 PARENTS=2000 ROWS=20000 NODE_PATH=… node /home/user/index-impact.js` | **0** | RI-probe plans before/after — 23/26 sequential scans → 0/26; 20 973 → 4 639 buffers; 46.87 → 2.38 ms |
+| L5 | `NODE_PATH=… node /home/user/index-impact.js` (20 schools, 2 000 rows) | **0** | 0/26 sequential scans before and after; 437 → 443 buffers; 1.05 → 0.92 ms — the honest multi-tenant counter-case |
+| L6 | `TEST_DATABASE_URL=… EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true npx tsx tests/migration-tenant-constraint-integrity.test.ts` | **0** | **20 passed, 0 failed** |
+| L7 | the seed-route probe (real seed handler → real login handler → real `GET /api/assignments`) | **0** | seed 201, `school_users` = 0, teacher login 200 with `school: null`, `GET /api/assignments` → **403** — the evidence for MEDIUM-4 |
+| L8 | `bash /home/user/run-ci-audit.sh` (exact replication of `.github/workflows/ci.yml`) | **0** | **13/13 steps exit 0** — see §3.3 |
+
+### 3.2 Mutation testing — is the regression suite actually meaningful?
+
+Each safeguard was **removed**, the suite was re-run, the code was **restored**, and the
+restoration was verified byte-for-byte with `sha256sum` plus a clean `git status`.
+
+| # | Safeguard removed | Location | Tests killed | Suite exit |
+|---|---|---|---|---|
+| M1 | the post-apply verification of the 26 constraints | `run-migration.js:656-663` | **2** — "applying 0018 under its gate installs all 26 constraints and records it"; "a healthy database re-runs cleanly and verifies its constraints" | 1 |
+| M2 | the baseline's catalog check (the check that stops a baseline certifying a schema without the constraints) | `run-migration.js:317` | **2** — "baseline refuses to record 0018 on a database without its constraints"; "baseline can still record a verified prefix that stops before 0018" | 1 |
+| M3 | the pre-apply fail-closed check | `run-migration.js:601-603` | **1** — "the runner fails closed when the ledger claims 0018 but the constraints are gone" (it failed because the runner printed the false success line first) | 1 |
+| M4 | the guarded schema sync's refusal to run push on a managed database | `db-schema-sync.js:140` | **1** — "the guarded schema sync refuses to run drizzle-kit push on a managed database" | 1 |
+| M5 | the 0018 gate's confirmation-token check | `run-migration.js:622` | **2** — "an explicit run without the confirmation token is still refused"; "the repair restores the 0017 unique targets and clears the false ledger claim" | 1 |
+
+**5 of 5 mutations were detected.** No mutation survived. The suite is not vacuous.
+
+**Restoration proof.** After the last mutation the files were restored with
+`git checkout -- run-migration.js db-schema-sync.js`; the digests returned to their pre-mutation
+values (`run-migration.js` → `e05208c0436c5c56ebad8ce1ede36ff246bba7a337aace9b8471ea8c1d814604`,
+`db-schema-sync.js` → `f23784eedb85f840836cd82f48c3c80892d3a909162502c519bc94de491a76d7`), `git
+status --porcelain` was empty, and the suite was re-run green: **20 passed, 0 failed, exit 0**.
+
+### 3.3 Local CI replication — exact commands and exit codes
+
+`bash /home/user/run-ci-audit.sh`, with the workflow's own environment:
+`TEST_DATABASE_URL=postgres://easylearn_test:easylearn_test@127.0.0.1:5432/postgres`,
+`DATABASE_URL=postgres://test:test@127.0.0.1:1/testdb` (a deliberately dead endpoint, as in
+CI), `JWT_SECRET=ci-only-not-a-production-secret-at-least-32-characters`.
+
+| Step | Command | Exit | Duration |
+|---|---|---|---|
+| 01 | `npm ci` | **0** | 18 s |
+| 02 | `npm audit --omit=dev` | **0** | 0 s |
+| 03 | `test -n "$TEST_DATABASE_URL"` | **0** | 0 s |
+| 04 | `npm test` | **0** | 2 s |
+| 05 | `EASY_LEARN_REQUIRE_TLS_E2E=true npm run test:tls-e2e` | **0** | 1 s |
+| 06 | `EASY_LEARN_REQUIRE_ASSIGNMENT_PREREQ=true EASY_LEARN_REQUIRE_SCRATCH_DB_LIFECYCLE=true npm run test:db` | **0** | 33 s |
+| 07 | `npm run test:tenant-auth` | **0** | 9 s |
+| 08 | `npm run test:mutation` | **0** | 21 s |
+| 09 | `npm run test:integration` | **0** | 1 s |
+| 10 | `EASY_LEARN_REQUIRE_TENANT_INTEGRITY=true npm run test:tenant-integrity` | **0** | 10 s |
+| 11 | `npm run typecheck` | **0** | 13 s |
+| 12 | `npm run build` | **0** | 26 s |
+| 13 | `npm run lint` | **0** | 17 s |
+
+**501 PASS lines, 0 test failures.** The only two lines containing the string "FAIL" are test
+*names* — "the learner role predicate FAILS CLOSED on a pre-0016 schema (no row, no leak)" and
+"the parent role predicate FAILS CLOSED on a pre-0016 schema (no row, no leak)" — both
+**passing** assertions. The TLS end-to-end suite really executed against the SSL-enabled
+disposable server (7 end-to-end and 11 TLS assertions passed); `EASY_LEARN_REQUIRE_TLS_E2E=true`
+would have turned a skip into a failure. **Zero scratch databases were left behind** (the
+suite's own `finally` blocks dropped them).
+
+One artefact was produced and reverted: `next build` regenerates `next-env.d.ts`. It was
+restored with `git checkout -- next-env.d.ts`; the worktree is clean.
+
+### 3.4 Evidence *not* produced by this audit — stated explicitly
+
+* **No production database was contacted.** Not read, not written, not even connected to.
+* **No production credential was requested or used.** The disposable server uses local-only
+  credentials created for this audit.
+* **Migration 0018 was not applied to any managed database.** It was applied only to disposable
+  databases, and only under its confirmation token, exactly as the gate requires.
+* **The proposed 26 child-side indexes were applied nowhere but a disposable measurement
+  database.** They are not in any migration in this repository.
+* **Branch protection on `main` remains UNKNOWN** (API `403`).
+* **The `9da7333…` commit is not in `main`'s history** and was not reviewed as part of the
+  merged state.
+* **No independent human reviewer has looked at any of this.** This audit was performed by the
+  same agent that wrote the remediation. It is *not* an independent review and must not be
+  presented as one.
+
+### 3.5 GitHub CI evidence (distinct from the local reproduction above)
+
+| Run | Head SHA | Conclusion |
+|---|---|---|
+| `39176807988` | `016d2291` | success |
+| `39176617079` | `851156ca` | success |
+| `39173649856` | `90ec0436` (the PR #32 merge) | success |
+
+These are GitHub's own verdicts. The local replication in §3.3 is an independent execution of
+the same workflow on the same commit, and the two agree. The CI job **logs** are not fetchable
+from this environment, so the per-step detail above is the *local* reproduction, not the content
+of the GitHub runs.
+
+---
+
+## 4. Remaining blockers
+
+| ID | Severity | Finding | Closable by code? |
+|---|---|---|---|
+| **BLOCKER-1** | BLOCKER | Production preflight evidence is absent (engine/version, migration history, offending-row counts, confirmation that nothing was reassigned, backup/restore verification, lock/duration measurement, TLS chain verification). | **No** — operator evidence on a restored production copy |
+| **MEDIUM-4** | MEDIUM | The development seed creates no `school_users` rows, so the three demo accounts it advertises have no tenant access (reproduced: 403). | Yes |
+| **MEDIUM-5** | MEDIUM | The 26 composite foreign keys do not cover the user-side links (`parent_learners.parent_id`/`learner_id`, `learner_classes.learner_id`, `teacher_classes.teacher_id`, `classes.class_teacher_id` → `school_users(school_id, user_id)`). | Yes — as a **separate, gated** migration |
+| **MEDIUM-3** | MEDIUM | 26 of 26 composite foreign keys have no conforming child-side index; measured 23/26 sequential scans in the single-school shape (46.87 ms → 2.38 ms with the proposed indexes). | Yes — as a **separate, non-transactional** migration |
+| **LOW-6** | LOW | The seed route authorizes on the token claim instead of the database role. | Yes |
+| **LOW-7** | LOW | `includeInactive` is an unused widening option with no enforcement behind its "never grants context" promise. | Yes |
+| **LOW-8** | LOW | `src/lib/authorization.ts` is not school-scoped; safe today only because every caller re-intersects with the school scope. | Yes |
+| **LOW-9** | LOW | The incompatible-constraint refusal (F-6) has no test in the repository, and the runbook does not say the operator must drop such a constraint by hand. | Yes |
+| **LOW-10** | LOW | The "apply a later migration while a gated one is skipped" ordering guard is unreachable and untested. | Yes (test only) |
+
+**Already closed and not re-opened here:** HIGH-1 (the inert regression guard), MEDIUM-1 (the
+suite could silently skip in CI), MEDIUM-2 (the inaccurate pre-0016 support claim), LOW-1
+(ungrammatical operator message), LOW-2 (the submit route used the non-schema-aware predicate),
+LOW-3 (the policy mirror granted a rule no route implements — the mirror now states ownership
+only, matching `eq(assignments.teacherId, context.userId)`), LOW-5 (scratch databases left
+behind — now always removed, verified in §3.3).
+
+**Not findings, restated so they are not mistaken for ones:** CSRF protection, session
+revocation and row-level security are absent from the codebase. They were out of scope for
+PR #32, no change here weakens them, and no claim is made that they are addressed.
+
+---
+
+## 5. Exact next action for each blocker
+
+**BLOCKER-1 — production preflight evidence.**
+1. An authorized operator restores a **production copy** to an isolated host (never production
+   itself) and confirms the copy is byte-identical.
+2. The operator runs `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` against the copy and
+   returns the output, including the offending-row counts and the explicit statement that no
+   row was reassigned or repaired.
+3. The operator measures the validation duration and captures `pg_locks` during it.
+4. The operator verifies backup/restore and the TLS certificate chain.
+5. Only then, and only under the 0018 gate, is 0018 applied to production.
+6. **This audit cannot advance this blocker, and no agent should be asked to close it.** The
+   account must not be a production credential, and no production setting may be changed.
+
+**MEDIUM-4 — the seed's missing memberships.**
+1. Insert the four `school_users` rows (`status = 'active'`, roles `school_admin`/`teacher`/
+   `parent`/`learner` for the CBISM school) in the same transaction as the user inserts in
+   `src/app/api/seed/route.ts`.
+2. Make the seed idempotent on re-run (it currently returns early only when `users` is
+   non-empty — L48-51).
+3. Add a regression test asserting a seeded non-platform account obtains a school context and
+   can list assignments.
+4. Keep it in its own small PR; it is unrelated to database safety.
+
+**MEDIUM-5 — the user-side composite foreign keys.**
+1. Open a **separate** issue/PR for a `0019` migration; do **not** amend 0018.
+2. Pre-flight on a restored production copy: count `parent_learners`, `learner_classes`,
+   `teacher_classes` and `classes.class_teacher_id` rows whose `(school_id, user_id)` pair has
+   no matching `school_users` row. Those rows are exactly what the constraint would reject.
+3. Decide, with the operator, whether to remediate or to quarantine those rows — this is a
+   **data** decision and must never be auto-repaired.
+4. Add the constraint `NOT VALID` + `VALIDATE CONSTRAINT` under its own gate and its own
+   confirmation token, exactly as 0018 does.
+5. No new unique index is needed (`school_users_school_user_unique` already exists).
+
+**MEDIUM-3 — the 26 child-side indexes.**
+1. Add a **non-transactional** path to `run-migration.js` for `CREATE INDEX CONCURRENTLY`,
+   with an explicit "this cannot run inside the per-file transaction" contract and a documented
+   recovery for a failed build (drop the invalid index, rebuild).
+2. Keep the 26 statements in `/home/user/proposed-index-migration.sql` as the starting point;
+   review the index names and sizes.
+3. Measure the write amplification and the storage cost on the restored production copy.
+4. Apply them in a **separate PR**, never bundled with a database-safety change, and measure
+   the query plans before and after on the copy.
+5. Until then, the performance issue is **not** fixed, and this report does not claim it is.
+
+**LOW-6 / LOW-7 / LOW-8 / LOW-9 / LOW-10.** All are small, independent, and can go into one
+low-risk maintenance PR:
+1. **LOW-6** — read `users.role` from the database in the seed route instead of the token claim.
+2. **LOW-7** — remove `includeInactive`, or make "never grants tenant context" structural.
+3. **LOW-8** — add a header warning to `src/lib/authorization.ts` that every caller **must**
+   intersect the result with `ctx.schoolId`, and cite the four call sites that do.
+4. **LOW-9** — add a repository test for the incompatible-constraint refusal, and add one line
+   to `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md` §4.1 stating that such a constraint must
+   be dropped by hand.
+5. **LOW-10** — add a unit-level test for the ordering guard so it is not silently deleted when
+   a migration is added after 0018.
+
+---
+
+## 6. Final verdict
+
+**READY FOR FURTHER REVIEW.**
+
+The schema-sync bypass remediation that PR #32 merged is **sound in the code**. This audit
+re-derived every material claim by execution rather than by reading: the destructive scenario
+was reproduced on a disposable database, the failure modes were exercised as a 47-check matrix,
+the documented recovery was executed end to end, and the regression suite was mutation-tested
+(5 of 5 safeguards removed, 5 of 5 detected, all restored byte-for-byte). The whole CI workflow
+was replicated locally: **13 of 13 steps exit 0, 501 passing assertions, zero scratch databases
+left behind.** No cross-tenant defect was found in the tenant-isolation, school-selection,
+lifecycle, role-authorization, or answer-key protections: the school context is always
+server-derived and revalidated against the database, the answer key is absent from the learner's
+and parent's projection by construction, lifecycle and membership states fail closed, and every
+write path validates the foreign id against the caller's school.
+
+The findings this audit adds are **MEDIUM-4** (the development seed creates no memberships, so
+the demo accounts it advertises get 403 — reproduced), **MEDIUM-5** (the 26 composite foreign
+keys do not cover the user-side links to `school_users`, a defence-in-depth gap with no live
+exploit), and the re-measured **MEDIUM-3** (26 of 26 child-side indexes missing; 23 of 26
+referential-integrity probes degrade to a sequential scan in the single-school shape this product
+actually has). None of the three is a tenant-isolation leak, and none of them may be fixed by
+quietly widening 0018's scope: MEDIUM-5 and MEDIUM-3 each need their own, separately gated
+migration.
+
+**This is NOT a production-readiness statement, and it must not be read as one.**
+`BLOCKER-1` is open and cannot be closed by any code change: the production preflight evidence
+does not exist, and until an authorized operator produces it against a restored production copy,
+**0018 must not be applied to production**. This audit performed no independent human review,
+none of its work may be represented as one, and the branch-protection state of `main` could not
+be read (API `403`) and remains UNKNOWN.
+
+**Stop here. Do not merge, deploy, or apply 0018 on the strength of this report.**
+
+---
+
+# Appendix A — Remediation status (2026-10-19)
+
+This appendix records what was changed **after** the audit above, on the branch
+`arena/7d4511bc-easylearn`. The audit text above is unchanged: it is the evidence, and it
+must not be edited to match the code. Everything below is a separate, later statement.
+
+Nothing here is a production-readiness statement. `BLOCKER-1` is still open, 0018 is still
+refused for production, and no production system, credential, setting or branch-protection
+rule was touched.
+
+## A.1 What was implemented, and the evidence for each
+
+| ID | Status | Change | Evidence |
+|---|---|---|---|
+| MEDIUM-4 | **IMPLEMENTED** | `src/app/api/seed/route.ts` now creates the `school_users` rows for the teacher, parent and learner demo accounts. The platform `super_admin` deliberately gets **none** (`super_admin` is a platform role; migration 0015 excludes it; `resolveAuthContext` never grants a platform account a school context). The rows are written through `addSchoolMembership()` in `src/lib/tenant.ts`, the one module that owns `school_users` — a route must not touch the membership table itself, and the tenant-foundation boundary test now enforces that for this route too. | `tests/seed-membership.test.ts` — **7 assertions, 0 failures, exit 0**. The suite proves the three memberships exist with the right roles and `status = 'active'`, that the platform administrator has none, that the three demo logins return a real school context, that a tenant-scoped API is reachable, and that the role is read from the database and not from the token claim. Mutation-tested twice: removing the membership write fails **3** of the 7; restoring the claim-based authorisation fails **1**. The source was restored byte-for-byte after each mutation. |
+| LOW-6 | **IMPLEMENTED** | The seed route now re-reads the caller's role **from the database** (`findAuthUser` + `isActive` + `role === 'super_admin'`) whenever the database is populated, because a signed claim can be up to 24 hours stale. The **empty-database bootstrap** case still trusts the signed claim: there is no account to read, and the only administrator the route creates is the one it is about to insert. That exception is stated in the code at the branch it applies to. | Same suite — the "role is not taken from the claim" assertion fails if the claim-trust is restored, and the "a real super_admin is still allowed" assertion fails if the database check is made too strict. |
+| LOW-7 | **IMPLEMENTED (corrected — see A.2)** | The public `includeInactive` option is **gone**. `listSchoolMemberships(userId)` now takes no options and returns only active memberships in active schools. The widening read is a separate, explicitly-named export, `listAllSchoolMembershipsForInspection(userId)`, and it is still scoped to one user — a membership is never looked up by school alone. | `tests/membership-foundation.test.js` — **37 assertions, 0 failures, exit 0**, including two new guards: the active read must take no options and no membership read may offer a widening switch; every membership read, the inspection one included, must start its WHERE clause from the caller's own user id. Mutation-tested: re-adding the option fails the new guard (**1** failure, exit 1); the source was restored byte-for-byte. |
+| LOW-8 | **IMPLEMENTED** | `src/lib/authorization.ts` now carries a header warning: the Phase 1 helpers filter a relationship table by a **person or a class**, never by a school, so a new caller that uses one of them without re-intersecting the result with the caller's own school would be cross-tenant. The four current call sites are named in the header, with the intersection each of them performs. | Source-level. The existing boundary test `Boundary: no tenant filtering added to authorization helpers` still passes, and still enforces that the helpers themselves stay tenant-free — the warning adds no filter and no school parameter. |
+| LOW-9 | **IMPLEMENTED** | (a) The F-6 refusal — "0018 found an incompatible constraint named … on public.…" — now has repository coverage: the test replaces `assignments_school_class_fk` with an incompatible `(school_id, subject_id)` foreign key, proves the repair clears the false 0018 claim, proves 0018 then **refuses** and writes **no** ledger row, drops the constraint by hand, and proves 0018 then applies and reaches 26/26. (b) `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md` §4.1 now tells the operator to read the constraint's definition first and drop it **by hand**, with the exact read-only inspection query, and states plainly that the automated repair will not drop it. | `tests/migration-tenant-constraint-integrity.test.ts` — **24 assertions, 0 failures, exit 0** (was 20 before this phase). |
+| LOW-10 | **IMPLEMENTED** | The unreachable "apply a migration after a skipped gated migration" guard is now a **pure, exported** function, `findOrderingViolation(toApply, skippedGated, orderedList)`, which the run loop calls. The order list is a parameter so the case can be exercised at all: with the real 19-file list, 0018 is last and nothing can follow it. | The same suite, now **24 assertions**. The new test proves: no violation for an empty apply list, no violation when no gate was skipped, no violation when the gated migration itself is applied, and a violation — naming both the blocked and the skipped migration — when a migration registered after the gate is applied while the gate is skipped. The suite also records the fact that 0018 is currently last, so the guard is defensive code. |
+
+## A.2 Two corrections to the audit above
+
+**1. LOW-7 was described as an "unused widening option". That was wrong.** The audit's
+grep covered `src/` only. `includeInactive: true` was used by **two** call sites in
+`tests/membership-auth-db.test.ts` (lines 462 and 757), which need to see a *historical*
+membership to assert that a revoked, disabled or archived membership really is absent from
+the active set. The remediation therefore did not delete the capability: it removed the
+**public switch** and gave the widening read its own explicitly-named export, and the two
+test call sites were updated. The hazard the finding described — a public boolean whose
+safety rested on a doc comment — is gone either way, but the audit understated the blast
+radius, and a reviewer reading only the audit would have been misled.
+
+**2. The audit's independent harnesses lived outside the repository.** `audit-bypass.js`
+(37 checks), `audit-failures.js` (47 checks), `index-gap-analysis.js`, `index-impact.js`,
+`proposed-index-migration.sql` and `run-ci-audit.sh` were written to the sandbox home
+directory, **not** into the repository. A reviewer could not re-run them from a clone, and
+their results are not reproducible from the commit that cites them. That is a real weakness
+in the evidence, and it is recorded here rather than glossed over.
+
+The sandbox that hosted them was reset during the remediation phase and they are **gone**;
+their results could therefore **not** be re-verified here and are not restated as if they
+had been. What was done instead is to move the coverage they provided **into the
+repository**, where it was actually missing:
+
+* the "both confirmation tokens present and the catalog still lacks the constraints" case —
+  the strongest form of the false-certification guard — was **not** covered and is now a
+  test in `tests/migration-tenant-constraint-integrity.test.ts`;
+* the **complete documented recovery** of §4.1 (damage → `--repair-tenant-integrity` →
+  `--baseline` of the verified prefix → re-apply 0018 under its gate → the ordinary run
+  verifies 26/26) had **no** end-to-end coverage — the repair test re-applied 0018
+  directly, and the baseline test ran on a database whose ledger had never been destroyed —
+  and is now a test as well;
+* the ordering guard (LOW-10) is now exercised directly instead of being reasoned about;
+* the CI-replication script was re-created and re-run (A.3).
+
+The harnesses themselves are still outside the repository. **Proposed, not implemented:**
+committing them under `tests/` or `scripts/`. They duplicate coverage the repository now
+has, and adding them is a separate decision with its own review.
+
+## A.3 Verification actually performed for this appendix
+
+All of it on a **disposable PostgreSQL 16.14** on `127.0.0.1:5432` with TLS enabled
+(`bash /home/user/setup-audit-pg.sh` recreates it from scratch). No production system,
+credential, setting or branch-protection rule was touched.
+
+| Suite | Result |
+|---|---|
+| `tests/seed-membership.test.ts` | **7 passed, 0 failed, exit 0** |
+| `tests/migration-tenant-constraint-integrity.test.ts` | **24 passed, 0 failed, exit 0** |
+| `tests/membership-auth-db.test.ts` | **48 passed, 0 failed, exit 0** |
+| `tests/tenant-authorization-mutation.test.ts` | **7 passed, 0 failed, exit 0** |
+| `tests/membership-foundation.test.js` | **37 passed, 0 failed, exit 0** |
+| `npm test` (4 source-security suites) | **28 / 15 / 23 / 35 passed, 0 failed** |
+| `npm run typecheck` | **exit 0** |
+| Local replication of the CI workflow (13 steps) | **13 of 13 exit 0** |
+
+Mutation evidence: the seed membership write removed → **3** seed assertions fail; the
+claim-based authorisation restored → **1** seed assertion fails; the public
+`includeInactive` option restored → **1** membership-foundation assertion fails. In each
+case the source was restored byte-for-byte afterwards.
+
+## A.4 Deliberately NOT changed, and why
+
+* **MEDIUM-5** (the 26 composite foreign keys cover no *user-side* link to
+  `school_users(school_id, user_id)`) — a new gated migration `0019` is required. **No
+  migration was created, no schema was altered, and no CI gate was weakened.**
+* **MEDIUM-3** (the 26 child-side `CREATE INDEX CONCURRENTLY` indexes) — a separate PR with
+  its own non-transactional path. **Not implemented.** The measurement in §2.4 stands; the
+  performance issue is **not** fixed.
+* **`BLOCKER-1`** — the production preflight evidence does not exist. It cannot be closed
+  by any code change, and no code in this phase changes that. **0018 must not be applied to
+  production.**
+* **Branch protection on `main`** — the read-only API call returns `403`; the state remains
+  **UNKNOWN** and was not modified.
+* **The seed route is still not transactional.** A failure part-way through the seed would
+  leave a partially seeded database, which is the same shape MEDIUM-4 describes. Making the
+  whole seed atomic is a larger refactor than this phase's scope, and it is **proposed
+  here rather than silently made**. The membership write is the one place this phase
+  introduced a new failure point, and it fails loudly with a 500 rather than silently
+  leaving the demo accounts without a school.
+
+## A.5 Status of the audit's own blocking items
+
+| Item | Status |
+|---|---|
+| `BLOCKER-1` — production preflight evidence | **BLOCKED** (no authorized operator checkpoint against a restored production copy) |
+| 0018 applied to production | **BLOCKED** |
+| Restored-production-copy rehearsal | **BLOCKED** |
+| Branch-protection confirmation on `main` | **BLOCKED** (API `403`, state UNKNOWN) |
+| `0019` user-side FK migration | **PROPOSED ONLY** |
+| 26 child-side indexes | **PROPOSED ONLY** |
+| Independent human review of the tenant and migration work | **NOT PERFORMED** — this work is not an independent review and must not be represented as one |

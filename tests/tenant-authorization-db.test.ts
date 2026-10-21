@@ -42,6 +42,7 @@ import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
 import { NextRequest } from "next/server";
+import { createTestJwtSecret } from "./helpers/test-secret";
 
 const REPO_ROOT = path.join(__dirname, "..");
 const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
@@ -51,7 +52,7 @@ const { createScratchDatabase, assertCleanupSucceeded } = requireFromRepo(
 );
 
 const DB_NAME = `easylearn_2c_test_${crypto.randomBytes(4).toString("hex")}`;
-const JWT_SECRET = "phase-2c-integration-test-secret-0123456789";
+const JWT_SECRET = createTestJwtSecret();
 const UPLOAD_DIR = path.join(os.tmpdir(), `${DB_NAME}-uploads`);
 
 let passed = 0;
@@ -833,6 +834,22 @@ async function main() {
         assertEq(result.status, 200, "same-school participant can view conversation");
         assert(bodyText(result).includes("A-only-content"), "School A message remains accessible");
         assert(!bodyText(result).includes("B-secret-content"), "School B message is not exposed");
+
+        /* Reading a conversation must not change anything: a `GET` that marks
+           messages as read is reachable by a cross-site request, by a link prefetch
+           and by a crawler. The write is a separate POST. */
+        const afterRead = await one(`SELECT is_read FROM messages WHERE id=$1`, [a]);
+        assertEq(afterRead.is_read, false, "reading the conversation does not mark it as read");
+
+        /* The write is tenant-scoped: it marks the current school's conversation
+           and never another school's. */
+        const markRead = await call("messages/read", {
+          token: dualTeacher.token,
+          method: "POST",
+          body: { userId: dualPeer.id },
+        });
+        assertEq(markRead.status, 200, "the participant can mark the conversation as read");
+
         const aState = await one(`SELECT is_read FROM messages WHERE id=$1`, [a]);
         const bState = await one(`SELECT is_read FROM messages WHERE id=$1`, [b]);
         assertEq(aState.is_read, true, "School A incoming message is marked read");
@@ -884,15 +901,21 @@ async function main() {
       assertEq(result.status, 404, "cross-school submission file");
     });
 
-    await test("Files: an unattributable file (no resolvable school) is denied", async () => {
+    await test("Files: a file stored in School A is invisible to School B and to a platform account", async () => {
       // A platform account has no school context at all → 403 before the file is even read.
       const platform = await call("files/[id]", { token: tokens["platform"], params: { id: orphanFile } });
       assertEq(platform.status, 403, "platform account must not receive a school context");
-      // A school member must not be able to learn that somebody else's file exists → 404.
-      for (const key of ["admin-a", "admin-b"]) {
-        const result = await call("files/[id]", { token: tokens[key], params: { id: orphanFile } });
-        assertEq(result.status, 404, `${key} must not be able to resolve an unattributable file`);
-      }
+      // A school member must not be able to learn that another school's file exists → 404.
+      const foreign = await call("files/[id]", { token: tokens["admin-b"], params: { id: orphanFile } });
+      assertEq(foreign.status, 404, "admin-b must not be able to resolve another school's file");
+      /* The storing school owns the file. On a migrated schema (0016/0017) a file is
+         attributed by its own `school_id` — the same rule Phase 2D applies to classes and
+         assignments — so the uploader's membership is irrelevant to attribution. This
+         cannot be forged: BOTH write paths (POST /api/uploads and POST /api/uploads/presign)
+         set `school_id` from the caller's VERIFIED school context, never from client input,
+         so a file can only ever be stored in a school the uploader was a member of. */
+      const own = await call("files/[id]", { token: tokens["admin-a"], params: { id: orphanFile } });
+      assertEq(own.status, 200, "the school that stored the file owns it");
     });
 
     await test("Files: the same-school owner can download their own file (legitimate access)", async () => {
@@ -1255,8 +1278,7 @@ async function main() {
          OWN school_id rather than by which schools can "reach" it through memberships. A
          dual-membership learner enrolling in School A's class therefore no longer makes the
          class belong to neither school: School A keeps it (direct school_id) and School B is
-         still denied. The relational "reachable from two schools → deny both" rule still
-         applies to routes that attribute via membership (e.g. files), asserted below. */
+         still denied. Uploaded files follow the same rule (Phase 2D), asserted below. */
       const dual = (
         await one(
           `INSERT INTO users (email, username, password_hash, role, first_name, last_name, is_active)
@@ -1292,8 +1314,15 @@ async function main() {
         const foreignSchool = await call("attendance", { token: tokens["admin-b"], query: { classId: classA } });
         assertEq(foreignSchool.status, 404, "School B must still be denied the class");
 
-        /* A file that is reachable from School A (its assignment) and from School B (its
-           uploader) is still unattributable under the relational file predicate. */
+        /* A file is attributed by the school that STORED it (`uploaded_files.school_id`,
+           NOT NULL since 0017) — the same treatment assignments got in Phase 2D. The
+           uploader's second membership no longer makes the file unattributable, so
+           School A keeps the file it stored.
+           The isolation property the old relational rule protected is UNCHANGED: the
+           file stays invisible in School B, the uploader's other school, and to School B's
+           administrator. The relational "reachable from two schools → deny both" rule
+           survives as the fallback for legacy rows whose `school_id` is still NULL —
+           see tests/tenant-file-attribution-db.test.ts (case F1). */
         const dualFile = (
           await one(
             `INSERT INTO uploaded_files (school_id, uploader_id, purpose, assignment_id, original_name, stored_name, mime_type, category, size_bytes)
@@ -1302,10 +1331,10 @@ async function main() {
           )
         ).id as string;
         fs.writeFileSync(path.join(UPLOAD_DIR, "stored-dual.pdf"), "%PDF-1.4 dual");
-        for (const token of [tokens["admin-a"], tokens["admin-b"]]) {
-          const result = await call("files/[id]", { token, params: { id: dualFile } });
-          assertEq(result.status, 404, "a file two schools can reach must be denied to both");
-        }
+        const fileOwnSchool = await call("files/[id]", { token: tokens["admin-a"], params: { id: dualFile } });
+        assertEq(fileOwnSchool.status, 200, "the file stays readable in the school that stored it");
+        const fileOtherSchool = await call("files/[id]", { token: tokens["admin-b"], params: { id: dualFile } });
+        assertEq(fileOtherSchool.status, 404, "the file must stay invisible in the uploader's other school");
 
         /* The dual member must choose; only the signed, selected school token carries context. */
         const noSelection = await call("attendance", { token: unselectedDualToken, query: { learnerId: dual } });
@@ -1461,6 +1490,67 @@ async function main() {
         assertEq(legit.json.data.classId, classA, "same-school class is persisted");
       } finally {
         await q(`DELETE FROM quizzes WHERE id = $1`, [quizA]);
+      }
+    });
+
+    await test("Relational attribution: a quiz belongs to exactly one school, and an ambiguous one is denied to both", async () => {
+      /* These are genuinely legacy, unattributed rows, not modern selected-school
+         quizzes. Keep every cross-school/ambiguity assertion load-bearing for M2/M5;
+         an explicitly school-attributed multi-school teacher is covered separately.
+         Only this disposable fixture relaxes NOT NULL; production schema is untouched. */
+      await q(`ALTER TABLE quizzes ALTER COLUMN school_id DROP NOT NULL`);
+      let quizA: string | undefined;
+      let dualQuiz: string | undefined;
+      try {
+        quizA = (
+        await one(
+          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+           VALUES (NULL, 'Attribution Quiz A', $1, $2, $3, false) RETURNING id`,
+          [classA, subjectA, ids["teacher-a"]]
+        )
+      ).id as string;
+
+        dualQuiz = (
+        await one(
+          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+           VALUES (NULL, 'Dual Quiz A', $1, $2, $3, false) RETURNING id`,
+          [classA, subjectA, dualTeacher.id]
+        )
+      ).id as string;
+
+        /* A quiz of one school is invisible in the other. */
+        const foreign = await call("quizzes/[id]", { token: tokens["admin-b"], params: { id: quizA } });
+        assertEq(foreign.status, 404, "another school's administrator must not read the quiz");
+        const own = await call("quizzes/[id]", { token: tokens["admin-a"], params: { id: quizA } });
+        assertEq(own.status, 200, "the owning school's administrator must read the quiz");
+
+        /* A quiz whose teacher belongs to TWO schools is reachable from both, so
+           the relational rule makes it unattributable and denies it to both. */
+        for (const key of ["admin-a", "admin-b"]) {
+          const result = await call("quizzes/[id]", { token: tokens[key], params: { id: dualQuiz } });
+          assertEq(result.status, 404, "a quiz two schools can reach must be denied to both");
+        }
+      } finally {
+        await q(`DELETE FROM quizzes WHERE id IN ($1, $2)`, [quizA, dualQuiz]);
+        await q(`ALTER TABLE quizzes ALTER COLUMN school_id SET NOT NULL`);
+      }
+    });
+
+    await test("Quiz direct attribution: a selected dual-school owner is allowed only in the stored school", async () => {
+      const item = await one(
+        `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+         VALUES ($1, 'Selected-school quiz', $2, $3, $4, false) RETURNING id`,
+        [schoolA, classA, subjectA, dualTeacher.id]
+      );
+      try {
+        const own = await call("quizzes/[id]", { token: dualTeacher.token, params: { id: item.id } });
+        assertEq(own.status, 200, "a second membership does not re-home or invalidate a stored-school quiz");
+        const admin = await call("quizzes/[id]", { token: tokens["admin-a"], params: { id: item.id } });
+        assertEq(admin.status, 200, "the stored school's administrator retains access");
+        const foreign = await call("quizzes/[id]", { token: tokens["admin-b"], params: { id: item.id } });
+        assertEq(foreign.status, 404, "the owner's other membership must not grant another school access");
+      } finally {
+        await q(`DELETE FROM quizzes WHERE id=$1`, [item.id]);
       }
     });
 

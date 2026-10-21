@@ -312,6 +312,32 @@ CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS \
 If the ledger itself was dropped, record the verified prefix **without** 0018 first
 (§3.2) — a baseline that includes 0018 is refused until the constraints are really there.
 
+**If 0018 refuses to apply because an incompatible constraint of the same name already
+exists**, it is doing the right thing: it will not drop and recreate a constraint it does
+not recognise, because that could destroy an index or a rule you did not write. The message
+names the exact constraint and its table:
+
+```
+0018 found an incompatible constraint named assignments_school_class_fk on public.assignments
+```
+
+The repair above **cannot** clear such a constraint — the repair is deliberately one-way and
+never drops a constraint. You have to remove it yourself, after checking what it is:
+
+```sql
+-- Read-only first: what exactly is this constraint?
+SELECT c.conname, ch.relname AS table_name, pg_get_constraintdef(c.oid)
+  FROM pg_constraint c
+  JOIN pg_class ch ON ch.oid = c.conrelid
+ WHERE c.conname = '<the name from the error>';
+
+-- Then, only once you have confirmed it is the old shape and not something you need:
+ALTER TABLE public.<table_name> DROP CONSTRAINT <constraint_name>;
+```
+
+Then re-apply 0018 under its normal confirmation. Never "fix" the refusal by dropping
+constraints you have not inspected.
+
 **Never** respond to a schema gap by running `drizzle-kit push`. It is the thing that
 caused the damage.
 

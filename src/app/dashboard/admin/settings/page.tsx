@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface AcademicYear {
   id: string;
@@ -89,13 +90,12 @@ export default function AdminSettingsPage() {
   useEffect(() => { loadData(); }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
       const [yearRes, termRes, overrideRes] = await Promise.all([
-        fetch("/api/academic-years", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/terms", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/dashboard/overrides", { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch("/api/academic-years"),
+        apiFetch("/api/terms"),
+        apiFetch("/api/dashboard/overrides"),
       ]);
       const yearData = await yearRes.json().catch(() => null);
       const termData = await termRes.json().catch(() => null);
@@ -123,10 +123,9 @@ export default function AdminSettingsPage() {
   }
 
   async function loadActivity() {
-    const token = localStorage.getItem("el_token");
     setActivityLoading(true);
     try {
-      const res = await fetch("/api/activity-logs?limit=50", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch("/api/activity-logs?limit=50");
       const data = await res.json().catch(() => null);
       if (data?.success) {
         setActivityLogs(Array.isArray(data.data?.logs) ? data.data.logs : []);
@@ -150,11 +149,10 @@ export default function AdminSettingsPage() {
   async function handleCreateYear(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/academic-years", {
+      const res = await apiFetch("/api/academic-years", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(yearForm),
       });
       const data = await res.json();
@@ -169,11 +167,10 @@ export default function AdminSettingsPage() {
   async function handleCreateTerm(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/terms", {
+      const res = await apiFetch("/api/terms", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(termForm),
       });
       const data = await res.json();
@@ -188,13 +185,12 @@ export default function AdminSettingsPage() {
   async function handleCreateOverride(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
     try {
       const url = editingOverride ? `/api/dashboard/overrides/${editingOverride.id}` : "/api/dashboard/overrides";
       const method = editingOverride ? "PUT" : "POST";
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         method,
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...overrideForm,
           scopeId: overrideForm.scopeId || null,
@@ -247,11 +243,9 @@ export default function AdminSettingsPage() {
 
   async function handleDeleteOverride(id: string) {
     if (!confirm("Delete this override? The card will revert to live data.")) return;
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch(`/api/dashboard/overrides/${id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await apiFetch(`/api/dashboard/overrides/${id}`, {
+        method: "DELETE"
       });
       const data = await res.json();
       if (data.success) loadData();
@@ -260,11 +254,10 @@ export default function AdminSettingsPage() {
   }
 
   async function toggleOverride(ov: CardOverride) {
-    const token = localStorage.getItem("el_token");
     try {
-      await fetch(`/api/dashboard/overrides/${ov.id}`, {
+      await apiFetch(`/api/dashboard/overrides/${ov.id}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ isEnabled: !ov.isEnabled }),
       });
       loadData();

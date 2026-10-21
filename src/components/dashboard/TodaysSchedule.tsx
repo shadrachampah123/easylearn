@@ -10,6 +10,7 @@ import {
   type DayValue,
   type TimetableEntry,
 } from "@/components/dashboard/TimetableGrid";
+import { apiFetch } from "../../lib/api-client";
 
 type ScheduleStatus = "completed" | "current" | "upcoming";
 
@@ -79,18 +80,12 @@ export default function TodaysSchedule({
   const [reloadCount, setReloadCount] = useState(0);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
     const controller = new AbortController();
     let active = true;
 
     async function loadSchedule() {
       try {
-        if (!token) {
-          throw new Error("Sign in to view your schedule.");
-        }
-
-        const response = await fetch(`/api/timetable?day=${today.value}`, {
-          headers: { Authorization: `Bearer ${token}` },
+        const response = await apiFetch(`/api/timetable?day=${today.value}`, {
           signal: controller.signal,
         });
         const data = (await response.json()) as {

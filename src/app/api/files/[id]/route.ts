@@ -7,8 +7,9 @@ import { db } from "@/db";
 import { assignments, uploadedFiles } from "@/db/schema";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { getObjectStorageConfig, objectDownloadUrl } from "@/lib/object-storage";
+import { verifyStoredObject } from "@/lib/object-guard";
 import { uploadStorageDir } from "@/lib/upload-storage";
-import { isInlinePreviewable } from "@/lib/uploads";
+import { FILE_RESPONSE_CSP, servedContentTypeFor } from "@/lib/upload-content";
 import { and, eq } from "drizzle-orm";
 import {
   guardSchoolContext,
@@ -26,11 +27,15 @@ const ADMIN_ROLES = new Set<string>(SCHOOL_ADMIN_EXTENDED_ROLES);
 /**
  * Serve an uploaded file with authentication, TENANT and per-file access control.
  *
- *  - Phase 2C: the file must belong to the caller's school. Ownership is resolved through
- *    the relational chain (uploader membership + the assignment it belongs to) inside the
- *    SQL predicate, so another school's file is "not found" — it is never fetched, never
- *    counted and never distinguishable from a file that does not exist. A file whose
- *    ownership cannot be resolved (no membership anywhere) is denied to everyone.
+ *  - Phase 2C: the file must belong to the caller's school. On a migrated schema
+ *    (0016/0017) that means the file's own `school_id` — the school that wrote it — so
+ *    another school's file is "not found": it is never fetched, never counted and never
+ *    distinguishable from a file that does not exist. A legacy row whose `school_id` is
+ *    still NULL is attributed through the relational chain (uploader membership + the
+ *    assignment it belongs to) and is denied to everyone when that chain is ambiguous.
+ *  - A user who belongs to more than one school therefore sees the files they uploaded
+ *    to each of those schools in the school that stored them, and NEVER in their other
+ *    school.
  *  - Submission files: only the learner who uploaded them, the teacher who
  *    owns the assignment, and school administrators may read them.
  *  - Assignment materials: any authenticated member of the file's school may read them.
@@ -40,20 +45,18 @@ const ADMIN_ROLES = new Set<string>(SCHOOL_ADMIN_EXTENDED_ROLES);
  * Video/audio players (and PDF viewers) issue HTTP Range requests, so this
  * endpoint implements byte-range serving (206 Partial Content).
  *
- * The browser passes the token as a ?token= query parameter because <img>,
- * <video> and <a download> cannot set an Authorization header; plain fetch
- * callers may use the Bearer header or the el_token cookie as usual.
+ * The session is the `httpOnly` `el_token` cookie. The browser attaches it to a
+ * same-origin <img>, <video> and <a download> request by itself, so no credential
+ * has to be put in the URL. The earlier `?token=` query-parameter fallback has been
+ * removed: a token in a URL leaks into browser history, server access logs, and the
+ * `Referer` header of every outbound link on the page.
  */
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    /* Media elements cannot set an Authorization header, so the Phase 1 `?token=` fallback
-       is preserved. It changes where the token may come from, never what it grants. */
-    const queryToken = request.nextUrl.searchParams.get("token");
-
-    const auth = await guardSchoolContext(request, queryToken);
+    const auth = await guardSchoolContext(request);
     if (!auth.ok) {
       /* The gate owns the status: 401 for a missing/expired session, 403 for an
          authenticated account with no active membership. */
@@ -102,6 +105,33 @@ export async function GET(
     // Purpose "assignment": readable by any authenticated member of the file's school
     // (the tenant predicate above is what establishes membership).
 
+    /* ── What is served, and how ──
+       The content type is derived from the STORED FILE NAME, which ends in the
+       extension the server validated when the file was uploaded. It is NOT
+       the `mime_type` column: that column used to hold the MIME type the
+       CLIENT declared, which meant a client could upload a file called
+       `photo.png`, declare `text/html`, and have this route serve the bytes
+       as an HTML document in the application's own origin.
+
+       The content type now always comes from the server's allow-list, so it
+       is never `text/html`, `image/svg+xml` or any other type a browser can
+       execute. Files whose stored extension is not on the allow-list — rows
+       uploaded before this rule existed, or a name the server does not
+       recognise — are served as `application/octet-stream` with a download
+       disposition, so unknown content is never rendered inline.
+
+       The `Content-Security-Policy: sandbox` is the second layer: even if a
+       browser were to treat a response as a document, the sandbox puts it in
+       an opaque origin with scripting disabled, so it cannot reach this
+       application's session or DOM. */
+    const served = servedContentTypeFor(row.storedName);
+    const contentType = served.contentType;
+    const inline = served.inline;
+    const encodedName = encodeURIComponent(row.originalName)
+      .replace(/['()]/g, (character) => `%${character.charCodeAt(0).toString(16)}`);
+    const asciiName = row.originalName.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
+    const disposition = `${inline ? "inline" : "attachment"}; filename="${asciiName}"; filename*=UTF-8''${encodedName}`;
+
     /* ── Cloud object storage: redirect to a presigned (or public) URL ──
        Media/PDF clients follow the redirect and then issue Range requests
        directly against the object store, so large video/audio streams never
@@ -117,9 +147,51 @@ export async function GET(
           { status: 404, headers: { "Content-Type": "application/json" } }
         );
       }
+
+      /* The bytes were uploaded straight to the bucket and never passed through
+         this application, so the content policy the local path applies has to
+         be applied here: read the object's first bytes back and prove that the
+         object is what its key says it is, and that it is within the size
+         limits the presign request only ASKED for. */
+      const guard = await verifyStoredObject(config, row.storedName);
+      if (!guard.ok) {
+        if (guard.status === 404) {
+          /* A refused object is reported exactly like a file that does not
+             exist: the caller learns nothing about the store's contents. */
+          console.error("Object file refused:", guard.reason, row.id);
+          return new Response(JSON.stringify({ success: false, error: "File not found" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({ success: false, error: "The file store is temporarily unavailable." }),
+          { status: guard.status, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      /* The object store serves the object itself, so the STORE's response
+         headers are the ones the browser finally sees — the 307's own headers
+         below govern the redirect response only and never reach it.
+         The response-header overrides therefore carry the whole policy:
+         the server-determined content type (never a scriptable one), the safe
+         disposition (inline only for images, audio and video) and a PRIVATE
+         cache directive, so a shared cache may not store a private file.
+         A store cannot carry `X-Content-Type-Options` or a
+         `Content-Security-Policy`: the S3 API allows exactly six
+         `response-*` overrides, and any other one is rejected. */
       return new Response(null, {
         status: 307,
-        headers: { Location: objectDownloadUrl(config, row.storedName) },
+        headers: {
+          Location: objectDownloadUrl(config, row.storedName, {
+            contentType: guard.contentType,
+            disposition,
+            cacheControl: "private, max-age=3600",
+          }),
+          "Cache-Control": "private, max-age=3600",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy": FILE_RESPONSE_CSP,
+        },
       });
     }
 
@@ -135,12 +207,6 @@ export async function GET(
       });
     }
 
-    const contentType = row.mimeType || "application/octet-stream";
-    const inline = isInlinePreviewable(row.category);
-    const encodedName = encodeURIComponent(row.originalName)
-      .replace(/['()]/g, (character) => `%${character.charCodeAt(0).toString(16)}`);
-    const asciiName = row.originalName.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
-    const disposition = `${inline ? "inline" : "attachment"}; filename="${asciiName}"; filename*=UTF-8''${encodedName}`;
 
     const baseHeaders: Record<string, string> = {
       "Content-Type": contentType,
@@ -148,6 +214,11 @@ export async function GET(
       "Accept-Ranges": "bytes",
       "Cache-Control": "private, max-age=3600",
       "X-Content-Type-Options": "nosniff",
+      // Defence in depth: a file response is never a scriptable document.
+      "Content-Security-Policy": FILE_RESPONSE_CSP,
+      // A private, cookie-authenticated resource must not be embedded by
+      // another origin.
+      "Cross-Origin-Resource-Policy": "same-origin",
     };
 
     /* ── HTTP Range support (video/audio seeking, PDF readers) ── */
