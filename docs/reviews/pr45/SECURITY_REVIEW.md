@@ -220,22 +220,49 @@ Within `test:all`, the CSRF policy suite passed 49, tenant authorization passed 
 
 ### Additional tests for actual gaps
 
-The deliverable [additional-tests.patch](additional-tests.patch) adds only five test files. It does not alter production code, existing tests, package scripts, or mutation assertions. It targets the **exact PR head**, not the older mixed Arena working tree. Apply it only in an isolated copy/export of that commit, for example with `patch -p1 < /path/to/additional-tests.patch`.
+The five reviewer-authored reproductions now live permanently in `tests/` and run in CI. They
+were originally delivered out-of-band as `docs/reviews/pr45/additional-tests.patch`; that patch
+has been applied and deleted so the coverage cannot drift away from the code it checks.
 
-| Command | Exit | Actual result |
+| File | Scope | CI |
+|---|---|---|
+| `tests/pr45-review-db.test.ts` | R1, R2, R3, R4, R6 — live PostgreSQL, real route handlers, 14 cases | **required** |
+| `tests/pr45-review-mutation.test.cjs` | R7 — the M6 mutant must be executable SQL | **required** |
+| `tests/pr45-review-harness.test.cjs` | R5 — a failed setup must exit nonzero | **required** |
+| `tests/pr45-review-csrf.test.ts` | credential/CSRF edge cases (24 cases) — runs in its own process | **required** |
+| `tests/pr45-review-http.test.cjs` | the same CSRF policy through a real `next start` server (20 cases) | **not in CI** — needs a built app |
+
+Required coverage runs as `npm run test:review-pr45` in the
+`PR #45 reviewer regressions (PostgreSQL required)` CI step. `npm run test:review-pr45-http` is
+a deliberate manual run; it has not been validated in CI and is not claimed to be.
+
+**One assertion was adopted, not copied.** The R3 concurrent-submission case originally required
+that exactly one of the two responses be HTTP 200. That contradicts the documented idempotent
+replay contract (see `README.md`, "Repeating a submission"): a repeat of a completed submission
+answers 200 with the persisted grade and `alreadySubmitted: true`. The case now asserts that both
+statuses are 200 **and** that exactly one response carries `alreadySubmitted: false` and exactly
+one `true`, then that only one points row, one notification and one completed attempt exist. The
+security property under test — a single award — is unchanged; only the transport expectation was
+corrected to match the contract.
+
+The original reviewer results at `a4fbc401` are retained below for the record. They describe the
+state *before* the remediation and are not the current CI expectation.
+
+| Command (at `a4fbc401`) | Exit | Actual result |
 |---|---:|---|
 | `npx --no-install tsx tests/pr45-review-db.test.ts` | **1** | **7 passed / 7 failed**; the failures reproduce R1–R4/R6, including both dual-member cases |
 | `npx --no-install tsx tests/pr45-review-csrf.test.ts` | 0 | **24 passed / 0 failed** |
 | `node --test tests/pr45-review-harness.test.cjs` | **1** | **0 passed / 1 failed**; detects the erroneous child exit 0 in R5 |
 | `node --test tests/pr45-review-http.test.cjs` | 0 | **20 passed / 0 failed**, real Next HTTP proxy |
 | `node --test tests/pr45-review-mutation.test.cjs` | **1** | **0 passed / 1 failed**; detects M6's invalid SQL in R7; same result on the base |
-| `npx --no-install tsx tests/tenant-authorization-db.test.ts` in the separate syntax-correct M6 export | **1** | **75 passed / 6 failed** on authorization assertions; this independently catches the intended mutant |
-| `npm run typecheck` after adding review tests | 0 | Supplemental TypeScript tests also typecheck |
-| `npx --no-install eslint tests/pr45-review-db.test.ts tests/pr45-review-csrf.test.ts tests/pr45-review-harness.test.cjs tests/pr45-review-http.test.cjs tests/pr45-review-mutation.test.cjs` | 0 | Supplemental tests lint cleanly |
 
-The HTTP probe used `npm run start -- --hostname 0.0.0.0 --port 3015`, with a disposable secret and `EASY_LEARN_TEST_DATABASE=true`. It sent only synthetic invalid credentials to `/api/quizzes`; 403 indicated proxy rejection, while 401 indicated passage to authentication. It did not exercise production accounts. Temporary servers were stopped after the review.
+The HTTP probe used `npm run start -- --hostname 0.0.0.0 --port 3015`, with a disposable secret
+and `EASY_LEARN_TEST_DATABASE=true`. It sent only synthetic invalid credentials to `/api/quizzes`;
+403 indicated proxy rejection, while 401 indicated passage to authentication. It did not exercise
+production accounts. Temporary servers were stopped after the review.
 
-**The red tests are findings, not successful security checks.** No assertion was relaxed to make them pass.
+**The red tests were findings, not successful security checks.** No assertion was relaxed to make
+them pass; the single R3 transport expectation was corrected against a documented contract.
 
 ### Base comparison and corrections to the earlier report
 
