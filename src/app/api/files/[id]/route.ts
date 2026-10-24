@@ -7,6 +7,7 @@ import { db } from "@/db";
 import { assignments, uploadedFiles } from "@/db/schema";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { getObjectStorageConfig, objectDownloadUrl } from "@/lib/object-storage";
+import { verifyStoredObject } from "@/lib/object-guard";
 import { uploadStorageDir } from "@/lib/upload-storage";
 import { FILE_RESPONSE_CSP, servedContentTypeFor } from "@/lib/upload-content";
 import { and, eq } from "drizzle-orm";
@@ -146,17 +147,46 @@ export async function GET(
           { status: 404, headers: { "Content-Type": "application/json" } }
         );
       }
-      /* The object store serves the object itself, so its response headers are
-         the ones the browser sees. The response-header overrides force the
-         server-determined content type and the safe disposition onto that
-         response — the bytes were uploaded straight to the bucket and never
-         passed through this application. */
+
+      /* The bytes were uploaded straight to the bucket and never passed through
+         this application, so the content policy the local path applies has to
+         be applied here: read the object's first bytes back and prove that the
+         object is what its key says it is, and that it is within the size
+         limits the presign request only ASKED for. */
+      const guard = await verifyStoredObject(config, row.storedName);
+      if (!guard.ok) {
+        if (guard.status === 404) {
+          /* A refused object is reported exactly like a file that does not
+             exist: the caller learns nothing about the store's contents. */
+          console.error("Object file refused:", guard.reason, row.id);
+          return new Response(JSON.stringify({ success: false, error: "File not found" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({ success: false, error: "The file store is temporarily unavailable." }),
+          { status: guard.status, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      /* The object store serves the object itself, so the STORE's response
+         headers are the ones the browser finally sees — the 307's own headers
+         below govern the redirect response only and never reach it.
+         The response-header overrides therefore carry the whole policy:
+         the server-determined content type (never a scriptable one), the safe
+         disposition (inline only for images, audio and video) and a PRIVATE
+         cache directive, so a shared cache may not store a private file.
+         A store cannot carry `X-Content-Type-Options` or a
+         `Content-Security-Policy`: the S3 API allows exactly six
+         `response-*` overrides, and any other one is rejected. */
       return new Response(null, {
         status: 307,
         headers: {
           Location: objectDownloadUrl(config, row.storedName, {
-            contentType,
+            contentType: guard.contentType,
             disposition,
+            cacheControl: "private, max-age=3600",
           }),
           "Cache-Control": "private, max-age=3600",
           "X-Content-Type-Options": "nosniff",

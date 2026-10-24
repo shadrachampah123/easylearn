@@ -55,9 +55,8 @@ const {
   UNIQUE_SCHOOL_ID_TARGET_TABLES,
   summarizeConstraintInventory,
 } = requireFromRepo("./src/lib/tenant-constraints.js");
-const { GATED_MIGRATIONS, MIGRATIONS, REPAIR_CONFIRMATION } = requireFromRepo(
-  "./run-migration.js"
-);
+const { GATED_MIGRATIONS, MIGRATIONS, REPAIR_CONFIRMATION, findOrderingViolation } =
+  requireFromRepo("./run-migration.js");
 
 const DB_NAME = `easylearn_tci_test_${crypto.randomBytes(4).toString("hex")}`;
 const GATE_FILE = "0018_composite_school_foreign_keys.sql";
@@ -575,6 +574,75 @@ async function main() {
       }
     });
 
+    /* An incompatible SAME-NAMED constraint is a different situation from a wrongly
+       shaped one: migration 0018 refuses to touch it rather than dropping and recreating
+       it. The refusal is documented (F-6 in
+       docs/PRODUCTION_MIGRATION_SAFETY_REVIEW_PR32.md) but had no automated coverage, so
+       it could have been removed without any test noticing. */
+    await test("0018 refuses to overwrite an incompatible constraint of the same name", async () => {
+      const url = await createDb(`${DB_NAME}_incompatible`);
+      const client = new Client({ connectionString: url });
+      await client.connect();
+      try {
+        runNode(["run-migration.js"], url);
+        runNode(["run-migration.js", GATE_FILE], url, { [GATE.env]: GATE.token });
+        assertEq(await ledgerRow(client, GATE_FILE), 1, "0018 must be recorded first");
+
+        /* Replace one constraint with a same-named but incompatible one. */
+        await client.query(
+          "ALTER TABLE public.assignments DROP CONSTRAINT assignments_school_class_fk"
+        );
+        await client.query(
+          `ALTER TABLE public.assignments ADD CONSTRAINT assignments_school_class_fk
+             FOREIGN KEY (school_id, subject_id) REFERENCES public.classes(school_id, id)`
+        );
+
+        /* The documented repair clears the now-false 0018 claim, which makes 0018 pending
+           again — and that is exactly the state in which it must refuse to proceed. */
+        const repaired = runNode(["run-migration.js", "--repair-tenant-integrity"], url, {
+          CONFIRM_REPAIR_TENANT_INTEGRITY: REPAIR_CONFIRMATION,
+        });
+        assertEq(repaired.status, 0, `the repair must succeed: ${repaired.output}`);
+        assertEq(
+          await ledgerRow(client, GATE_FILE),
+          0,
+          "the repair must clear the 0018 claim so the gate can be reached again"
+        );
+
+        const refused = runNode(["run-migration.js", GATE_FILE], url, { [GATE.env]: GATE.token });
+        assertEq(refused.status, 1, "0018 must refuse to proceed against an incompatible constraint");
+        assertIncludes(
+          refused.output,
+          "0018 found an incompatible constraint named assignments_school_class_fk on public.assignments",
+          "the refusal must name the exact constraint and its table"
+        );
+        assertEq(
+          await ledgerRow(client, GATE_FILE),
+          0,
+          "a refused migration must not write a ledger row"
+        );
+
+        /* The documented recovery cannot clear such a constraint: the repair is
+           deliberately one-way and never drops a constraint. The operator has to remove
+           it by hand. The runbook states this (F-6). */
+        await client.query(
+          "ALTER TABLE public.assignments DROP CONSTRAINT assignments_school_class_fk"
+        );
+        const afterManualRemoval = runNode(["run-migration.js", GATE_FILE], url, {
+          [GATE.env]: GATE.token,
+        });
+        assertEq(
+          afterManualRemoval.status,
+          0,
+          `0018 must apply once the incompatible constraint is removed by hand: ${afterManualRemoval.output}`
+        );
+        assertEq(await countComposite(client), 26, "all 26 constraints must be back");
+      } finally {
+        await client.end().catch(() => {});
+        await dropDb(`${DB_NAME}_incompatible`);
+      }
+    });
+
     /* ─────────────────────────────────────────────────────────────────────────
        4. Baseline must not certify an invalid schema.
        ───────────────────────────────────────────────────────────────────────── */
@@ -637,6 +705,141 @@ async function main() {
         1,
         "the baseline must record the verified prefix"
       );
+    });
+
+    /* The strongest form of the false-certification guard: BOTH confirmation tokens are
+       present and the operator has done everything the procedure asks, and the baseline
+       still refuses because the CATALOG does not have the constraints. The catalog, not
+       the token, decides. */
+    await test("a baseline with BOTH tokens is still refused when the catalog lacks the constraints", async () => {
+      const url = await createDb(`${DB_NAME}_baseline_both_tokens`);
+      const client = new Client({ connectionString: url });
+      await client.connect();
+      try {
+        const chain = runNode(["run-migration.js"], url);
+        assertEq(chain.status, 0, `the chain must apply: ${chain.output}`);
+        assertEq(
+          await countComposite(client),
+          0,
+          "the ordinary run must not install the composite constraints, so the catalog lacks them"
+        );
+        const before = await client.query(
+          "SELECT filename FROM public.easylearn_schema_migrations ORDER BY filename"
+        );
+        const beforeRows = before.rows.map((row: any) => row.filename);
+
+        const run = runNode(
+          ["run-migration.js", "--baseline", MIGRATIONS.join(",")],
+          url,
+          {
+            CONFIRM_MIGRATION_BASELINE: "I_HAVE_VERIFIED_THESE_MIGRATIONS",
+            [GATE.env]: GATE.token,
+          }
+        );
+        assertEq(run.status, 1, "the baseline must be refused");
+        assertIncludes(
+          run.output,
+          "does not have the 26 composite tenant foreign keys it installs",
+          "the refusal must be about the catalog, not about a missing token"
+        );
+        assertEq(
+          await ledgerRow(client, GATE_FILE),
+          0,
+          "the refused baseline must not record 0018"
+        );
+        const after = await client.query(
+          "SELECT filename FROM public.easylearn_schema_migrations ORDER BY filename"
+        );
+        assertEq(
+          JSON.stringify(after.rows.map((row: any) => row.filename)),
+          JSON.stringify(beforeRows),
+          "the refused baseline must not change the ledger at all"
+        );
+      } finally {
+        await client.end().catch(() => {});
+        await dropDb(`${DB_NAME}_baseline_both_tokens`);
+      }
+    });
+
+    /* The COMPLETE documented recovery, end to end, on a database that a schema sync has
+       really damaged: the constraints, the ledger and the 0017 unique targets are all
+       gone. The operator procedure is repair -> baseline the verified prefix -> re-apply
+       0018 under its gate -> the ordinary run is happy again.
+
+       This is the path docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md §4.1 describes, and
+       it had no end-to-end coverage: the repair test above re-applies 0018 directly, and
+       the baseline test above runs on a database whose ledger was never destroyed. */
+    await test("the documented recovery repairs, baselines and re-applies 0018 end to end", async () => {
+      const url = await createDb(`${DB_NAME}_recovery`);
+      const client = new Client({ connectionString: url });
+      await client.connect();
+      try {
+        const chain = runNode(["run-migration.js"], url);
+        assertEq(chain.status, 0, `the chain must apply: ${chain.output}`);
+        const gate = runNode(["run-migration.js", GATE_FILE], url, { [GATE.env]: GATE.token });
+        assertEq(gate.status, 0, `0018 must apply: ${gate.output}`);
+        assertEq(await countComposite(client), 26, "the database starts healthy");
+
+        /* Damage it exactly the way `drizzle-kit push --force` does. */
+        const push = runDrizzleKitPushForce(url);
+        assertEq(push.status, 0, `the push must succeed on the disposable database: ${push.output}`);
+        assertEq(await countComposite(client), 0, "the constraints must be gone");
+        const ledgerGone = await client.query(
+          "SELECT to_regclass('public.easylearn_schema_migrations') IS NOT NULL AS present"
+        );
+        assertEq(ledgerGone.rows[0].present, false, "the ledger must be gone");
+        assert(
+          (await countUniqueTargets(client)) < 24,
+          "some UNIQUE (school_id, id) targets must be gone"
+        );
+
+        /* Step 1 — the controlled repair restores the 0017 unique targets. */
+        const repaired = runNode(["run-migration.js", "--repair-tenant-integrity"], url, {
+          CONFIRM_REPAIR_TENANT_INTEGRITY: REPAIR_CONFIRMATION,
+        });
+        assertEq(repaired.status, 0, `the repair must succeed: ${repaired.output}`);
+        assertEq(
+          await countUniqueTargets(client),
+          24,
+          "the repair must restore every UNIQUE (school_id, id) target"
+        );
+        assertEq(
+          await countComposite(client),
+          0,
+          "the repair must NOT create the composite foreign keys"
+        );
+
+        /* Step 2 — record the verified prefix, WITHOUT 0018. */
+        const prefix = MIGRATIONS.slice(0, MIGRATIONS.indexOf(GATE_FILE)).join(",");
+        const baselined = runNode(["run-migration.js", "--baseline", prefix], url, {
+          CONFIRM_MIGRATION_BASELINE: "I_HAVE_VERIFIED_THESE_MIGRATIONS",
+        });
+        assertEq(baselined.status, 0, `the baseline must succeed: ${baselined.output}`);
+        assertIncludes(baselined.output, "Recorded operator-asserted baseline");
+        assertEq(
+          await ledgerRow(client, GATE_FILE),
+          0,
+          "the baseline must not record 0018"
+        );
+
+        /* Step 3 — re-apply 0018 under its gate. */
+        const reapplied = runNode(["run-migration.js", GATE_FILE], url, { [GATE.env]: GATE.token });
+        assertEq(reapplied.status, 0, `0018 must apply again: ${reapplied.output}`);
+        assertEq(await countComposite(client), 26, "all 26 constraints must be back");
+        assertEq(await ledgerRow(client, GATE_FILE), 1, "the ledger must record 0018 again");
+
+        /* Step 4 — the ordinary run is happy again and verifies the constraints. */
+        const finalRun = runNode(["run-migration.js"], url);
+        assertEq(finalRun.status, 0, `the ordinary run must succeed: ${finalRun.output}`);
+        assertIncludes(
+          finalRun.output,
+          "26/26 present, validated and correct",
+          "the runner must verify the constraints it just applied"
+        );
+      } finally {
+        await client.end().catch(() => {});
+        await dropDb(`${DB_NAME}_recovery`);
+      }
     });
 
     /* ─────────────────────────────────────────────────────────────────────────
@@ -746,6 +949,63 @@ async function main() {
       assertEq(inventory.valid, 26, `every constraint must be correct: ${inventory.problems.join("; ")}`);
       assertEq(inventory.complete, true);
       assertEq(inventory.problems.length, 0);
+    });
+
+    /* The runner refuses to apply a migration that comes AFTER a gated migration the
+       operator skipped, because the skipped migration may change the shape of the later
+       ones. With 0018 as the last registered migration, no end-to-end run can reach that
+       guard — so it is exercised directly here. An untested branch is a branch that gets
+       deleted, and this one becomes load-bearing the moment a migration is registered
+       after 0018. */
+    await test("the runner refuses to apply a migration after a skipped gated migration", () => {
+      assertEq(findOrderingViolation([], []), null, "nothing to apply and nothing skipped");
+      assertEq(
+        findOrderingViolation(["0000_wet_legion.sql"], []),
+        null,
+        "an ordinary migration with no skipped gate is fine"
+      );
+      assertEq(
+        findOrderingViolation(
+          [MIGRATIONS[MIGRATIONS.length - 1]],
+          [GATE_FILE]
+        ),
+        null,
+        "applying the gated migration itself is not a violation"
+      );
+
+      /* The shape the guard exists for: a migration registered AFTER the gated one, with
+         the gated one skipped. The synthetic list is what makes the case reachable at
+         all — with the real list, 0018 is last and nothing can follow it. */
+      const later = "0019_later_migration.sql";
+      const orderWithALaterMigration = [...MIGRATIONS, later];
+      const violation = findOrderingViolation([later], [GATE_FILE], orderWithALaterMigration);
+      assert(violation !== null, "the guard must refuse to apply a migration after a skipped gate");
+      assertEq(violation?.blocked, later, "the refusal must name the blocked migration");
+      assertEq(violation?.skipped, GATE_FILE, "the refusal must name the skipped gate");
+
+      /* And with the same synthetic list, applying the gated migration first is fine. */
+      assertEq(
+        findOrderingViolation([later], [], orderWithALaterMigration),
+        null,
+        "with no skipped gate, the later migration may be applied"
+      );
+      assertEq(
+        findOrderingViolation(
+          [GATE_FILE, later],
+          [],
+          orderWithALaterMigration
+        ),
+        null,
+        "applying the gated migration and the later one in order is fine"
+      );
+
+      /* And the current shape of the list is recorded here on purpose: 0018 is the last
+         registered migration, so the end-to-end path cannot reach the guard today. */
+      assertEq(
+        MIGRATIONS[MIGRATIONS.length - 1],
+        GATE_FILE,
+        "0018 is currently the last registered migration; the guard is defensive code"
+      );
     });
 
     console.log(`\n📊 Tenant constraint integrity results: ${passed} passed, ${failed} failed\n`);

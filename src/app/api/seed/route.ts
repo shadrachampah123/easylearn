@@ -15,9 +15,10 @@ import {
   parentLearners,
   timetableEntries,
 } from "@/db/schema";
-import { hashPassword, getTokenFromRequest, verifyToken } from "@/lib/auth";
+import { findAuthUser, hashPassword, getTokenFromRequest, verifyToken } from "@/lib/auth";
+import { addSchoolMembership } from "@/lib/tenant";
 import { successResponse, errorResponse, unauthorizedResponse } from "@/lib/api-helpers";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 /**
  * Database seeding endpoint - PROTECTED
@@ -34,19 +35,39 @@ export async function POST(request: NextRequest) {
       return errorResponse("Not found", 404);
     }
 
-    // In non-production, require super_admin authentication
+    // In non-production, require super_admin authentication.
     const token = getTokenFromRequest(request);
     if (!token) return unauthorizedResponse();
     const payload = await verifyToken(token);
     if (!payload) return unauthorizedResponse();
 
-    if (payload.role !== "super_admin") {
-      return errorResponse("Only super administrators can seed the database", 403);
-    }
-
     // Check if already seeded
     const existingUsers = await db.select({ id: users.id }).from(users).limit(1);
-    if (existingUsers.length > 0) {
+    const databaseIsEmpty = existingUsers.length === 0;
+
+    if (databaseIsEmpty) {
+      /* BOOTSTRAP CASE. The route seeds a blank database, so there is no account to read a
+         role from — the only super administrator the route creates is the one it is about
+         to insert. The signed claim is all that exists here, and this route is a
+         development seeder that is 404 in production. */
+      if (payload.role !== "super_admin") {
+        return errorResponse("Only super administrators can seed the database", 403);
+      }
+    } else {
+      /* A POPULATED database. The role is read from the DATABASE, not from the token
+         claim: a signed claim can be up to 24 hours stale, so a platform administrator
+         whose role was changed would still pass a claim check. `src/lib/tenant.ts`
+         re-reads `users.role` on every request for exactly this reason; this route now
+         does the same. `findAuthUser` also proves the account still exists and is
+         active, and never returns the password hash. */
+      const actor = await findAuthUser(eq(users.id, payload.userId));
+      if (!actor || !actor.isActive) return unauthorizedResponse();
+      if (actor.role !== "super_admin") {
+        return errorResponse("Only super administrators can seed the database", 403);
+      }
+    }
+
+    if (!databaseIsEmpty) {
       return successResponse({ message: "Database already seeded" });
     }
 
@@ -124,6 +145,36 @@ export async function POST(request: NextRequest) {
     }
     if (!schoolId) {
       return errorResponse("Failed to resolve CBISM school for seed", 500);
+    }
+
+    /* ── School memberships ────────────────────────────────────────────────────
+       Since migration 0013/0015 a school context comes ONLY from `school_users`:
+       `src/lib/tenant.ts` resolves it from the caller's active membership rows and
+       never from `users.role` (which is a PLATFORM role). Migration 0015's backfill
+       cannot help here — it ran before these users existed.
+
+       Without these rows the three demo accounts this route advertises log in
+       successfully and then get "You do not have an active school membership in an
+       active school" from every tenant-scoped API. (Independently reproduced: see
+       docs/PRODUCTION_MIGRATION_SAFETY_REVIEW_PR32.md, MEDIUM-4.)
+
+       The platform administrator deliberately gets NO membership: `super_admin` is a
+       platform role (plan §7), migration 0015 excludes it from membership rows, and
+       `resolveAuthContext` never grants a platform account a school context. A
+       platform account reaches the platform surfaces instead.
+
+       The rows are written through `addSchoolMembership()` in `src/lib/tenant.ts`, the
+       ONE module that owns `school_users`: a route must never touch the membership
+       table itself (the same rule the tenant-foundation boundary test enforces for
+       reads). The helper also refuses a platform role, so a `super_admin` could not be
+       written into a membership row even by accident. */
+    const memberships = await Promise.all([
+      addSchoolMembership({ schoolId, userId: teacher1.id, role: "teacher" }),
+      addSchoolMembership({ schoolId, userId: parent1.id, role: "parent" }),
+      addSchoolMembership({ schoolId, userId: learner1.id, role: "learner" }),
+    ]);
+    if (memberships.some((membership) => membership === null)) {
+      return errorResponse("Failed to create the seed school memberships", 500);
     }
 
     // Academic year

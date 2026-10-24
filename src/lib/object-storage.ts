@@ -129,11 +129,17 @@ function objectUrlParts(config: ObjectStorageConfig, key: string): UrlParts {
 export function objectDownloadUrl(
   config: ObjectStorageConfig,
   key: string,
-  options?: { contentType?: string; disposition?: string }
+  options?: { contentType?: string; disposition?: string; cacheControl?: string }
 ): string {
   const query = new URLSearchParams();
   if (options?.contentType) query.set("response-content-type", options.contentType);
   if (options?.disposition) query.set("response-content-disposition", options.disposition);
+  /* The bucket's own response carries this cache directive — the 307's own
+     `Cache-Control` header does NOT, because the 307 is not the response the
+     browser finally sees. Without it the object store may let a SHARED cache
+     store a private file and hand it to the next user. `private` forbids that;
+     the browser may still keep its own copy so media seeking stays fast. */
+  if (options?.cacheControl) query.set("response-cache-control", options.cacheControl);
   const suffix = query.toString();
 
   if (config.publicBaseUrl) {
@@ -146,6 +152,7 @@ export function objectDownloadUrl(
     expiresSeconds: config.downloadExpirySeconds,
     responseContentType: options?.contentType,
     responseContentDisposition: options?.disposition,
+    responseContentCacheControl: options?.cacheControl,
   }).url;
 }
 
@@ -159,13 +166,22 @@ interface PresignRequest {
   contentType?: string;
   /**
    * Response-header overrides for a GET. S3-compatible stores accept
-   * `response-content-type` and `response-content-disposition` as query
-   * parameters and apply them to the response, which is how an uploaded
-   * object can be served with a server-determined type and a download
-   * disposition even though the bytes were uploaded straight to the bucket.
+   * `response-content-type`, `response-content-disposition` and
+   * `response-cache-control` as query parameters and apply them to the
+   * response, which is how an uploaded object can be served with a
+   * server-determined type, a download disposition and a private cache
+   * directive even though the bytes were uploaded straight to the bucket.
+   *
+   * These SIX parameters are the complete set the S3 API allows
+   * (`response-content-type`, `response-content-language`, `response-expires`,
+   * `response-cache-control`, `response-content-disposition`,
+   * `response-content-encoding`). A store REJECTS any other `response-*`
+   * parameter, so an object-store response can never carry
+   * `X-Content-Type-Options` or a `Content-Security-Policy`.
    */
   responseContentType?: string;
   responseContentDisposition?: string;
+  responseContentCacheControl?: string;
   now?: Date;
 }
 
@@ -221,6 +237,9 @@ export function presignUrl(config: ObjectStorageConfig, request: PresignRequest)
   }
   if (request.responseContentDisposition) {
     query["response-content-disposition"] = request.responseContentDisposition;
+  }
+  if (request.responseContentCacheControl) {
+    query["response-cache-control"] = request.responseContentCacheControl;
   }
 
   const canonicalQueryString = Object.keys(query)
@@ -296,5 +315,69 @@ export async function deleteObject(
     return response.ok || response.status === 404;
   } catch {
     return false;
+  }
+}
+
+/* ── Reading an object back ───────────────────────────────────────────────── */
+
+/** What the store reports about an object. */
+export interface ObjectPrefix {
+  /** The first bytes of the object (at most the requested number). */
+  bytes: Buffer;
+  /** The object's REAL size, when the store reported it. */
+  totalSize: number | null;
+  /** The content type the store recorded for the object. */
+  contentType: string | null;
+  /** The object's ETag — it changes when the object changes. */
+  etag: string | null;
+}
+
+/**
+ * Read the first bytes of an object, with a signed request.
+ *
+ * The direct-to-bucket upload sends the bytes from the browser to the store, so
+ * the application never sees them. This is how the application gets them back:
+ * a small ranged GET that also reports the object's real size, its recorded
+ * content type and its ETag.
+ *
+ * The request is signed WITHOUT any response-header override, so the store
+ * answers with the object's OWN metadata — the same metadata the uploader
+ * caused to be stored.
+ */
+export async function readObjectPrefix(
+  config: ObjectStorageConfig,
+  key: string,
+  maxBytes = 1024
+): Promise<ObjectPrefix | null> {
+  if (!config.enabled) return null;
+  const { url } = presignUrl(config, {
+    method: "GET",
+    key,
+    expiresSeconds: config.downloadExpirySeconds,
+  });
+  try {
+    const response = await fetch(url, { headers: { Range: `bytes=0-${maxBytes - 1}` } });
+    if (response.status === 404 || response.status === 403) return null;
+    if (!response.ok) return null;
+    const bytes = Buffer.from(await response.arrayBuffer());
+    /* A ranged answer carries the real size in `Content-Range`
+       (`bytes 0-1023/12345`); an unranged one carries it in `Content-Length`. */
+    let totalSize: number | null = null;
+    const contentRange = response.headers.get("content-range");
+    if (contentRange) {
+      const match = /\/(\d+)\s*$/.exec(contentRange);
+      if (match) totalSize = Number(match[1]);
+    } else {
+      const length = response.headers.get("content-length");
+      if (length !== null && Number.isFinite(Number(length))) totalSize = Number(length);
+    }
+    return {
+      bytes,
+      totalSize,
+      contentType: response.headers.get("content-type"),
+      etag: response.headers.get("etag"),
+    };
+  } catch {
+    return null;
   }
 }

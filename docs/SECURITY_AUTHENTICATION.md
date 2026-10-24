@@ -218,12 +218,20 @@ A request is evaluated as follows, in order:
 | 5 | There is no `Origin`, but `Sec-Fetch-Site` is `same-origin` or `none` | **Allowed.** |
 | 6 | There is no `Origin`, and `Sec-Fetch-Site` is `cross-site` or `same-site` | **Refused.** |
 | 7 | There is neither an `Origin` nor a `Sec-Fetch-Site` | **Refused.** |
+| 8 | The comparison origin was **derived**, the `Origin` header's **host** is one of ours, and the browser reports `Sec-Fetch-Site: same-origin` | **Allowed.** The browser's own proof of same-origin — see "The browser's own assertion" below. |
 
 **Rule 7 is the important one.** When a request carries no information at all
 about where it came from, the policy refuses it. Failing open would make "strip
 the `Origin` header" a bypass, which is exactly the kind of bypass an attacker
 tries first. A request that genuinely has neither header — an old client, a
 command-line tool — can present a bearer token and be allowed by rule 2.
+
+**Rule 8 is the narrow one.** It exists because the derived *scheme* is not
+fully trustworthy (Next.js keeps a client-supplied `X-Forwarded-Proto`), and it
+only ever allows what rule 3 would have refused, and only when the browser
+itself asserts the request is same-origin. A foreign origin, a same-host
+different-scheme request and a request with no `Sec-Fetch-Site` are all still
+refused.
 
 `Sec-Fetch-Site: same-site` is refused. A sibling subdomain is a different
 origin and is not this application; allowing it would hand the session to every
@@ -257,6 +265,8 @@ with the headers it forwards.
 
 **2. Otherwise the origin comes from the request itself** — the `Host` header
 and the scheme of the request URL. The forwarded headers are **not** consulted.
+The derived scheme is not fully trustworthy, and rule 8 of the policy above
+exists for that reason.
 
 **3. `EASY_LEARN_TRUST_PROXY_HEADERS=true` opts in to the forwarded headers.**
 
@@ -302,7 +312,7 @@ The comparison ignores the path and the query, treats `https://host` and
 `https://host:443` as the same, and compares the **host**, not a suffix of it —
 `evil.app.example.test` is not `app.example.test`.
 
-#### The scheme is still forwarded-header-derived — this matters for availability
+#### The scheme is still forwarded-header-derived — and what the application does about it
 
 The **host** is taken from the `Host` header, and the **scheme** from the
 request URL. In Next.js those two are not independent of the forwarded
@@ -313,12 +323,19 @@ headers:
 const protocol = req.headers["x-forwarded-proto"]?.includes("https") ? "https" : "http";
 ```
 
-and the header is **synthesised** when it is absent
-(`next/dist/server/base-server.js`). So in the default configuration:
+and the header is **synthesised** when it is absent, from the socket's TLS
+state — but it is **kept** when the client sent one:
+
+```js
+// next/dist/server/base-server.js
+req.headers["x-forwarded-proto"] ??= isHttps ? "https" : "http";
+```
+
+So in the default configuration:
 
 - `X-Forwarded-Host` is genuinely ignored — the host comes from `Host`;
 - `X-Forwarded-Proto` still reaches the derived scheme, indirectly, through
-  the request URL.
+  the request URL, and a **client-supplied** value survives.
 
 What that can and cannot do:
 
@@ -331,10 +348,31 @@ A browser cannot set `X-Forwarded-Host` or `X-Forwarded-Proto` on a cross-site
 request without a CORS preflight, and this application does not enable CORS, so
 these headers cannot be used to forge an origin from a foreign page.
 
-The consequence for deployment is the same as for the host: **set
-`EASY_LEARN_PUBLIC_ORIGIN`** whenever an edge is in front of the application.
-It is the only configuration in which neither half of the compared origin
-depends on a forwarded header.
+##### The browser's own assertion (rule 3b)
+
+The denial above is now gone. When the comparison fails, and the comparison
+origin was **derived** (no `EASY_LEARN_PUBLIC_ORIGIN`), and the `Origin`
+header's **host** is one of the hosts the request was addressed to, and the
+browser reports **`Sec-Fetch-Site: same-origin`**, the request is **allowed**.
+
+`same-origin` means the request's origin **is** the initiator's origin, so the
+browser has already answered the question the derived origin was supposed to
+answer — about the **real** origins, not about a header a client could send. A
+page on another origin cannot set `Sec-Fetch-Site`: it is a forbidden header
+name, so only the browser sets it.
+
+What the rule does **not** weaken:
+
+| | |
+|---|---|
+| A foreign origin | Still refused — its host is not one of ours. |
+| A same-host, **different-scheme** browser request (a page on the plaintext version of the same host) | Still refused — the browser reports `same-site` for it, not `same-origin`. This is the attack the scheme comparison used to stop. |
+| A request with **no** `Sec-Fetch-Site` | Still refused — without the browser's own claim there is no proof about the real origins, so the comparison stays strict. Failing closed. |
+| A deployment with `EASY_LEARN_PUBLIC_ORIGIN` | The rule does **not** apply. The configured origin is exact, and it is the authoritative answer. |
+| The trusted-proxy opt-in | The forwarded host joins the trusted host set, exactly as it already joins the candidate origins. A multi-valued forwarded host is distrusted entirely. |
+
+The rule only ever allows what the strict comparison would have refused, and
+only when the browser itself has said the request is same-origin.
 
 #### Deployment assumptions
 
@@ -579,26 +617,47 @@ it over a server-side channel. That is a real piece of architecture and it is
 **not** implemented here. Until it is, the formats are refused, and the
 refusal is a refusal rather than a warning.
 
-### The object-storage path, and its one weakness
+### The object-storage path
 
 When `OBJECT_STORAGE_*` is configured, the browser PUTs the bytes straight to
-the bucket and the application never sees them. Two consequences:
+the bucket and the application never sees them. The complete flow is:
 
-- The **content type** the object is stored with is the server's, not the
-  client's: the signed PUT requires exactly the type the allow-list names.
-- The **bytes** are not content-validated, because they never reach the
-  application. The download therefore forces the response headers onto the
-  object store's own response (`response-content-type` and
-  `response-content-disposition`), so the object is served with the
-  server-determined type and the safe disposition.
+1. `POST /api/uploads/presign` — the server authenticates the caller, checks
+   the role/purpose rules, derives the content type **from the extension
+   allow-list** (never from the client's declared type), refuses a client that
+   declares a scriptable type, applies the size limits to the declared size,
+   mints the object key (`uploads/<purpose>/<uuid>.<ext>`), registers the
+   `uploaded_files` row with `storage_backend = "object"` and returns a
+   presigned PUT bound to the server's content type.
+2. The browser PUTs the bytes to the bucket. **The application never sees
+   them.**
+3. `GET /api/files/<id>` — the tenant predicate resolves the file, the
+   per-file rules run, and the route redirects (**307**) to a presigned GET
+   that carries the response-header overrides.
+4. The bucket serves the object. **Its** response headers are the ones the
+   browser finally sees; the 307's own headers never reach it.
 
-The residual risk is that an object whose bytes are not what its extension
-claims can exist in the bucket. It is served as a non-scriptable type, so it
-cannot execute, but it is not the same guarantee the local-disk path gives.
-Closing it means validating the object after the upload — a server-side step
-that fetches the head of the object and compares it with the extension — or
-configuring the bucket to serve with a fixed `Content-Disposition` and
-`nosniff`.
+#### What the provider can and cannot enforce — measured, not assumed
+
+`tests/object-storage-live.test.ts` runs a real S3 API server
+(`s3rver`, a from-scratch implementation of the S3 REST API) and measures the
+store's actual behaviour:
+
+| Response header on the object store's response | Possible? |
+|---|---|
+| `Content-Type` | **Yes** — `response-content-type` |
+| `Content-Disposition` | **Yes** — `response-content-disposition` |
+| `Cache-Control` | **Yes** — `response-cache-control` |
+| `Content-Language`, `Expires`, `Content-Encoding` | **Yes** — the remaining three |
+| `X-Content-Type-Options` (`nosniff`) | **No** — not in the overridable set |
+| `Content-Security-Policy` | **No** — not in the overridable set |
+| Any other `response-*` parameter | **No** — the store answers **400 `InvalidArgument`** and names the S3-documented set |
+
+So an object-store response **cannot** carry `nosniff` or a CSP. The
+protection on that path is therefore the *forced content type* (never a
+scriptable one) plus the *forced disposition* (inline only for images, audio
+and video), and the bucket must live on a **separate, cookieless origin** —
+see "Deployment requirements" below.
 
 **Measured in Chromium 153** (`tests/manual/browser-content-type-sniffing-probe.js`,
 nine header combinations): serving HTML bytes with `Content-Type: image/png`
@@ -609,35 +668,102 @@ sandbox policy, does **not** execute the script — the browser treats
 `text/plain` is rendered as literal text. **0 of the 9 combinations executed
 script.** That is an observation about Chromium, not a guarantee of the
 platform: the served types are never scriptable, which is the property that
-holds everywhere, and the object store's response cannot be given `nosniff` or
-a CSP — only `response-content-type`, `response-content-disposition` and
-`response-cache-control` — so the object-store path has one fewer layer than
-the local-disk path.
+holds everywhere.
 
-### Who can open a file, and a known limitation for shared identities
+#### What the application now does about it
 
-`GET /api/files/<id>` resolves the file's owning school **relationally** — the
-schools of its uploader and of its assignment — and then requires that set to
-resolve to exactly one school, so a file that two schools can reach is denied
-to both (`sqlSchoolsOfFile` / `sqlOwnedBySchool` in `src/lib/tenant.ts`).
+The decision is **private storage plus a controlled download endpoint, with the
+object verified before the URL is handed out**. Proxying every download
+through the application was rejected: it would put hundreds of megabytes of
+video through a serverless function, which is the whole reason the direct path
+exists. A separate cookieless origin is required as a *deployment*
+requirement rather than something the application can enforce.
 
-That rule is deliberate and is covered by an existing regression test. Its
-consequence is that a user who is an **active member of two schools** produces
-a file that neither school can resolve: the uploader's own attachment is
-`404` to them, so the preview and the download do not work. This is
-**pre-existing** — the predicate is byte-for-byte identical in `main`, PR #38,
-PR #39 and PR #40 — and it is **not** a regression introduced by the uploaded
-file work. It is recorded here because the uploaded-file requirements
-("preserve legitimate assignment submissions, previews and downloads") are
-only met for single-school accounts; the live probe in
-`tests/manual/live-upload-content-probe.js` uses a single-school account and
-does not exercise it.
+- **The bytes are verified before the URL is handed out.** `GET /api/files/<id>`
+  reads the object's first bytes back from the store (a small ranged GET) and
+  applies the same policy the local-disk path applies
+  (`verifyObjectContent` in `src/lib/upload-content.ts`): the bytes must match
+  the signature of the extension, must not be markup, and the type the store
+  recorded must be the type the server derived. A verdict is remembered per
+  object ETag, so an unchanged object is not re-validated on every range
+  request, and a **changed** object always is.
+- **The real size is enforced.** The size the presign request carried is a
+  number the *client* supplied; the object that actually arrived is now
+  measured, and an object over the 50 MB / 100 MB limits is refused.
+- **The store's response is told not to be cached by a shared cache.** The
+  download URL signs `response-cache-control: private, max-age=3600`. Without
+  it the store sends no cache directive at all, so a CDN in front of the
+  bucket could store a private file and serve it to the next user. (The
+  307's own `Cache-Control` does **not** help: it governs the redirect
+  response, not the object's.)
+- **A refused object is reported as "not found"**, so a caller learns nothing
+  about what the store holds; a store that cannot be reached is reported as
+  **503**, because the file may well exist.
 
-Changing the predicate to read the file's own tenant-attributed
-`uploaded_files.school_id` (NOT NULL since migration 0017, written server-side
-at upload time) would fix it, but that is a **tenant-isolation** change and
-it contradicts an existing deliberate test. It is therefore **not** made here;
-it is recorded as a finding for an independently reviewed change.
+**Measured against the real store** (`tests/object-storage-live.test.ts`):
+an object whose bytes are HTML under a `.png` key is refused (404), an object
+over the size limit is refused (404), a deleted object is reported as not
+found, a legitimate object is served with the forced type and disposition, and
+the store's response carries the signed `private` cache directive — and still
+no `nosniff` and no CSP, which is the provider limit, not an oversight.
+
+#### What has and has not been verified against the storage provider
+
+This matters, so it is stated exactly.
+
+**The store used by the live suite is `s3rver` — an S3-compatible
+implementation, not AWS S3.** Everything the suite measures is a measurement of
+*that* store.
+
+| | Verified | Not verified |
+|---|---|---|
+| The `response-*` override set | The store **applies** the signed content type, disposition and cache-control, and **rejects** any other `response-*` parameter with **400 `InvalidArgument`**, naming the S3-documented set. | That **AWS S3** behaves identically. The set enforced is the one AWS documents and the error message names that document, but the behaviour was not observed on AWS S3. |
+| The signed PUT / GET round trip | The application's presigned URLs work end to end against a real S3 API server. | **That a forged signature is rejected.** `s3rver` does **not** verify AWS Signature Version 4 signatures — its authentication middleware contains the comment "Signature version 4 calculation is unimplemeneted". The live suite therefore says **nothing** about whether a tampered signature would be accepted by a real store. The *structure* of the signature (the signed headers, the canonical query, the expiry) is covered by `tests/object-storage-content-policy.test.ts`, which inspects the URLs the application builds. |
+| The content verification and the size measurement | The application's own guard refuses the mismatched-bytes object, the over-size object and the deleted object, against a real store and a real database. | That the store's own `Content-Length` and `Content-Type` metadata are the ones a real store would return. The suite reads the values the store reports. |
+| The presigned URL as a bearer credential | The download URL grants access with **no application session at all**, for as long as it is valid. | — |
+| The cache directive | The store's response carried **no** cache directive before the fix and carries the signed `private, max-age=3600` after it. | That a real CDN in front of a real bucket honours it. |
+
+**Nothing in this repository proves that the application's signatures would be
+accepted, or rejected, by AWS S3 itself.** No AWS account, bucket or
+credential was used, and no production object store was contacted. Verifying
+the signature behaviour against the real provider is an operator step: point
+`OBJECT_STORAGE_*` at a disposable bucket in a test account and run the
+presign → PUT → GET round trip there, including a deliberately tampered URL.
+
+#### Deployment requirements (not enforceable by the application)
+
+- The bucket must be served from an origin that is **not** the application's
+  origin and that sets **no cookies**. The session cookie `el_token` is
+  host-only (no `Domain` attribute), so the browser does not send it to the
+  bucket — but that protection depends on the bucket being a different host.
+- `OBJECT_STORAGE_PUBLIC_URL` must **not** be used for private content: it
+  makes the download URL an unsigned, permanently public address.
+- `OBJECT_STORAGE_DOWNLOAD_EXPIRY` (default 3600 s) is the window in which a
+  presigned URL is a bearer credential. The presigned URL grants access with
+  **no application session at all** — that is measured in the live suite and
+  is inherent to presigned URLs.
+
+### Who can open a file
+
+`GET /api/files/<id>` resolves the file's owning school from the file's own
+`uploaded_files.school_id` — the school that wrote it (NOT NULL since
+migration 0017, written server-side from the caller's verified school). A
+file is readable in that school and **in no other**: a user who belongs to
+two schools sees the files they uploaded to each of those schools in the
+school that stored them, and never in their other school.
+
+That is the same rule Phase 2D applies to assignments and classes, and it
+replaces an earlier relational rule that resolved a file's schools from its
+uploader's memberships and its assignment — a rule that made a two-school
+uploader's own upload unreadable in **both** schools (`201` on upload, `404`
+on download). The purely relational predicate survives as
+`sqlFileOwnedRelationally()` and is still used for legacy rows whose
+`school_id` is NULL, which remain unattributable and denied to everyone.
+
+`tests/tenant-file-attribution-db.test.ts` (17 assertions, real route handlers
+against a real PostgreSQL) covers one school, multiple schools, unauthorized
+users, cross-school access, the delete route, membership revocation, the
+legacy fallback and the per-file submission rules.
 
 ### What is NOT verified here
 
@@ -675,10 +801,12 @@ noise on direct navigation only, not on an `<img>` in a page.
 | Suite | File | What it proves |
 |---|---|---|
 | JWT secret policy | `tests/jwt-secret-policy.test.ts` | Weak, short, low-diversity, placeholder and periodic secrets are rejected; a 5000-sample random sweep produces no false rejections. |
-| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; and the four forwarded-header cases the review asked for — **forged headers, chained proxies, HTTPS termination and ordinary legitimate writes** — under each of the three configurations (default, `EASY_LEARN_TRUST_PROXY_HEADERS`, `EASY_LEARN_PUBLIC_ORIGIN`). |
+| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; the four forwarded-header cases the review asked for — **forged headers, chained proxies, HTTPS termination and ordinary legitimate writes** — under each of the three configurations (default, `EASY_LEARN_TRUST_PROXY_HEADERS`, `EASY_LEARN_PUBLIC_ORIGIN`); and the **browser's own assertion** (rule 8): that a forged `X-Forwarded-Proto` no longer refuses a legitimate same-origin write, that the rule does not apply without `Sec-Fetch-Site`, that a foreign origin and a same-host different-scheme request are still refused, and that it does not apply at all when `EASY_LEARN_PUBLIC_ORIGIN` is configured. |
 | Cookie auth and safe methods | `tests/cookie-auth.test.ts` | The response bodies carry no token; no browser file stores, reads or sends a token; no route reads a token from a URL; no `GET` handler writes; the cookie name has one definition; and, on the **parsed** call sites, no browser file calls `fetch()` or builds an `Authorization` header. The call-path guard covers the **aliased** `fetch` (`const f = fetch`), the **destructured** `fetch` (`const { fetch } = window`), **bracket-notation** access (`window["fetch"]`) and `navigator.sendBeacon`, and pins the one justified `XMLHttpRequest` exception. |
 | Uploaded file content | `tests/upload-content.test.ts` | The served content type is server-determined for every allow-listed extension; a mismatched declared MIME type, an HTML/SVG/XHTML payload, an extension-spoofed file and an inline-rendered unknown file are all refused; the routes store and serve the server's type rather than the client's; and the forbidden extensions are refused outright. |
 | Object-storage content policy | `tests/object-storage-content-policy.test.ts` | The download URL forces the server-determined type and the safe disposition onto the object store's response **and signs them**, so they cannot be swapped out by whoever holds the URL; the signed PUT binds the server's content type; the presign route derives the type from the allow-list and refuses a scriptable declared type. |
+| Object storage, against a **real** S3-compatible server | `tests/object-storage-live.test.ts` | The full round trip (presign → PUT → `GET /api/files/<id>` → 307 → the store serves the object) against a real S3 API server and a real PostgreSQL; that the store **applies** the signed content type, disposition and private cache directive; that the store **cannot** apply `nosniff` or a CSP and **rejects** any `response-*` override outside the S3-documented set; that the presigned URL is a bearer credential; and that the application refuses an object whose bytes do not match its key, an object over the size limit, and an object that no longer exists. **Its stated limits:** the store is `s3rver`, not AWS S3, and it does **not** verify SigV4 signatures — so the suite says nothing about whether a forged signature would be accepted by a real store (§7, "What has and has not been verified against the storage provider"). |
+| Uploaded-file tenant attribution | `tests/tenant-file-attribution-db.test.ts` | One school, multiple schools, unauthorized users, cross-school access, the delete route, membership revocation, the legacy `NULL school_id` fallback and the per-file submission rules — each against the real route handlers. |
 | Membership and session | `tests/membership-auth-db.test.ts` | The login flow, the school-selection flow and the session, read from the cookie the way a browser does, and asserting that the response body carries no token. |
 | The existing suites | `tests/security.test.js`, `tests/tenant-*.test.ts`, `tests/membership-*.test.ts`, … | The tenant isolation and authorization boundaries are unchanged. |
 
@@ -705,11 +833,13 @@ binary; the instructions are in each file's header.
   forged-forwarded-header write, an ordinary write, a cross-site write, the
   real upload UI with legitimate and hostile files, the served response, the
   attempt to execute an uploaded payload, logout, and the console — and
-  reports **34 of 34 checks passed**. `tests/manual/browser-content-type-sniffing-probe.js`
+  reports **36 of 36 checks passed**. `tests/manual/browser-content-type-sniffing-probe.js`
   reports **0 of 9 header combinations executed script** and **0 preview
   failures**. `tests/manual/forwarded-header-configuration-matrix.js` runs the
-  same write against all three configurations. **Firefox and Safari were not
-  available** — see §7.
+  same write against all three configurations — **24 of 24** — and
+  `tests/manual/csrf-proxy-trust-probe.js` measures the cross-site policy
+  against a production build over HTTP — **9 of 9**. **Firefox and Safari were
+  not available** — see §7.
 - **Video decoding in a browser.** The element's request was confirmed; no
   sample video was available in the environment, so no frame was decoded (§7).
 - **The production CSP change could not be observed in a browser.** The
@@ -737,10 +867,13 @@ binary; the instructions are in each file's header.
 | 6 | The rate limit on the login route is in-process. | **Open.** A multi-instance deployment does not share it. Out of scope for this change. |
 | 7 | No MFA, and no account lockout beyond the login rate limit. | **Open.** Out of scope. |
 | 8 | No database-level row security (RLS). | **Open.** Out of scope; tenant isolation is enforced in the application layer and covered by the tenant test suites. |
-| 9 | In the object-storage path the bytes never reach the application, so they are not content-validated. | **Open.** Mitigated by forcing the server-determined type and disposition onto the object store's response, and measured to not execute in Chromium (§7). Closing it properly needs a post-upload validation step. |
+| 9 | In the object-storage path the bytes never reach the application, so they are not content-validated. | **Closed for the retrievable object.** The application now reads the object's first bytes back from the store and applies the same content policy the local path applies, measures the real size against the limits, and refuses anything that does not match (§7). The upload itself is still a direct browser→bucket PUT, so a **quarantined** object can exist in the bucket; it is inert, but it is stored. |
+| 9b | An object-store response cannot carry `nosniff` or a CSP. | **Open, provider limit.** The S3 API allows exactly six `response-*` overrides and the store rejects any other (§7). The protection is the forced content type plus the forced disposition, and the bucket must be on a separate cookieless origin. |
+| 9c | A presigned download URL is a bearer credential. | **Accepted, inherent.** It grants access with no application session for `OBJECT_STORAGE_DOWNLOAD_EXPIRY` seconds (default 3600). Measured in the live suite (§7). Keep the expiry short; never set `OBJECT_STORAGE_PUBLIC_URL` for private content. |
+| 9d | The signing of the presigned URLs has **not** been validated against the real provider. | **Open, not verified.** The live suite runs against `s3rver`, which does **not** verify AWS Signature Version 4 signatures, so nothing here proves that a tampered URL would be rejected by AWS S3 — or that a correctly signed one would be accepted. The signing *structure* is unit-tested. The operator check is a disposable bucket in a test account: presign → PUT → GET, including a deliberately tampered URL (§7, "What has and has not been verified against the storage provider"). |
 | 10 | `EASY_LEARN_TRUST_PROXY_HEADERS=true` lets a client-supplied `X-Forwarded-Host` choose the comparison origin. | **Accepted, and off by default.** It is an explicit operator decision that the edge overwrites the header (§4). A browser still cannot set it cross-site without a CORS preflight. |
-| 11 | In the **default** configuration the derived scheme still comes from `x-forwarded-proto`, because Next.js builds the request URL from it. | **Open, availability only.** It cannot make a foreign origin acceptable — the host still comes from `Host` — but it can refuse a write. `EASY_LEARN_PUBLIC_ORIGIN` removes the dependency entirely (§4). |
-| 12 | A user who is an active member of **two** schools cannot open their own uploaded files: the file's owning-school set resolves to two schools and is denied to both. | **Open. Pre-existing, not a regression** — the predicate is identical in `main`, PR #38, PR #39 and PR #40, and an existing deliberate test asserts it. Changing it is a tenant-isolation change and needs an independently reviewed change of its own (§7). |
+| 11 | In the **default** configuration the derived scheme still comes from `x-forwarded-proto`, because Next.js builds the request URL from it and keeps a client-supplied value. | **Closed for availability.** It can never make a foreign origin acceptable — the host still comes from `Host` — and it can no longer refuse a legitimate write either: the browser's own `Sec-Fetch-Site: same-origin` is accepted as proof of same-origin when the derived scheme disagrees (§4, rule 8). The dependency itself is removed by `EASY_LEARN_PUBLIC_ORIGIN`, which remains the recommended configuration behind an edge. |
+| 12 | A user who is an active member of **two** schools cannot open their own uploaded files: the file's owning-school set resolves to two schools and is denied to both. | **Closed.** A file is now attributed by its own `uploaded_files.school_id` — the school that wrote it — the same rule Phase 2D applies to assignments and classes. The file is readable in that school and in no other; the uploader's second school still gets 404. The relational predicate survives for legacy `NULL school_id` rows, which stay denied to everyone (§7). **Needs an independent review**, because it is a tenant-isolation change. |
 
 ---
 
@@ -758,5 +891,7 @@ binary; the instructions are in each file's header.
 | The session lifecycle routes | `src/app/api/auth/{login,select-school,me,logout}/route.ts` |
 | The security headers | `next.config.ts` |
 | The uploaded-file content policy | `src/lib/upload-content.ts` |
+| The object-storage client and the provider's limits | `src/lib/object-storage.ts` |
+| The guard for objects that live in the bucket | `src/lib/object-guard.ts` |
 | The upload and file-serving routes | `src/app/api/uploads/route.ts`, `src/app/api/uploads/presign/route.ts`, `src/app/api/files/[id]/route.ts` |
 | The operator secret checker | `scripts/check-jwt-secret.mjs` |

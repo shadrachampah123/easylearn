@@ -51,6 +51,10 @@ function decide(overrides: Partial<Parameters<typeof evaluateCsrfRequest>[0]> = 
     origin: ORIGIN,
     fetchSite: "same-origin",
     hasBearerAuthorization: false,
+    /* These cases are about the bearer client path, which by definition carries no
+       session cookie. The cookie+bearer combination has its own suite
+       (tests/csrf-credential-consistency.test.ts). */
+    hasSessionCookie: false,
     requestOrigin: REQUEST_ORIGIN,
     allowedOrigins: [],
     ...overrides,
@@ -600,6 +604,189 @@ async function main() {
     });
     const decision = evaluateCsrfRequestForRequest(request);
     assert.ok(!decision.allowed, "a Basic header must not bypass the origin check");
+  });
+
+  /* ══════════════ The browser's own assertion (rule 3b) ══════════════ */
+
+  await test("Browser's assertion: a forged forwarded PROTO no longer refuses a legitimate write", () => {
+    /* The measured finding: Next.js builds the request URL's scheme from
+       `x-forwarded-proto` and KEEPS a client-supplied value, so a client that
+       sends `X-Forwarded-Proto: https` to a deployment the browser reaches
+       over plain HTTP makes the application compare the write against
+       `https://app.example.test` while the browser sent
+       `http://app.example.test` — and the legitimate write was refused.
+       The browser's own `Sec-Fetch-Site: same-origin` is proof about the real
+       origins, so the write is allowed.
+
+       The request URL below is the one Next.js builds from the forged
+       header — an `https` URL — while the `Origin` header still carries the
+       browser's real, `http` origin. */
+    const request = new Request("https://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "http://app.example.test",
+        host: "app.example.test",
+        "sec-fetch-site": "same-origin",
+        "x-forwarded-proto": "https",
+      },
+    });
+    /* The derived origin really is the wrong one — otherwise this test would
+       pass for the wrong reason. */
+    assert.deepStrictEqual(getRequestOrigins(request), ["https://app.example.test"]);
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(
+      decision.allowed,
+      `a same-origin browser write must not be refused: ${decision.reason ?? decision.rule}`
+    );
+    assert.strictEqual(decision.rule, "same-origin");
+  });
+
+  await test("Browser's assertion: it does not apply without the browser's own claim", () => {
+    /* Without `Sec-Fetch-Site` there is no proof about the real origins, so
+       the comparison stays strict and the write is refused. Failing closed. */
+    const request = new Request("https://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "http://app.example.test",
+        host: "app.example.test",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(!decision.allowed, "without the browser's assertion the write must be refused");
+    assert.strictEqual(decision.rule, "cross-origin");
+  });
+
+  await test("Browser's assertion: a foreign origin is still refused", () => {
+    const request = new Request("http://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://evil.example.test",
+        host: "app.example.test",
+        "sec-fetch-site": "same-origin",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(!decision.allowed, "a foreign origin must never be allowed");
+    assert.strictEqual(decision.rule, "cross-origin");
+  });
+
+  await test("Browser's assertion: a same-host, different-scheme request is still refused", () => {
+    /* A page on the PLAINTEXT version of the same host is same-SITE but not
+       same-origin, so the browser reports `same-site` and the request is
+       refused. This is the attack the scheme comparison used to stop. */
+    const request = new Request("https://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "http://app.example.test",
+        host: "app.example.test",
+        "sec-fetch-site": "same-site",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(!decision.allowed, "a same-site request must not be allowed");
+    assert.strictEqual(decision.rule, "cross-origin");
+  });
+
+  await test("Browser's assertion: a different port is a different host", () => {
+    const request = new Request("https://app.example.test/api/x", {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.test:8443",
+        host: "app.example.test",
+        "sec-fetch-site": "same-origin",
+      },
+    });
+    const decision = evaluateCsrfRequestForRequest(request);
+    assert.ok(!decision.allowed, "a different port must not match the request's host");
+  });
+
+  await test("Browser's assertion: it does not apply when the public origin is configured", () => {
+    /* With `EASY_LEARN_PUBLIC_ORIGIN` the comparison origin is EXACT, so the
+       derived-origin rule must not apply: a plaintext origin is refused even
+       when the browser claims same-origin, because the deployment has said
+       that it is https. */
+    withEnv({ [PUBLIC_ORIGIN_ENV]: "https://app.example.test" }, () => {
+      const request = new Request("https://app.example.test/api/x", {
+        method: "POST",
+        headers: {
+          origin: "http://app.example.test",
+          host: "app.example.test",
+          "sec-fetch-site": "same-origin",
+        },
+      });
+      const decision = evaluateCsrfRequestForRequest(request);
+      assert.ok(!decision.allowed, "the configured public origin must be authoritative");
+      assert.strictEqual(decision.rule, "cross-origin");
+    });
+  });
+
+  await test("Public origin: the forwarded headers are ignored completely", () => {
+    withEnv({ [PUBLIC_ORIGIN_ENV]: "https://app.example.test" }, () => {
+      const request = new Request("http://internal.local/api/x", {
+        headers: {
+          host: "internal.local",
+          "x-forwarded-host": "evil.example.test",
+          "x-forwarded-proto": "https",
+        },
+      });
+      assert.deepStrictEqual(
+        getRequestOrigins(request),
+        ["https://app.example.test"],
+        "the configured origin must be the only candidate"
+      );
+    });
+  });
+
+  await test("Public origin: a legitimate HTTPS write through a rewriting proxy is allowed", () => {
+    withEnv({ [PUBLIC_ORIGIN_ENV]: "https://app.example.test" }, () => {
+      const request = new Request("http://internal.local/api/x", {
+        method: "POST",
+        headers: {
+          origin: "https://app.example.test",
+          host: "internal.local",
+          "x-forwarded-host": "app.example.test",
+          "x-forwarded-proto": "https",
+        },
+      });
+      const decision = evaluateCsrfRequestForRequest(request);
+      assert.ok(decision.allowed, "the configured origin must accept its own write");
+    });
+  });
+
+  await test("Opt-in: the forwarded host is only trusted for a host the edge published", () => {
+    /* Under the opt-in the forwarded host joins the trusted host set, so the
+       browser's assertion is evaluated against it too. A multi-valued
+       forwarded host is distrusted entirely, so only the `Host` header counts. */
+    withEnv({ [TRUST_PROXY_HEADERS_ENV]: "true" }, () => {
+      const trusted = new Request("https://app.example.test/api/x", {
+        method: "POST",
+        headers: {
+          origin: "https://edge.example.test",
+          host: "internal.local",
+          "x-forwarded-host": "edge.example.test",
+          "sec-fetch-site": "same-origin",
+        },
+      });
+      assert.ok(
+        evaluateCsrfRequestForRequest(trusted).allowed,
+        "the forwarded host the edge published must be recognised"
+      );
+
+      const chained = new Request("https://app.example.test/api/x", {
+        method: "POST",
+        headers: {
+          origin: "https://evil.example.test",
+          host: "internal.local",
+          "x-forwarded-host": "evil.example.test, edge.example.test",
+          "sec-fetch-site": "same-origin",
+        },
+      });
+      assert.ok(
+        !evaluateCsrfRequestForRequest(chained).allowed,
+        "a multi-valued forwarded host must be distrusted entirely"
+      );
+    });
   });
 
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed`);

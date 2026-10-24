@@ -7,15 +7,20 @@ import {
   classes,
   subjects,
   users,
-  learnerClasses,
 } from "@/db/schema";
 import {
   guardSchoolContext,
-  hasSchoolAdminRole,
   hasSchoolStaffRole,
   isClassInSchool,
+  isSubjectInSchool,
   sqlQuizInSchool,
 } from "@/lib/tenant";
+import {
+  evaluateQuizMutationAccess,
+  evaluateQuizReadAccess,
+  isLearnerEnrolledInClass,
+  quizAudienceForRole,
+} from "@/lib/quiz-access";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureQuizImageColumn, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { eq, asc, and, sql } from "drizzle-orm";
@@ -68,26 +73,33 @@ export async function GET(
       return notFoundResponse("Quiz");
     }
 
-    // Teachers can only inspect quizzes they manage; administrators can inspect all
-    // school quizzes. This also protects the attempt count returned below.
-    if (ctx.school.role === "teacher" && quiz.teacherId !== ctx.userId) {
-      return errorResponse("You can only view your own quizzes", 403);
+    /* ── Who may open this quiz, and what may they see? ────────────────────────
+       The rules live in `@/lib/quiz-access` so that the list route, this route and
+       the attempt routes cannot drift apart again. In short:
+         - a learner needs a PUBLISHED quiz and an enrollment in its class;
+         - a parent needs a PUBLISHED quiz and never sees the answer key;
+         - a teacher may open their own quizzes (drafts included);
+         - the other staff roles may open every quiz of their school.
+       The enrollment is read with the caller's school, so an enrollment that belongs
+       to another school never satisfies it. */
+    const audience = quizAudienceForRole(ctx.school.role);
+    const isEnrolled =
+      audience === "learner"
+        ? await isLearnerEnrolledInClass(ctx.schoolId, ctx.userId, quiz.classId)
+        : false;
+
+    const access = evaluateQuizReadAccess({
+      role: ctx.school.role,
+      isOwner: quiz.teacherId === ctx.userId,
+      isPublished: quiz.isPublished === true,
+      isEnrolled,
+    });
+
+    if (!access.allowed) {
+      return errorResponse(access.reason, access.status);
     }
 
     const isStaff = hasSchoolStaffRole(ctx);
-
-    if (ctx.school.role === "learner") {
-      if (!quiz.isPublished) {
-        return errorResponse("This quiz has not been published by your teacher yet", 403);
-      }
-      const enrolled = await db
-        .select({ classId: learnerClasses.classId })
-        .from(learnerClasses)
-        .where(eq(learnerClasses.learnerId, ctx.userId));
-      if (enrolled.length > 0 && !enrolled.some((row) => row.classId === quiz.classId)) {
-        return errorResponse("This quiz was set for a different class", 403);
-      }
-    }
 
     // Get questions
     let questions = await db
@@ -96,11 +108,11 @@ export async function GET(
       .where(eq(quizQuestions.quizId, id))
       .orderBy(asc(quizQuestions.orderIndex));
 
-    // For learners taking the quiz, hide correct answers
-    if (ctx.school.role === "learner") {
+    // Anyone who is not staff (a learner, a parent) never receives the answer key.
+    if (!access.revealAnswerKeys) {
       questions = questions.map((q) => ({
         ...q,
-        correctAnswer: null, // Hide correct answer from learners
+        correctAnswer: null, // Hide correct answer from learners and parents
       }));
 
       // Shuffle if enabled
@@ -114,7 +126,9 @@ export async function GET(
       .from(quizAttempts)
       .where(and(
         eq(quizAttempts.quizId, id),
-        isStaff ? sql`true` : eq(quizAttempts.learnerId, ctx.userId)
+        isStaff
+          ? sql`true`
+          : and(eq(quizAttempts.learnerId, ctx.userId), sql`${quizAttempts.completedAt} IS NOT NULL`)
       ));
 
     return successResponse({
@@ -157,8 +171,13 @@ export async function PUT(
 
     if (!existing) return notFoundResponse("Quiz");
 
-    if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
-      return errorResponse("You can only edit your own quizzes", 403);
+    const editAccess = evaluateQuizMutationAccess({
+      role: ctx.school.role,
+      isOwner: existing.teacherId === ctx.userId,
+      action: "edit",
+    });
+    if (!editAccess.allowed) {
+      return errorResponse(editAccess.reason, editAccess.status);
     }
 
     const body = await request.json();
@@ -227,12 +246,16 @@ export async function PUT(
     }
 
     /* ── TENANT FIRST (Phase 2C review fix F1) ──
-       Moving a quiz to another class may only target a class of the caller's school.
-       Without this the update could point the quiz at School B's class, which would make
-       the quiz ambiguous (owned by neither school) instead of safely denied. */
-    if (classId !== undefined && classId !== null && classId !== "") {
-      if (!(await isClassInSchool(ctx.schoolId, classId))) {
+       Moving a quiz to another class or subject may only target records of the caller's
+       selected school. Reject cross-school or empty foreign keys before mutating. */
+    if (classId !== undefined) {
+      if (!classId || !(await isClassInSchool(ctx.schoolId, classId))) {
         return notFoundResponse("Class");
+      }
+    }
+    if (subjectId !== undefined) {
+      if (!subjectId || !(await isSubjectInSchool(ctx.schoolId, subjectId))) {
+        return notFoundResponse("Subject");
       }
     }
 
@@ -251,7 +274,14 @@ export async function PUT(
     if (isPublished !== undefined) updates.isPublished = Boolean(isPublished);
 
     if (Object.keys(updates).length > 0 || replacesQuestions) {
-      await db.transaction(async (tx) => {
+      const mutated = await db.transaction(async (tx) => {
+        const [scopedQuiz] = await tx
+          .select({ id: quizzes.id })
+          .from(quizzes)
+          .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
+          .limit(1);
+        if (!scopedQuiz) return false;
+
         if (Object.keys(updates).length > 0) {
           await tx
             .update(quizzes)
@@ -266,10 +296,20 @@ export async function PUT(
             await tx.insert(quizQuestions).values(questionRows);
           }
         }
+
+        return true;
       });
+
+      if (!mutated) return notFoundResponse("Quiz");
     }
 
-    const [updated] = await db.select().from(quizzes).where(eq(quizzes.id, id)).limit(1);
+    const [updated] = await db
+      .select()
+      .from(quizzes)
+      .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
+      .limit(1);
+
+    if (!updated) return notFoundResponse("Quiz");
 
     return successResponse(updated);
   } catch (error) {
@@ -300,16 +340,31 @@ export async function DELETE(
 
     if (!existing) return notFoundResponse("Quiz");
 
-    if (existing.teacherId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
-      return errorResponse("You can only delete your own quizzes", 403);
+    const deleteAccess = evaluateQuizMutationAccess({
+      role: ctx.school.role,
+      isOwner: existing.teacherId === ctx.userId,
+      action: "delete",
+    });
+    if (!deleteAccess.allowed) {
+      return errorResponse(deleteAccess.reason, deleteAccess.status);
     }
 
-    // Attempts reference the quiz, so clear the whole tree or the delete fails on the FK.
-    await db.transaction(async (tx) => {
+    // Attempts reference the quiz, so clear the whole tree atomically after confirming scope.
+    const deleted = await db.transaction(async (tx) => {
+      const [scopedQuiz] = await tx
+        .select({ id: quizzes.id })
+        .from(quizzes)
+        .where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)))
+        .limit(1);
+      if (!scopedQuiz) return false;
+
       await tx.delete(quizAttempts).where(eq(quizAttempts.quizId, id));
       await tx.delete(quizQuestions).where(eq(quizQuestions.quizId, id));
       await tx.delete(quizzes).where(and(eq(quizzes.id, id), sqlQuizInSchool(ctx.schoolId, quizzes.id)));
+      return true;
     });
+
+    if (!deleted) return notFoundResponse("Quiz");
 
     return successResponse({ message: "Quiz deleted" });
   } catch (error) {

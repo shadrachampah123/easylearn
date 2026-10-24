@@ -257,6 +257,57 @@ test('Tenant module: membership queries are always scoped to the authenticated u
   );
 });
 
+test('Tenant module: the public membership read cannot be widened by a flag', () => {
+  // LOW-7: `listSchoolMemberships` used to take a public `includeInactive` option. A
+  // public boolean that widens a membership read is a trap — the only thing that kept a
+  // caller from treating a disabled or archived membership as school context was a
+  // sentence in a doc comment. The widening read now has its own, explicitly-named
+  // export, and the active read takes no options at all.
+  assert(
+    !/listSchoolMemberships\s*\([^)]*options/.test(tenant),
+    'the active membership read must not take an options object'
+  );
+  assert(
+    !/options:\s*\{\s*includeInactive/.test(tenant),
+    'no membership read may offer a widening includeInactive switch'
+  );
+  assert(
+    tenant.includes('export async function listAllSchoolMembershipsForInspection'),
+    'the widening read must have its own, explicitly-named export'
+  );
+  assert(
+    tenant.includes('export async function listActiveSchoolMemberships'),
+    'the active membership read must keep its named export'
+  );
+});
+
+test('Tenant module: every membership read is scoped to ONE user, the inspection read too', () => {
+  const reads = [
+    ['listSchoolMemberships', 'export async function listSchoolMemberships', '/** Only `status = '],
+    [
+      'listAllSchoolMembershipsForInspection',
+      'export async function listAllSchoolMembershipsForInspection',
+      'export async function resolveSchoolMembership',
+    ],
+  ];
+  for (const [name, start, end] of reads) {
+    const body = tenant.slice(tenant.indexOf(start), tenant.indexOf(end));
+    assert(body.length > 0, `${name} must exist in tenant.ts`);
+    assert(
+      /const conditions = \[eq\(schoolUsers\.userId, userId\)\]/.test(body),
+      `${name} must start its WHERE clause from the caller's own user id`
+    );
+    assert(
+      body.includes('.where(and(...conditions))'),
+      `${name} must actually apply those conditions`
+    );
+    assert(
+      !/\.where\(\s*eq\(schoolUsers\.schoolId/.test(body),
+      `${name} must never look a membership up by school alone`
+    );
+  }
+});
+
 test('Tenant module: narrowing by schoolId can only reduce the caller\'s own memberships', () => {
   const resolveBody = tenant.slice(
     tenant.indexOf('export async function resolveSchoolMembership'),
