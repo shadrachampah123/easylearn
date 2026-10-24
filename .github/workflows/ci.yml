@@ -67,9 +67,18 @@ jobs:
           # actually run.
           EASY_LEARN_REQUIRE_ASSIGNMENT_PREREQ: "true"
           EASY_LEARN_REQUIRE_SCRATCH_DB_LIFECYCLE: "true"
+          # A skip must fail this job: the seed-membership assertions have to actually run.
+          EASY_LEARN_REQUIRE_SEED_MEMBERSHIP: "true"
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth
+      - name: "PR #45 reviewer regressions (PostgreSQL required)"
+        # Independent reproductions of the PR #45 review findings R1-R7, authored by the
+        # reviewer rather than by the remediation author. Kept as a separate step so a
+        # failure points straight at the reviewer oracle. test:review-pr45 sets
+        # EASY_LEARN_TEST_DATABASE itself and runs the CSRF file in its own process,
+        # because that file mutates process.env at module load.
+        run: npm run test:review-pr45
       - name: Tenant negative mutation tests
         run: npm run test:mutation
       - name: PR integration regression suite (PostgreSQL required)

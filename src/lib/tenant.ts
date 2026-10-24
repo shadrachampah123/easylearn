@@ -176,27 +176,27 @@ let missingMembershipTableReported = false;
 
 /**
  * Every membership the user holds, newest-independent and deterministic
- * (`created_at`, then `id`). Only active membership rows in active schools are returned by
- * the default path. `includeInactive` is reserved for platform/lifecycle inspection and may
- * include disabled memberships and non-active school rows; it never grants tenant context.
+ * (`created_at`, then `id`). Only active membership rows in active schools are returned.
+ *
+ * This read used to take a public option that widened it to disabled memberships and
+ * non-active schools. A public boolean that widens a membership read is a trap: the only
+ * thing that stopped a caller from treating a disabled or archived membership as school
+ * context was a sentence in a doc comment. The widening read now has its own,
+ * explicitly-named export (`listAllSchoolMembershipsForInspection`) and there is no flag
+ * left to flip by accident.
  *
  * Degrades to `[]` when `school_users` does not exist yet (migration 0013/0015 not
  * applied) — the same degrade-instead-of-crash rule the rest of the codebase follows, so
  * login and `/api/auth/me` keep working on an un-migrated database.
  */
-export async function listSchoolMemberships(
-  userId: string,
-  options: { includeInactive?: boolean } = {}
-): Promise<SchoolMembership[]> {
+export async function listSchoolMemberships(userId: string): Promise<SchoolMembership[]> {
   if (!isUuid(userId)) return [];
 
   const conditions = [eq(schoolUsers.userId, userId)];
-  if (!options.includeInactive) {
-    conditions.push(
-      eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS),
-      eq(schools.status, ACTIVE_SCHOOL_LIFECYCLE_STATUS)
-    );
-  }
+  conditions.push(
+    eq(schoolUsers.status, ACTIVE_MEMBERSHIP_STATUS),
+    eq(schools.status, ACTIVE_SCHOOL_LIFECYCLE_STATUS)
+  );
 
   try {
     const rows = await db
@@ -210,23 +210,65 @@ export async function listSchoolMemberships(
       .map(toSchoolMembership)
       .filter((membership): membership is SchoolMembership => membership !== null);
   } catch (error) {
-    if (isMissingRelation(error)) {
-      if (!missingMembershipTableReported) {
-        missingMembershipTableReported = true;
-        console.warn(
-          "[tenant] school_users/schools are missing — run `node run-migration.js` " +
-            "(0013/0015). School context is unavailable until then."
-        );
-      }
-      return [];
-    }
-    throw error;
+    return degradeMissingMembershipTable(error);
   }
 }
 
 /** Only `status = 'active'` memberships. This is the set that can grant school context. */
 export async function listActiveSchoolMemberships(userId: string): Promise<SchoolMembership[]> {
   return listSchoolMemberships(userId);
+}
+
+/**
+ * EVERY membership row, including disabled memberships and non-active schools.
+ *
+ * RESERVED for platform/lifecycle inspection. These records are NOT school context:
+ * nothing in the application calls this, and `requireSchoolContext` never reads it. It
+ * exists for the membership suite, which has to assert that a revoked, disabled or
+ * archived membership really is absent from the active set, and for platform
+ * inspection of historical rows.
+ *
+ * The name states what it returns precisely so that it cannot be reached by flipping a
+ * flag on the active-context read by accident. It is still scoped to ONE user — a
+ * membership is never looked up by school alone.
+ */
+export async function listAllSchoolMembershipsForInspection(
+  userId: string
+): Promise<SchoolMembership[]> {
+  if (!isUuid(userId)) return [];
+
+  const conditions = [eq(schoolUsers.userId, userId)];
+
+  try {
+    const rows = await db
+      .select(membershipSelection)
+      .from(schoolUsers)
+      .innerJoin(schools, eq(schoolUsers.schoolId, schools.id))
+      .where(and(...conditions))
+      .orderBy(asc(schoolUsers.createdAt), asc(schoolUsers.id));
+
+    return (rows as unknown as Record<string, unknown>[])
+      .map(toSchoolMembership)
+      .filter((membership): membership is SchoolMembership => membership !== null);
+  } catch (error) {
+    return degradeMissingMembershipTable(error);
+  }
+}
+
+/**
+ * The shared "the membership tables are not there yet" path. A missing relation is a
+ * degraded (empty) membership set, never a crash; anything else is re-thrown.
+ */
+function degradeMissingMembershipTable(error: unknown): SchoolMembership[] {
+  if (!isMissingRelation(error)) throw error;
+  if (!missingMembershipTableReported) {
+    missingMembershipTableReported = true;
+    console.warn(
+      "[tenant] school_users/schools are missing — run `node run-migration.js` " +
+        "(0013/0015). School context is unavailable until then."
+    );
+  }
+  return [];
 }
 
 /**
@@ -744,7 +786,11 @@ function sqlSchoolsOfAssignment(assignmentRef: SQL | AnyColumn): SQL {
   )`;
 }
 
-/** Every school reachable from a quiz: its teacher plus its class's members. */
+/**
+ * Legacy quiz attribution: memberships plus any persisted quiz/parent school IDs.
+ * A membership transfer must not re-home legacy content whose class/subject still belongs
+ * to the old school. to_jsonb also permits the pre-0016 schema (no school_id column).
+ */
 function sqlSchoolsOfQuiz(quizRef: SQL | AnyColumn): SQL {
   return sql`(
     select su."school_id" as "school_id"
@@ -753,6 +799,19 @@ function sqlSchoolsOfQuiz(quizRef: SQL | AnyColumn): SQL {
      where q."id" = ${quizRef}
     union
     select ss."school_id" from ${sqlSchoolsOfClass(sql`(select q."class_id" from "quizzes" q where q."id" = ${quizRef})`)} ss
+    union
+    select attributed."school_id"
+      from "quizzes" q
+      left join "classes" c on c."id" = q."class_id"
+      left join "subjects" s on s."id" = q."subject_id"
+      left join "terms" t on t."id" = q."term_id"
+      cross join lateral (values
+        ((to_jsonb(q)->>'school_id')::uuid),
+        ((to_jsonb(c)->>'school_id')::uuid),
+        ((to_jsonb(s)->>'school_id')::uuid),
+        ((to_jsonb(t)->>'school_id')::uuid)
+      ) as attributed("school_id")
+     where q."id" = ${quizRef} and attributed."school_id" is not null
   )`;
 }
 
@@ -854,8 +913,31 @@ export function sqlAssignmentOwnedRelationally(
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfAssignment(assignmentRef));
 }
 
-/** Content predicate: the quiz belongs to this school's alone. */
+/**
+ * Persisted quiz attribution wins over changing memberships, exactly as for assignments.
+ * The selected school is freshly verified by guardSchoolContext; an explicit different
+ * school can NEVER fall back to relational ownership. NULL legacy rows remain fail-closed
+ * unless their complete ownership set resolves to this school alone.
+ */
 export function sqlQuizInSchool(schoolId: string, quizRef: SQL | AnyColumn): SQL {
+  assertSchoolId(schoolId);
+  return sql`(
+    exists (
+      select 1 from "quizzes" q
+       where q."id" = ${quizRef} and q."school_id" = ${schoolId}
+    )
+    or (
+      not exists (
+        select 1 from "quizzes" q
+         where q."id" = ${quizRef} and q."school_id" is not null
+      )
+      and ${sqlQuizOwnedRelationally(schoolId, quizRef)}
+    )
+  )`;
+}
+
+/** Only for legacy NULL attribution or a schema with no quiz school_id column. */
+export function sqlQuizOwnedRelationally(schoolId: string, quizRef: SQL | AnyColumn): SQL {
   return sqlOwnedBySchool(schoolId, sqlSchoolsOfQuiz(quizRef));
 }
 

@@ -91,6 +91,52 @@ also the only configuration that survives an edge that appends to
 state exactly this, and two regression tests pin both halves of it. No
 behaviour was changed.
 
+**Status — CLOSED for the availability half (PR #44).** The self-inflicted
+denial is gone. `src/lib/csrf.ts` now accepts the **browser's own** proof of
+same-origin: when the strict comparison fails, the comparison origin was
+**derived** (no `EASY_LEARN_PUBLIC_ORIGIN`), the `Origin` header's **host** is
+one of the hosts the request was addressed to, and the browser reports
+`Sec-Fetch-Site: same-origin`, the request is allowed. `same-origin` is
+proof about the **real** origins, and it is not forgeable by a page on another
+origin (`Sec-Fetch-Site` is a forbidden header name).
+
+What did **not** change: a foreign origin is still refused, a same-host
+different-scheme browser request is still refused (the browser reports
+`same-site` for it), a request with no `Sec-Fetch-Site` is still refused, and
+with `EASY_LEARN_PUBLIC_ORIGIN` configured the rule does not apply at all.
+The underlying dependency is unchanged and `EASY_LEARN_PUBLIC_ORIGIN` remains
+the recommended configuration behind an edge.
+
+Re-measured against a production build on a disposable database
+(`tests/manual/browser-upload-verification.js`, a real Chromium, the same
+`POST /api/auth/select-school` write):
+
+| Request headers (from the app's own page) | Before | After |
+|---|---|---|
+| none | 200 | 200 |
+| `X-Forwarded-Host: evil.test` | 200 | 200 |
+| `X-Forwarded-Proto: https` | **403** | **200** |
+| `X-Forwarded-Host: evil.test` + `X-Forwarded-Proto: https` | **403** | **200** |
+
+and the HTTP-level matrix (`tests/manual/forwarded-header-configuration-matrix.js`,
+24 checks over the three configurations) now records the difference between a
+browser request and a client that sends no `Sec-Fetch-Site`:
+
+| Request | Default | Opt-in | `EASY_LEARN_PUBLIC_ORIGIN` |
+|---|---|---|---|
+| The app's own origin | allowed | allowed | allowed |
+| A foreign origin | refused | refused | refused |
+| A foreign origin, forged forwarded headers | refused | allowed (the documented opt-in trade-off) | refused |
+| A foreign origin, the browser claims same-origin | refused | refused | refused |
+| The app's own origin, forged forwarded headers, **no** browser claim | refused | refused | allowed |
+| The app's own origin, forged forwarded headers, **the browser's claim** | allowed | allowed | allowed |
+| The same host, the other scheme, the browser reports same-site | refused | refused | refused |
+| No `Origin` and no `Sec-Fetch-Site` | refused | refused | refused |
+
+The last row is the fail-closed rule: a request that carries no information
+about where it came from is refused, and a non-browser client presents a
+Bearer token instead.
+
 ---
 
 ### F-2 — MEDIUM / pre-existing, functional — a user who is a member of two schools cannot open their own uploaded files
@@ -144,6 +190,24 @@ including for a uploader who is a member of both). **But that is a
 tenant-isolation change and it contradicts a deliberate existing test**, so it
 needs its own independently reviewed change. It is recorded in §7 and §9 of
 `docs/SECURITY_AUTHENTICATION.md` as risk #12.
+
+**Status — CLOSED (PR #42, `0403a4c`).** The recommendation was implemented in
+a separate, narrowly scoped draft PR: a file is now attributed by its own
+`uploaded_files.school_id` — the school that wrote it — exactly as an
+assignment is (Phase 2D). The relational predicate survives **only** for
+legacy rows whose `school_id` is `NULL`, and those stay denied to everyone.
+A uploader who is a member of two schools can now open their own file in the
+school that stored it, and still gets **404** in the other one. The change is
+a tenant-isolation change and still needs an independent review.
+
+`tests/tenant-file-attribution-db.test.ts` (new) — **17/17**, covering one
+school, multiple schools, unauthorized users, cross-school access, the delete
+route, membership revocation and the legacy `NULL` fallback. The mutation
+harness gained **M6** (the file's own school check removed) so the new
+predicate is proven load-bearing, and a new assertion keeps the *relational*
+ownership rule load-bearing through a resource that still uses it (a quiz), so
+M2 and M5 are still killed: `tests/tenant-authorization-mutation.test.ts` →
+**8/8**.
 
 ---
 
@@ -201,6 +265,30 @@ everywhere.
 needs the object store to be **same-origin with the application**
 (`OBJECT_STORAGE_PUBLIC_URL` on the app's own domain), add a post-upload
 validation step, or serve the bucket from a cookieless origin.
+
+**Status — the validation step was implemented (PR #43, `8e1803c`).** Before a
+download URL is handed out, the application's new object guard reads the
+object's first bytes back from the store and applies the **same** policy the
+local path applies: the bytes must match the signature of the key's
+extension, must not be markup, and the type the store recorded must be the
+type the server derived. The object's **real** size is measured against the
+50 MB / 100 MB limits, and the verdict is remembered per object ETag, so a
+changed object is always re-validated. A refused or missing object is
+reported as **404** and a store that cannot be reached as **503**.
+
+Measured against a **real S3-compatible server** (`tests/object-storage-live.test.ts`,
+11 assertions, real PostgreSQL, real route handlers): the store **applies** the
+signed content type, disposition and `response-cache-control`; it **cannot**
+apply `nosniff` or a CSP (the S3 API allows exactly six `response-*` overrides
+and the store answers **400 `InvalidArgument`** for any other); and the store's
+response carried **no** cache directive at all before the fix, so a shared
+cache in front of the bucket could have stored a private file.
+
+What is **still** open, and is a deployment requirement rather than a code
+change: the bucket must be on a **separate cookieless origin**,
+`OBJECT_STORAGE_PUBLIC_URL` must not be used for private content, and a
+presigned download URL is a **bearer credential** for as long as it is valid
+(measured).
 
 ---
 
@@ -263,7 +351,12 @@ the disposable database only), and a throwaway upload directory under `/tmp`.
 
 **Nothing in production was read, written, deployed or migrated.**
 
-### 3.1 `tests/manual/browser-upload-verification.js` — **34 of 34 checks passed**
+### 3.1 `tests/manual/browser-upload-verification.js` — **36 of 36 checks passed**
+
+> Re-measured against the PR #44 code on 2026-10-20. The original run
+> (PR #40) reported 34 of 34; one check — #11 below — asserted the
+> self-inflicted denial that PR #44 removes, and it is now three
+> checks that say what actually matters.
 
 | # | Check | Result |
 |---|---|---|
@@ -277,39 +370,41 @@ the disposable database only), and a throwaway upload directory under `/tmp`.
 | 8 | The teacher assignments page loads | ✅ |
 | 9 | An account with **two** memberships is offered the school selection | ✅ |
 | 10 | Choosing a school opens the dashboard | ✅ |
-| 11 | A write with **forged** `X-Forwarded-Host` + `X-Forwarded-Proto` is refused by default (**403**) | ✅ |
-| 12 | An ordinary same-origin write still succeeds (**200**) | ✅ |
-| 13 | A cross-site write from another origin is refused (not 2xx) | ✅ |
-| 14 | The assignment form exposes a file input | ✅ |
-| 15 | A legitimate PNG is accepted by the **real UI** | ✅ |
-| 16 | **HTML bytes in a `.png`** are refused by the real UI (server **400**, not attached, error shown) | ✅ |
-| 17 | An **`.svg`** file is refused by the real UI (client refused it; no request made) | ✅ |
-| 18 | An **`.xhtml`** file is refused by the real UI (client refused it; no request made) | ✅ |
-| 19 | **ZIP bytes in a `.png`** are refused by the real UI (server **400**) | ✅ |
-| 20 | A legitimate `.txt` file is accepted by the real UI | ✅ |
-| 21 | The legacy row (`mime_type = 'text/html'`) is served (not a 404) | ✅ |
-| 22 | It is **not** served as `text/html` | ✅ |
-| 23 | It is served as `image/png` | ✅ |
-| 24 | It is served with `nosniff` | ✅ |
-| 25 | It is served with a sandboxing policy | ✅ |
-| 26 | It forbids cross-origin embedding (`CORP: same-origin`) | ✅ |
-| 27 | A legacy `.html` row is served as a download, not a document (`application/octet-stream` + `attachment`) | ✅ |
-| 28 | The legacy row served as `image/png` **does not execute script** | ✅ |
-| 29 | The legacy row served as a `.html` download **does not execute script** | ✅ |
-| 30 | Logout succeeds | ✅ |
-| 31 | The session cookie is cleared on logout | ✅ |
-| 32 | The API refuses the request after logout (**401**) | ✅ |
-| 33 | **No** Content-Security-Policy violation was reported in the console | ✅ |
-| 34 | **No** uncaught page error was raised | ✅ |
+| 11 | A write with a **forged** `X-Forwarded-Host` is still made against this application's own origin (**200**) — the default configuration does not trust the forwarded host | ✅ |
+| 12 | A write with a **forged** `X-Forwarded-Proto` is no longer refused (**200**) — the browser's own `Sec-Fetch-Site: same-origin` is proof about the real origins (PR #44) | ✅ |
+| 13 | A write with **both** forged forwarded headers is still made against this application's own origin (**200**) | ✅ |
+| 14 | An ordinary same-origin write still succeeds (**200**) | ✅ |
+| 15 | A cross-site write from another origin is refused (not 2xx) | ✅ |
+| 16 | The assignment form exposes a file input | ✅ |
+| 17 | A legitimate PNG is accepted by the **real UI** | ✅ |
+| 18 | **HTML bytes in a `.png`** are refused by the real UI (server **400**, not attached, error shown) | ✅ |
+| 19 | An **`.svg`** file is refused by the real UI (client refused it; no request made) | ✅ |
+| 20 | An **`.xhtml`** file is refused by the real UI (client refused it; no request made) | ✅ |
+| 21 | **ZIP bytes in a `.png`** are refused by the real UI (server **400**) | ✅ |
+| 22 | A legitimate `.txt` file is accepted by the real UI | ✅ |
+| 23 | The legacy row (`mime_type = 'text/html'`) is served (not a 404) | ✅ |
+| 24 | It is **not** served as `text/html` | ✅ |
+| 25 | It is served as `image/png` | ✅ |
+| 26 | It is served with `nosniff` | ✅ |
+| 27 | It is served with a sandboxing policy | ✅ |
+| 28 | It forbids cross-origin embedding (`CORP: same-origin`) | ✅ |
+| 29 | A legacy `.html` row is served as a download, not a document (`application/octet-stream` + `attachment`) | ✅ |
+| 30 | The legacy row served as `image/png` **does not execute script** | ✅ |
+| 31 | The legacy row served as a `.html` download **does not execute script** | ✅ |
+| 32 | Logout succeeds | ✅ |
+| 33 | The session cookie is cleared on logout | ✅ |
+| 34 | The API refuses the request after logout (**401**) | ✅ |
+| 35 | **No** Content-Security-Policy violation was reported in the console | ✅ |
+| 36 | **No** uncaught page error was raised | ✅ |
 
 Two notes on method:
 
-- The **cross-site** write (check 13) is driven from an attacker page served
+- The **cross-site** write (check 15) is driven from an attacker page served
   from its **own** origin (a second local HTTP server), not from the
   application, so the application's own CSP cannot mask the server's answer.
   The browser reports the request as `opaque`; the server's status was read
   from the DevTools network event and was **not** 2xx.
-- The upload refusals (checks 16–19) are asserted from the **network**, not
+- The upload refusals (checks 18–21) are asserted from the **network**, not
   from the DOM: the file must not be attached (the attachment list is read by
   its "Remove file" buttons) and the request must have been refused (4xx) or
   never made (client-side refusal).
@@ -500,6 +595,24 @@ for an independently reviewed change.
 - **No self-certification.** This is not an independent review.
 - **No claim of browser verification for Firefox or Safari**, and no claim
   that a video frame was decoded.
+
+### The later draft PRs (added 2026-10-20)
+
+Three further **draft** PRs were opened on top of this one, each narrowly
+scoped and each with its own base:
+
+| PR | Base | What it does |
+|---|---|---|
+| **#42** | `security/pr40-review-followup` | Closes **F-2**: a file is attributed by its own `uploaded_files.school_id`. Head `0403a4c`. |
+| **#43** | `security/pr42-file-attribution` | Closes the **F-3** content-integrity gap: the stored object is verified before a download URL is handed out, and the download URL signs a private cache directive. Head `9a0cbb3`. |
+| **#44** | `security/pr43-object-storage-guard` | Closes the **availability half of F-1**: the browser's own `Sec-Fetch-Site: same-origin` is accepted as proof of same-origin, so a client-supplied `X-Forwarded-Proto` can no longer refuse a legitimate write. Head `984e0e3`. |
+
+**None of them is merged, and none of them is independently reviewed.** The
+browser evidence in this document was re-measured against the PR #44 code:
+`tests/manual/browser-upload-verification.js` **36/36**,
+`tests/manual/forwarded-header-configuration-matrix.js` **24/24**,
+`tests/manual/live-upload-content-probe.js` **39/39**,
+`tests/manual/browser-content-type-sniffing-probe.js` **4/4**.
 
 ---
 

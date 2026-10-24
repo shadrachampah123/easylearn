@@ -218,12 +218,20 @@ A request is evaluated as follows, in order:
 | 5 | There is no `Origin`, but `Sec-Fetch-Site` is `same-origin` or `none` | **Allowed.** |
 | 6 | There is no `Origin`, and `Sec-Fetch-Site` is `cross-site` or `same-site` | **Refused.** |
 | 7 | There is neither an `Origin` nor a `Sec-Fetch-Site` | **Refused.** |
+| 8 | The comparison origin was **derived**, the `Origin` header's **host** is one of ours, and the browser reports `Sec-Fetch-Site: same-origin` | **Allowed.** The browser's own proof of same-origin — see "The browser's own assertion" below. |
 
 **Rule 7 is the important one.** When a request carries no information at all
 about where it came from, the policy refuses it. Failing open would make "strip
 the `Origin` header" a bypass, which is exactly the kind of bypass an attacker
 tries first. A request that genuinely has neither header — an old client, a
 command-line tool — can present a bearer token and be allowed by rule 2.
+
+**Rule 8 is the narrow one.** It exists because the derived *scheme* is not
+fully trustworthy (Next.js keeps a client-supplied `X-Forwarded-Proto`), and it
+only ever allows what rule 3 would have refused, and only when the browser
+itself asserts the request is same-origin. A foreign origin, a same-host
+different-scheme request and a request with no `Sec-Fetch-Site` are all still
+refused.
 
 `Sec-Fetch-Site: same-site` is refused. A sibling subdomain is a different
 origin and is not this application; allowing it would hand the session to every
@@ -257,6 +265,8 @@ with the headers it forwards.
 
 **2. Otherwise the origin comes from the request itself** — the `Host` header
 and the scheme of the request URL. The forwarded headers are **not** consulted.
+The derived scheme is not fully trustworthy, and rule 8 of the policy above
+exists for that reason.
 
 **3. `EASY_LEARN_TRUST_PROXY_HEADERS=true` opts in to the forwarded headers.**
 
@@ -302,7 +312,7 @@ The comparison ignores the path and the query, treats `https://host` and
 `https://host:443` as the same, and compares the **host**, not a suffix of it —
 `evil.app.example.test` is not `app.example.test`.
 
-#### The scheme is still forwarded-header-derived — this matters for availability
+#### The scheme is still forwarded-header-derived — and what the application does about it
 
 The **host** is taken from the `Host` header, and the **scheme** from the
 request URL. In Next.js those two are not independent of the forwarded
@@ -313,12 +323,19 @@ headers:
 const protocol = req.headers["x-forwarded-proto"]?.includes("https") ? "https" : "http";
 ```
 
-and the header is **synthesised** when it is absent
-(`next/dist/server/base-server.js`). So in the default configuration:
+and the header is **synthesised** when it is absent, from the socket's TLS
+state — but it is **kept** when the client sent one:
+
+```js
+// next/dist/server/base-server.js
+req.headers["x-forwarded-proto"] ??= isHttps ? "https" : "http";
+```
+
+So in the default configuration:
 
 - `X-Forwarded-Host` is genuinely ignored — the host comes from `Host`;
 - `X-Forwarded-Proto` still reaches the derived scheme, indirectly, through
-  the request URL.
+  the request URL, and a **client-supplied** value survives.
 
 What that can and cannot do:
 
@@ -331,10 +348,31 @@ A browser cannot set `X-Forwarded-Host` or `X-Forwarded-Proto` on a cross-site
 request without a CORS preflight, and this application does not enable CORS, so
 these headers cannot be used to forge an origin from a foreign page.
 
-The consequence for deployment is the same as for the host: **set
-`EASY_LEARN_PUBLIC_ORIGIN`** whenever an edge is in front of the application.
-It is the only configuration in which neither half of the compared origin
-depends on a forwarded header.
+##### The browser's own assertion (rule 3b)
+
+The denial above is now gone. When the comparison fails, and the comparison
+origin was **derived** (no `EASY_LEARN_PUBLIC_ORIGIN`), and the `Origin`
+header's **host** is one of the hosts the request was addressed to, and the
+browser reports **`Sec-Fetch-Site: same-origin`**, the request is **allowed**.
+
+`same-origin` means the request's origin **is** the initiator's origin, so the
+browser has already answered the question the derived origin was supposed to
+answer — about the **real** origins, not about a header a client could send. A
+page on another origin cannot set `Sec-Fetch-Site`: it is a forbidden header
+name, so only the browser sets it.
+
+What the rule does **not** weaken:
+
+| | |
+|---|---|
+| A foreign origin | Still refused — its host is not one of ours. |
+| A same-host, **different-scheme** browser request (a page on the plaintext version of the same host) | Still refused — the browser reports `same-site` for it, not `same-origin`. This is the attack the scheme comparison used to stop. |
+| A request with **no** `Sec-Fetch-Site` | Still refused — without the browser's own claim there is no proof about the real origins, so the comparison stays strict. Failing closed. |
+| A deployment with `EASY_LEARN_PUBLIC_ORIGIN` | The rule does **not** apply. The configured origin is exact, and it is the authoritative answer. |
+| The trusted-proxy opt-in | The forwarded host joins the trusted host set, exactly as it already joins the candidate origins. A multi-valued forwarded host is distrusted entirely. |
+
+The rule only ever allows what the strict comparison would have refused, and
+only when the browser itself has said the request is same-origin.
 
 #### Deployment assumptions
 
@@ -763,7 +801,7 @@ noise on direct navigation only, not on an `<img>` in a page.
 | Suite | File | What it proves |
 |---|---|---|
 | JWT secret policy | `tests/jwt-secret-policy.test.ts` | Weak, short, low-diversity, placeholder and periodic secrets are rejected; a 5000-sample random sweep produces no false rejections. |
-| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; and the four forwarded-header cases the review asked for — **forged headers, chained proxies, HTTPS termination and ordinary legitimate writes** — under each of the three configurations (default, `EASY_LEARN_TRUST_PROXY_HEADERS`, `EASY_LEARN_PUBLIC_ORIGIN`). |
+| CSRF policy | `tests/csrf-policy.test.ts` | Every rule in §4, including the fail-closed case and the fact that a `Basic` header is not a bypass; the four forwarded-header cases the review asked for — **forged headers, chained proxies, HTTPS termination and ordinary legitimate writes** — under each of the three configurations (default, `EASY_LEARN_TRUST_PROXY_HEADERS`, `EASY_LEARN_PUBLIC_ORIGIN`); and the **browser's own assertion** (rule 8): that a forged `X-Forwarded-Proto` no longer refuses a legitimate same-origin write, that the rule does not apply without `Sec-Fetch-Site`, that a foreign origin and a same-host different-scheme request are still refused, and that it does not apply at all when `EASY_LEARN_PUBLIC_ORIGIN` is configured. |
 | Cookie auth and safe methods | `tests/cookie-auth.test.ts` | The response bodies carry no token; no browser file stores, reads or sends a token; no route reads a token from a URL; no `GET` handler writes; the cookie name has one definition; and, on the **parsed** call sites, no browser file calls `fetch()` or builds an `Authorization` header. The call-path guard covers the **aliased** `fetch` (`const f = fetch`), the **destructured** `fetch` (`const { fetch } = window`), **bracket-notation** access (`window["fetch"]`) and `navigator.sendBeacon`, and pins the one justified `XMLHttpRequest` exception. |
 | Uploaded file content | `tests/upload-content.test.ts` | The served content type is server-determined for every allow-listed extension; a mismatched declared MIME type, an HTML/SVG/XHTML payload, an extension-spoofed file and an inline-rendered unknown file are all refused; the routes store and serve the server's type rather than the client's; and the forbidden extensions are refused outright. |
 | Object-storage content policy | `tests/object-storage-content-policy.test.ts` | The download URL forces the server-determined type and the safe disposition onto the object store's response **and signs them**, so they cannot be swapped out by whoever holds the URL; the signed PUT binds the server's content type; the presign route derives the type from the allow-list and refuses a scriptable declared type. |
@@ -795,11 +833,13 @@ binary; the instructions are in each file's header.
   forged-forwarded-header write, an ordinary write, a cross-site write, the
   real upload UI with legitimate and hostile files, the served response, the
   attempt to execute an uploaded payload, logout, and the console — and
-  reports **34 of 34 checks passed**. `tests/manual/browser-content-type-sniffing-probe.js`
+  reports **36 of 36 checks passed**. `tests/manual/browser-content-type-sniffing-probe.js`
   reports **0 of 9 header combinations executed script** and **0 preview
   failures**. `tests/manual/forwarded-header-configuration-matrix.js` runs the
-  same write against all three configurations. **Firefox and Safari were not
-  available** — see §7.
+  same write against all three configurations — **24 of 24** — and
+  `tests/manual/csrf-proxy-trust-probe.js` measures the cross-site policy
+  against a production build over HTTP — **9 of 9**. **Firefox and Safari were
+  not available** — see §7.
 - **Video decoding in a browser.** The element's request was confirmed; no
   sample video was available in the environment, so no frame was decoded (§7).
 - **The production CSP change could not be observed in a browser.** The
@@ -832,7 +872,7 @@ binary; the instructions are in each file's header.
 | 9c | A presigned download URL is a bearer credential. | **Accepted, inherent.** It grants access with no application session for `OBJECT_STORAGE_DOWNLOAD_EXPIRY` seconds (default 3600). Measured in the live suite (§7). Keep the expiry short; never set `OBJECT_STORAGE_PUBLIC_URL` for private content. |
 | 9d | The signing of the presigned URLs has **not** been validated against the real provider. | **Open, not verified.** The live suite runs against `s3rver`, which does **not** verify AWS Signature Version 4 signatures, so nothing here proves that a tampered URL would be rejected by AWS S3 — or that a correctly signed one would be accepted. The signing *structure* is unit-tested. The operator check is a disposable bucket in a test account: presign → PUT → GET, including a deliberately tampered URL (§7, "What has and has not been verified against the storage provider"). |
 | 10 | `EASY_LEARN_TRUST_PROXY_HEADERS=true` lets a client-supplied `X-Forwarded-Host` choose the comparison origin. | **Accepted, and off by default.** It is an explicit operator decision that the edge overwrites the header (§4). A browser still cannot set it cross-site without a CORS preflight. |
-| 11 | In the **default** configuration the derived scheme still comes from `x-forwarded-proto`, because Next.js builds the request URL from it. | **Open, availability only.** It cannot make a foreign origin acceptable — the host still comes from `Host` — but it can refuse a write. `EASY_LEARN_PUBLIC_ORIGIN` removes the dependency entirely (§4). |
+| 11 | In the **default** configuration the derived scheme still comes from `x-forwarded-proto`, because Next.js builds the request URL from it and keeps a client-supplied value. | **Closed for availability.** It can never make a foreign origin acceptable — the host still comes from `Host` — and it can no longer refuse a legitimate write either: the browser's own `Sec-Fetch-Site: same-origin` is accepted as proof of same-origin when the derived scheme disagrees (§4, rule 8). The dependency itself is removed by `EASY_LEARN_PUBLIC_ORIGIN`, which remains the recommended configuration behind an edge. |
 | 12 | A user who is an active member of **two** schools cannot open their own uploaded files: the file's owning-school set resolves to two schools and is denied to both. | **Closed.** A file is now attributed by its own `uploaded_files.school_id` — the school that wrote it — the same rule Phase 2D applies to assignments and classes. The file is readable in that school and in no other; the uploader's second school still gets 404. The relational predicate survives for legacy `NULL school_id` rows, which stay denied to everyone (§7). **Needs an independent review**, because it is a tenant-isolation change. |
 
 ---

@@ -1,3 +1,33 @@
+/**
+ * Phase 1 relationship helpers.
+ *
+ * ⚠️  THESE HELPERS ARE NOT TENANT-SCOPED — READ THIS BEFORE USING THEM
+ *
+ * Every query below filters a relationship table by a PERSON or a CLASS, never by a
+ * school. `isParentLinkedToLearner` matches `parent_learners` on `(parent_id,
+ * learner_id)`, `getParentLinkedLearnerIds` on `parent_id`, `getTeacherAccessibleClassIds`
+ * on `teacher_classes.teacher_id` and `classes.class_teacher_id`, and
+ * `getTeacherAccessibleLearnerIds` on `learner_classes.class_id`. A row in those tables
+ * belongs to a school, but nothing in these queries says which one.
+ *
+ * The callers make that safe by intersecting the result with the caller's own tenant
+ * scope — the school of the authenticated context:
+ *
+ *   - `src/app/api/attendance/route.ts`   → `getLearnerIdsInSchool(…)` with the
+ *                                            caller's school
+ *   - `src/app/api/enrollments/route.ts`   → `getLearnerIdsInSchool(…)` with the
+ *                                            caller's school
+ *   - `src/app/api/grades/route.ts`        → the route's own school-scoped conditions
+ *   - `src/app/api/learner/stats/route.ts` → the route's own school-scoped conditions
+ *
+ * A NEW caller that uses one of these helpers WITHOUT re-intersecting the result with
+ * the caller's own school would be cross-tenant. There is no school filter to inherit
+ * here, so the check has to be written out every time.
+ *
+ * (LOW-8 in docs/PRODUCTION_MIGRATION_SAFETY_REVIEW_PR32.md. The underlying rows are
+ * only school-consistent because of the composite tenant foreign keys of migration 0018
+ * and the school-scoped write paths — not because of this module.)
+ */
 import { db } from "@/db";
 import {
   classes,
