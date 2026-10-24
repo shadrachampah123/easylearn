@@ -183,11 +183,25 @@ export async function getUserFromToken(token: string) {
   return user?.isActive ? user : null;
 }
 
+/**
+ * Bearer values a browser produced by interpolating a missing credential.
+ *
+ * `Authorization: Bearer ${token}` with `token === null` yields the literal string
+ * "null". Such a value is not a credential: accepting it shadows a perfectly valid
+ * session cookie and turns an authenticated request into a 401.
+ */
+function isPlaceholderBearer(token: string): boolean {
+  return token === "null" || token === "undefined";
+}
+
 export function getTokenFromRequest(request: Request): string | null {
   const authHeader = request.headers.get("authorization");
   if (authHeader?.startsWith("Bearer ")) {
+    /* Whitespace-only values are rejected by the truthiness check; the explicit
+       placeholder list covers a client that interpolated an absent credential.
+       Falling through to the cookie is fail-closed — a real token is still required. */
     const bearerToken = authHeader.slice(7).trim();
-    if (bearerToken) return bearerToken;
+    if (bearerToken && !isPlaceholderBearer(bearerToken)) return bearerToken;
   }
 
   const cookieToken = readSessionCookie(request.headers.get("cookie"));
