@@ -167,10 +167,11 @@ async function main() {
       const runner = fs.readFileSync(path.join(REPO_ROOT, "run-migration.js"), "utf8");
       assert(runner.includes('"0017_school_id_not_null.sql"'), "run-migration.js must list 0017");
       assert(runner.includes('"0018_composite_school_foreign_keys.sql"'), "run-migration.js must list 0018");
+      assert(runner.includes('"0019_session_revocation.sql"'), "run-migration.js must list 0019");
     });
 
     let result = runMigrations();
-    await test("Full chain 0000…0018 applies successfully", () => {
+    await test("Full chain 0000…0019 applies successfully", () => {
       assertEq(
         result.status,
         0,
@@ -198,11 +199,19 @@ async function main() {
 
     await test("Runner records ordered checksummed migration history", async () => {
       const rows = await q(`SELECT filename, checksum FROM easylearn_schema_migrations ORDER BY filename`);
-      assertEq(rows.length, 19, "all migrations 0000 through 0018 recorded");
+      assertEq(rows.length, 20, "all migrations 0000 through 0019 recorded");
       for (const row of rows) {
         assert(/^[0-9a-f]{64}$/.test(row.checksum), `${row.filename} has a SHA-256 checksum`);
       }
-      assertEq(rows[18].filename, "0018_composite_school_foreign_keys.sql", "0018 is the final applied migration");
+      assertEq(rows[19].filename, "0019_session_revocation.sql", "0019 is the final applied migration");
+    });
+
+    await test("Session revocation: users.session_version exists after the ordinary runner (0019, independent review I-1)", async () => {
+      const col = await one(
+        `SELECT data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'session_version'`
+      );
+      assert(col, "session_version must exist after run-migration.js — previously only lazy runtime repair created it");
+      assertEq(col.is_nullable, "NO", "session_version is NOT NULL");
     });
 
     await test("Runner rejects checksum drift and migration-history gaps", async () => {
@@ -465,7 +474,8 @@ async function main() {
         "0009_file_uploads.sql", "0010_object_storage.sql", "0011_attendance_unique_constraint.sql",
         "0012_login_attempts.sql", "0013_multi_school_foundation.sql", "0014_drop_single_school_guard.sql",
         "0015_cbism_school_and_membership_backfill.sql", "0016_school_id_columns.sql",
-        "0017_school_id_not_null.sql", "0018_composite_school_foreign_keys.sql",
+        "0017_school_id_not_null.sql", "0019_session_revocation.sql",
+        "0018_composite_school_foreign_keys.sql",
       ];
       const baselineEnv = { ...process.env, DATABASE_URL: scratchUrl };
       const unconfirmed = spawnSync(process.execPath, ["run-migration.js", "--baseline", prefix.join(",")], {
