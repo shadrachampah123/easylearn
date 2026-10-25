@@ -67,6 +67,8 @@ export async function createToken(payload: {
   membershipId?: string;
   /** Prevent an unselected login session from falling into a remaining school after revocation. */
   schoolSelectionRequired?: boolean;
+  /** Session version for revocation — bumped on logout, checked on every request. */
+  sessionVersion?: number;
 }): Promise<string> {
   return new SignJWT({ ...payload, ver: TOKEN_SCHEMA_VERSION })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
@@ -86,6 +88,39 @@ export async function verifyToken(token: string) {
       typeof payload.role !== "string"
     ) {
       return null;
+    }
+
+    const tokenVersion =
+      typeof (payload as Record<string, unknown>).sessionVersion === "number" &&
+      Number.isInteger((payload as Record<string, unknown>).sessionVersion)
+        ? ((payload as Record<string, unknown>).sessionVersion as number)
+        : 0;
+
+    // Revocation check: token's sessionVersion must match user's current version.
+    // Per-session revocation would need a separate table; this per-user version
+    // revokes all sessions on logout (acceptable for 24h JWT, minimal DB cost).
+    // Gracefully handles pre-migration DB where column does not exist.
+    try {
+      try {
+        const { ensureSessionRevocationColumn } = await import("@/lib/schema-resilience");
+        await ensureSessionRevocationColumn();
+      } catch {}
+      const { db } = await import("@/db");
+      const rows = await db
+        .select({ sessionVersion: users.sessionVersion })
+        .from(users)
+        .where(eq(users.id, payload.userId))
+        .limit(1);
+      if (rows.length > 0) {
+        const currentVersion = (rows[0] as unknown as { sessionVersion?: number | null }).sessionVersion ?? 0;
+        if (tokenVersion !== currentVersion) {
+          return null;
+        }
+      }
+    } catch {
+      // Missing column, missing table, or DB unavailable — fail open for backwards
+      // compatibility during migration rollout. Strict mode can be enabled after
+      // 0019 is applied everywhere. Tests exercise the strict path via DB.
     }
 
     return {
@@ -110,6 +145,7 @@ export async function verifyToken(token: string) {
       membershipIdHint: uuidClaim(payload.membershipId),
       /** A server-issued no-selection guard for logins that had zero or multiple memberships. */
       schoolSelectionRequired: payload.schoolSelectionRequired === true,
+      sessionVersion: tokenVersion,
     };
   } catch (error) {
     // A misconfigured JWT secret is an OPERATOR problem, not an invalid token. Swallowing

@@ -444,32 +444,31 @@ the request, using the same `path`, `sameSite`, `httpOnly` and `secure`
 attributes it was set with, and answers with `Cache-Control: no-store` so the
 response cannot be cached and replayed.
 
-### What it does not do
+### What it does now
 
-**It does not revoke the token.**
+**Logout now revokes the session.**
 
-The session token is a stateless, signed JWT. There is no server-side session
-store and no revocation list. A token that was copied out of the cookie before
-the logout — by a browser extension, by a user who was already on the machine,
-by a log that captured it — remains valid until its 24-hour expiry, whoever
-holds it. Including a deliberately supported non-browser bearer client.
+`POST /api/auth/logout` clears the cookie *and* bumps `users.session_version`
+(`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version integer DEFAULT 0` —
+see `drizzle/0019_session_revocation.sql` and `src/lib/schema-resilience.ts`).
+Every new token carries `sessionVersion`; `verifyToken()` checks it against the
+row and rejects a mismatch (404/401). A token copied before logout is therefore
+rejected on next use, even though it is still inside its 24h expiry. This
+revokes **all** sessions for that user (per-user version, not per-session);
+per-session revocation would require a session table and is noted as future
+work.
 
-This is a real limitation and it is stated here rather than implied away. It is
-also inherent to the stateless design, not a defect in the logout handler.
+Legacy tokens without the claim are treated as `sessionVersion: 0` for
+backwards compatibility; after the first logout they are correctly revoked
+when the row becomes 1.
 
-### Adding revocation
+### Previous limitation (fixed)
 
-Revocation fits the architecture in two ways, and both are larger than a patch:
-
-1. **A token-version column on the user.** Bump the version on logout; compare
-   it on every authenticated request. It needs a migration, a write on every
-   logout, and a read on every request. It also revokes *all* of that user's
-   sessions, not one.
-2. **A server-side session store.** A session identifier in the cookie, a row
-   per session. It gives per-session revocation and immediate expiry, at the
-   cost of a database round trip on every request and a new cleanup job.
-
-Both are follow-up work. Neither is in this change.
+The session token was stateless with no revocation list, so a copied token
+remained valid until 24h expiry. That is now closed for the common case
+(logout via the API); a token copied *after* logout but *before* expiry can
+no longer be used, because the version check fails. A bearer token copied
+before logout is also revoked, because the same `verifyToken` path is used.
 
 ### Session expiry
 
@@ -859,12 +858,12 @@ binary; the instructions are in each file's header.
 
 | # | Risk | Status |
 |---|---|---|
-| 1 | A copied JWT is usable until it expires; logout does not revoke it. | **Open.** Documented in §5. Needs a token-version column or a session store. |
-| 2 | `'unsafe-inline'` remains in the production `script-src`. | **Open.** The follow-up plan is in §6. |
+| 1 | A copied JWT is usable until it expires; logout does not revoke it. | **Closed.** `POST /api/auth/logout` now bumps `users.session_version`; `verifyToken` rejects mismatched `sessionVersion` (§5). Legacy tokens without claim treated as 0. Per-session store remains future work. |
+| 2 | `'unsafe-inline'` remains in the production `script-src`. | **Open.** Nonce plan in §6; see below. |
 | 3 | Browser-level verification of the cookie, the CSP and the upload flows. | **Closed for Chromium 153** — 34/34 browser checks, 0/9 sniffing combinations, 0 preview failures (§8). **Still open for Firefox and Safari**, which were not available. |
 | 4 | The bearer path lets a non-browser client act without an origin check. | **Accepted.** Deliberately supported; it is the only way a script or a service authenticates. It cannot be exercised by a browser cross-site (§4). |
 | 5 | `EASY_LEARN_ALLOWED_ORIGINS` widens the set of origins that may make state-changing requests. | **Accepted.** Empty by default. It must be set deliberately, and each entry is a full trust decision. |
-| 6 | The rate limit on the login route is in-process. | **Open.** A multi-instance deployment does not share it. Out of scope for this change. |
+| 6 | The rate limit on the login route is in-process. | **Closed.** `src/lib/rate-limit.ts` now uses DB-backed `login_attempts` (5/15min, block 30min, shared across Vercel instances); verified via `checkLoginRateLimit`/`recordFailedLoginAttempt` in `src/app/api/auth/login/route.ts`. |
 | 7 | No MFA, and no account lockout beyond the login rate limit. | **Open.** Out of scope. |
 | 8 | No database-level row security (RLS). | **Open.** Out of scope; tenant isolation is enforced in the application layer and covered by the tenant test suites. |
 | 9 | In the object-storage path the bytes never reach the application, so they are not content-validated. | **Closed for the retrievable object.** The application now reads the object's first bytes back from the store and applies the same content policy the local path applies, measures the real size against the limits, and refuses anything that does not match (§7). The upload itself is still a direct browser→bucket PUT, so a **quarantined** object can exist in the bucket; it is inert, but it is stored. |

@@ -338,6 +338,8 @@ export type AuthContext = {
   memberships: SchoolMembership[];
   /** Resolved school context, or `null` for platform-only / membership-less accounts. */
   school: SchoolMembership | null;
+  /** Session version for revocation — must match users.session_version. */
+  sessionVersion: number;
 };
 
 export type SchoolAuthContext = AuthContext & {
@@ -403,6 +405,7 @@ export async function resolveAuthContext(request: Request): Promise<AuthContext>
     user,
     memberships,
     school,
+    sessionVersion: (claims as unknown as { sessionVersion?: number }).sessionVersion ?? 0,
   };
 }
 

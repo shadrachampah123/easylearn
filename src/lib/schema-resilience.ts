@@ -236,6 +236,7 @@ export function clientSafeErrorMessage(error: unknown, fallback = "The database 
 /* ── Optional self-healing for the migrations that only add optional columns/tables ── */
 
 export type SchemaFeature =
+  | "session_revocation"
   | "dashboard_card_overrides"
   | "activity_logs_enrichment"
   | "optional_user_columns"
@@ -248,6 +249,7 @@ export type SchemaFeature =
 const FEATURE_STATUS_TTL_MS = 60_000;
 
 const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
+  session_revocation: "drizzle/0019_session_revocation.sql",
   dashboard_card_overrides: "drizzle/0004_dashboard_overrides.sql",
   activity_logs_enrichment: "drizzle/0005_activity_enhancements.sql",
   optional_user_columns: "drizzle/0006_user_identity_columns.sql",
@@ -343,6 +345,10 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
     `ALTER TABLE "uploaded_files" ADD COLUMN IF NOT EXISTS "storage_backend" varchar(20) DEFAULT 'local' NOT NULL;`,
     `CREATE INDEX IF NOT EXISTS "uploaded_files_storage_backend_idx" ON "uploaded_files" USING btree ("storage_backend");`,
   ],
+  session_revocation: [
+    `ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "session_version" integer DEFAULT 0 NOT NULL;`,
+    `CREATE INDEX IF NOT EXISTS "users_session_version_idx" ON "users" USING btree ("session_version");`,
+  ],
   /* The composite tenant foreign keys are intentionally NOT auto-repairable. Migration
      0018 is gated: it needs a reviewed read-only preflight against a restored copy
      before it may touch a database, and it aborts atomically on legacy cross-school
@@ -389,6 +395,11 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     mode: "columns",
     table: "uploaded_files",
     columns: ["storage_backend"],
+  },
+  session_revocation: {
+    mode: "columns",
+    table: "users",
+    columns: ["session_version"],
   },
   composite_tenant_foreign_keys: { mode: "compositeTenantConstraints" },
 };
@@ -537,6 +548,10 @@ export function ensureFileUploadSchema(): Promise<FeatureStatus[]> {
     ensureSchemaFeature("assignment_file_uploads"),
     ensureSchemaFeature("uploaded_files_object_storage"),
   ]);
+}
+
+export function ensureSessionRevocationColumn(): Promise<FeatureStatus> {
+  return ensureSchemaFeature("session_revocation");
 }
 
 export interface OptionalSchemaStatus {
