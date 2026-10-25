@@ -39,11 +39,19 @@ function testBuildCsp() {
     // Modern browsers ignore unsafe-inline when nonce present, per CSP spec
     assert(csp.includes("nonce-") && csp.includes("strict-dynamic"), "nonce + strict-dynamic present, so unsafe-inline is fallback only");
   });
-  await test("Proxy generates unique nonce per request", async()=>{
-    // Simulate two nonces
-    const n1 = Math.random().toString(36).slice(2, 20);
-    const n2 = Math.random().toString(36).slice(2, 20);
-    assert(n1 !== n2, "nonces should differ");
+  await test("Proxy uses cryptographic randomness and never falls back to Math.random", async()=>{
+    const fs = await import("fs");
+    const path = await import("path");
+    const proxy = fs.readFileSync(path.join(process.cwd(), "src/proxy.ts"), "utf8");
+    assert(proxy.includes("cryptoApi.getRandomValues(bytes)"), "nonce must use Web Crypto secure randomness");
+    assert(!proxy.includes("Math.random()"), "weak randomness must never be used for CSP nonces");
+  });
+  await test("Forwarded request includes CSP so Next.js can nonce generated scripts", async()=>{
+    const fs = await import("fs");
+    const path = await import("path");
+    const proxy = fs.readFileSync(path.join(process.cwd(), "src/proxy.ts"), "utf8");
+    assert(proxy.includes('requestHeaders.set("Content-Security-Policy", csp)'), "CSP must be forwarded on request");
+    assert(proxy.includes('response.headers.set("Content-Security-Policy", csp)'), "CSP must also be sent on response");
   });
   await test("next.config.ts no longer emits CSP", async()=>{
     const fs = await import("fs");

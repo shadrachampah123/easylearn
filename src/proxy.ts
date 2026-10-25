@@ -2,18 +2,13 @@ import { NextResponse, type NextRequest } from "next/server";
 import { evaluateCsrfRequestForRequest } from "@/lib/csrf";
 
 function generateNonce(): string {
-  // Edge runtime has crypto.randomUUID, Node has crypto.randomBytes
-  try {
-    // @ts-ignore - Next.js edge provides global crypto
-    if (typeof crypto !== "undefined" && typeof (crypto as unknown as { randomUUID?: () => string }).randomUUID === "function") {
-      return (crypto as unknown as { randomUUID: () => string }).randomUUID().replace(/-/g, "");
-    }
-  } catch {}
-  // Fallback: 16 random bytes base64
+  // CSP nonces must come from a cryptographically secure random source.
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi || typeof cryptoApi.getRandomValues !== "function") {
+    throw new Error("Secure randomness is unavailable; refusing to generate a weak CSP nonce.");
+  }
   const bytes = new Uint8Array(16);
-  // @ts-ignore
-  if (typeof crypto !== "undefined" && crypto.getRandomValues) crypto.getRandomValues(bytes);
-  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  cryptoApi.getRandomValues(bytes);
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary);
@@ -84,6 +79,8 @@ export default function proxy(request: NextRequest) {
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set("x-nonce", nonce);
   requestHeaders.set("x-csp-nonce", nonce);
+  // Next.js reads the forwarded request CSP to nonce its generated scripts.
+  requestHeaders.set("Content-Security-Policy", csp);
 
   // API routes: enforce CSRF first, then add CSP headers
   if (request.nextUrl.pathname.startsWith("/api/")) {
