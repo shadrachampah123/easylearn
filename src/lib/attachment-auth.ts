@@ -38,6 +38,7 @@ export async function resolveUploadedAttachments(
   attachments: unknown,
   options: {
     uploaderId: string;
+    schoolId: string;
     purpose: "assignment" | "submission";
     assignmentId?: string | null;
   }
@@ -60,6 +61,7 @@ export async function resolveUploadedAttachments(
   const where = [
     inArray(uploadedFiles.id, fileIds),
     eq(uploadedFiles.uploaderId, options.uploaderId),
+    eq(uploadedFiles.schoolId, options.schoolId),
     eq(uploadedFiles.purpose, options.purpose),
   ];
   if (options.purpose === "submission") {

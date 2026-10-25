@@ -148,9 +148,10 @@ export async function POST(request: NextRequest) {
       return notFoundResponse("Term");
     }
 
-    // Every attached file must be one the teacher actually uploaded.
+    // Every attached file must be one the teacher actually uploaded and stored in their school.
     const resolved = await resolveUploadedAttachments(attachments, {
       uploaderId: ctx.userId,
+      schoolId: ctx.schoolId,
       purpose: "assignment",
     });
     if (!resolved.ok) {

@@ -1260,12 +1260,16 @@ async function main() {
       assert(bodyText(result).includes(ids["learner-a"]), "child's attendance present");
     });
 
-    await test("Legitimate: assignment material is readable by school members, submission files are not", async () => {
-      // Phase 2C decision: a file attached to an assignment is course material for the
-      // school, so a same-school member may read it; a `purpose=submission` file keeps the
-      // Phase 1 owner/teacher/admin rule (proved above by the learner-b2 → 403 case).
-      const material = await call("files/[id]", { token: tokens["learner-a2"], params: { id: fileA } });
-      assertEq(material.status, 200, "same-school assignment material stays readable inside the school");
+    await test("Legitimate: assignment material is readable by enrolled class members, not by any school member; submission files stay owner-scoped", async () => {
+      // Phase 2E follow-up: assignment materials are course content for the
+      // class they are attached to, not school-wide. Only enrolled learners,
+      // teaching staff, linked parents and school administrators may read them.
+      // This replaces the former "any school member may read" rule which leaked
+      // materials across classes.
+      const enrolledMaterial = await call("files/[id]", { token: tokens["learner-a"], params: { id: fileA } });
+      assertEq(enrolledMaterial.status, 200, "enrolled learner must read assignment material for their class");
+      const unenrolledMaterial = await call("files/[id]", { token: tokens["learner-a2"], params: { id: fileA } });
+      assertEq(unenrolledMaterial.status, 403, "unenrolled learner must be denied assignment material for another class");
 
       const foreignSubmission = await call("files/[id]", { token: tokens["teacher-a"], params: { id: submissionFileB } });
       assertEq(foreignSubmission.status, 404, "another school's submission file is invisible");

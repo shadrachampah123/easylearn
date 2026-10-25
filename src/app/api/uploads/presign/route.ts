@@ -47,14 +47,6 @@ export async function POST(request: NextRequest) {
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
 
-    const config = getObjectStorageConfig();
-    if (!config.enabled) {
-      return errorResponse(
-        "Cloud object storage is not configured. Set OBJECT_STORAGE_BUCKET, OBJECT_STORAGE_ACCESS_KEY_ID and OBJECT_STORAGE_SECRET_ACCESS_KEY to enable direct uploads.",
-        503
-      );
-    }
-
     const body = (await request.json().catch(() => null)) as PresignBody | null;
     if (!body || typeof body !== "object") {
       return errorResponse("Invalid request body. Expected JSON.");
@@ -113,19 +105,30 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 0009 + 0010 must exist before we can insert a row with storage_backend.
-    await ensureFileUploadSchema();
-
-    /* ── Role + purpose authorization (shared with the multipart flow) ── */
+    /* ── Role + purpose authorization (shared with the multipart flow) ──
+       Must run before storage-disabled check so that unauthenticated (401),
+       unauthorized (403) and not-found (404) responses are not masked by 503. */
     const authorization = await authorizeUpload({
       role: ctx.school.role,
       schoolId: ctx.schoolId,
+      userId: ctx.userId,
       purpose,
       assignmentId: purpose === "submission" ? assignmentId : null,
     });
     if (!authorization.ok) {
       return errorResponse(authorization.error || "Upload not allowed", authorization.status || 400);
     }
+
+    const config = getObjectStorageConfig();
+    if (!config.enabled) {
+      return errorResponse(
+        "Cloud object storage is not configured. Set OBJECT_STORAGE_BUCKET, OBJECT_STORAGE_ACCESS_KEY_ID and OBJECT_STORAGE_SECRET_ACCESS_KEY to enable direct uploads.",
+        503
+      );
+    }
+
+    // 0009 + 0010 must exist before we can insert a row with storage_backend.
+    await ensureFileUploadSchema();
 
     const ext = fileExtension(name);
     const key = newObjectKey(purpose, ext);

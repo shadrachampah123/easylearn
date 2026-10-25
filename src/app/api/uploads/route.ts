@@ -158,6 +158,7 @@ export async function POST(request: NextRequest) {
     const authorization = await authorizeUpload({
       role: ctx.school.role,
       schoolId: ctx.schoolId,
+      userId: ctx.userId,
       purpose,
       assignmentId: purpose === "submission" ? assignmentId : null,
     });
