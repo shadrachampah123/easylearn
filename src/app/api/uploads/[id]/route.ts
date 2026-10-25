@@ -61,7 +61,7 @@ export async function DELETE(
     const publishedRefs = await db.execute(sql`
       SELECT 1 FROM assignments
       WHERE school_id = ${ctx.schoolId}::uuid
-        AND status = 'published'
+        AND status != 'draft'
         AND attachments @> ${fileIdJson}::jsonb
       LIMIT 1
     `);

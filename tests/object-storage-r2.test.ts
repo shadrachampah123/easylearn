@@ -291,7 +291,7 @@ test("presigned URL declares UNSIGNED-PAYLOAD and a bounded expiry", () => {
     const { url } = presignedUploadUrl(getObjectStorageConfig(), KEY, "application/pdf");
     const params = new URL(url).searchParams;
     assert.strictEqual(params.get("X-Amz-Content-Sha256"), "UNSIGNED-PAYLOAD");
-    assert.strictEqual(params.get("X-Amz-Expires"), "900");
+    assert.strictEqual(params.get("X-Amz-Expires"), "300");
     assert.strictEqual(params.get("X-Amz-Algorithm"), "AWS4-HMAC-SHA256");
     assert.ok(params.get("X-Amz-Credential")?.endsWith("/auto/s3/aws4_request"), "credential scope uses the signing region");
     /* SigV4 rejects expiries beyond seven days. */
