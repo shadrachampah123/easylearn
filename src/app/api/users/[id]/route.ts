@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { users, parentLearners, learnerClasses } from "@/db/schema";
 import { hashPassword } from "@/lib/auth";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   guardPlatformAdmin,
   guardSchoolContext,
@@ -15,6 +15,7 @@ import {
   updateSchoolMembershipRole,
 } from "@/lib/tenant";
 import {
+  ensureSessionRevocationColumn,
   ensureUserIdentityColumns,
   schemaAwareErrorMessage,
 } from "@/lib/schema-resilience";
@@ -202,10 +203,24 @@ export async function PATCH(
       return errorResponse("Password must be at least 6 characters");
     }
 
+    /* An administrative reset must revoke the account's existing sessions
+       in the SAME atomic update as the password change — resetting the
+       password of a compromised account while its 24h tokens stay valid
+       defeats the reset (found in the PR #55 independent review; the
+       self-service change-password route already bumps). Revocation is
+       mandatory here too: if the schema cannot support it, refuse with
+       503 and change nothing. */
+    const revocation = await ensureSessionRevocationColumn();
+    if (!revocation.available) {
+      return errorResponse(
+        "Password cannot be reset until the session-revocation migration (drizzle/0019) is applied.",
+        503
+      );
+    }
     const passwordHash = await hashPassword(password);
     const [updated] = await db
       .update(users)
-      .set({ passwordHash, updatedAt: new Date() })
+      .set({ passwordHash, sessionVersion: sql`${users.sessionVersion} + 1`, updatedAt: new Date() })
       .where(eq(users.id, id))
       .returning({ id: users.id });
     if (!updated) return notFoundResponse("User");

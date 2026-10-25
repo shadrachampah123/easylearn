@@ -77,6 +77,25 @@ export async function createToken(payload: {
     .sign(getJwtKey());
 }
 
+/**
+ * Thrown when the session-revocation check itself cannot be performed —
+ * the `session_version` column is missing and could not be repaired, or
+ * the database cannot be reached. This is a fail-CLOSED signal, distinct
+ * from "token invalid" (null): callers should surface a safe 503-style
+ * error rather than silently accepting a token whose revocation state
+ * is unknown. A security-critical check must never fail open silently.
+ */
+export class SessionRevocationCheckError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionRevocationCheckError";
+  }
+}
+
+export function isSessionRevocationCheckError(error: unknown): boolean {
+  return error instanceof SessionRevocationCheckError;
+}
+
 export async function verifyToken(token: string) {
   try {
     const { payload } = await jwtVerify(token, getJwtKey(), {
@@ -98,29 +117,65 @@ export async function verifyToken(token: string) {
 
     // Revocation check: token's sessionVersion must match user's current version.
     // Per-session revocation would need a separate table; this per-user version
-    // revokes all sessions on logout (acceptable for 24h JWT, minimal DB cost).
-    // Gracefully handles pre-migration DB where column does not exist.
+    // revokes all sessions on logout and on password change (acceptable for
+    // 24h JWT, minimal DB cost).
+    //
+    // FAIL CLOSED, never silently open: if revocation cannot be checked —
+    // the column is missing and lazy repair could not restore it (repair
+    // disabled or no DDL privilege), or the database is unreachable — the
+    // token is NOT accepted on faith. A SessionRevocationCheckError is
+    // thrown so callers answer a safe 503-style error. Normal operation is
+    // unaffected on a migrated database: `ensureSessionRevocationColumn`
+    // probes (and by default repairs) the column first, so the only
+    // deployments that see the error are those where revocation genuinely
+    // does not exist — exactly the ones that must not silently accept
+    // revoked tokens. (Pre-fix, this block swallowed every failure and
+    // accepted the token; see tests/session-revocation-failclosed-db.test.ts.)
+    const { ensureSessionRevocationColumn } = await import("@/lib/schema-resilience");
+    let revocationStatus;
     try {
-      try {
-        const { ensureSessionRevocationColumn } = await import("@/lib/schema-resilience");
-        await ensureSessionRevocationColumn();
-      } catch {}
+      revocationStatus = await ensureSessionRevocationColumn();
+    } catch (error) {
+      console.error("[auth] session-revocation schema check failed:", error);
+      throw new SessionRevocationCheckError(
+        "Session revocation could not be verified (schema check failed). Apply drizzle/0019_session_revocation.sql."
+      );
+    }
+    if (!revocationStatus.available) {
+      console.error(
+        `[auth] session-revocation column unavailable (migration ${revocationStatus.migration}); refusing token rather than skipping revocation.`
+      );
+      throw new SessionRevocationCheckError(
+        "Session revocation is unavailable on this database. Apply drizzle/0019_session_revocation.sql (or enable AUTO_SCHEMA_REPAIR)."
+      );
+    }
+    let rows;
+    try {
       const { db } = await import("@/db");
-      const rows = await db
+      rows = await db
         .select({ sessionVersion: users.sessionVersion })
         .from(users)
         .where(eq(users.id, payload.userId))
         .limit(1);
-      if (rows.length > 0) {
-        const currentVersion = (rows[0] as unknown as { sessionVersion?: number | null }).sessionVersion ?? 0;
-        if (tokenVersion !== currentVersion) {
-          return null;
-        }
+    } catch (error) {
+      console.error("[auth] session-revocation database check failed:", error);
+      throw new SessionRevocationCheckError(
+        "Session revocation could not be verified (database unavailable)."
+      );
+    }
+    if (rows.length === 0) {
+      /* No row to compare against. Deliberately NOT a revocation failure:
+         the dev seed route's documented bootstrap mints a claim for the
+         super administrator it is about to create on a blank database.
+         Every data-bearing caller re-reads the user row immediately
+         after (resolveAuthContext/findAuthUser) and rejects a missing
+         account, so this alone grants no access. */
+      console.warn("[auth] revocation check: no user row for token subject; deferring to caller user lookup.");
+    } else {
+      const currentVersion = (rows[0] as unknown as { sessionVersion?: number | null }).sessionVersion ?? 0;
+      if (tokenVersion !== currentVersion) {
+        return null;
       }
-    } catch {
-      // Missing column, missing table, or DB unavailable — fail open for backwards
-      // compatibility during migration rollout. Strict mode can be enabled after
-      // 0019 is applied everywhere. Tests exercise the strict path via DB.
     }
 
     return {
@@ -152,6 +207,10 @@ export async function verifyToken(token: string) {
     // it here would make every request answer 401 "Unauthorized" and hide the real cause
     // from the health endpoint and the logs, so it is re-thrown and reported as a 503.
     if (isJwtSecretConfigurationError(error)) throw error;
+    // Same reasoning: an unverifiable revocation check must surface as a
+    // safe availability error (callers map it to 503), not as a quiet 401
+    // that looks like an ordinary bad token — and never as an accepted one.
+    if (isSessionRevocationCheckError(error)) throw error;
     return null;
   }
 }
