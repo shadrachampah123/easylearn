@@ -228,9 +228,14 @@ test('Security headers: configured in next.config.ts', () => {
 });
 
 test('Security headers: CSP not breaking app', () => {
-  const content = readFile('next.config.ts');
-  assert(content.includes("'self'"), 'CSP should allow self');
-  assert(content.includes('unsafe-inline') || content.includes('unsafe-eval'), 'CSP should allow Next.js requirements');
+  // CSP is now set in src/proxy.ts with per-request nonce (next.config no longer emits CSP to avoid duplicate)
+  const proxy = readFile('src/proxy.ts');
+  const nextConfig = readFile('next.config.ts');
+  const hasCspInProxy = proxy.includes("'self'") && proxy.includes("Content-Security-Policy");
+  const hasCspInNext = nextConfig.includes("'self'") && nextConfig.includes("Content-Security-Policy");
+  assert(hasCspInProxy || hasCspInNext, 'CSP should allow self (now in proxy.ts with nonce)');
+  const hasUnsafe = proxy.includes('unsafe-inline') || proxy.includes('unsafe-eval') || nextConfig.includes('unsafe-inline');
+  assert(hasUnsafe, 'CSP should allow Next.js requirements (unsafe-inline fallback + nonce)');
 });
 
 // 12. Attendance integrity

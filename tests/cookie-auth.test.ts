@@ -595,7 +595,9 @@ async function main() {
   // ── The CSRF enforcement point ─────────────────────────────────────────────
   await test("The CSRF policy is enforced in one place for every API route", () => {
     const source = read("src/proxy.ts");
-    assert.ok(source.includes('matcher: ["/api/:path*"]'), "the proxy must cover the whole API");
+    // Proxy now matches all routes for CSP, but CSRF still only for /api (checked via pathname.startsWith("/api/"))
+    const coversApi = source.includes('"/api/:path*"') || source.includes('"/api/"') || source.includes("/api*") || source.includes('request.nextUrl.pathname.startsWith("/api/")');
+    assert.ok(coversApi, "the proxy must cover the whole API (via matcher or pathname check)");
     assert.ok(
       source.includes("evaluateCsrfRequestForRequest"),
       "the proxy must use the shared policy"
