@@ -179,13 +179,35 @@ function trustedForwardedHost(header: string | null): string | null {
 /**
  * The scheme the request was addressed with.
  *
- * The scheme of the request URL is used, which is the scheme of the last hop
- * and — in Next.js — is already derived from `x-forwarded-proto`.
+ * The scheme of the request URL is used, which is the scheme of the last hop.
  *
- * `x-forwarded-proto` is consulted directly only when the deployment has
- * opted in to trusting the forwarded headers. It cannot widen the accepted
- * HOST set, so trusting it is a question of availability rather than of
- * whether a foreign origin is accepted.
+ * IMPORTANT — the request URL's scheme is NOT independent of the forwarded
+ * headers. Next.js builds it from `x-forwarded-proto`:
+ *
+ *   next/dist/server/next-server.js
+ *     const protocol = req.headers["x-forwarded-proto"]?.includes("https")
+ *       ? "https" : "http";
+ *
+ * and it SYNTHESISES the header when it is absent
+ * (`next/dist/server/base-server.js`). So in the default configuration the
+ * scheme is still, in the end, a value the client can influence — but only
+ * through that one header, and only in one direction:
+ *
+ *   - it cannot make a FOREIGN origin acceptable: the host still comes from
+ *     the `Host` header, which the server routes on, so a client that names
+ *     another host in `Origin` is still refused;
+ *   - it can only cause a REFUSAL: a client that sends
+ *     `X-Forwarded-Proto: https` to a deployment the browser reaches over
+ *     plain HTTP makes the application compare the request against
+ *     `https://<host>` while the browser sent `http://<host>`, and the write
+ *     is refused. That is a self-inflicted denial, not a cross-origin hole,
+ *     and it is the reason `EASY_LEARN_PUBLIC_ORIGIN` is the recommended
+ *     configuration for any deployment behind an edge.
+ *
+ * `x-forwarded-proto` is consulted DIRECTLY (as opposed to through the
+ * request URL) only when the deployment has opted in to trusting the
+ * forwarded headers; the opt-in additionally allows a multi-valued host to
+ * be distrusted entirely.
  */
 function requestScheme(request: Request, trustProxy: boolean): string | null {
   if (trustProxy) {
