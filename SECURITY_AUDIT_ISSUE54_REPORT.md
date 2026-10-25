@@ -106,6 +106,17 @@ Environment: Node 22.22.3, npm 10.9.8, `npm ci` clean, disposable JWT secret gen
 
 ---
 
+## 3b. Follow-up (same PR): session-revocation fail-open — NEW-6
+
+A post-PR review question asked whether revocation can silently fail open. Traced answer: **yes, it could**, in two places:
+
+- `verifyToken` (`src/lib/auth.ts`) wrapped the `session_version` comparison in a catch-all that **accepted the token on any failure** — missing column with repair disabled/no DDL privilege, schema-helper failure, or database outage — with no logging.
+- The change-password route's fallback changed the password **without** the revocation bump and returned 200.
+
+Fix (fail closed, no outage on migrated databases): `verifyToken` now uses the `ensureSessionRevocationColumn()` verdict; unavailable schema or a failed DB check throws the new `SessionRevocationCheckError`, which tenant context maps to **503** (never a silently accepted token). The password-change route refuses with **503 and changes nothing** when revocation cannot be guaranteed, and the hash+bump is one atomic update; the non-critical `must_change_password` clear keeps its separate tolerant path. Deleted-user tokens keep the documented seed-bootstrap behaviour (downstream user re-reads still reject missing accounts).
+
+Evidence: `session-revocation-failclosed-db` **3/3** (missing column → throw; password change 503 + password unchanged; DB error → throw), `session-revocation-autorepair-db` **2/2** (default lazy repair recreates the column, no lockout, revocation then works), `change-password-revocation-db` **5/5**; `jwt-secret-policy` updated to assert the fail-closed contract. Full suites re-run green (`test:db` 252 PASS incl. all three revocation suites, tenant-auth, review-pr45, mutation, integration 11/11, tls-e2e 7/7, build, lint).
+
 ## 4. Changes in this PR
 
 | File | Change |

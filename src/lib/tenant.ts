@@ -25,7 +25,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/db";
 import { schools, schoolUsers, users } from "@/db/schema";
 import { errorResponse } from "@/lib/api-helpers";
-import { findAuthUser, getTokenFromRequest, verifyToken } from "@/lib/auth";
+import { findAuthUser, getTokenFromRequest, isSessionRevocationCheckError, verifyToken } from "@/lib/auth";
 import { isMissingColumn, isMissingRelation } from "@/lib/schema-resilience";
 
 /* ── Roles ── */
@@ -361,7 +361,17 @@ export async function resolveAuthContext(request: Request): Promise<AuthContext>
   const token = getTokenFromRequest(request);
   if (!token) throw new AuthContextError("Authentication required", 401);
 
-  const claims = await verifyToken(token);
+  let claims;
+  try {
+    claims = await verifyToken(token);
+  } catch (error) {
+    // Revocation could not be checked (missing 0019 schema / DB down):
+    // a safe 503, never a silently accepted token. See src/lib/auth.ts.
+    if (isSessionRevocationCheckError(error)) {
+      throw new AuthContextError("Session validation is temporarily unavailable", 503);
+    }
+    throw error;
+  }
   if (!claims || !isUuid(claims.userId)) {
     throw new AuthContextError("Invalid or expired session", 401);
   }

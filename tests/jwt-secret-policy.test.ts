@@ -309,16 +309,25 @@ async function main() {
 
   await test("Chokepoint: a valid random secret signs and verifies a token", async () => {
     setSecret(randomSecret());
-    const { createToken, verifyToken } = await import("@/lib/auth");
+    const { createToken, verifyToken, isSessionRevocationCheckError } = await import("@/lib/auth");
     const token = await createToken({
       userId: "00000000-0000-4000-8000-000000000001",
       email: "learner@example.test",
       role: "learner",
     });
     assert.ok(token, "a token must be produced");
-    const payload = await verifyToken(token);
-    assert.ok(payload, "the token must verify");
-    assert.strictEqual(payload.userId, "00000000-0000-4000-8000-000000000001");
+    /* This unit suite runs without a database, so verification must now
+       stop at the revocation stage with SessionRevocationCheckError —
+       proof the signature WAS accepted (a bad secret fails earlier) and
+       that revocation fails closed instead of silently accepting the
+       token (the pre-fix fail-open behaviour this test used to rely on).
+       End-to-end verification of a valid token against a real database
+       lives in the DB suites (session-revocation-*, membership-auth-db). */
+    await assert.rejects(
+      () => verifyToken(token),
+      (error: unknown) => isSessionRevocationCheckError(error),
+      "without a database, verification must fail closed at revocation, not accept"
+    );
   });
 
   await test("Chokepoint: the env helper and the policy agree on every verdict", async () => {
