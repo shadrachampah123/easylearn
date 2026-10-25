@@ -141,7 +141,7 @@ async function main() {
     const url = objectDownloadUrl(
       { ...CONFIG, publicBaseUrl: "https://cdn.example.test/" },
       "uploads/assignment/file.png",
-      { contentType: "image/png", disposition: "attachment; filename=\"file.png\"" }
+      { contentType: "image/png", disposition: "attachment; filename=\"file.png\"", allowPublic: true }
     );
     assert.ok(url.startsWith("https://cdn.example.test/uploads/assignment/file.png?"));
     const query = queryOf(url);
