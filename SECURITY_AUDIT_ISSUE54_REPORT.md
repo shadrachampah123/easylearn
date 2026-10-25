@@ -117,6 +117,19 @@ Fix (fail closed, no outage on migrated databases): `verifyToken` now uses the `
 
 Evidence: `session-revocation-failclosed-db` **3/3** (missing column → throw; password change 503 + password unchanged; DB error → throw), `session-revocation-autorepair-db` **2/2** (default lazy repair recreates the column, no lockout, revocation then works), `change-password-revocation-db` **5/5**; `jwt-secret-policy` updated to assert the fail-closed contract. Full suites re-run green (`test:db` 252 PASS incl. all three revocation suites, tenant-auth, review-pr45, mutation, integration 11/11, tls-e2e 7/7, build, lint).
 
+## 3c. Independent review of PR #55 (self-review, reviewer stance)
+
+| # | Severity | Finding | Disposition |
+|---|---|---|---|
+| R-1 | High | **Admin password reset did not revoke sessions.** `PATCH /api/users/[id]` updated only the hash; a reset victim's 24h tokens survived. | **FIXED** — atomic hash+`session_version` bump, 503-and-change-nothing if schema unavailable; new `admin-password-reset-revocation-db` **4/4** |
+| R-2 | Medium | **`must_change_password` partial failure misreported.** After a successful revoking password change, a failing flag-clear rethrew → caller got 500 "Failed to update password" though the password HAD changed. | **FIXED** — clear is now log-and-succeed (documented deliberate) |
+| R-3 | Low | Deactivated accounts could still change password (route bypasses `resolveAuthContext`'s `isActive` rule). | **FIXED** — explicit `isActive` check |
+| R-4 | Low | Direct `verifyToken` consumers (`images/search`, `seed`) receive the new thrown revocation error. | **PASS (verified)** — image-search outer catch already answers 503; seed's is dev-only/404-in-prod. No change warranted |
+| — | — | Logout bump, login version minting, select-school reissue, JWT-failure → null, weak-secret rethrow, seed bootstrap (nonexistent-user claim), CSP `/api/files/` carve-out, 60s schema-probe cache | **PASS** — traced, no defect |
+| — | Info | Admin reset minimum length 6 vs self-service 8 | Pre-existing product policy; owner may align — not changed unilaterally |
+
+**Blocker checklist:** PR #55 review **PASS** (fixes above, suites green) · R2/S3 live **BLOCKED** (no disposable credentials in environment) · Browser verification **BLOCKED** (no installable browsers) · Announcements `?public=true` **BLOCKED on owner decision** — exact question: *"Should public announcements be scoped to a single designated school (which one?), or is a cross-school public feed intended for the marketing site?"* · Health endpoint **PASS** (booleans/migration names only, no secrets — accepted) · Neon **BLOCKED** (no Neon access; §3 owner steps; nothing claimed) · Production readiness **NOT READY** until human approval + blocked items close. No critical/high findings remain open in code.
+
 ## 4. Changes in this PR
 
 | File | Change |

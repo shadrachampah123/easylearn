@@ -50,6 +50,10 @@ export async function POST(request: NextRequest) {
     if (!user) {
       return NextResponse.json({ success: false, error: "User not found" }, { status: 404 });
     }
+    // Deactivated accounts cannot change passwords (resolveAuthContext
+    // applies the same rule to tenant routes; this route verifies the
+    // token directly, so it must apply it too).
+    if (!user.isActive) return unauthorizedResponse();
 
     const isMatch = await bcrypt.compare(currentPassword, user.passwordHash);
     if (!isMatch) {
@@ -103,12 +107,17 @@ export async function POST(request: NextRequest) {
     }
 
     /* Clearing must_change_password (drizzle/0006) is NOT security-critical
-       in the same way — the password itself has already changed — so it
-       keeps the tolerant pre-0006 behaviour as a separate update. */
+       in the same way — the password itself has already changed and every
+       old session is already revoked — so it keeps the tolerant pre-0006
+       behaviour as a separate update. Deliberately, a failure here must
+       NEVER turn a successful, revoking password change into a reported
+       failure (the caller would retry against the new password and be
+       told their current password is wrong): log it and still succeed.
+       The flag being left set only re-prompts the user later. */
     try {
       await db.update(users).set({ mustChangePassword: false }).where(eq(users.id, userId));
     } catch (error) {
-      if (!isMissingColumn(error)) throw error;
+      console.warn("[change-password] password changed and sessions revoked, but must_change_password could not be cleared:", error);
     }
 
     return NextResponse.json({
