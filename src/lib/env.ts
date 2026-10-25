@@ -1,3 +1,5 @@
+import { describeJwtSecretProblem } from "@/lib/jwt-policy";
+
 function cleanEnvironmentValue(value: string | undefined, key?: string): string {
   if (!value) return "";
 
@@ -74,16 +76,15 @@ export function getDatabaseConfigurationProblem(): string | null {
   return null;
 }
 
+/**
+ * Reports whether the configured JWT secret is usable, using the shared policy in
+ * `@/lib/jwt-policy` — the same policy enforced at the signing/verification
+ * chokepoint in `@/lib/auth`. Keeping one policy means the health endpoint and the
+ * token code can never disagree about what "acceptable" means.
+ *
+ * The returned string describes the requirement; it never contains the secret.
+ */
 export function getJwtConfigurationProblem(): string | null {
-  const secret = getJwtSecret();
-
-  if (!secret) {
-    return "JWT_SECRET is not configured in Vercel. Add a random secret of at least 32 characters and redeploy.";
-  }
-
-  if (secret.length < 32) {
-    return "JWT_SECRET is too short. Use a random value of at least 32 characters and redeploy.";
-  }
-
-  return null;
+  const problem = describeJwtSecretProblem(getJwtSecret());
+  return problem ? problem.message : null;
 }

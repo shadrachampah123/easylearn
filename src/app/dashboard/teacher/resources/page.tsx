@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Resource {
   id: string;
@@ -61,14 +62,11 @@ export default function TeacherResourcesPage() {
   }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
-    if (!token) return;
-
     try {
       const [resourceRes, classRes, subjectRes] = await Promise.all([
-        fetch("/api/resources", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/classes", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/subjects", { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch("/api/resources"),
+        apiFetch("/api/classes"),
+        apiFetch("/api/subjects"),
       ]);
 
       const resourceData = await resourceRes.json();
@@ -88,14 +86,11 @@ export default function TeacherResourcesPage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
-
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/resources", {
+      const res = await apiFetch("/api/resources", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
         },
         body: JSON.stringify(formData),
       });

@@ -13,12 +13,11 @@ import {
   MAX_REQUEST_SIZE_BYTES,
   MAX_VIDEO_SIZE_BYTES,
   MAX_FILE_SIZE_BYTES,
-  categoryForFile,
+  categoryForExtension,
   fileExtension,
-  isVideoFile,
-  type AttachmentCategory,
   type StoredAttachment,
 } from "@/lib/uploads";
+import { verifyUploadContent } from "@/lib/upload-content";
 import { uploadStorageDir } from "@/lib/upload-storage";
 import { guardSchoolContext } from "@/lib/tenant";
 
@@ -113,18 +112,20 @@ export async function POST(request: NextRequest) {
     const saved: { attachment: StoredAttachment; storedName: string }[] = [];
     try {
       for (const file of files) {
-        const category: AttachmentCategory | null = categoryForFile(
-          file.name,
-          file.type || undefined
-        );
-        if (!category) {
+        /* ── What is this file? ──
+           The extension is the only part of the request the server stores, so
+           it is the anchor. The size limit follows from the extension alone —
+           a client cannot buy itself a larger limit by declaring a different
+           MIME type. */
+        const extensionCategory = categoryForExtension(file.name);
+        if (!extensionCategory) {
           return errorResponse(
             `"${file.name}" is not a supported file type. Allowed: documents (PDF, Word, PowerPoint, Excel, text), images, audio, video and ZIP archives.`
           );
         }
 
         // Strict size enforcement — video: 100 MB, everything else: 50 MB.
-        if (isVideoFile(file.name, file.type || undefined)) {
+        if (extensionCategory === "video") {
           if (file.size > MAX_VIDEO_SIZE_BYTES) {
             return errorResponse(
               `"${file.name}" exceeds the strict 100 MB size limit for video uploads.`,
@@ -141,6 +142,21 @@ export async function POST(request: NextRequest) {
         const ext = fileExtension(file.name);
         const storedName = `${randomUUID()}${ext ? `.${ext}` : ""}`;
         const buffer = Buffer.from(await file.arrayBuffer());
+
+        /* ── The server decides what the file IS ──
+           The client's declared MIME type is NOT the answer: a client can
+           claim anything. The server checks the file's own bytes against the
+           allow-list entry for its extension and stores the content type IT
+           derived, so the file can never be served as a document the browser
+           would execute. */
+        const verdict = verifyUploadContent(file.name, buffer, file.type || undefined);
+        if (!verdict.ok) {
+          return errorResponse(
+            verdict.reason ||
+              `"${file.name}" is not a supported file type. Allowed: documents (PDF, Word, PowerPoint, Excel, text), images, audio, video and ZIP archives.`
+          );
+        }
+
         await writeFile(path.join(storageDir, storedName), buffer);
 
         const [row] = await db
@@ -153,8 +169,9 @@ export async function POST(request: NextRequest) {
             assignmentId: purpose === "submission" ? assignmentId : null,
             originalName: file.name.slice(0, 255),
             storedName,
-            mimeType: (file.type || "application/octet-stream").slice(0, 150),
-            category,
+            // The SERVER's content type, not the one the client declared.
+            mimeType: verdict.contentType!.slice(0, 150),
+            category: verdict.category!,
             sizeBytes: file.size,
             storageBackend: "local",
           })

@@ -1,4 +1,3 @@
-/* eslint-disable react-hooks/set-state-in-effect */
 "use client";
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
@@ -6,6 +5,7 @@ import StatCard from "@/components/dashboard/StatCard";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../lib/api-client";
 
 interface ActivityItem {
   id: string;
@@ -113,16 +113,7 @@ export default function AdminDashboard() {
   const [warningsDismissed, setWarningsDismissed] = useState(false);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    if (!token) {
-      setLoading(false);
-      setError("Not authenticated");
-      return;
-    }
-
-    fetch("/api/dashboard/admin", {
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    apiFetch("/api/dashboard/admin")
       .then(async (r) => {
         const result = await r.json().catch(() => null);
         if (!r.ok && !result?.data) {

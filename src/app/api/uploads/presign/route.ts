@@ -7,12 +7,11 @@ import { authorizeUpload } from "@/lib/upload-auth";
 import {
   MAX_VIDEO_SIZE_BYTES,
   MAX_FILE_SIZE_BYTES,
-  categoryForFile,
+  categoryForExtension,
   fileExtension,
-  isVideoFile,
-  type AttachmentCategory,
   type StoredAttachment,
 } from "@/lib/uploads";
+import { ruleForExtension, SCRIPTABLE_CONTENT_TYPES } from "@/lib/upload-content";
 import {
   getObjectStorageConfig,
   newObjectKey,
@@ -75,13 +74,32 @@ export async function POST(request: NextRequest) {
     }
 
     /* ── Same type + size rules as the multipart endpoint ── */
-    const category: AttachmentCategory | null = categoryForFile(name, mimeType || undefined);
-    if (!category) {
+    /* The content type is the SERVER's, derived from the extension allow-list.
+       The client's declared MIME type is never used to decide what a file is:
+       it is signed into the PUT only so the object store stores the type the
+       server chose, and it is refused outright when it names a type a browser
+       can execute.
+
+       NOTE: in this flow the bytes go straight from the browser to the object
+       store, so the server never sees them and cannot check that the file
+       really is what its extension says. The download therefore forces a
+       server-determined content type and a safe disposition on the object
+       store's own response — see `objectDownloadUrl`. */
+    const extension = fileExtension(name);
+    const rule = ruleForExtension(extension);
+    if (!rule) {
       return errorResponse(
         `"${name}" is not a supported file type. Allowed: documents (PDF, Word, PowerPoint, Excel, text), images, audio, video and ZIP archives.`
       );
     }
-    if (isVideoFile(name, mimeType || undefined)) {
+    const declaredType = mimeType.split(";")[0].trim().toLowerCase();
+    if (declaredType && SCRIPTABLE_CONTENT_TYPES.has(declaredType)) {
+      return errorResponse(
+        `"${name}" declares the content type "${declaredType}", which a browser can execute. It was refused.`
+      );
+    }
+    const category = rule.category;
+    if (category === "video") {
       if (size > MAX_VIDEO_SIZE_BYTES) {
         return errorResponse(
           `"${name}" exceeds the strict 100 MB size limit for video uploads.`,
@@ -111,7 +129,9 @@ export async function POST(request: NextRequest) {
 
     const ext = fileExtension(name);
     const key = newObjectKey(purpose, ext);
-    const contentType = mimeType || "application/octet-stream";
+    // The SERVER's content type, not the one the client declared. The signed
+    // PUT requires exactly this type, so the object store stores it.
+    const contentType = rule.contentType;
     const presigned = presignedUploadUrl(config, key, contentType);
 
     // Register the file now; the browser uploads the bytes next. If the PUT

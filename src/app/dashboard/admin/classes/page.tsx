@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { adminNav } from "@/lib/admin-nav";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface ClassRow {
   id: string;
@@ -52,13 +53,12 @@ export default function AdminClassesPage() {
   }, []);
 
   async function loadData() {
-    const token = localStorage.getItem("el_token");
     setLoading(true);
     try {
       const [classResponse, teacherResponse, learnerResponse] = await Promise.all([
-        fetch("/api/classes", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/users?role=teacher", { headers: { Authorization: `Bearer ${token}` } }),
-        fetch("/api/users?role=learner", { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch("/api/classes"),
+        apiFetch("/api/users?role=teacher"),
+        apiFetch("/api/users?role=learner"),
       ]);
       const classData = await classResponse.json();
       const teacherData = await teacherResponse.json();
@@ -99,12 +99,11 @@ export default function AdminClassesPage() {
   async function handleClassSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSaving(true);
-    const token = localStorage.getItem("el_token");
 
     try {
-      const response = await fetch(editing ? `/api/classes/${editing.id}` : "/api/classes", {
+      const response = await apiFetch(editing ? `/api/classes/${editing.id}` : "/api/classes", {
         method: editing ? "PUT" : "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: classForm.name.trim(),
           level: classForm.level,
@@ -131,13 +130,10 @@ export default function AdminClassesPage() {
 
   async function handleDelete(classRow: ClassRow) {
     if (!confirm(`Delete ${classRow.name}? Its enrollments, timetable periods, attendance records, assignments, and quizzes will also be removed.`)) return;
-
-    const token = localStorage.getItem("el_token");
     setSaving(true);
     try {
-      const response = await fetch(`/api/classes/${classRow.id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await apiFetch(`/api/classes/${classRow.id}`, {
+        method: "DELETE"
       });
       const data = await response.json();
       if (!data.success) {
@@ -158,11 +154,10 @@ export default function AdminClassesPage() {
     if (!enrollClass || !selectedLearner) return;
     setSaving(true);
     setEnrollMessage("");
-    const token = localStorage.getItem("el_token");
     try {
-      const response = await fetch("/api/enrollments", {
+      const response = await apiFetch("/api/enrollments", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ learnerId: selectedLearner, classId: enrollClass.id }),
       });
       const data = await response.json();
@@ -181,11 +176,10 @@ export default function AdminClassesPage() {
   }
 
   async function handleAssignTeacher(classId: string, teacherId: string) {
-    const token = localStorage.getItem("el_token");
     try {
-      const response = await fetch(`/api/classes/${classId}`, {
+      const response = await apiFetch(`/api/classes/${classId}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ classTeacherId: teacherId }),
       });
       const data = await response.json();

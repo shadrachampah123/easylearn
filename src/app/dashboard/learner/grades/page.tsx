@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
+import { apiFetch } from "../../../../lib/api-client";
 
 interface Grade {
   id: string;
@@ -38,11 +39,8 @@ export default function LearnerGradesPage() {
 
 
   const loadGrades = useCallback(async () => {
-    const token = localStorage.getItem("el_token");
     try {
-      const res = await fetch("/api/grades", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch("/api/grades");
       const result = await res.json();
       if (result.success) setData(result.data);
     } catch (err) {

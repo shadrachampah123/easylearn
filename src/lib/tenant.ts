@@ -313,16 +313,8 @@ export type SchoolAuthContext = AuthContext & {
  * the token claim, which is what makes this the Phase 2C replacement for the stale
  * `payload.role` checks.
  */
-export async function resolveAuthContext(
-  request: Request,
-  /**
-   * Phase 1 compatibility hook: `/api/files/[id]` also accepts `?token=` because <img>,
-   * <video> and <a download> cannot set an `Authorization` header. This only widens WHERE a
-   * token may be read from — never what it grants, and never a school.
-   */
-  tokenOverride?: string | null
-): Promise<AuthContext> {
-  const token = tokenOverride || getTokenFromRequest(request);
+export async function resolveAuthContext(request: Request): Promise<AuthContext> {
+  const token = getTokenFromRequest(request);
   if (!token) throw new AuthContextError("Authentication required", 401);
 
   const claims = await verifyToken(token);
@@ -377,11 +369,8 @@ export async function resolveAuthContext(
  * every request, so an existing token loses ordinary tenant access as soon as its school is no
  * longer active. Multi-school users must first use the server-side selection route.
  */
-export async function requireSchoolContext(
-  request: Request,
-  tokenOverride?: string | null
-): Promise<SchoolAuthContext> {
-  const context = await resolveAuthContext(request, tokenOverride);
+export async function requireSchoolContext(request: Request): Promise<SchoolAuthContext> {
+  const context = await resolveAuthContext(request);
   if (!context.school) {
     const message = context.memberships.length > 1
       ? "Select one of your schools before continuing"
@@ -525,11 +514,10 @@ export function tenantErrorResponse(error: unknown, fallbackMessage = "Request f
  * is read for a school, so a forged `schoolId` has nothing to attach to.
  */
 export async function guardSchoolContext(
-  request: Request,
-  tokenOverride?: string | null
+  request: Request
 ): Promise<TenantGuard<SchoolAuthContext>> {
   try {
-    return { ok: true, context: await requireSchoolContext(request, tokenOverride) };
+    return { ok: true, context: await requireSchoolContext(request) };
   } catch (error) {
     if (error instanceof AuthContextError) return guardDenied(error.status, error.message);
     throw error;
@@ -547,11 +535,10 @@ export async function guardSchoolContext(
  * school data. Never use this to skip a school predicate.
  */
 export async function guardPlatformAdmin(
-  request: Request,
-  tokenOverride?: string | null
+  request: Request
 ): Promise<TenantGuard<AuthContext>> {
   try {
-    const context = await resolveAuthContext(request, tokenOverride);
+    const context = await resolveAuthContext(request);
     if (!isPlatformAdminContext(context)) {
       throw new AuthContextError("Only platform administrators may perform this action", 403);
     }

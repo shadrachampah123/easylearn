@@ -1,4 +1,3 @@
-/* eslint-disable react-hooks/set-state-in-effect */
 "use client";
 
 import DashboardShell from "@/components/dashboard/DashboardShell";
@@ -7,6 +6,7 @@ import TodaysSchedule from "@/components/dashboard/TodaysSchedule";
 import { useEffect, useState } from "react";
 import { learnerNav } from "@/lib/learner-nav";
 import Link from "next/link";
+import { apiFetch } from "../../../lib/api-client";
 
 interface DashboardData {
   stats: Record<string, {
@@ -54,16 +54,7 @@ export default function LearnerDashboard() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const token = localStorage.getItem("el_token");
-    if (!token) {
-      setLoading(false);
-      setError("Not authenticated");
-      return;
-    }
-
-    fetch("/api/dashboard/learner", {
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    apiFetch("/api/dashboard/learner")
       .then((r) => r.json())
       .then((result) => {
         if (result.success) setData(result.data);
