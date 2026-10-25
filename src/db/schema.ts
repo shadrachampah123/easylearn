@@ -122,6 +122,7 @@ export const users = pgTable("users", {
   mustChangePassword: boolean("must_change_password").notNull().default(false), 
   emailVerified: boolean("email_verified").notNull().default(false),
   lastLogin: timestamp("last_login"),
+  sessionVersion: integer("session_version").notNull().default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });

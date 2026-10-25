@@ -101,6 +101,19 @@ export async function POST(request: NextRequest) {
     const { isPlatformRole, resolveLoginSchoolContext, toSchoolSummary } = await import("@/lib/tenant");
     const { memberships, school } = await resolveLoginSchoolContext(user.id);
 
+    // Revocation: include current sessionVersion so logout can invalidate.
+    let sessionVersion = 0;
+    try {
+      const [row] = await db
+        .select({ sessionVersion: users.sessionVersion })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .limit(1);
+      sessionVersion = (row as unknown as { sessionVersion?: number | null })?.sessionVersion ?? user.sessionVersion ?? 0;
+    } catch {
+      sessionVersion = user.sessionVersion ?? 0;
+    }
+
     const token = await createToken({
       userId: user.id,
       email: user.email || undefined,
@@ -111,6 +124,7 @@ export async function POST(request: NextRequest) {
       membershipId: school?.membershipId,
       // Keep an unselected login ambiguous for its lifetime, even if memberships later change.
       schoolSelectionRequired: !isPlatformRole(user.role) && memberships.length !== 1,
+      sessionVersion,
     });
 
     await db

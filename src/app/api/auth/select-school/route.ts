@@ -58,6 +58,7 @@ export async function POST(request: NextRequest) {
       role: context.role,
       schoolId: selected.schoolId,
       membershipId: selected.membershipId,
+      sessionVersion: context.sessionVersion,
     });
 
     const response = successResponse({
