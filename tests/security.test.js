@@ -168,7 +168,8 @@ test('Password: prevents changing another user password', () => {
   assert(content.includes('requestedUserId') || content.includes('userId'), 'Should check requested userId');
   assert(content.includes('You can only change your own password'), 'Should reject cross-user');
   assert(content.includes('bcrypt.compare'), 'Should verify current password');
-  assert(content.includes('bcrypt.hash'), 'Should hash new password');
+  assert(content.includes('hashPassword(newPassword)'), 'Should hash new password via hashPassword (cost 12)');
+  assert(content.includes('sessionVersion'), 'Should bump session_version to revoke pre-change tokens');
 });
 
 // 8. Seed protection
