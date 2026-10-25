@@ -41,19 +41,19 @@ const SCHOOL_ID = "11111111-1111-4111-8111-111111111111";
 
 const CONFIGURATIONS = [
   {
+    kind: "default",
     name: "default (forwarded headers are NOT trusted)",
     base: process.env.PROBE_BASE || "http://127.0.0.1:3400",
-    publicOrigin: null,
   },
   {
+    kind: "opt-in",
     name: "opt-in (EASY_LEARN_TRUST_PROXY_HEADERS=true)",
     base: process.env.PROBE_OPTIN_BASE || "http://127.0.0.1:3401",
-    publicOrigin: null,
   },
   {
+    kind: "public-origin",
     name: "configured public origin (EASY_LEARN_PUBLIC_ORIGIN)",
     base: process.env.PROBE_PUBLIC_ORIGIN_BASE || "http://127.0.0.1:3402",
-    publicOrigin: "https://easylearn.example.com",
   },
 ];
 
@@ -81,18 +81,54 @@ const REQUESTS = [
     expect: "refused unless the opt-in is on",
   },
   {
+    id: "foreign-origin-browser-claims-same-origin",
+    description: "Origin is foreign but the browser claims same-origin",
+    origin: () => "https://evil.test",
+    headers: { "Sec-Fetch-Site": "same-origin" },
+    expect: "refused",
+  },
+  {
     id: "same-origin-forged-forwarded",
-    description: "Origin is the app's own origin and the forwarded headers are forged",
+    description: "Origin is the app's own origin, the forwarded headers are forged and no browser claim is present",
     origin: (base) => base,
     headers: { "X-Forwarded-Host": "evil.test", "X-Forwarded-Proto": "https" },
+    /* A forged `X-Forwarded-Proto` makes the DERIVED scheme `https`, so the
+       strict comparison against `http://<host>` fails. Without the browser's
+       own `Sec-Fetch-Site: same-origin` there is no proof about the real
+       origins, so the request is refused — failing closed. With
+       EASY_LEARN_PUBLIC_ORIGIN the comparison origin is exact and the
+       request is allowed. */
+    expect: { default: "refused", "opt-in": "refused", "public-origin": "allowed" },
+  },
+  {
+    id: "same-origin-forged-forwarded-browser",
+    description: "the same, with the browser's own same-origin claim",
+    origin: (base) => base,
+    headers: {
+      "X-Forwarded-Host": "evil.test",
+      "X-Forwarded-Proto": "https",
+      "Sec-Fetch-Site": "same-origin",
+    },
     expect: "allowed",
+  },
+  {
+    id: "same-host-different-scheme-browser",
+    description: "the same host, the other scheme, and the browser reports same-site",
+    origin: (base) => (base.startsWith("https:") ? "http" : "https") + base.slice(base.indexOf("//")),
+    headers: { "Sec-Fetch-Site": "same-site" },
+    expect: "refused",
   },
   {
     id: "no-origin",
     description: "no Origin header at all (a non-browser client)",
     origin: null,
     headers: {},
-    expect: "allowed",
+    /* A request that carries NEITHER `Origin` nor `Sec-Fetch-Site` is REFUSED:
+       there is no information about where it came from, and failing open would
+       make "strip the Origin header" a bypass. A non-browser client presents a
+       Bearer token instead — that is the documented path, and it is what
+       `tests/csrf-policy.test.ts` covers. */
+    expect: "refused",
   },
 ];
 
@@ -148,15 +184,18 @@ async function main() {
       const allowed = response.status >= 200 && response.status < 400;
       const label = `${request.description} → ${response.status}`;
 
+      /* The expectation may be one string for every configuration, or a map
+         keyed by the configuration's kind. */
+      const expectation =
+        typeof request.expect === "string" ? request.expect : request.expect[configuration.kind];
       let expected;
-      if (request.expect === "allowed") expected = allowed;
-      else if (request.expect === "refused") expected = !allowed;
+      if (expectation === "allowed") expected = allowed;
+      else if (expectation === "refused") expected = !allowed;
       else {
         /* "refused unless the opt-in is on" */
-        const optIn = configuration.name.startsWith("opt-in");
-        expected = optIn ? allowed : !allowed;
+        expected = configuration.kind === "opt-in" ? allowed : !allowed;
       }
-      check(label, expected, `expected ${request.expect}`);
+      check(label, expected, `expected ${expectation}`);
     }
     console.log("");
   }

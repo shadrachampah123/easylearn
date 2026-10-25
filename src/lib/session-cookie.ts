@@ -15,18 +15,25 @@
 export const SESSION_COOKIE_NAME = "el_token";
 
 /**
- * Reads the session token out of a `Cookie` request header.
- *
- * Returns `null` when the header is absent or does not carry the session cookie.
+ * The pattern that finds the session cookie in a `Cookie` header.
  *
  * The match is anchored to the start of a cookie pair (`(?:^|;\s*)`) so that a
  * cookie such as `other_el_token=…` is never mistaken for the session cookie.
  */
+function sessionCookiePattern(): RegExp {
+  const escapedName = SESSION_COOKIE_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|;\\s*)${escapedName}=([^;]*)`);
+}
+
+/**
+ * Reads the session token out of a `Cookie` request header.
+ *
+ * Returns `null` when the header is absent or does not carry the session cookie.
+ */
 export function readSessionCookie(cookieHeader: string | null | undefined): string | null {
   if (!cookieHeader) return null;
 
-  const escapedName = SESSION_COOKIE_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${escapedName}=([^;]*)`));
+  const match = cookieHeader.match(sessionCookiePattern());
   if (!match || !match[1]) return null;
 
   try {
@@ -36,4 +43,18 @@ export function readSessionCookie(cookieHeader: string | null | undefined): stri
     // than letting a decoding error turn into a 500.
     return null;
   }
+}
+
+/**
+ * Does the `Cookie` header carry the session cookie at all?
+ *
+ * This is deliberately weaker than "is the session cookie a valid token" and stronger
+ * than "does the cookie hold a usable credential": it answers the question the CSRF
+ * policy actually asks — "is this request carrying the browser's ambient authority?" —
+ * for ANY value, including an empty or malformed one. A request that carries the
+ * session cookie is a browser request, and a browser request has to prove its origin.
+ */
+export function hasSessionCookie(cookieHeader: string | null | undefined): boolean {
+  if (!cookieHeader) return false;
+  return sessionCookiePattern().test(cookieHeader);
 }

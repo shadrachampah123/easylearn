@@ -512,6 +512,67 @@ export function verifyUploadContent(
 }
 
 /**
+ * Verify an object that was uploaded straight to the object store.
+ *
+ * The direct-to-bucket flow sends the bytes from the browser to the store, so
+ * the application never sees them and `verifyUploadContent` never ran for
+ * them: the store holds whatever the browser sent, under a key whose
+ * extension the server chose. This is the same policy applied to the object's
+ * first bytes after they are read back from the store.
+ *
+ * `storedContentType` is the type the STORE recorded. The signed PUT binds the
+ * server's type into the request, so a store that honours the binding can
+ * only have recorded the server's type; a mismatch means the object was
+ * written with something else and is refused.
+ */
+export function verifyObjectContent(
+  storedName: string,
+  bytes: Buffer,
+  storedContentType?: string | null
+): ContentVerdict {
+  const dot = storedName.lastIndexOf(".");
+  const extension = dot < 0 ? "" : storedName.slice(dot + 1).trim().toLowerCase();
+
+  const rule = ruleForExtension(extension);
+  if (!rule) {
+    return {
+      ok: false,
+      reason: `"${storedName}" is not a supported file type.`,
+    };
+  }
+
+  /* The store must have recorded the type the server derived from the
+     extension — never a type the client chose. */
+  const stored = (storedContentType || "").trim().toLowerCase().split(";")[0].trim();
+  const expected = rule.contentType.split(";")[0].trim().toLowerCase();
+  if (stored && stored !== expected) {
+    return {
+      ok: false,
+      reason: `The stored object records the content type "${stored}" but "${extension}" is served as "${expected}". It was refused.`,
+    };
+  }
+
+  if (looksLikeMarkup(bytes)) {
+    return {
+      ok: false,
+      reason: `The stored object contains HTML, SVG or XHTML markup. It was refused because a browser would run it.`,
+    };
+  }
+
+  if (rule.signatures.length > 0) {
+    const matched = rule.signatures.some((signature) => matchesSignature(bytes, signature));
+    if (!matched) {
+      return {
+        ok: false,
+        reason: `The stored object does not look like the ${extension.toUpperCase()} file it claims to be. It was refused.`,
+      };
+    }
+  }
+
+  return { ok: true, contentType: rule.contentType, category: rule.category };
+}
+
+/**
  * The content type to serve a stored file with.
  *
  * The stored file name is `<uuid>.<extension>` (or an object key ending in

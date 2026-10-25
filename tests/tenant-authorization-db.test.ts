@@ -1260,12 +1260,16 @@ async function main() {
       assert(bodyText(result).includes(ids["learner-a"]), "child's attendance present");
     });
 
-    await test("Legitimate: assignment material is readable by school members, submission files are not", async () => {
-      // Phase 2C decision: a file attached to an assignment is course material for the
-      // school, so a same-school member may read it; a `purpose=submission` file keeps the
-      // Phase 1 owner/teacher/admin rule (proved above by the learner-b2 → 403 case).
-      const material = await call("files/[id]", { token: tokens["learner-a2"], params: { id: fileA } });
-      assertEq(material.status, 200, "same-school assignment material stays readable inside the school");
+    await test("Legitimate: assignment material is readable by enrolled class members, not by any school member; submission files stay owner-scoped", async () => {
+      // Phase 2E follow-up: assignment materials are course content for the
+      // class they are attached to, not school-wide. Only enrolled learners,
+      // teaching staff, linked parents and school administrators may read them.
+      // This replaces the former "any school member may read" rule which leaked
+      // materials across classes.
+      const enrolledMaterial = await call("files/[id]", { token: tokens["learner-a"], params: { id: fileA } });
+      assertEq(enrolledMaterial.status, 200, "enrolled learner must read assignment material for their class");
+      const unenrolledMaterial = await call("files/[id]", { token: tokens["learner-a2"], params: { id: fileA } });
+      assertEq(unenrolledMaterial.status, 403, "unenrolled learner must be denied assignment material for another class");
 
       const foreignSubmission = await call("files/[id]", { token: tokens["teacher-a"], params: { id: submissionFileB } });
       assertEq(foreignSubmission.status, 404, "another school's submission file is invisible");
@@ -1494,31 +1498,30 @@ async function main() {
     });
 
     await test("Relational attribution: a quiz belongs to exactly one school, and an ambiguous one is denied to both", async () => {
-      /* `sqlQuizInSchool` still attributes a quiz RELATIONALLY (its teacher, its
-         class and the enrolled learners), so the "reachable from exactly one
-         school" rule still applies to quizzes. These assertions keep that rule
-         load-bearing — the mutation suite proves it by removing it, and these
-         are the assertions that must then fail.
-         (Uploaded files are the opposite case: they are attributed by their own
-         `school_id`, like assignments, and the multi-school uploader's own file
-         is readable in the school that stored it.) */
-      const quizA = (
-        await one(
-          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
-           VALUES ($1, 'Attribution Quiz A', $2, $3, $4, false) RETURNING id`,
-          [schoolA, classA, subjectA, ids["teacher-a"]]
-        )
-      ).id as string;
-
-      const dualQuiz = (
-        await one(
-          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
-           VALUES ($1, 'Dual Quiz A', $2, $3, $4, false) RETURNING id`,
-          [schoolA, classA, subjectA, dualTeacher.id]
-        )
-      ).id as string;
-
+      /* These are genuinely legacy, unattributed rows, not modern selected-school
+         quizzes. Keep every cross-school/ambiguity assertion load-bearing for M2/M5;
+         an explicitly school-attributed multi-school teacher is covered separately.
+         Only this disposable fixture relaxes NOT NULL; production schema is untouched. */
+      await q(`ALTER TABLE quizzes ALTER COLUMN school_id DROP NOT NULL`);
+      let quizA: string | undefined;
+      let dualQuiz: string | undefined;
       try {
+        quizA = (
+        await one(
+          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+           VALUES (NULL, 'Attribution Quiz A', $1, $2, $3, false) RETURNING id`,
+          [classA, subjectA, ids["teacher-a"]]
+        )
+      ).id as string;
+
+        dualQuiz = (
+        await one(
+          `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+           VALUES (NULL, 'Dual Quiz A', $1, $2, $3, false) RETURNING id`,
+          [classA, subjectA, dualTeacher.id]
+        )
+      ).id as string;
+
         /* A quiz of one school is invisible in the other. */
         const foreign = await call("quizzes/[id]", { token: tokens["admin-b"], params: { id: quizA } });
         assertEq(foreign.status, 404, "another school's administrator must not read the quiz");
@@ -1533,6 +1536,25 @@ async function main() {
         }
       } finally {
         await q(`DELETE FROM quizzes WHERE id IN ($1, $2)`, [quizA, dualQuiz]);
+        await q(`ALTER TABLE quizzes ALTER COLUMN school_id SET NOT NULL`);
+      }
+    });
+
+    await test("Quiz direct attribution: a selected dual-school owner is allowed only in the stored school", async () => {
+      const item = await one(
+        `INSERT INTO quizzes (school_id, title, class_id, subject_id, teacher_id, is_published)
+         VALUES ($1, 'Selected-school quiz', $2, $3, $4, false) RETURNING id`,
+        [schoolA, classA, subjectA, dualTeacher.id]
+      );
+      try {
+        const own = await call("quizzes/[id]", { token: dualTeacher.token, params: { id: item.id } });
+        assertEq(own.status, 200, "a second membership does not re-home or invalidate a stored-school quiz");
+        const admin = await call("quizzes/[id]", { token: tokens["admin-a"], params: { id: item.id } });
+        assertEq(admin.status, 200, "the stored school's administrator retains access");
+        const foreign = await call("quizzes/[id]", { token: tokens["admin-b"], params: { id: item.id } });
+        assertEq(foreign.status, 404, "the owner's other membership must not grant another school access");
+      } finally {
+        await q(`DELETE FROM quizzes WHERE id=$1`, [item.id]);
       }
     });
 

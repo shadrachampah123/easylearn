@@ -78,7 +78,9 @@ export function getObjectStorageConfig(): ObjectStorageConfig {
     secretAccessKey,
     forcePathStyle,
     publicBaseUrl,
-    uploadExpirySeconds: positiveInt(process.env.OBJECT_STORAGE_UPLOAD_EXPIRY, 900),
+    // SEC-6: Shorter upload expiry (5 min vs 15 min) reduces window for
+    // oversized/replaceable uploads. Download stays 1h for media seeking.
+    uploadExpirySeconds: positiveInt(process.env.OBJECT_STORAGE_UPLOAD_EXPIRY, 300),
     downloadExpirySeconds: positiveInt(process.env.OBJECT_STORAGE_DOWNLOAD_EXPIRY, 3600),
   };
 }
@@ -129,14 +131,25 @@ function objectUrlParts(config: ObjectStorageConfig, key: string): UrlParts {
 export function objectDownloadUrl(
   config: ObjectStorageConfig,
   key: string,
-  options?: { contentType?: string; disposition?: string }
+  options?: { contentType?: string; disposition?: string; cacheControl?: string; allowPublic?: boolean }
 ): string {
   const query = new URLSearchParams();
   if (options?.contentType) query.set("response-content-type", options.contentType);
   if (options?.disposition) query.set("response-content-disposition", options.disposition);
+  /* The bucket's own response carries this cache directive — the 307's own
+     `Cache-Control` header does NOT, because the 307 is not the response the
+     browser finally sees. Without it the object store may let a SHARED cache
+     store a private file and hand it to the next user. `private` forbids that;
+     the browser may still keep its own copy so media seeking stays fast. */
+  if (options?.cacheControl) query.set("response-cache-control", options.cacheControl);
   const suffix = query.toString();
 
-  if (config.publicBaseUrl) {
+  // SEC-1: Protected files (assignments/submissions) must never use permanent
+  // public URLs. Only explicitly public files may use the public base URL.
+  // All EasyLearn uploaded files are private and require authentication, so
+  // the default is presigned. Public mode is only for intentionally public
+  // assets and must be explicitly opted into per-call.
+  if (config.publicBaseUrl && options?.allowPublic) {
     const base = `${config.publicBaseUrl.replace(/\/+$/, "")}/${canonicalUri(key)}`;
     return suffix ? `${base}?${suffix}` : base;
   }
@@ -146,7 +159,41 @@ export function objectDownloadUrl(
     expiresSeconds: config.downloadExpirySeconds,
     responseContentType: options?.contentType,
     responseContentDisposition: options?.disposition,
+    responseContentCacheControl: options?.cacheControl,
   }).url;
+}
+
+/**
+ * SEC-1: Validate object-storage configuration for production.
+ * Fails clearly when OBJECT_STORAGE_PUBLIC_URL is set in production,
+ * because all EasyLearn files are private and must not be exposed via
+ * permanent unauthenticated URLs. Public buckets must use presigned URLs.
+ */
+export function assertObjectStorageConfigForProduction(): void {
+  const publicBaseUrl = cleanEnv(process.env.OBJECT_STORAGE_PUBLIC_URL).replace(/\/+$/, "");
+  if (publicBaseUrl && process.env.NODE_ENV === "production") {
+    // Allow explicit override for intentional public-asset deployments that
+    // have been audited — the override must be set to "true" to bypass.
+    const allowPublic = cleanEnv(process.env.OBJECT_STORAGE_ALLOW_PUBLIC_URL).toLowerCase();
+    if (allowPublic !== "true" && allowPublic !== "1") {
+      throw new Error(
+        `OBJECT_STORAGE_PUBLIC_URL is set to \"${publicBaseUrl}\" in production. ` +
+          "All EasyLearn files are private and must not be served via permanent public URLs. " +
+          "Unset OBJECT_STORAGE_PUBLIC_URL to use presigned URLs, or set OBJECT_STORAGE_ALLOW_PUBLIC_URL=true if this deployment has been audited for public assets."
+      );
+    }
+  }
+}
+
+/**
+ * SEC-1: Check if using public URL is safe for a given file purpose.
+ * Submission files are always protected; assignment files are protected unless
+ * explicitly marked public (none are currently).
+ */
+export function isPublicUrlSafeForPurpose(purpose: string | null | undefined): boolean {
+  // All current purposes are protected. Public URLs are never safe for them.
+  if (purpose === "submission" || purpose === "assignment") return false;
+  return false;
 }
 
 /* ── AWS Signature Version 4 presigner (no SDK dependency) ── */
@@ -159,13 +206,22 @@ interface PresignRequest {
   contentType?: string;
   /**
    * Response-header overrides for a GET. S3-compatible stores accept
-   * `response-content-type` and `response-content-disposition` as query
-   * parameters and apply them to the response, which is how an uploaded
-   * object can be served with a server-determined type and a download
-   * disposition even though the bytes were uploaded straight to the bucket.
+   * `response-content-type`, `response-content-disposition` and
+   * `response-cache-control` as query parameters and apply them to the
+   * response, which is how an uploaded object can be served with a
+   * server-determined type, a download disposition and a private cache
+   * directive even though the bytes were uploaded straight to the bucket.
+   *
+   * These SIX parameters are the complete set the S3 API allows
+   * (`response-content-type`, `response-content-language`, `response-expires`,
+   * `response-cache-control`, `response-content-disposition`,
+   * `response-content-encoding`). A store REJECTS any other `response-*`
+   * parameter, so an object-store response can never carry
+   * `X-Content-Type-Options` or a `Content-Security-Policy`.
    */
   responseContentType?: string;
   responseContentDisposition?: string;
+  responseContentCacheControl?: string;
   now?: Date;
 }
 
@@ -221,6 +277,9 @@ export function presignUrl(config: ObjectStorageConfig, request: PresignRequest)
   }
   if (request.responseContentDisposition) {
     query["response-content-disposition"] = request.responseContentDisposition;
+  }
+  if (request.responseContentCacheControl) {
+    query["response-cache-control"] = request.responseContentCacheControl;
   }
 
   const canonicalQueryString = Object.keys(query)
@@ -296,5 +355,115 @@ export async function deleteObject(
     return response.ok || response.status === 404;
   } catch {
     return false;
+  }
+}
+
+/* ── Reading an object back ───────────────────────────────────────────────── */
+
+/** What the store reports about an object. */
+export interface ObjectPrefix {
+  /** The first bytes of the object (at most the requested number). */
+  bytes: Buffer;
+  /** The object's REAL size, when the store reported it. */
+  totalSize: number | null;
+  /** The content type the store recorded for the object. */
+  contentType: string | null;
+  /** The object's ETag — it changes when the object changes. */
+  etag: string | null;
+}
+
+/**
+ * Read the first bytes of an object, with a signed request.
+ *
+ * The direct-to-bucket upload sends the bytes from the browser to the store, so
+ * the application never sees them. This is how the application gets them back:
+ * a small ranged GET that also reports the object's real size, its recorded
+ * content type and its ETag.
+ *
+ * The request is signed WITHOUT any response-header override, so the store
+ * answers with the object's OWN metadata — the same metadata the uploader
+ * caused to be stored.
+ */
+export async function readObjectPrefix(
+  config: ObjectStorageConfig,
+  key: string,
+  maxBytes = 1024
+): Promise<ObjectPrefix | null> {
+  if (!config.enabled) return null;
+  const { url } = presignUrl(config, {
+    method: "GET",
+    key,
+    expiresSeconds: config.downloadExpirySeconds,
+  });
+  try {
+    const response = await fetch(url, { headers: { Range: `bytes=0-${maxBytes - 1}` } });
+    // SEC-9: Distinguish missing vs outage. 404/403 = missing (or not authorized to know)
+    if (response.status === 404 || response.status === 403) return null;
+    // 5xx = storage outage — must surface as 503, not 404
+    if (response.status >= 500 && response.status < 600) {
+      throw new Error(`Object storage outage: ${response.status} ${response.statusText}`);
+    }
+    if (!response.ok) return null;
+
+    // SEC-9: Bound the read even if provider ignores Range.
+    // A ranged GET should return 206 with Content-Range; if provider ignores Range it may return 200 with full body (100 MB).
+    // We must not buffer that. Read at most maxBytes via streaming.
+    let bytes: Buffer;
+    const contentLengthHeader = response.headers.get("content-length");
+    const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+    if (Number.isFinite(contentLength) && contentLength <= maxBytes * 4) {
+      const buf = Buffer.from(await response.arrayBuffer());
+      bytes = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+    } else if (response.body) {
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      try {
+        while (received < maxBytes) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value) break;
+          const needed = maxBytes - received;
+          if (value.length > needed) {
+            chunks.push(value.subarray(0, needed));
+            received += needed;
+            try { await reader.cancel(); } catch {}
+            break;
+          } else {
+            chunks.push(value);
+            received += value.length;
+          }
+          if (received >= maxBytes) break;
+        }
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+      bytes = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+    } else {
+      const buf = Buffer.from(await response.arrayBuffer());
+      bytes = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+    }
+
+    let totalSize: number | null = null;
+    const contentRange = response.headers.get("content-range");
+    if (contentRange) {
+      const match = /\/(\d+)\s*$/.exec(contentRange);
+      if (match) totalSize = Number(match[1]);
+    } else {
+      const length = response.headers.get("content-length");
+      if (length !== null && Number.isFinite(Number(length))) totalSize = Number(length);
+    }
+    return {
+      bytes,
+      totalSize,
+      contentType: response.headers.get("content-type"),
+      etag: response.headers.get("etag"),
+    };
+  } catch (error) {
+    if ((error as Error)?.message?.includes("Object storage outage")) throw error;
+    if ((error as Error)?.message?.includes("fetch") || (error as Error)?.message?.includes("network")) {
+      throw new Error(`Object storage outage: ${String(error)}`);
+    }
+    return null;
   }
 }

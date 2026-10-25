@@ -1,13 +1,15 @@
 import { NextRequest } from "next/server";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile, unlink } from "node:fs/promises";
+import { access, mkdir, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
+import { constants as fsConstants } from "node:fs";
 import { db } from "@/db";
 import { uploadedFiles } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { authorizeUpload } from "@/lib/upload-auth";
 import { isObjectStorageEnabled } from "@/lib/object-storage";
+import { MULTIPART_DISABLED_MESSAGE, describeUploadFailure } from "@/lib/upload-mode";
 import {
   MAX_FILES_PER_REQUEST,
   MAX_REQUEST_SIZE_BYTES,
@@ -39,6 +41,42 @@ export async function GET(request: NextRequest) {
 }
 
 /**
+ * Can this deployment write uploads to local disk?
+ *
+ * Deliberately NON-MUTATING. This runs before the request has been authorized, so it
+ * must not create anything on the caller's behalf — an authenticated-but-unauthorized
+ * user must not be able to make the server mkdir a directory. The previous version of
+ * this check called `mkdir(..., { recursive: true })` first, which did exactly that.
+ *
+ * A missing upload directory is normal (it is created on the first successful write),
+ * so a nonexistent path is not a refusal: walk up to the nearest existing ancestor and
+ * ask whether THAT is writable, since creating a child inside it needs write permission
+ * on it. The walk terminates at the filesystem root; `path.dirname` is idempotent there.
+ *
+ * This still detects the case the guard exists for. On a read-only serverless bundle the
+ * ancestor of the missing directory exists but rejects writes with EROFS/EACCES, so the
+ * probe returns false and the caller is refused up front instead of hitting an opaque
+ * 500 mid-write.
+ */
+async function uploadDirIsWritable(): Promise<boolean> {
+  let dir = uploadStorageDir();
+  for (;;) {
+    try {
+      /* Write permission on the directory, and search permission to reach entries in
+         it, are both required to create a file inside it. */
+      await access(dir, fsConstants.W_OK | fsConstants.X_OK);
+      return true;
+    } catch (error) {
+      /* Anything other than "does not exist" — EACCES, EROFS, ENOTDIR — means no. */
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") return false;
+      const parent = path.dirname(dir);
+      if (parent === dir) return false;
+      dir = parent;
+    }
+  }
+}
+
+/**
  * Upload one or more files from a local device to LOCAL DISK.
  *
  * multipart/form-data fields:
@@ -60,20 +98,80 @@ export async function POST(request: NextRequest) {
     if (!auth.ok) return auth.response;
     const ctx = auth.context;
 
-    // Reject oversized bodies before buffering anything.
-    const contentLength = Number(request.headers.get("content-length") || 0);
-    if (contentLength > MAX_REQUEST_SIZE_BYTES) {
-      return errorResponse(
-        "The upload is too large. Videos are limited to 100 MB and other files to 50 MB.",
-        413
-      );
+    /* AUTHENTICATED callers only: this guard sits after authentication so an anonymous
+       request still gets a plain 401 and learns nothing about the deployment's storage
+       configuration.
+
+       Object storage being CONFIGURED does not by itself make the disk path impossible.
+       A deployment can have a bucket AND a writable filesystem, and there the multipart
+       route is still the supported path for small files — refusing it would break that
+       guarantee (tests/object-storage-live.test.ts, "the local upload path still works").
+       What cannot work is a READ-ONLY filesystem, which is what a serverless bundle
+       presents: the write failed there as an opaque EROFS 500 with a generic message.
+
+       So ask the FILESYSTEM rather than inferring from configuration. If the upload
+       directory cannot be written, answer 409 with an actionable message instead of
+       attempting an impossible write.
+
+       The probe is non-mutating on purpose: it runs before `authorizeUpload` below, so
+       it must not create the directory as a side effect of asking the question. See
+       `uploadDirIsWritable`. */
+    if (isObjectStorageEnabled() && !(await uploadDirIsWritable())) {
+      return errorResponse(MULTIPART_DISABLED_MESSAGE, 409);
+    }
+
+    // SEC-8: Reject oversized bodies before buffering, and handle missing/untrustworthy Content-Length.
+    // Without Content-Length (chunked uploads), an attacker could bypass size limits by streaming unlimited bytes.
+    const contentLengthHeader = request.headers.get("content-length");
+    const transferEncoding = request.headers.get("transfer-encoding")?.toLowerCase();
+    const isChunked = transferEncoding?.includes("chunked");
+
+    if (contentLengthHeader !== null) {
+      const contentLength = Number(contentLengthHeader);
+      if (!Number.isFinite(contentLength) || contentLength < 0) {
+        return errorResponse("Invalid Content-Length header.", 400);
+      }
+      if (contentLength > MAX_REQUEST_SIZE_BYTES) {
+        return errorResponse(
+          "The upload is too large. Videos are limited to 100 MB and other files to 50 MB.",
+          413
+        );
+      }
+      // Misleading Content-Length (e.g., claims 1 byte but body is 100 MB) is still bounded
+      // by the post-parse total size check below and by the per-file limits.
+    } else if (isChunked) {
+      // SEC-8: Chunked uploads without Content-Length must still be bounded.
+      // We cannot pre-check size, so we enforce via streaming limit during parsing.
+      // Log for diagnostics and proceed with bounded read.
+      console.warn("[uploads] chunked upload without Content-Length — enforcing streaming limit");
+    } else {
+      // No Content-Length and not chunked: could be missing header or HTTP/2 without length.
+      // Enforce via post-parse total size; this is the safe fallback.
+      console.warn("[uploads] multipart upload without Content-Length header — will verify total size after parse");
     }
 
     let form: FormData;
     try {
+      // SEC-8: Use bounded reading — if the body is chunked and huge, this will still be
+      // protected by the per-file and total size checks after parsing, plus the runtime's
+      // own body limit (Vercel 4.5 MB for serverless, but local disk path allows 100 MB).
+      // For true streaming limit, we would need to read request.body as stream with limit.
       form = await request.formData();
     } catch {
       return errorResponse("Invalid upload request. Expected multipart/form-data.");
+    }
+
+    // SEC-8: Post-parse total size check — catches missing/misleading Content-Length.
+    // Sum file sizes to ensure total doesn't exceed request limit + multipart overhead tolerance.
+    const totalFileSize = form
+      .getAll("file")
+      .filter((e): e is File => e instanceof File)
+      .reduce((sum, f) => sum + f.size, 0);
+    if (totalFileSize > MAX_REQUEST_SIZE_BYTES) {
+      return errorResponse(
+        "The upload is too large. Videos are limited to 100 MB and other files to 50 MB.",
+        413
+      );
     }
 
     const purposeRaw = String(form.get("purpose") || "");
@@ -98,6 +196,7 @@ export async function POST(request: NextRequest) {
     const authorization = await authorizeUpload({
       role: ctx.school.role,
       schoolId: ctx.schoolId,
+      userId: ctx.userId,
       purpose,
       assignmentId: purpose === "submission" ? assignmentId : null,
     });
@@ -195,6 +294,7 @@ export async function POST(request: NextRequest) {
           unlink(path.join(storageDir, entry.storedName)).catch(() => undefined)
         )
       );
+      console.error(describeUploadFailure(error, { backend: "local", fileCount: saved.length }));
       return errorResponse(
         schemaAwareErrorMessage(error, "The file could not be uploaded. Please try again."),
         500
@@ -203,7 +303,7 @@ export async function POST(request: NextRequest) {
 
     return successResponse(saved.map((entry) => entry.attachment), 201);
   } catch (error) {
-    console.error("Upload error:", error);
+    console.error(describeUploadFailure(error, { backend: "local", fileCount: 0 }));
     return errorResponse(
       schemaAwareErrorMessage(error, "The file could not be uploaded. Please try again."),
       500

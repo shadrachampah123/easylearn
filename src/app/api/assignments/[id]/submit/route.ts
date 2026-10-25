@@ -15,6 +15,7 @@ import {
   partialPoints,
   type EasyAIReport,
 } from "@/lib/easyai";
+import { normalizeQuizAnswer } from "@/lib/quiz-access";
 import { eq, and } from "drizzle-orm";
 import { resolveAssignmentAccessPredicate } from "@/lib/assignment-access";
 
@@ -101,6 +102,7 @@ export async function POST(
     if (submittedFiles.length > 0) {
       const resolved = await resolveUploadedAttachments(submittedFiles, {
         uploaderId: ctx.userId,
+        schoolId: ctx.schoolId,
         purpose: "submission",
         assignmentId,
       });
@@ -273,10 +275,10 @@ export async function POST(
         continue;
       }
 
-      if (learnerAnswer && question.correctAnswer) {
-        const normalizedLearner = String(learnerAnswer).trim().toLowerCase();
-        const normalizedCorrect = String(question.correctAnswer).trim().toLowerCase();
+      const normalizedLearner = normalizeQuizAnswer(learnerAnswer);
+      const normalizedCorrect = normalizeQuizAnswer(question.correctAnswer);
 
+      if (normalizedLearner.length > 0 && normalizedCorrect.length > 0) {
         switch (question.questionType) {
           case "mcq":
           case "true_false":

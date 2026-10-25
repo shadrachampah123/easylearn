@@ -22,10 +22,11 @@ import { evaluateCsrfRequestForRequest } from "@/lib/csrf";
  *   - a state-changing request must come from this application's own origin
  *     (`Origin`, or `Sec-Fetch-Site` when `Origin` is absent);
  *   - a request with neither header is REFUSED, not allowed;
- *   - a request that carries `Authorization: Bearer` is a deliberately supported
- *     non-browser client and is not origin-checked. A browser cannot set that
- *     header cross-site without a CORS preflight, and this application does not
- *     enable CORS.
+ *   - a request that carries `Authorization: Bearer` AND no session cookie is a
+ *     deliberately supported non-browser client and is not origin-checked. A browser
+ *     cannot set that header cross-site without a CORS preflight, and this
+ *     application does not enable CORS. A request that carries the session cookie as
+ *     well is a browser request and is ALWAYS origin-checked.
  *
  * `GET`, `HEAD` and `OPTIONS` are not state-changing and pass straight through.
  */

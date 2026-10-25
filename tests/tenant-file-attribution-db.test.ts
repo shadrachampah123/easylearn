@@ -139,7 +139,7 @@ async function main() {
     process.env.OBJECT_STORAGE_REGION = "us-east-1";
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-    const runMigrations = () => runMigrationChain({ databaseUrl: scratchUrl, env: { JWT_SECRET } });
+    const runMigrations = () => runMigrationChain({ databaseUrl: scratchUrl, env: { JWT_SECRET, EASY_LEARN_TEST_DATABASE: "true" } });
 
     const q = async (sql: string, values: unknown[] = []): Promise<any[]> =>
       (await db.query(sql, values)).rows;
@@ -220,9 +220,15 @@ async function main() {
        VALUES ($1, 'Attribution Assignment', $2, $3, $4, 'published', 100, true) RETURNING id`,
       [schoolA, classA, subjectA, ids["single"]]
     )).id as string;
+    // Enrollment is now required for submission uploads (security/pr43 follow-up).
+    // The original INSERT ... SELECT academic_years would insert 0 rows when no
+    // academic year exists, leaving the learner unenrolled and causing the new
+    // enrollment guard to correctly reject the upload. Insert directly.
+    await q(`INSERT INTO learner_classes (school_id, learner_id, class_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [schoolA, ids["learner-dual"], classA]).catch(() => undefined);
+    // Keep the original academic-year attempt for backward compatibility where it exists
     await q(
       `INSERT INTO learner_classes (school_id, learner_id, class_id, academic_year_id)
-       SELECT $1, $2, $3, id FROM academic_years WHERE school_id = $1 LIMIT 1`,
+       SELECT $1, $2, $3, id FROM academic_years WHERE school_id = $1 LIMIT 1 ON CONFLICT DO NOTHING`,
       [schoolA, ids["learner-dual"], classA]
     ).catch(() => undefined);
 

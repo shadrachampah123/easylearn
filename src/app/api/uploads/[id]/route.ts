@@ -6,7 +6,7 @@ import { uploadedFiles } from "@/db/schema";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { deleteObject, getObjectStorageConfig } from "@/lib/object-storage";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { uploadStorageDir } from "@/lib/upload-storage";
 import {
   guardSchoolContext,
@@ -20,6 +20,10 @@ export const runtime = "nodejs";
  * Remove a previously uploaded file. Only the uploader may delete their own
  * upload (used when a teacher/learner removes a file from the form before the
  * assignment/submission is saved).
+ *
+ * SEC-3: Files referenced by submissions or published assignments cannot be
+ * deleted. This prevents breaking submitted work. Returns 409 Conflict if the
+ * file is still referenced.
  */
 export async function DELETE(
   request: NextRequest,
@@ -48,6 +52,48 @@ export async function DELETE(
     // Phase 1 rule, now backed by the DB membership role: uploader or school administrator.
     if (row.uploaderId !== ctx.userId && !hasSchoolAdminRole(ctx)) {
       return errorResponse("You can only delete files you uploaded", 403);
+    }
+
+    // SEC-3: Prevent deletion of files referenced by published assignments or submissions.
+    // Check assignments (published only) and submissions in the same school that reference this file.
+    const fileIdJson = JSON.stringify([{ fileId: id }]);
+    // Check published assignments that reference this file
+    const publishedRefs = await db.execute(sql`
+      SELECT 1 FROM assignments
+      WHERE school_id = ${ctx.schoolId}::uuid
+        AND status != 'draft'
+        AND attachments @> ${fileIdJson}::jsonb
+      LIMIT 1
+    `);
+    const hasPublishedRef =
+      (publishedRefs as unknown as { rows?: unknown[] })?.rows?.length ||
+      (Array.isArray(publishedRefs) ? (publishedRefs as unknown[]).length : 0) ||
+      (publishedRefs as unknown as { rowCount?: number })?.rowCount;
+
+    if (hasPublishedRef) {
+      return errorResponse(
+        "This file is attached to a published assignment and cannot be deleted. Remove it from the assignment first.",
+        409
+      );
+    }
+
+    // Check submissions that reference this file
+    const submissionRefs = await db.execute(sql`
+      SELECT 1 FROM submissions
+      WHERE school_id = ${ctx.schoolId}::uuid
+        AND attachments @> ${fileIdJson}::jsonb
+      LIMIT 1
+    `);
+    const hasSubmissionRef =
+      (submissionRefs as unknown as { rows?: unknown[] })?.rows?.length ||
+      (Array.isArray(submissionRefs) ? (submissionRefs as unknown[]).length : 0) ||
+      (submissionRefs as unknown as { rowCount?: number })?.rowCount;
+
+    if (hasSubmissionRef) {
+      return errorResponse(
+        "This file is part of a submission and cannot be deleted. Submissions preserve their attachments for grading and audit.",
+        409
+      );
     }
 
     // Remove the database row first so nothing can resolve it mid-delete,

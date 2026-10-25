@@ -4,15 +4,17 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { db } from "@/db";
-import { assignments, uploadedFiles } from "@/db/schema";
+import { assignments, uploadedFiles, learnerClasses, teacherClasses, classes } from "@/db/schema";
 import { ensureFileUploadSchema, schemaAwareErrorMessage } from "@/lib/schema-resilience";
 import { getObjectStorageConfig, objectDownloadUrl } from "@/lib/object-storage";
+import { verifyStoredObject } from "@/lib/object-guard";
 import { uploadStorageDir } from "@/lib/upload-storage";
 import { FILE_RESPONSE_CSP, servedContentTypeFor } from "@/lib/upload-content";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   guardSchoolContext,
   SCHOOL_ADMIN_EXTENDED_ROLES,
+  isParentLinkedToActiveLearnerInClass,
   sqlFileInSchool,
 } from "@/lib/tenant";
 
@@ -100,9 +102,23 @@ export async function GET(
           headers: { "Content-Type": "application/json" },
         });
       }
+    } else if (row.purpose === "assignment") {
+      // Class-level authorization: assignment materials are course content for
+      // a specific class, not school-wide. Only participants of that class
+      // (enrolled learners, teaching staff, linked parents, and school admins)
+      // may read them. This replaces the former "any school member may read"
+      // rule which leaked materials across classes.
+      const isUploader = row.uploaderId === ctx.userId;
+      if (!isUploader && !ADMIN_ROLES.has(ctx.school.role)) {
+        const authorized = await isAuthorizedForAssignmentFile(ctx, row);
+        if (!authorized) {
+          return new Response(JSON.stringify({ success: false, error: "You cannot access this file" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
     }
-    // Purpose "assignment": readable by any authenticated member of the file's school
-    // (the tenant predicate above is what establishes membership).
 
     /* ── What is served, and how ──
        The content type is derived from the STORED FILE NAME, which ends in the
@@ -146,17 +162,46 @@ export async function GET(
           { status: 404, headers: { "Content-Type": "application/json" } }
         );
       }
-      /* The object store serves the object itself, so its response headers are
-         the ones the browser sees. The response-header overrides force the
-         server-determined content type and the safe disposition onto that
-         response — the bytes were uploaded straight to the bucket and never
-         passed through this application. */
+
+      /* The bytes were uploaded straight to the bucket and never passed through
+         this application, so the content policy the local path applies has to
+         be applied here: read the object's first bytes back and prove that the
+         object is what its key says it is, and that it is within the size
+         limits the presign request only ASKED for. */
+      const guard = await verifyStoredObject(config, row.storedName);
+      if (!guard.ok) {
+        if (guard.status === 404) {
+          /* A refused object is reported exactly like a file that does not
+             exist: the caller learns nothing about the store's contents. */
+          console.error("Object file refused:", guard.reason, row.id);
+          return new Response(JSON.stringify({ success: false, error: "File not found" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({ success: false, error: "The file store is temporarily unavailable." }),
+          { status: guard.status, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      /* The object store serves the object itself, so the STORE's response
+         headers are the ones the browser finally sees — the 307's own headers
+         below govern the redirect response only and never reach it.
+         The response-header overrides therefore carry the whole policy:
+         the server-determined content type (never a scriptable one), the safe
+         disposition (inline only for images, audio and video) and a PRIVATE
+         cache directive, so a shared cache may not store a private file.
+         A store cannot carry `X-Content-Type-Options` or a
+         `Content-Security-Policy`: the S3 API allows exactly six
+         `response-*` overrides, and any other one is rejected. */
       return new Response(null, {
         status: 307,
         headers: {
           Location: objectDownloadUrl(config, row.storedName, {
-            contentType,
+            contentType: guard.contentType,
             disposition,
+            cacheControl: "private, max-age=3600",
           }),
           "Cache-Control": "private, max-age=3600",
           "X-Content-Type-Options": "nosniff",
@@ -233,6 +278,120 @@ export async function GET(
       }),
       { status: 500, headers: { "Content-Type": "application/json" } }
     );
+  }
+}
+
+/**
+ * Class-level authorization for assignment materials.
+ *
+ * An assignment file is course content for the class it is attached to, not
+ * school-wide. We locate assignments that reference this fileId in their
+ * attachments jsonb (school-scoped) and then verify the caller participates in
+ * the assignment's class: as the owning teacher, the homeroom teacher, an
+ * assigned teacher, an enrolled learner, or a parent linked to an enrolled
+ * learner. Unattached files are only readable by their uploader and admins.
+ */
+async function isAuthorizedForAssignmentFile(
+  ctx: { schoolId: string; userId: string; school: { role: string } },
+  row: { id: string; assignmentId: string | null }
+): Promise<boolean> {
+  try {
+    const fileId = row.id;
+    let normalized: { id: string; classId: string; teacherId: string; status: string }[] = [];
+
+    // First, check direct assignment linkage via uploaded_files.assignment_id.
+    // Legacy data (and tenant-authorization-db.test.ts) sets this column even for
+    // purpose=assignment files. If it points to an assignment in the caller's school,
+    // that assignment's class is the authorization scope.
+    if (row.assignmentId) {
+      const [directAssignment] = await db
+        .select({ id: assignments.id, classId: assignments.classId, teacherId: assignments.teacherId, schoolId: assignments.schoolId, status: assignments.status })
+        .from(assignments)
+        .where(and(eq(assignments.id, row.assignmentId), eq(assignments.schoolId, ctx.schoolId)))
+        .limit(1);
+      if (directAssignment?.classId) {
+        normalized = [{ id: directAssignment.id, classId: directAssignment.classId, teacherId: directAssignment.teacherId, status: directAssignment.status }];
+      }
+    }
+
+    // If no direct linkage, search for assignments that reference this file in their attachments jsonb.
+    // This is the normal path: teacher uploads assignment material, then attaches it via
+    // POST /api/assignments where attachments is a jsonb array of {fileId,...}.
+    if (normalized.length === 0) {
+      const rows = await db.execute(sql`
+        SELECT id, class_id as "classId", teacher_id as "teacherId", status
+          FROM assignments
+         WHERE school_id = ${ctx.schoolId}::uuid
+           AND attachments @> ${JSON.stringify([{ fileId }])}::jsonb
+      `);
+      const assignmentsList = (rows as unknown as { rows?: unknown[] })?.rows ?? (rows as unknown as unknown[]);
+      const list = Array.isArray(assignmentsList) ? assignmentsList : (Array.isArray(rows) ? rows : []);
+      normalized = (list as any[]).map((r: any) => ({
+          id: r.id,
+          classId: r.classId ?? r.class_id,
+          teacherId: r.teacherId ?? r.teacher_id,
+          status: r.status,
+        })).filter((r) => r.classId);
+    }
+
+    if (normalized.length === 0) {
+      // No assignment references this file — it is unattached; deny non-admin non-uploader
+      return false;
+    }
+
+    for (const assignment of normalized) {
+      const classId = assignment.classId;
+      // SEC-7: Draft assignments hide attachments from ordinary learners/parents.
+      // Only teaching staff (owner, assigned teacher, homeroom) and admins may
+      // read draft materials. Enrolled learners/parents require published/closed.
+      const isDraft = assignment.status === "draft";
+
+      // Owner teacher of this assignment — always allowed even for drafts
+      if (assignment.teacherId === ctx.userId) return true;
+
+      // Teaching staff: assigned via teacher_classes or homeroom — allowed for drafts
+      if (ctx.school.role === "teacher" || ctx.school.role === "head_teacher" || ctx.school.role === "school_admin") {
+        const [teacherLink] = await db
+          .select({ id: teacherClasses.id })
+          .from(teacherClasses)
+          .where(and(eq(teacherClasses.schoolId, ctx.schoolId), eq(teacherClasses.teacherId, ctx.userId), eq(teacherClasses.classId, classId)))
+          .limit(1);
+        if (teacherLink) return true;
+        const [homeroom] = await db
+          .select({ id: classes.id })
+          .from(classes)
+          .where(and(eq(classes.id, classId), eq(classes.classTeacherId, ctx.userId)))
+          .limit(1);
+        if (homeroom) return true;
+        // For head_teacher/school_admin we already returned above, but keep
+        // teacher check for completeness; admins already allowed earlier.
+      }
+
+      // SEC-7: For draft assignments, ordinary learners and parents are denied
+      if (isDraft) continue;
+
+      // Enrolled learner — only for published/closed assignments
+      if (ctx.school.role === "learner") {
+        const [enrolled] = await db
+          .select({ id: learnerClasses.id })
+          .from(learnerClasses)
+          .where(and(eq(learnerClasses.schoolId, ctx.schoolId), eq(learnerClasses.learnerId, ctx.userId), eq(learnerClasses.classId, classId)))
+          .limit(1);
+        if (enrolled) return true;
+      }
+
+      // Parent linked to an enrolled learner in this class whose school membership is still active — only for published/closed
+      if (ctx.school.role === "parent") {
+        if (await isParentLinkedToActiveLearnerInClass(ctx.schoolId, ctx.userId, classId)) return true;
+      }
+
+      // Administrator already handled; but if we reach here for learner/parent/teacher
+      // and the assignment's class is the one, we have checked.
+    }
+    return false;
+  } catch {
+    // On any error (e.g. attachments column missing), fail closed
+    return false;
   }
 }
 

@@ -315,6 +315,7 @@ export async function PUT(
     if (attachments !== undefined) {
       const resolved = await resolveUploadedAttachments(attachments, {
         uploaderId: ctx.userId,
+        schoolId: ctx.schoolId,
         purpose: "assignment",
       });
       if (!resolved.ok) return errorResponse(resolved.error || "The attached files could not be verified");
