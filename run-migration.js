@@ -38,6 +38,17 @@ const MIGRATIONS = [
   "0015_cbism_school_and_membership_backfill.sql",
   "0016_school_id_columns.sql",
   "0017_school_id_not_null.sql",
+  /* 0019 lives only in drizzle/ (resolved by the fallback path below).
+     It is additive and idempotent (ADD COLUMN IF NOT EXISTS + CREATE
+     INDEX IF NOT EXISTS) and must be in the ordinary run: without it a
+     fresh deployment has no users.session_version and relies entirely
+     on runtime lazy repair — with AUTO_SCHEMA_REPAIR=false every
+     authenticated request then fails closed with 503. It is registered
+     BEFORE the gated 0018 on purpose: it touches only users and has no
+     dependency on 0018's composite foreign keys, and the runner
+     (correctly) refuses to apply anything registered after a skipped
+     gated migration. */
+  "0019_session_revocation.sql",
   "0018_composite_school_foreign_keys.sql",
 ];
 

@@ -156,3 +156,30 @@ Diff reviewed: no secrets, no migrations, no unrelated changes. **This PR must n
 5. **[Owner/QA]** Browser pass (Chromium + Firefox + WebKit) with Playwright/manual probes on a machine where browsers install; record results on Issue #54.
 6. **[Owner/DBA]** Staging manual checks: legacy NULL `school_id` attribution; confirm `users.session_version` exists in production; video Range 206 seek test.
 7. **[Team]** Post-merge independent review of the already-merged PRs #40–#42 (historical BLOCKED item), filed as its own issue.
+
+---
+
+## 8. Independent review addendum (separate from author's self-review) — main @ fb31b39
+
+Reviewer stance: PR #57 (`security/issue54-current-state-2026-10-25` @ `d9db71d`, docs-only, 44-line addendum) was checked against actual source, not trusted. Its claims reconcile: PR #57 CI run `40243684780` tested exactly `d9db71d` and passed; main's code files are byte-identical to the reviewed PR #55 final head except `src/lib/tenant.ts`, whose only delta is the additive designated-public-school resolver; PR #56 (`fb31b39`) scopes `?public=true` announcements to the `cbism` school and fails closed to an empty feed. PR #57's "no local execution" disclaimer is accurate — the local results below are this review's own.
+
+### Independent findings
+
+| # | Severity | Finding | Disposition |
+|---|---|---|---|
+| I-1 | Medium | **Ordinary migration run never applied 0019.** `run-migration.js` listed 0000–0018 only; verified on a fresh disposable DB: `users.session_version` ABSENT after `node run-migration.js`. Fresh deployments depended entirely on runtime lazy repair; with `AUTO_SCHEMA_REPAIR=false` every authenticated request would fail closed to 503 with no migration-time signal. | **FIXED** (this review's PR): `0019_session_revocation.sql` registered before the gated 0018 (no dependency; runner refuses post-gated registrations), existing assertions updated, new assertion proves the column exists after the ordinary run. Migration suite 20/20 |
+| I-2 | Low | PR #57 addendum §7 remains a PR-#57-branch-only document until merged; its GO statement ("conditional GO") could be misread as sign-off. | Noted here: **release sign-off stays NO-GO** (below). PR #57 left open/draft as instructed |
+
+All other areas re-verified on `fb31b39` by local execution: typecheck, lint, `npm audit` (0), `npm test`, `test:auth-security` (26/49/31/34/14), `test:db` (257 PASS incl. fail-closed 3/3, autorepair 2/2, admin-reset 4/4, legacy-NULL attribution cases), `test:tenant-auth`, `test:review-pr45`, `test:mutation`, `test:tenant-integrity`, `test:integration`, `test:tls-e2e` 7/7, production build — all PASS.
+
+### External checks
+
+- **R2/S3: BLOCKED** — no disposable bucket/credentials in environment. Operator: create a throwaway bucket, set non-production `OBJECT_STORAGE_*` + `OBJECT_STORAGE_LIVE_TEST=true`, run `npx tsx tests/object-storage-real-provider-harness.test.ts`, delete bucket. Never production.
+- **Browsers: BLOCKED** — no Chromium/Firefox/WebKit installable here (no repo Playwright config; browser CDNs unreachable). Operator: run Playwright/manual probes in a browser-capable CI and attach results.
+- **Staging DB checks: PARTIAL** — legacy-NULL and tenant boundaries verified in disposable DB suites; production/staging `session_version` presence, video Range, and NULL-row checks on real staging remain owner/DBA actions (read-only queries only).
+- **Neon: BLOCKED/UNVERIFIED** — no Neon access; no recovery claimed. Owner console steps in §3.
+
+### GO / NO-GO (independent)
+
+- **Code security (main @ fb31b39 + this fix): GO** for review/merge of the I-1 fix PR after its CI passes.
+- **Production release: NO-GO** until: (1) a human (not the author) reviews/merges, (2) production `session_version` presence is confirmed read-only, (3) R2 live test and browser pass are executed where infrastructure permits or formally risk-accepted.
