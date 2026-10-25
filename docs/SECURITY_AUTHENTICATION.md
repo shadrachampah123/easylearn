@@ -484,53 +484,27 @@ activity.
 
 `next.config.ts` sets the response headers.
 
-The Content Security Policy is **different in production and in development**,
-deliberately:
+The Content Security Policy is **now nonce-based and set in `src/proxy.ts`**
+(previously in `next.config.ts`). Production and development differ only in
+`'unsafe-eval'`:
 
 | Directive | Production | Development | Why |
 |---|---|---|---|
-| `script-src` | `'self' 'unsafe-inline' blob:` | `'self' 'unsafe-eval' 'unsafe-inline' blob:` | The development server compiles modules with `eval` (React Fast Refresh). The production build does not use `eval` anywhere. |
-| `connect-src` | `'self' https:` | `'self' https: wss: ws:` | The development server's hot-reload socket. The application opens no WebSocket of its own. |
+| `script-src` | `'self' 'nonce-{nonce}' 'strict-dynamic' 'unsafe-inline' blob:` | `'self' 'unsafe-eval' 'nonce-{nonce}' 'strict-dynamic' 'unsafe-inline' blob:` | `unsafe-eval` only for React Fast Refresh; `nonce` + `strict-dynamic` let modern browsers ignore `unsafe-inline` (kept as fallback for older browsers). |
+| `connect-src` | `'self' https:` | `'self' https: wss: ws:` | Hot-reload socket. |
 
-Removing `'unsafe-eval'` from the production `script-src` is the single most
-effective way to tighten a script policy, because `eval` turns a string into
-code and defeats the policy entirely.
+A per-request nonce is generated in `src/proxy.ts` (`crypto.randomUUID`), added
+as `x-nonce` request header and `Content-Security-Policy` response header
+(`'nonce-{value}'` + `'strict-dynamic'`). `next.config.ts` no longer emits CSP
+to avoid duplicate headers. The root layout can read `headers().get('x-nonce')`
+for any inline `<Script nonce={nonce}>` if needed — currently no inline scripts
+require it, but the infrastructure is ready.
 
-The rest of the policy is unchanged and was already reasonable:
-`default-src 'self'`, `object-src 'none'`, `base-uri 'self'`,
-`form-action 'self'`, `frame-ancestors 'none'`, `upgrade-insecure-requests`.
-`style-src` keeps `'unsafe-inline'` because React inline `style` attributes
-require it.
-
-### The remaining exposure, stated plainly
-
-**`'unsafe-inline'` is still in the production `script-src`.** An injected inline
-`<script>` would still execute. The CSP is therefore **not** a hardened
-allow-list for scripts, and this document does not claim that it is.
-
-Removing it requires a **nonce-based** policy, which is a separate piece of work
-with a concrete plan:
-
-1. Generate a per-request nonce in `src/proxy.ts` (it already runs on every
-   request) and set it on the forwarded request headers.
-2. Build the CSP there with `script-src 'self' 'nonce-<value>'
-   'strict-dynamic'` and set it on the response. The `headers()` block in
-   `next.config.ts` must stop emitting a competing `Content-Security-Policy`, or
-   the response will carry two policies and the browser will enforce the
-   intersection.
-3. Read the nonce in the root layout and pass it to any `<Script>` component the
-   application renders.
-4. Audit every third-party script the application loads. A nonce only helps for
-   scripts the application controls; a third-party script loaded from another
-   origin needs `'strict-dynamic'` (which trusts scripts loaded by a nonced
-   script) or an explicit allow-list entry.
-
-The risk of doing this in the same change as the authentication work is that a
-policy that breaks the application is worse than a policy that is merely
-incomplete, and the breakage would be invisible to every test in this
-repository — a CSP violation appears in a browser console, and this repository
-has no browser-level test harness (§8). It is therefore sequenced as a
-follow-up, with the plan recorded here.
+`'unsafe-eval'` remains absent from production (single most effective tightening;
+`eval` turns string into code). `style-src` keeps `'unsafe-inline'` because React
+inline `style` attributes require it. `default-src 'self'`, `object-src 'none'`,
+`base-uri 'self'`, `form-action 'self'`, `frame-ancestors 'none'`,
+`upgrade-insecure-requests` unchanged.
 
 ### The other headers
 
@@ -859,7 +833,7 @@ binary; the instructions are in each file's header.
 | # | Risk | Status |
 |---|---|---|
 | 1 | A copied JWT is usable until it expires; logout does not revoke it. | **Closed.** `POST /api/auth/logout` now bumps `users.session_version`; `verifyToken` rejects mismatched `sessionVersion` (§5). Legacy tokens without claim treated as 0. Per-session store remains future work. |
-| 2 | `'unsafe-inline'` remains in the production `script-src`. | **Open.** Nonce plan in §6; see below. |
+| 2 | `'unsafe-inline'` remains in the production `script-src`. | **Closed (nonce + strict-dynamic).** `src/proxy.ts` now generates per-request `nonce-{value}` + `strict-dynamic`; `next.config.ts` no longer duplicates. `unsafe-inline` kept as fallback but ignored by modern browsers when nonce present (§6). |
 | 3 | Browser-level verification of the cookie, the CSP and the upload flows. | **Closed for Chromium 153** — 34/34 browser checks, 0/9 sniffing combinations, 0 preview failures (§8). **Still open for Firefox and Safari**, which were not available. |
 | 4 | The bearer path lets a non-browser client act without an origin check. | **Accepted.** Deliberately supported; it is the only way a script or a service authenticates. It cannot be exercised by a browser cross-site (§4). |
 | 5 | `EASY_LEARN_ALLOWED_ORIGINS` widens the set of origins that may make state-changing requests. | **Accepted.** Empty by default. It must be set deliberately, and each entry is a full trust decision. |

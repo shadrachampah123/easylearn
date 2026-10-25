@@ -3,52 +3,12 @@ import { FILE_RESPONSE_CSP } from "./src/lib/upload-content";
 
 const nextConfig: NextConfig = {
   async headers() {
+    // CSP is now set in src/proxy.ts with a per-request nonce (Risk #2).
+    // Keeping 'unsafe-inline' as fallback for browsers without nonce support,
+    // but modern browsers will enforce 'nonce-*' + 'strict-dynamic' and ignore
+    // 'unsafe-inline' per CSP spec. next.config no longer emits CSP to avoid
+    // duplicate headers; see docs/SECURITY_AUTHENTICATION.md §6.
     const isProduction = process.env.NODE_ENV === "production";
-
-    /*
-     * Content Security Policy.
-     *
-     * The development and production policies differ deliberately:
-     *
-     *   - `'unsafe-eval'` is needed by the Next.js development server (React Fast
-     *     Refresh compiles modules with `eval`). The PRODUCTION build does not use
-     *     `eval` anywhere, so the production policy does not allow it. `eval` is the
-     *     single most effective way to defeat a script-src policy, because it turns
-     *     a string into code.
-     *   - `ws:` / `wss:` are only needed by the development server's hot-reload
-     *     socket. The application opens no WebSocket of its own.
-     *
-     * KNOWN REMAINING EXPOSURE: `'unsafe-inline'` is still present in `script-src`,
-     * so an injected inline `<script>` would still execute. Removing it requires a
-     * nonce-based policy, which needs the root layout to pass a per-request nonce to
-     * every script and a review of every third-party script the app loads. That is
-     * tracked as a follow-up in docs/SECURITY_AUTHENTICATION.md rather than being
-     * half-done here: a policy that breaks the application is worse than a policy
-     * that is merely incomplete.
-     */
-    const scriptSrc = isProduction
-      ? "script-src 'self' 'unsafe-inline' blob:"
-      : "script-src 'self' 'unsafe-eval' 'unsafe-inline' blob:";
-
-    const connectSrc = isProduction
-      ? "connect-src 'self' https:"
-      : "connect-src 'self' https: wss: ws:";
-
-    const csp = [
-      "default-src 'self'",
-      scriptSrc,
-      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-      "font-src 'self' data: https://fonts.gstatic.com",
-      "img-src 'self' data: blob: https: http:",
-      "media-src 'self' data: blob: https:",
-      connectSrc,
-      "frame-src 'self'",
-      "object-src 'none'",
-      "base-uri 'self'",
-      "form-action 'self'",
-      "frame-ancestors 'none'",
-      "upgrade-insecure-requests",
-    ].join("; ");
 
     const securityHeaders = [
       {
@@ -75,10 +35,7 @@ const nextConfig: NextConfig = {
         key: "Permissions-Policy",
         value: "camera=(), microphone=(), geolocation=(), interest-cohort=()",
       },
-      {
-        key: "Content-Security-Policy",
-        value: csp,
-      },
+      // Content-Security-Policy is set in src/proxy.ts with per-request nonce.
     ];
 
     // HSTS only in production
