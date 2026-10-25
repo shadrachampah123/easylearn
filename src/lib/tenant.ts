@@ -34,6 +34,25 @@ import { isMissingColumn, isMissingRelation } from "@/lib/schema-resilience";
  *  membership verification. */
 export const CBISM_SCHOOL_SLUG = "cbism";
 
+/**
+ * Resolve the designated public-school identifier for unauthenticated public feeds.
+ * Keep tenant-table reads centralized in this module rather than route handlers.
+ */
+export async function getDesignatedPublicSchoolId(): Promise<string | null> {
+  try {
+    const rows = await db
+      .select({ id: schools.id })
+      .from(schools)
+      .where(eq(schools.slug, CBISM_SCHOOL_SLUG))
+      .limit(1);
+    return rows[0]?.id ?? null;
+  } catch (error) {
+    // Fail closed: no designated school means no public announcements.
+    console.error("[tenant] unable to resolve designated public school", error);
+    return null;
+  }
+}
+
 /** Platform-level role. Never a school membership role (plan §7). */
 export const PLATFORM_ROLE = "super_admin";
 

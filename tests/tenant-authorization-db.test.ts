@@ -159,7 +159,7 @@ async function main() {
     const passwordHash: string = await bcrypt.hash("Phase2c-Test-Password!", 4);
 
     const schoolA = (await one(
-      `INSERT INTO schools (name, short_name, slug) VALUES ('Tenant School A', 'TSA', 'tenant-a') RETURNING id`
+      `INSERT INTO schools (name, short_name, slug) VALUES ('Tenant School A', 'TSA', 'cbism') ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id`
     )).id as string;
     const schoolB = (await one(
       `INSERT INTO schools (name, short_name, slug) VALUES ('Tenant School B', 'TSB', 'tenant-b') RETURNING id`
