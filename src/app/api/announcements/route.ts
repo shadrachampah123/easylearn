@@ -1,12 +1,12 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
-import { announcements, users, schools } from "@/db/schema";
+import { announcements, users } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { desc, eq, or, and, isNull, sql } from "drizzle-orm";
 import {
-  CBISM_SCHOOL_SLUG,
+  getDesignatedPublicSchoolId,
   guardSchoolContext,
   hasSchoolRole,
   isClassInSchool,
@@ -33,6 +33,9 @@ export async function GET(request: NextRequest) {
 
     // Public announcements can be accessed without authentication for marketing website
     if (isPublic) {
+      const publicSchoolId = await getDesignatedPublicSchoolId();
+      if (!publicSchoolId) return successResponse([]);
+
       const results = await db
         .select({
           id: announcements.id,
@@ -46,8 +49,7 @@ export async function GET(request: NextRequest) {
         })
         .from(announcements)
         .leftJoin(users, eq(announcements.authorId, users.id))
-        .innerJoin(schools, eq(announcements.schoolId, schools.id))
-        .where(and(eq(announcements.isPublic, true), eq(schools.slug, CBISM_SCHOOL_SLUG)))
+        .where(and(eq(announcements.isPublic, true), eq(announcements.schoolId, publicSchoolId)))
         .orderBy(desc(announcements.isPinned), desc(announcements.createdAt))
         .limit(20);
 
