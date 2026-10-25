@@ -1,11 +1,12 @@
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { isSchemaOutOfDate, legacyInsert } from "@/lib/schema-resilience";
-import { announcements, users } from "@/db/schema";
+import { announcements, users, schools } from "@/db/schema";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { logActivity } from "@/lib/activity";
 import { desc, eq, or, and, isNull, sql } from "drizzle-orm";
 import {
+  CBISM_SCHOOL_SLUG,
   guardSchoolContext,
   hasSchoolRole,
   isClassInSchool,
@@ -45,7 +46,8 @@ export async function GET(request: NextRequest) {
         })
         .from(announcements)
         .leftJoin(users, eq(announcements.authorId, users.id))
-        .where(eq(announcements.isPublic, true))
+        .innerJoin(schools, eq(announcements.schoolId, schools.id))
+        .where(and(eq(announcements.isPublic, true), eq(schools.slug, CBISM_SCHOOL_SLUG)))
         .orderBy(desc(announcements.isPinned), desc(announcements.createdAt))
         .limit(20);
 
