@@ -297,7 +297,7 @@ async function isAuthorizedForAssignmentFile(
 ): Promise<boolean> {
   try {
     const fileId = row.id;
-    let normalized: { id: string; classId: string; teacherId: string }[] = [];
+    let normalized: { id: string; classId: string; teacherId: string; status: string }[] = [];
 
     // First, check direct assignment linkage via uploaded_files.assignment_id.
     // Legacy data (and tenant-authorization-db.test.ts) sets this column even for
@@ -305,12 +305,12 @@ async function isAuthorizedForAssignmentFile(
     // that assignment's class is the authorization scope.
     if (row.assignmentId) {
       const [directAssignment] = await db
-        .select({ id: assignments.id, classId: assignments.classId, teacherId: assignments.teacherId, schoolId: assignments.schoolId })
+        .select({ id: assignments.id, classId: assignments.classId, teacherId: assignments.teacherId, schoolId: assignments.schoolId, status: assignments.status })
         .from(assignments)
         .where(and(eq(assignments.id, row.assignmentId), eq(assignments.schoolId, ctx.schoolId)))
         .limit(1);
       if (directAssignment?.classId) {
-        normalized = [{ id: directAssignment.id, classId: directAssignment.classId, teacherId: directAssignment.teacherId }];
+        normalized = [{ id: directAssignment.id, classId: directAssignment.classId, teacherId: directAssignment.teacherId, status: directAssignment.status }];
       }
     }
 
@@ -319,7 +319,7 @@ async function isAuthorizedForAssignmentFile(
     // POST /api/assignments where attachments is a jsonb array of {fileId,...}.
     if (normalized.length === 0) {
       const rows = await db.execute(sql`
-        SELECT id, class_id as "classId", teacher_id as "teacherId"
+        SELECT id, class_id as "classId", teacher_id as "teacherId", status
           FROM assignments
          WHERE school_id = ${ctx.schoolId}::uuid
            AND attachments @> ${JSON.stringify([{ fileId }])}::jsonb
@@ -330,6 +330,7 @@ async function isAuthorizedForAssignmentFile(
           id: r.id,
           classId: r.classId ?? r.class_id,
           teacherId: r.teacherId ?? r.teacher_id,
+          status: r.status,
         })).filter((r) => r.classId);
     }
 
@@ -340,10 +341,15 @@ async function isAuthorizedForAssignmentFile(
 
     for (const assignment of normalized) {
       const classId = assignment.classId;
-      // Owner teacher of this assignment
+      // SEC-7: Draft assignments hide attachments from ordinary learners/parents.
+      // Only teaching staff (owner, assigned teacher, homeroom) and admins may
+      // read draft materials. Enrolled learners/parents require published/closed.
+      const isDraft = assignment.status === "draft";
+
+      // Owner teacher of this assignment — always allowed even for drafts
       if (assignment.teacherId === ctx.userId) return true;
 
-      // Teaching staff: assigned via teacher_classes or homeroom
+      // Teaching staff: assigned via teacher_classes or homeroom — allowed for drafts
       if (ctx.school.role === "teacher" || ctx.school.role === "head_teacher" || ctx.school.role === "school_admin") {
         const [teacherLink] = await db
           .select({ id: teacherClasses.id })
@@ -361,7 +367,10 @@ async function isAuthorizedForAssignmentFile(
         // teacher check for completeness; admins already allowed earlier.
       }
 
-      // Enrolled learner
+      // SEC-7: For draft assignments, ordinary learners and parents are denied
+      if (isDraft) continue;
+
+      // Enrolled learner — only for published/closed assignments
       if (ctx.school.role === "learner") {
         const [enrolled] = await db
           .select({ id: learnerClasses.id })
@@ -371,7 +380,7 @@ async function isAuthorizedForAssignmentFile(
         if (enrolled) return true;
       }
 
-      // Parent linked to an enrolled learner in this class whose school membership is still active
+      // Parent linked to an enrolled learner in this class whose school membership is still active — only for published/closed
       if (ctx.school.role === "parent") {
         if (await isParentLinkedToActiveLearnerInClass(ctx.schoolId, ctx.userId, classId)) return true;
       }

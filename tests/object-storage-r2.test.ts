@@ -328,14 +328,27 @@ test("a private bucket uses a signed GET URL by default", () => {
   });
 });
 
-test("OBJECT_STORAGE_PUBLIC_URL switches downloads to the public base URL", () => {
+test("OBJECT_STORAGE_PUBLIC_URL switches downloads to the public base URL when explicitly allowed", () => {
   withEnv({ ...R2, OBJECT_STORAGE_PUBLIC_URL: "https://files.example.com/" }, () => {
-    const url = objectDownloadUrl(getObjectStorageConfig(), "uploads/assignment/1111-2222.pdf");
+    const url = objectDownloadUrl(getObjectStorageConfig(), "uploads/assignment/1111-2222.pdf", {
+      allowPublic: true,
+    });
     assert.strictEqual(
       url,
       "https://files.example.com/uploads/assignment/1111-2222.pdf",
       "the trailing slash on the public base must not double up"
     );
+  });
+});
+
+test("protected files never use public URL even when OBJECT_STORAGE_PUBLIC_URL is set", () => {
+  withEnv({ ...R2, OBJECT_STORAGE_PUBLIC_URL: "https://files.example.com/" }, () => {
+    const url = objectDownloadUrl(getObjectStorageConfig(), KEY);
+    assert.ok(
+      url.includes("X-Amz-Signature="),
+      "protected files must use presigned URLs, not public URLs"
+    );
+    assert.ok(!url.startsWith("https://files.example.com/"), "protected file leaked to public URL");
   });
 });
 

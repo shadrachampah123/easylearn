@@ -129,7 +129,7 @@ function objectUrlParts(config: ObjectStorageConfig, key: string): UrlParts {
 export function objectDownloadUrl(
   config: ObjectStorageConfig,
   key: string,
-  options?: { contentType?: string; disposition?: string; cacheControl?: string }
+  options?: { contentType?: string; disposition?: string; cacheControl?: string; allowPublic?: boolean }
 ): string {
   const query = new URLSearchParams();
   if (options?.contentType) query.set("response-content-type", options.contentType);
@@ -142,7 +142,12 @@ export function objectDownloadUrl(
   if (options?.cacheControl) query.set("response-cache-control", options.cacheControl);
   const suffix = query.toString();
 
-  if (config.publicBaseUrl) {
+  // SEC-1: Protected files (assignments/submissions) must never use permanent
+  // public URLs. Only explicitly public files may use the public base URL.
+  // All EasyLearn uploaded files are private and require authentication, so
+  // the default is presigned. Public mode is only for intentionally public
+  // assets and must be explicitly opted into per-call.
+  if (config.publicBaseUrl && options?.allowPublic) {
     const base = `${config.publicBaseUrl.replace(/\/+$/, "")}/${canonicalUri(key)}`;
     return suffix ? `${base}?${suffix}` : base;
   }
@@ -154,6 +159,39 @@ export function objectDownloadUrl(
     responseContentDisposition: options?.disposition,
     responseContentCacheControl: options?.cacheControl,
   }).url;
+}
+
+/**
+ * SEC-1: Validate object-storage configuration for production.
+ * Fails clearly when OBJECT_STORAGE_PUBLIC_URL is set in production,
+ * because all EasyLearn files are private and must not be exposed via
+ * permanent unauthenticated URLs. Public buckets must use presigned URLs.
+ */
+export function assertObjectStorageConfigForProduction(): void {
+  const publicBaseUrl = cleanEnv(process.env.OBJECT_STORAGE_PUBLIC_URL).replace(/\/+$/, "");
+  if (publicBaseUrl && process.env.NODE_ENV === "production") {
+    // Allow explicit override for intentional public-asset deployments that
+    // have been audited — the override must be set to "true" to bypass.
+    const allowPublic = cleanEnv(process.env.OBJECT_STORAGE_ALLOW_PUBLIC_URL).toLowerCase();
+    if (allowPublic !== "true" && allowPublic !== "1") {
+      throw new Error(
+        `OBJECT_STORAGE_PUBLIC_URL is set to \"${publicBaseUrl}\" in production. ` +
+          "All EasyLearn files are private and must not be served via permanent public URLs. " +
+          "Unset OBJECT_STORAGE_PUBLIC_URL to use presigned URLs, or set OBJECT_STORAGE_ALLOW_PUBLIC_URL=true if this deployment has been audited for public assets."
+      );
+    }
+  }
+}
+
+/**
+ * SEC-1: Check if using public URL is safe for a given file purpose.
+ * Submission files are always protected; assignment files are protected unless
+ * explicitly marked public (none are currently).
+ */
+export function isPublicUrlSafeForPurpose(purpose: string | null | undefined): boolean {
+  // All current purposes are protected. Public URLs are never safe for them.
+  if (purpose === "submission" || purpose === "assignment") return false;
+  return false;
 }
 
 /* ── AWS Signature Version 4 presigner (no SDK dependency) ── */

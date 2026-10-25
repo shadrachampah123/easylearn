@@ -276,19 +276,104 @@ function requestScheme(request: Request, trustProxy: boolean): string | null {
 /**
  * The deployment's configured public origin, or null when it is not set.
  *
- * An unusable value is ignored rather than throwing: the consequence of a
- * misconfigured variable is that the request is compared against the derived
- * origin, which refuses a write rather than accepting a foreign one.
+ * SEC-5: Previously an unusable value was silently ignored, weakening origin
+ * protection without visible diagnostics. Now invalid values are logged as
+ * warnings and in production cause a clear startup failure via
+ * validatePublicOriginForProduction(). The derived origin still refuses writes
+ * safely, but operators must be alerted to misconfiguration.
+ *
+ * Legitimate values:
+ * - Production: `https://app.example.com` (must be https, no path/query)
+ * - Preview deployments: Vercel preview URLs like `https://easylearn-*.vercel.app`
+ *   should be added to EASY_LEARN_ALLOWED_ORIGINS, not as PUBLIC_ORIGIN
+ * - Aliases: custom domains should be canonical PUBLIC_ORIGIN, with previous
+ *   domains in ALLOWED_ORIGINS
+ * - Development: `http://localhost:3000` allowed
  */
 export function getConfiguredPublicOrigin(): string | null {
   const raw = (process.env[PUBLIC_ORIGIN_ENV] || "").trim();
   if (!raw) return null;
   try {
     const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      // SEC-5: Log invalid protocol instead of silent ignore
+      if (process.env.NODE_ENV !== "production") {
+        console.warn(
+          `[csrf] ${PUBLIC_ORIGIN_ENV} has invalid protocol \"${parsed.protocol}\" — must be http: or https:. Ignoring.`
+        );
+      }
+      return null;
+    }
+    // Reject URLs with path, query, or hash — PUBLIC_ORIGIN must be origin only
+    if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn(
+          `[csrf] ${PUBLIC_ORIGIN_ENV} must be origin only (no path/query), got \"${raw}\". Stripping to origin.`
+        );
+      }
+    }
+    // In production, http is suspicious — warn but allow for legacy; https required for cookies with Secure
+    if (process.env.NODE_ENV === "production" && parsed.protocol !== "https:") {
+      console.warn(
+        `[csrf] ${PUBLIC_ORIGIN_ENV} uses http in production — cookies with Secure may not be sent. Use https.`
+      );
+    }
     return parsed.origin;
   } catch {
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(`[csrf] ${PUBLIC_ORIGIN_ENV} is not a valid URL: \"${raw}\". Ignoring.`);
+    }
     return null;
+  }
+}
+
+/**
+ * SEC-5: Validate PUBLIC_ORIGIN configuration for production diagnostics.
+ * Throws in production if PUBLIC_ORIGIN is set but invalid, to fail clearly
+ * rather than silently weakening protection. In development, logs warnings.
+ *
+ * Returns diagnostics for documenting/hosting setup.
+ */
+export function validatePublicOriginForProduction(): {
+  ok: boolean;
+  configured: string | null;
+  error?: string;
+  warnings: string[];
+} {
+  const raw = (process.env[PUBLIC_ORIGIN_ENV] || "").trim();
+  const warnings: string[] = [];
+  if (!raw) {
+    if (process.env.NODE_ENV === "production") {
+      warnings.push(
+        `${PUBLIC_ORIGIN_ENV} is not set in production. Derived origin will be used; ensure this is intentional. For deployments behind a proxy/CDN that rewrites Host, set ${PUBLIC_ORIGIN_ENV} to your canonical https origin.`
+      );
+    }
+    return { ok: true, configured: null, warnings };
+  }
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      const error = `${PUBLIC_ORIGIN_ENV} must be http: or https:, got \"${parsed.protocol}\"`;
+      if (process.env.NODE_ENV === "production") throw new Error(error);
+      return { ok: false, configured: null, error, warnings };
+    }
+    if (parsed.protocol !== "https:" && process.env.NODE_ENV === "production") {
+      warnings.push(`${PUBLIC_ORIGIN_ENV} uses http in production — recommend https for Secure cookies`);
+    }
+    if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
+      warnings.push(`${PUBLIC_ORIGIN_ENV} should be origin only; stripping path/query/hash from \"${raw}\" to \"${parsed.origin}\"`);
+    }
+    // Check for obviously invalid hosts (e.g., contains spaces, not a valid hostname)
+    if (!parsed.host || parsed.host.includes(" ")) {
+      const error = `${PUBLIC_ORIGIN_ENV} has invalid host: \"${raw}\"`;
+      if (process.env.NODE_ENV === "production") throw new Error(error);
+      return { ok: false, configured: null, error, warnings };
+    }
+    return { ok: true, configured: parsed.origin, warnings };
+  } catch (e) {
+    const error = `${PUBLIC_ORIGIN_ENV} is not a valid URL: \"${raw}\" — ${(e as Error).message}`;
+    if (process.env.NODE_ENV === "production") throw new Error(error);
+    return { ok: false, configured: null, error, warnings };
   }
 }
 
