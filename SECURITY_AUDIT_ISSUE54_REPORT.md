@@ -156,3 +156,47 @@ Diff reviewed: no secrets, no migrations, no unrelated changes. **This PR must n
 5. **[Owner/QA]** Browser pass (Chromium + Firefox + WebKit) with Playwright/manual probes on a machine where browsers install; record results on Issue #54.
 6. **[Owner/DBA]** Staging manual checks: legacy NULL `school_id` attribution; confirm `users.session_version` exists in production; video Range 206 seek test.
 7. **[Team]** Post-merge independent review of the already-merged PRs #40–#42 (historical BLOCKED item), filed as its own issue.
+
+
+---
+
+## 7. Current-state addendum — 2026-10-25 (main @ fb31b39)
+
+This addendum supersedes the report's earlier audited-commit label and any status that has changed since the original run. It does not claim unavailable infrastructure checks were performed.
+
+### Reconciled GitHub evidence
+
+- Current main: fb31b39b175b66b832f15344907495765fd137fa, commit `fix(security): scope public announcements to CBISM`.
+- Main CI run #96 succeeded: [run 40242086333](https://github.com/shadrachampah123/easylearn/actions/runs/40242086333). Its single job shows the disposable PostgreSQL suites, security/auth tests, TLS E2E, typecheck, production build, and lint all completed successfully.
+- PR #56 merged as fb31b39. `src/app/api/announcements/route.ts` resolves the designated school through `getDesignatedPublicSchoolId()` and filters public announcements by that school; `src/lib/tenant.ts` returns no designated school on lookup failure, so the public feed fails closed to an empty result.
+- The older report's statement that public-announcement scope was awaiting an owner decision is superseded by PR #56. It is scoped to the designated `cbism` school today; per-school public-site configuration remains future work.
+- Preserve `security/audit-pr40-49-final` untouched.
+
+### Session revocation follow-up — do not conflate commit with main
+
+Commit `346aba04df7a4bb1c6b9d98a54f73164b8ea479f` describes a further fail-closed correction for session-revocation checks: token verification should not accept a token when the revocation database check fails, and password change should return 503 without changing the password if revocation cannot be guaranteed. Its PR #55 CI run #88 succeeded ([run 40237532084](https://github.com/shadrachampah123/easylearn/actions/runs/40237532084)). However, the currently fetched main head is `fb31b39`; this follow-up commit is not the current main head. Treat the fail-closed follow-up as not yet verified on current main until ancestry/source confirms it is included. Do not infer production deployment from CI success on a PR commit.
+
+### Current-state matrix
+
+| Area | Current assessment | Evidence / next action |
+|---|---|---|
+| Public announcements tenant boundary | **FIXED on main** | `src/app/api/announcements/route.ts` filters by designated `cbism` school; `src/lib/tenant.ts` fail-closed resolver. Main CI #96 green. |
+| Proxy CSRF / forwarded-header behavior | **Automated checks pass; external live matrix not re-run in this addendum** | Main CI #96 includes auth/CSRF suites. Do not treat historical disposable production probes as newly executed against this exact SHA. |
+| Uploaded file CSP sandbox | **Code fix present on main; runtime re-probe not performed here** | `src/proxy.ts` documents the `/api/files/*` carve-out; historical report records 39/39 disposable probe on PR #55's earlier head. Main CI #96 green. |
+| Attachment authorization / cross-school access | **Automated regression coverage passes in main CI** | CI job reports tenant authorization, database, integration, and mutation suites passed. Live object-storage provider behavior remains separate. |
+| Password-change session revocation | **Fail-closed follow-up requires ancestry confirmation** | PR #55 CI passed on its commit, but current main is `fb31b39`. Confirm whether `346aba0` is in current main ancestry and inspect the exact current route/auth implementation before marking fully verified. |
+| Real R2/S3 presign → upload → download, expiry, tampered signature, content type, range, deletion safeguards | **BLOCKED / not verified against a real provider** | No disposable test-bucket credentials/infrastructure have been provided in this environment. Do not use production bucket credentials. |
+| Playwright Firefox/WebKit | **BLOCKED / not verified in this run** | No browser installation/run was performed here. Run in a disposable CI/QA environment with browser binaries installed and attach results. |
+| Legacy rows with NULL school attribution | **Automated negative case reported; manual staging verification outstanding** | Do not mutate production. In staging, verify cross-school denial for legacy NULL attribution and record redacted results. |
+| Neon deleted preview branch recovery | **UNVERIFIED — no Neon access** | No Neon API/dashboard access was available to confirm branch ID, parent, retention window, or restore outcome. Follow owner-only console steps in §3; restore only to a new branch and do not change production connection settings. |
+| Independent security review | **NOT COMPLETE unless a separate reviewer submits a review** | Author self-review and green CI are not a substitute for independent review. |
+
+### Execution limits for this addendum
+
+This update was reconciled using GitHub API source, pull-request metadata, and workflow job summaries. It did not execute repository commands in a local checkout, connect to a disposable database, start production-mode HTTP probes, install Playwright browsers, or access Neon/R2. Therefore, no local test, real-provider, browser, or Neon recovery result is newly claimed here. Main CI #96 is the verified automated evidence for `fb31b39`.
+
+### Go / No-Go — current main
+
+- **Code/CI: conditional GO** for the exact current main commit because configured CI #96 is green.
+- **Release/security sign-off: NO-GO pending** confirmation of the session-revocation fail-closed follow-up on main, independent security review, and the infrastructure-blocked R2/browser/legacy-row/Neon checks as applicable.
+- No production database, secret, storage, Neon branch, or historical audit branch was modified by this addendum.
