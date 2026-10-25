@@ -11,12 +11,13 @@ import { getTokenFromRequest, verifyToken } from "@/lib/auth";
  * next use, even though it is still inside its 24h expiry. This revokes all
  * sessions for the user; per-session revocation would require a session table.
  */
-export async function POST(request: Request) {
+export async function POST(request?: Request) {
   // Best-effort revocation: if we can identify the user, bump their version.
   // Fail open — clearing the cookie is still the primary logout even if DB is
   // unavailable or pre-migration.
   try {
-    const token = getTokenFromRequest(request);
+    if (request) {
+      const token = getTokenFromRequest(request as Request);
     if (token) {
       const payload = await verifyToken(token);
       // verifyToken already checks version, but for logout we need to handle
@@ -50,6 +51,7 @@ export async function POST(request: Request) {
           // Missing column pre-migration — ignore, cookie clear still happens.
         }
       }
+    }
     }
   } catch {
     // Revocation failure must not prevent cookie clear.
