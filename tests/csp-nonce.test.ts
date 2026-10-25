@@ -65,6 +65,17 @@ function testBuildCsp() {
     assert(!cfg.includes("script-src 'self' 'nonce-"), "main nonce CSP should be in proxy, not next.config");
     assert(!cfg.includes("default-src 'self'") || cfg.includes("FILE_RESPONSE_CSP"), "next.config should not emit main CSP (only file response CSP allowed)");
   });
+  await test("Proxy must not overwrite the uploaded-file sandbox CSP (PR #52/#53 regression)", async()=>{
+    const fs = await import("fs");
+    const path = await import("path");
+    const proxy = fs.readFileSync(path.join(process.cwd(), "src/proxy.ts"), "utf8");
+    // The global nonce CSP replaced FILE_RESPONSE_CSP (sandbox; default-src
+    // 'none') on /api/files/* when set unconditionally from the proxy —
+    // proven live by tests/manual/live-upload-content-probe.js (37/39).
+    assert(proxy.includes('"/api/files/"'), "proxy must special-case /api/files/ so the sandbox CSP survives");
+    const cfg = fs.readFileSync(path.join(process.cwd(), "next.config.ts"), "utf8");
+    assert(cfg.includes("FILE_RESPONSE_CSP"), "next.config must keep the file sandbox rule");
+  });
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed\n`);
   if(failed>0) process.exitCode=1;
 })();

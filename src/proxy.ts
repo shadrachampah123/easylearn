@@ -95,7 +95,18 @@ export default function proxy(request: NextRequest) {
       );
     }
     const response = NextResponse.next({ request: { headers: requestHeaders } });
-    response.headers.set("Content-Security-Policy", csp);
+    /* Uploaded-file responses carry their own sandbox policy
+       (FILE_RESPONSE_CSP in src/lib/upload-content.ts, set by both the
+       /api/files route handler and next.config.ts). Setting the global
+       nonce CSP here would replace it — Next.js applies the proxy's
+       response header over the route/config value — and silently drop
+       `sandbox; default-src 'none'` from user-supplied content
+       (regression found by tests/manual/live-upload-content-probe.js
+       against a production build after PRs #52/#53). Do not overwrite
+       the CSP for file downloads. */
+    if (!request.nextUrl.pathname.startsWith("/api/files/")) {
+      response.headers.set("Content-Security-Policy", csp);
+    }
     response.headers.set("x-nonce", nonce);
     return response;
   }

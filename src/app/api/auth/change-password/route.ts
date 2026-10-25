@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { users } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import bcrypt from "bcryptjs";
-import { findAuthUser, getTokenFromRequest, verifyToken } from "@/lib/auth";
+import { findAuthUser, getTokenFromRequest, hashPassword, verifyToken } from "@/lib/auth";
 import { unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
 
 export async function POST(request: NextRequest) {
@@ -56,7 +56,17 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, error: "Incorrect current password" }, { status: 400 });
     }
 
-    const newPasswordHash = await bcrypt.hash(newPassword, 10);
+    // Same cost factor as every other password write (src/lib/auth.ts hashPassword).
+    const newPasswordHash = await hashPassword(newPassword);
+
+    /* Revoke every outstanding session, exactly as logout does (PR #51):
+       bump users.session_version so tokens issued before the password
+       change stop verifying. Without this, a stolen 24h token survived a
+       password change the victim made precisely to lock the attacker out.
+       The bump is best-effort on pre-session_version schemas: the password
+       change itself must not fail there (verifyToken likewise tolerates a
+       missing column by treating every version as 0). */
+    const revokeSessions = { sessionVersion: sql`${users.sessionVersion} + 1` };
 
     try {
       await db
@@ -64,11 +74,12 @@ export async function POST(request: NextRequest) {
         .set({
           passwordHash: newPasswordHash,
           mustChangePassword: false,
+          ...revokeSessions,
           updatedAt: new Date(),
         })
         .where(eq(users.id, userId));
     } catch (error) {
-      // Older database without the must_change_password column
+      // Older database without the must_change_password / session_version columns
       const { isMissingColumn } = await import("@/lib/schema-resilience");
       if (!isMissingColumn(error)) throw error;
       await db
