@@ -1469,12 +1469,18 @@ export async function isParentLinkedToActiveLearnerInClass(
  * verified context) and a server-validated school role — `super_admin` is rejected by
  * `toSchoolRole`, so a platform role can never be written into a membership row.
  */
-export async function addSchoolMembership(params: {
-  schoolId: string;
-  userId: string;
-  role: unknown;
-  status?: MembershipStatus;
-}): Promise<{ id: string; role: SchoolRole } | null> {
+export async function addSchoolMembership(
+  params: {
+    schoolId: string;
+    userId: string;
+    role: unknown;
+    status?: MembershipStatus;
+  },
+  /* The caller may pass a transaction client so the membership row is written inside
+     the caller's transaction. It defaults to the module pool, which is what every
+     ordinary call wants. */
+  executor: Pick<typeof db, "insert"> = db
+): Promise<{ id: string; role: SchoolRole } | null> {
   const role = toSchoolRole(params.role);
   if (
     !role ||
@@ -1485,7 +1491,7 @@ export async function addSchoolMembership(params: {
     return null;
   }
 
-  const [row] = await db
+  const [row] = await executor
     .insert(schoolUsers)
     .values({
       schoolId: params.schoolId,
