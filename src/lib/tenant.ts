@@ -1423,6 +1423,45 @@ export async function getClassSchoolIdsDirectFirst(classId: string): Promise<Set
   return getClassSchoolIds(classId);
 }
 
+/**
+ * Parent authorization for assignment materials.
+ *
+ * A parent may read a class's assignment file only when linked via `parent_learners`
+ * to an ACTIVE learner (`school_users.status = 'active'` in the same school) who is
+ * enrolled in that class via `learner_classes`. The membership check belongs here in
+ * `tenant.ts` so API routes never query `school_users` directly (Phase 2B boundary).
+ * Fail-closed on invalid UUIDs or DB errors.
+ */
+export async function isParentLinkedToActiveLearnerInClass(
+  schoolId: string,
+  parentId: string,
+  classId: string
+): Promise<boolean> {
+  if (!isUuid(schoolId) || !isUuid(parentId) || !isUuid(classId)) return false;
+  try {
+    assertSchoolId(schoolId);
+    const result = await db.execute(sql`
+      SELECT 1 FROM parent_learners pl
+        JOIN learner_classes lc ON lc.school_id = pl.school_id
+          AND lc.learner_id = pl.learner_id
+          AND lc.class_id = ${classId}::uuid
+       WHERE pl.school_id = ${schoolId}::uuid
+         AND pl.parent_id = ${parentId}::uuid
+         AND EXISTS (
+           SELECT 1 FROM school_users su
+            WHERE su.school_id = pl.school_id
+              AND su.user_id = pl.learner_id
+              AND su.status = 'active'
+         )
+       LIMIT 1
+    `);
+    const rows = rowsFromResult(result);
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /* ── Membership writes (routes never touch `school_users` directly) ── */
 
 /**

@@ -6,7 +6,7 @@
  * role/purpose/assignment rules apply no matter where the bytes end up.
  */
 import { db } from "@/db";
-import { assignments } from "@/db/schema";
+import { assignments, learnerClasses } from "@/db/schema";
 import { and, eq } from "drizzle-orm";
 import { sqlAssignmentInSchool } from "@/lib/tenant";
 
@@ -26,10 +26,12 @@ export async function authorizeUpload(options: {
   role: string;
   /** The caller's verified school. Any referenced assignment must belong to it. */
   schoolId: string;
+  /** The authenticated learner id — required for enrollment verification. */
+  userId: string;
   purpose: "assignment" | "submission";
   assignmentId: string | null;
 }): Promise<UploadAuthorization> {
-  const { role, purpose, assignmentId, schoolId } = options;
+  const { role, purpose, assignmentId, schoolId, userId } = options;
 
   if (purpose === "assignment") {
     if (!TEACHER_ROLES.has(role)) {
@@ -56,6 +58,7 @@ export async function authorizeUpload(options: {
       dueDate: assignments.dueDate,
       allowLate: assignments.allowLate,
       allowFileUploads: assignments.allowFileUploads,
+      classId: assignments.classId,
     })
     .from(assignments)
     .where(and(eq(assignments.id, assignmentId), sqlAssignmentInSchool(schoolId, assignments.id)))
@@ -79,6 +82,38 @@ export async function authorizeUpload(options: {
   const isLate = assignment.dueDate && new Date() > new Date(assignment.dueDate);
   if (isLate && !assignment.allowLate) {
     return { ok: false, error: "Late submissions are not allowed for this assignment" };
+  }
+
+  // Enrollment is required — a learner may upload only for a class they belong to.
+  // This closes the gap where any learner in the school could upload for any
+  // assignment regardless of class membership. The submit route itself already
+  // enforces enrollment, but the file is registered earlier (multipart) or via
+  // presign; without this guard the file row would exist even when the
+  // submission is later refused. Fail closed if the user identity is missing.
+  if (!userId || typeof userId !== "string" || userId.trim() === "") {
+    return {
+      ok: false,
+      status: 401,
+      error: "Authentication required",
+    };
+  }
+  const [enrollment] = await db
+    .select({ id: learnerClasses.id })
+    .from(learnerClasses)
+    .where(
+      and(
+        eq(learnerClasses.schoolId, schoolId),
+        eq(learnerClasses.learnerId, userId),
+        eq(learnerClasses.classId, assignment.classId)
+      )
+    )
+    .limit(1);
+  if (!enrollment) {
+    return {
+      ok: false,
+      status: 403,
+      error: "You are not enrolled in the class for this assignment",
+    };
   }
 
   return { ok: true };

@@ -161,6 +161,7 @@ export async function POST(request: NextRequest) {
     if (submittedFiles.length > 0) {
       const resolved = await resolveUploadedAttachments(submittedFiles, {
         uploaderId: ctx.userId,
+        schoolId: ctx.schoolId,
         purpose: "submission",
         assignmentId,
       });
