@@ -69,6 +69,8 @@ jobs:
           EASY_LEARN_REQUIRE_SCRATCH_DB_LIFECYCLE: "true"
           # A skip must fail this job: the seed-membership assertions have to actually run.
           EASY_LEARN_REQUIRE_SEED_MEMBERSHIP: "true"
+          # A skip must fail this job: the seed-atomicity assertions have to actually run.
+          EASY_LEARN_REQUIRE_SEED_ATOMICITY: "true"
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth
