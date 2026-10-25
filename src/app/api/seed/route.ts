@@ -71,13 +71,17 @@ export async function POST(request: NextRequest) {
       return successResponse({ message: "Database already seeded" });
     }
 
+    /* Keep every seed write in one transaction. A failure at any point must roll back
+       the users, school memberships, and school-owned records together, so a retry
+       cannot mistake a partially seeded database for a complete one. */
+    const seeded = await db.transaction(async (tx) => {
     const adminHash = await hashPassword("admin123");
     const teacherHash = await hashPassword("teacher123");
     const parentHash = await hashPassword("parent123");
     const learnerHash = await hashPassword("learner123");
 
     // Create users
-    const [admin] = await db.insert(users).values({
+    const [admin] = await tx.insert(users).values({
       email: "admin@cbism.edu",
       passwordHash: adminHash,
       role: "super_admin",
@@ -87,7 +91,7 @@ export async function POST(request: NextRequest) {
       emailVerified: true,
     }).returning();
 
-    const [teacher1] = await db.insert(users).values({
+    const [teacher1] = await tx.insert(users).values({
       email: "teacher@cbism.edu",
       passwordHash: teacherHash,
       role: "teacher",
@@ -98,7 +102,7 @@ export async function POST(request: NextRequest) {
       emailVerified: true,
     }).returning();
 
-    const [parent1] = await db.insert(users).values({
+    const [parent1] = await tx.insert(users).values({
       email: "parent@cbism.edu",
       passwordHash: parentHash,
       role: "parent",
@@ -109,7 +113,7 @@ export async function POST(request: NextRequest) {
       emailVerified: true,
     }).returning();
 
-    const [learner1] = await db.insert(users).values({
+    const [learner1] = await tx.insert(users).values({
       email: "learner@cbism.edu",
       passwordHash: learnerHash,
       role: "learner",
@@ -132,11 +136,11 @@ export async function POST(request: NextRequest) {
       return typeof id === "string" ? id : undefined;
     };
     let schoolId = firstId(
-      await db.execute(sql`SELECT id FROM "schools" WHERE slug = 'cbism' LIMIT 1`)
+      await tx.execute(sql`SELECT id FROM "schools" WHERE slug = 'cbism' LIMIT 1`)
     );
     if (!schoolId) {
       schoolId = firstId(
-        await db.execute(sql`
+        await tx.execute(sql`
           INSERT INTO "schools" (name, short_name, slug, status)
           VALUES ('City Best International School Montessori', 'CBISM', 'cbism', 'active')
           ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug
@@ -144,7 +148,7 @@ export async function POST(request: NextRequest) {
       );
     }
     if (!schoolId) {
-      return errorResponse("Failed to resolve CBISM school for seed", 500);
+      throw new Error("Failed to resolve CBISM school for seed");
     }
 
     /* ── School memberships ────────────────────────────────────────────────────
@@ -169,16 +173,16 @@ export async function POST(request: NextRequest) {
        reads). The helper also refuses a platform role, so a `super_admin` could not be
        written into a membership row even by accident. */
     const memberships = await Promise.all([
-      addSchoolMembership({ schoolId, userId: teacher1.id, role: "teacher" }),
-      addSchoolMembership({ schoolId, userId: parent1.id, role: "parent" }),
-      addSchoolMembership({ schoolId, userId: learner1.id, role: "learner" }),
+      addSchoolMembership({ schoolId, userId: teacher1.id, role: "teacher" }, tx),
+      addSchoolMembership({ schoolId, userId: parent1.id, role: "parent" }, tx),
+      addSchoolMembership({ schoolId, userId: learner1.id, role: "learner" }, tx),
     ]);
     if (memberships.some((membership) => membership === null)) {
-      return errorResponse("Failed to create the seed school memberships", 500);
+      throw new Error("Failed to create the seed school memberships");
     }
 
     // Academic year
-    const [ay] = await db.insert(academicYears).values({
+    const [ay] = await tx.insert(academicYears).values({
       schoolId,
       name: "2024/2025",
       startDate: "2024-09-01",
@@ -187,14 +191,14 @@ export async function POST(request: NextRequest) {
     }).returning();
 
     // Terms
-    await db.insert(terms).values([
+    await tx.insert(terms).values([
       { schoolId, name: "term_1", academicYearId: ay.id, startDate: "2024-09-01", endDate: "2024-12-20", isCurrent: true },
       { schoolId, name: "term_2", academicYearId: ay.id, startDate: "2025-01-06", endDate: "2025-04-10" },
       { schoolId, name: "term_3", academicYearId: ay.id, startDate: "2025-04-28", endDate: "2025-07-31" },
     ]);
 
     // Departments
-    const [sciDept] = await db.insert(departments).values([
+    const [sciDept] = await tx.insert(departments).values([
       { schoolId, name: "Sciences", description: "Science department" },
       { schoolId, name: "Languages", description: "Language arts department" },
       { schoolId, name: "Mathematics", description: "Mathematics department" },
@@ -203,7 +207,7 @@ export async function POST(request: NextRequest) {
     ]).returning();
 
     // Classes
-    const seededClasses = await db.insert(classes).values([
+    const seededClasses = await tx.insert(classes).values([
       { schoolId, name: "Nursery 1", level: "nursery", capacity: 25, academicYearId: ay.id },
       { schoolId, name: "Nursery 2", level: "nursery", capacity: 25, academicYearId: ay.id },
       { schoolId, name: "KG 1", level: "kindergarten", capacity: 30, academicYearId: ay.id },
@@ -217,7 +221,7 @@ export async function POST(request: NextRequest) {
     ]).returning();
 
     // Subjects
-    const seededSubjects = await db.insert(subjects).values([
+    const seededSubjects = await tx.insert(subjects).values([
       { schoolId, name: "English Language", code: "ENG", departmentId: sciDept.id },
       { schoolId, name: "Mathematics", code: "MATH", departmentId: sciDept.id },
       { schoolId, name: "Integrated Science", code: "SCI", departmentId: sciDept.id },
@@ -241,13 +245,13 @@ export async function POST(request: NextRequest) {
       .limit(1);
 
     // Link the teacher to the class (subject assignment) so teachers can see the timetable.
-    await db.insert(teacherClasses).values([
+    await tx.insert(teacherClasses).values([
       { schoolId, teacherId: teacher1.id, classId: primary1.id, subjectId: english.id, academicYearId: ay.id },
       { schoolId, teacherId: teacher1.id, classId: primary1.id, subjectId: mathematics.id, academicYearId: ay.id },
     ]);
 
     // Enroll the demo learner into the class.
-    await db.insert(learnerClasses).values({
+    await tx.insert(learnerClasses).values({
       schoolId,
       learnerId: learner1.id,
       classId: primary1.id,
@@ -255,7 +259,7 @@ export async function POST(request: NextRequest) {
     });
 
     // Link the demo parent to the demo learner.
-    await db.insert(parentLearners).values({
+    await tx.insert(parentLearners).values({
       schoolId,
       parentId: parent1.id,
       learnerId: learner1.id,
@@ -263,7 +267,7 @@ export async function POST(request: NextRequest) {
     });
 
     // Publish a weekly timetable for the class so teachers, learners, and parents see periods.
-    await db.insert(timetableEntries).values([
+    await tx.insert(timetableEntries).values([
       { schoolId, classId: primary1.id, subjectId: english.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "monday", startTime: "07:30", endTime: "08:30", room: "Room 1", createdBy: admin.id },
       { schoolId, classId: primary1.id, subjectId: mathematics.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "monday", startTime: "08:30", endTime: "09:30", room: "Room 1", createdBy: admin.id },
       { schoolId, classId: primary1.id, subjectId: science.id, teacherId: teacher1.id, termId: term1?.id ?? null, academicYearId: ay.id, dayOfWeek: "tuesday", startTime: "09:00", endTime: "10:00", room: "Lab", createdBy: admin.id },
@@ -273,7 +277,7 @@ export async function POST(request: NextRequest) {
     ]);
 
     // Announcements
-    await db.insert(announcements).values([
+    await tx.insert(announcements).values([
       {
         schoolId,
         title: "Welcome to the New Academic Year!",
@@ -292,7 +296,7 @@ export async function POST(request: NextRequest) {
     ]);
 
     // FAQs
-    await db.insert(faqs).values([
+    await tx.insert(faqs).values([
       { schoolId, question: "What are the school hours?", answer: "School runs from 7:30 AM to 2:30 PM, Monday to Friday.", orderIndex: 1 },
       { schoolId, question: "What is the admission process?", answer: "Visit our admissions page, fill out the application form, and submit with required documents. An entrance assessment may be required.", orderIndex: 2 },
       { schoolId, question: "Do you offer transportation?", answer: "Yes, CBISM provides school bus services for various routes. Contact the school office for available routes and fees.", orderIndex: 3 },
@@ -301,7 +305,7 @@ export async function POST(request: NextRequest) {
     ]);
 
     // Achievements
-    await db.insert(achievements).values([
+    await tx.insert(achievements).values([
       { name: "First Login", description: "Logged in for the first time!", icon: "🌟", pointsRequired: 0 },
       { name: "Assignment Ace", description: "Completed 10 assignments", icon: "📝", pointsRequired: 100 },
       { name: "Quiz Master", description: "Scored 100% on 5 quizzes", icon: "🏆", pointsRequired: 500 },
@@ -309,7 +313,10 @@ export async function POST(request: NextRequest) {
       { name: "Perfect Attendance", description: "100% attendance for a month", icon: "⭐", pointsRequired: 300 },
     ]);
 
-    return successResponse({ message: "Database seeded successfully", users: { admin: admin.email, teacher: teacher1.email, parent: parent1.email, learner: learner1.email } }, 201);
+    return { admin, teacher1, parent1, learner1 };
+    });
+
+    return successResponse({ message: "Database seeded successfully", users: { admin: seeded.admin.email, teacher: seeded.teacher1.email, parent: seeded.parent1.email, learner: seeded.learner1.email } }, 201);
   } catch (error) {
     console.error("Seed error:", error);
     return errorResponse("Failed to seed database: " + String(error), 500);
