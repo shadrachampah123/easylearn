@@ -73,15 +73,17 @@ export async function verifyStoredObject(
   config: ObjectStorageConfig,
   key: string
 ): Promise<ObjectGuardResult> {
-  const prefix = await readObjectPrefix(config, key);
+  let prefix: Awaited<ReturnType<typeof readObjectPrefix>>;
+  try {
+    prefix = await readObjectPrefix(config, key);
+  } catch (error) {
+    // SEC-9: Storage outage — distinguish from missing object (404)
+    if ((error as Error)?.message?.includes("Object storage outage")) {
+      return { ok: false, status: 503, reason: "The file store is temporarily unavailable." };
+    }
+    return { ok: false, status: 404, reason: "The stored object could not be read." };
+  }
   if (!prefix) {
-    /* `readObjectPrefix` answers null both for "the store says there is no
-       such object" and for "the store could not be reached". Ask again
-       cheaply: a HEAD-free distinction is not available, so treat a null
-       answer as "the object is not there" and let the store outage surface
-       as a missing file. The store is reached through the same credentials
-       the download itself needs, so an outage means the download would fail
-       anyway. */
     return { ok: false, status: 404, reason: "The stored object could not be read." };
   }
 

@@ -78,7 +78,9 @@ export function getObjectStorageConfig(): ObjectStorageConfig {
     secretAccessKey,
     forcePathStyle,
     publicBaseUrl,
-    uploadExpirySeconds: positiveInt(process.env.OBJECT_STORAGE_UPLOAD_EXPIRY, 900),
+    // SEC-6: Shorter upload expiry (5 min vs 15 min) reduces window for
+    // oversized/replaceable uploads. Download stays 1h for media seeking.
+    uploadExpirySeconds: positiveInt(process.env.OBJECT_STORAGE_UPLOAD_EXPIRY, 300),
     downloadExpirySeconds: positiveInt(process.env.OBJECT_STORAGE_DOWNLOAD_EXPIRY, 3600),
   };
 }
@@ -395,11 +397,53 @@ export async function readObjectPrefix(
   });
   try {
     const response = await fetch(url, { headers: { Range: `bytes=0-${maxBytes - 1}` } });
+    // SEC-9: Distinguish missing vs outage. 404/403 = missing (or not authorized to know)
     if (response.status === 404 || response.status === 403) return null;
+    // 5xx = storage outage — must surface as 503, not 404
+    if (response.status >= 500 && response.status < 600) {
+      throw new Error(`Object storage outage: ${response.status} ${response.statusText}`);
+    }
     if (!response.ok) return null;
-    const bytes = Buffer.from(await response.arrayBuffer());
-    /* A ranged answer carries the real size in `Content-Range`
-       (`bytes 0-1023/12345`); an unranged one carries it in `Content-Length`. */
+
+    // SEC-9: Bound the read even if provider ignores Range.
+    // A ranged GET should return 206 with Content-Range; if provider ignores Range it may return 200 with full body (100 MB).
+    // We must not buffer that. Read at most maxBytes via streaming.
+    let bytes: Buffer;
+    const contentLengthHeader = response.headers.get("content-length");
+    const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+    if (Number.isFinite(contentLength) && contentLength <= maxBytes * 4) {
+      const buf = Buffer.from(await response.arrayBuffer());
+      bytes = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+    } else if (response.body) {
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      try {
+        while (received < maxBytes) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value) break;
+          const needed = maxBytes - received;
+          if (value.length > needed) {
+            chunks.push(value.subarray(0, needed));
+            received += needed;
+            try { await reader.cancel(); } catch {}
+            break;
+          } else {
+            chunks.push(value);
+            received += value.length;
+          }
+          if (received >= maxBytes) break;
+        }
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+      bytes = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+    } else {
+      const buf = Buffer.from(await response.arrayBuffer());
+      bytes = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+    }
+
     let totalSize: number | null = null;
     const contentRange = response.headers.get("content-range");
     if (contentRange) {
@@ -415,7 +459,11 @@ export async function readObjectPrefix(
       contentType: response.headers.get("content-type"),
       etag: response.headers.get("etag"),
     };
-  } catch {
+  } catch (error) {
+    if ((error as Error)?.message?.includes("Object storage outage")) throw error;
+    if ((error as Error)?.message?.includes("fetch") || (error as Error)?.message?.includes("network")) {
+      throw new Error(`Object storage outage: ${String(error)}`);
+    }
     return null;
   }
 }

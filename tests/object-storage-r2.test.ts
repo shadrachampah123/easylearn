@@ -186,7 +186,7 @@ test("values pasted with surrounding quotes and whitespace are tolerated", () =>
 test("expiry values: defaults, override, and invalid input falls back", () => {
   withEnv(R2, () => {
     const config = getObjectStorageConfig();
-    assert.strictEqual(config.uploadExpirySeconds, 900);
+    assert.strictEqual(config.uploadExpirySeconds, 300);
     assert.strictEqual(config.downloadExpirySeconds, 3600);
   });
   withEnv({ ...R2, OBJECT_STORAGE_UPLOAD_EXPIRY: "120", OBJECT_STORAGE_DOWNLOAD_EXPIRY: "60" }, () => {
@@ -196,7 +196,7 @@ test("expiry values: defaults, override, and invalid input falls back", () => {
   });
   withEnv({ ...R2, OBJECT_STORAGE_UPLOAD_EXPIRY: "not-a-number", OBJECT_STORAGE_DOWNLOAD_EXPIRY: "-5" }, () => {
     const config = getObjectStorageConfig();
-    assert.strictEqual(config.uploadExpirySeconds, 900, "invalid expiry falls back to the default");
+    assert.strictEqual(config.uploadExpirySeconds, 300, "invalid expiry falls back to the default");
     assert.strictEqual(config.downloadExpirySeconds, 3600, "non-positive expiry falls back to the default");
   });
 });
