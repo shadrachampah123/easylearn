@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
 import { apiFetch } from "../../../../lib/api-client";
@@ -29,18 +29,21 @@ export default function ParentGradesPage() {
   const [children, setChildren] = useState<{ id: string; firstName: string; lastName: string }[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    apiFetch("/api/auth/me")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.success) {
-          setCurrentParentId(data.data.user.id);
-          loadChildren(data.data.user.id);
-        }
-      });
+  const loadGrades = useCallback(async (learnerId: string) => {
+    setChildId(learnerId);
+    setLoading(true);
+    try {
+      const res = await apiFetch(`/api/grades?learnerId=${learnerId}`);
+      const result = await res.json();
+      if (result.success) setData(result.data);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  async function loadChildren(parentId: string) {
+  const loadChildren = useCallback(async (parentId: string) => {
     try {
       const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
       const data = await res.json();
@@ -57,21 +60,18 @@ export default function ParentGradesPage() {
     } catch (err) {
       console.error(err);
     }
-  }
+  }, [loadGrades]);
 
-  async function loadGrades(learnerId: string) {
-    setChildId(learnerId);
-    setLoading(true);
-    try {
-      const res = await apiFetch(`/api/grades?learnerId=${learnerId}`);
-      const result = await res.json();
-      if (result.success) setData(result.data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  }
+  useEffect(() => {
+    apiFetch("/api/auth/me")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.success) {
+          setCurrentParentId(data.data.user.id);
+          loadChildren(data.data.user.id);
+        }
+      });
+  }, [loadChildren]);
 
   return (
     <DashboardShell navItems={parentNav} roleLabel="Parent" roleColor="bg-gradient-to-r from-lavender to-purple-600">

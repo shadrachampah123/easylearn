@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import AttachmentList from "@/components/dashboard/AttachmentList";
 import FileUploader, { type StoredAttachment } from "@/components/dashboard/FileUploader";
@@ -110,11 +110,7 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
   const [attachments, setAttachments] = useState<StoredAttachment[]>([]);
   const [uploadingFiles, setUploadingFiles] = useState(false);
 
-  useEffect(() => {
-    loadAssignment();
-  }, [resolvedParams.id]);
-
-  async function loadAssignment() {
+  const loadAssignment = useCallback(async () => {
     try {
       const res = await apiFetch(`/api/assignments/${resolvedParams.id}`);
       const data = await res.json();
@@ -129,7 +125,18 @@ export default function LearnerAssignmentPage({ params }: { params: Promise<{ id
     } finally {
       setLoading(false);
     }
-  }
+  }, [resolvedParams.id]);
+
+  useEffect(() => {
+    // The loader only writes state after its requests resolve.
+    let cancelled = false;
+    void (async () => {
+      if (!cancelled) await loadAssignment();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadAssignment]);
 
   function setAnswer(questionId: string, value: string) {
     setAnswers((prev) => ({ ...prev, [questionId]: value }));

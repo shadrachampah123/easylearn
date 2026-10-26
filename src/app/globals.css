@@ -1,3 +1,11 @@
+/* App-wide webfonts (Inter + Fredoka). Loaded from the global stylesheet
+   so every route shares them (previously a <link> in the root layout,
+   which @next/next/no-page-custom-font flags as single-page). The build
+   never fetches fonts — next/font/google would require network access
+   at build time, which is not guaranteed in every build environment —
+   so the browser loads them from Google Fonts at runtime exactly as
+   before, with the same families, weights, and display=swap fallback. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Fredoka:wght@400;500;600;700&display=swap');
 @import "tailwindcss";
 
 @theme {

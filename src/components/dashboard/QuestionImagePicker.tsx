@@ -1,7 +1,20 @@
 "use client";
 
 import { useState } from "react";
+import Image from "next/image";
 import { apiFetch } from "../../lib/api-client";
+
+/** next/image needs a root-relative or absolute http(s) URL; anything else
+ *  (e.g. a partially typed URL) is not rendered as an image. */
+function isUsableImageUrl(url: string): boolean {
+  if (url.startsWith("/")) return true;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 interface ImageResult {
   id: string;
@@ -93,7 +106,9 @@ export default function QuestionImagePicker({
 
       {value && (
         <div className="mt-3 flex items-center gap-3 rounded-lg bg-slate-50 border border-slate-100 p-2">
-          <img src={value} alt="Selected question image" className="w-20 h-12 rounded-md object-cover bg-slate-200" />
+          {isUsableImageUrl(value) && (
+            <Image src={value} alt="Selected question image" width={160} height={96} unoptimized className="w-20 h-12 rounded-md object-cover bg-slate-200" />
+          )}
           <div className="min-w-0 flex-1">
             <p className="text-xs font-semibold text-green-700">Image selected</p>
             <p className="text-[11px] text-slate-400 truncate">{value}</p>
@@ -156,7 +171,7 @@ export default function QuestionImagePicker({
                     }`}
                     title={`${image.alt}${image.creator ? ` — ${image.creator}` : ""}`}
                   >
-                    <img src={image.thumbnailUrl} alt={image.alt} className="w-full h-full object-cover group-hover:scale-105 transition-transform" />
+                    <Image src={image.thumbnailUrl} alt={image.alt} width={320} height={240} unoptimized className="w-full h-full object-cover group-hover:scale-105 transition-transform" />
                     <span className="absolute inset-x-0 bottom-0 bg-black/60 text-white text-[9px] px-1.5 py-1 truncate text-left opacity-0 group-hover:opacity-100 transition-opacity">Use this image</span>
                   </button>
                 ))}

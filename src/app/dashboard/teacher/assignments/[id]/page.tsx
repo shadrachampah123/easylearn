@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import AttachmentList from "@/components/dashboard/AttachmentList";
 import { storedAttachments } from "@/lib/uploads";
@@ -106,11 +106,7 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
   const [showCorrectionForm, setShowCorrectionForm] = useState(false);
   const [correctionForm, setCorrectionForm] = useState({ questionId: "", correctionText: "" });
 
-  useEffect(() => {
-    loadAssignment();
-  }, [resolvedParams.id]);
-
-  async function loadAssignment() {
+  const loadAssignment = useCallback(async () => {
     try {
       const res = await apiFetch(`/api/assignments/${resolvedParams.id}`);
       const data = await res.json();
@@ -120,7 +116,18 @@ export default function AssignmentDetailPage({ params }: { params: Promise<{ id:
     } finally {
       setLoading(false);
     }
-  }
+  }, [resolvedParams.id]);
+
+  useEffect(() => {
+    // The loader only writes state after its requests resolve.
+    let cancelled = false;
+    void (async () => {
+      if (!cancelled) await loadAssignment();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadAssignment]);
 
   /** Open the grading panel and pull in what the learner actually wrote. */
   async function openGrading(sub: Submission) {
