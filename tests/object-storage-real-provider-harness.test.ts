@@ -32,24 +32,64 @@
 
 import assert from "assert";
 import crypto from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { getObjectStorageConfig, presignedUploadUrl, presignUrl, objectDownloadUrl } from "@/lib/object-storage";
 import { verifyStoredObject } from "@/lib/object-guard";
 
 const RUN_ID = crypto.randomUUID().slice(0, 8);
 const PREFIX = `__easylearn-test/${RUN_ID}`;
 
+/** Production bucket — the live harness must NEVER target it. */
+export const PRODUCTION_BUCKET = "easylearn-uploads";
+
+/** Refuse to run live against the production bucket (exact match after trim). */
+export function assertDisposableBucket(bucket: string | undefined): void {
+  if ((bucket ?? "").trim() === PRODUCTION_BUCKET) {
+    throw new Error(
+      `REFUSED: OBJECT_STORAGE_BUCKET is the production bucket '${PRODUCTION_BUCKET}'. ` +
+        "The live harness creates and deletes objects; point it at a disposable bucket (e.g. 'easylearn-security-test') instead."
+    );
+  }
+}
+
+/** Only 404 (NoSuchKey) or 403 (access gone) prove an object is inaccessible. */
+export function isObjectGoneStatus(status: number): boolean {
+  return status === 404 || status === 403;
+}
+
 function shouldRunLive(): boolean {
   return process.env.OBJECT_STORAGE_LIVE_TEST === "true" && getObjectStorageConfig().enabled;
 }
 
-async function cleanupKeys(keys: string[]) {
+export async function cleanupKeys(keys: string[]): Promise<string[]> {
+  /* Cleanup is VERIFIED, not assumed: a swallowed DELETE error would
+     leave test objects (and their cost) behind while the suite reports
+     success. Each key is deleted via presigned DELETE and then probed
+     with a presigned GET that must answer 404/403. Anything left over
+     is returned so the run fails loudly. Keys are always under this
+     run's unique __easylearn-test/<id>/ prefix; nothing else is touched. */
   const config = getObjectStorageConfig();
+  const leftovers: string[] = [];
   for (const key of keys) {
     try {
       const { url } = presignUrl(config, { method: "DELETE", key, expiresSeconds: 60 });
-      await fetch(url, { method: "DELETE" });
-    } catch {}
+      const del = await fetch(url, { method: "DELETE", signal: AbortSignal.timeout(15_000) });
+      if (!del.ok && del.status !== 404) throw new Error(`DELETE ${key} -> ${del.status}`);
+      const check = await fetch(presignUrl(config, { method: "GET", key, expiresSeconds: 60 }).url, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      /* STRICT: only 404/403 prove the object is gone. 200 means it is
+         still readable; 500/502/anything else is inconclusive and must
+         be reported as a cleanup failure, never as verified deletion. */
+      if (!isObjectGoneStatus(check.status)) {
+        throw new Error(`post-DELETE GET for ${key} returned ${check.status} (expected 404/403)`);
+      }
+    } catch (error) {
+      console.error(`⚠️  CLEANUP FAILED for ${key}: ${(error as Error).message}`);
+      leftovers.push(key);
+    }
   }
+  return leftovers;
 }
 
 async function run() {
@@ -57,6 +97,18 @@ async function run() {
   const config = getObjectStorageConfig();
   console.log(`Config: bucket=${config.bucket}, endpoint=${config.endpoint || "(aws)"}, region=${config.region}, enabled=${config.enabled}`);
   console.log(`Live test enabled: ${process.env.OBJECT_STORAGE_LIVE_TEST === "true"}`);
+
+  /* F-1 guard: refuse the production bucket BEFORE any network request,
+     object creation, or deletion — even if live mode was requested. */
+  if (process.env.OBJECT_STORAGE_LIVE_TEST === "true" && config.enabled) {
+    try {
+      assertDisposableBucket(config.bucket);
+    } catch (error) {
+      console.error(`\n❌ ${(error as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   if (!shouldRunLive()) {
     console.log("\n⚠️  Live provider test SKIPPED — not enabled or not configured.");
@@ -140,10 +192,21 @@ async function run() {
     const content = Buffer.alloc(2048, "a");
     const { url, headers } = presignedUploadUrl(config, key, "application/pdf");
     await fetch(url, { method: "PUT", headers, body: content });
+    /* The production path: readObjectPrefix parses the total from
+       Content-Range ("bytes 0-1023/2048"). (The previous raw assertion
+       was itself the defect: it preferred Content-Length — 1024 for a
+       partial body — and then looked for "2048/" with a trailing slash
+       that the header value never has, so a correctly reported size
+       failed. Production parsing was proven fine by the SEC-9 test
+       below, which asserts totalSize via the same function.) */
+    const prefix = await (await import("@/lib/object-storage")).readObjectPrefix(config, key, 1024);
+    assert.ok(prefix, "prefix should be readable");
+    assert.strictEqual(prefix!.totalSize, 2048, `totalSize wrong: ${prefix!.totalSize}`);
+    assert.strictEqual(prefix!.bytes.length, 1024, `prefix bytes wrong: ${prefix!.bytes.length}`);
     const res = await fetch(presignUrl(config, { method: "GET", key, expiresSeconds: 60 }).url, { headers: { Range: "bytes=0-1023" } });
     assert.ok(res.ok);
-    const len = res.headers.get("content-length") || res.headers.get("content-range") || "";
-    assert.ok(len.includes("2048") || res.headers.get("content-range")?.includes("2048/"), `size not reported, headers: ${JSON.stringify([...res.headers.entries()])}`);
+    const range = res.headers.get("content-range") || "";
+    assert.ok(/\/2048\s*$/.test(range), `content-range total not reported: ${range}`);
   });
 
   // Test 5: Response overrides — content-type, disposition, cache-control are applied; non-allowlisted rejected
@@ -184,14 +247,24 @@ async function run() {
     assert.ok(prefix!.totalSize === 5000, `totalSize wrong: ${prefix!.totalSize}`);
   });
 
-  await cleanupKeys(createdKeys);
+  const leftovers = await cleanupKeys(createdKeys);
+  if (leftovers.length > 0) {
+    console.error(`\n❌ CLEANUP INCOMPLETE: ${leftovers.length} test object(s) remain under ${PREFIX}/ — delete them manually: ${leftovers.join(", ")}`);
+    failed++;
+  } else {
+    console.log(`\n🧹 Cleanup verified: all ${createdKeys.length} test objects under ${PREFIX}/ deleted`);
+  }
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exitCode = 1;
   else console.log("✅ All live provider tests passed — bucket and presigning verified against real store");
 }
 
-run().catch((e) => {
-  console.error(e);
-  process.exitCode = 1;
-});
+// Importing exported safety helpers must never launch live provider tests.
+// Only execute the harness when this file is the entry point (tsx file.ts).
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  run().catch((e) => {
+    console.error(e);
+    process.exitCode = 1;
+  });
+}
