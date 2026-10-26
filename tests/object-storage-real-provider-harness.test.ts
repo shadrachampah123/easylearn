@@ -32,17 +32,36 @@
 
 import assert from "assert";
 import crypto from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { getObjectStorageConfig, presignedUploadUrl, presignUrl, objectDownloadUrl } from "@/lib/object-storage";
 import { verifyStoredObject } from "@/lib/object-guard";
 
 const RUN_ID = crypto.randomUUID().slice(0, 8);
 const PREFIX = `__easylearn-test/${RUN_ID}`;
 
+/** Production bucket — the live harness must NEVER target it. */
+export const PRODUCTION_BUCKET = "easylearn-uploads";
+
+/** Refuse to run live against the production bucket (exact match after trim). */
+export function assertDisposableBucket(bucket: string | undefined): void {
+  if ((bucket ?? "").trim() === PRODUCTION_BUCKET) {
+    throw new Error(
+      `REFUSED: OBJECT_STORAGE_BUCKET is the production bucket '${PRODUCTION_BUCKET}'. ` +
+        "The live harness creates and deletes objects; point it at a disposable bucket (e.g. 'easylearn-security-test') instead."
+    );
+  }
+}
+
+/** Only 404 (NoSuchKey) or 403 (access gone) prove an object is inaccessible. */
+export function isObjectGoneStatus(status: number): boolean {
+  return status === 404 || status === 403;
+}
+
 function shouldRunLive(): boolean {
   return process.env.OBJECT_STORAGE_LIVE_TEST === "true" && getObjectStorageConfig().enabled;
 }
 
-async function cleanupKeys(keys: string[]): Promise<string[]> {
+export async function cleanupKeys(keys: string[]): Promise<string[]> {
   /* Cleanup is VERIFIED, not assumed: a swallowed DELETE error would
      leave test objects (and their cost) behind while the suite reports
      success. Each key is deleted via presigned DELETE and then probed
@@ -54,10 +73,17 @@ async function cleanupKeys(keys: string[]): Promise<string[]> {
   for (const key of keys) {
     try {
       const { url } = presignUrl(config, { method: "DELETE", key, expiresSeconds: 60 });
-      const del = await fetch(url, { method: "DELETE" });
+      const del = await fetch(url, { method: "DELETE", signal: AbortSignal.timeout(15_000) });
       if (!del.ok && del.status !== 404) throw new Error(`DELETE ${key} -> ${del.status}`);
-      const check = await fetch(presignUrl(config, { method: "GET", key, expiresSeconds: 60 }).url);
-      if (check.ok) throw new Error(`object still readable after DELETE: ${key}`);
+      const check = await fetch(presignUrl(config, { method: "GET", key, expiresSeconds: 60 }).url, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      /* STRICT: only 404/403 prove the object is gone. 200 means it is
+         still readable; 500/502/anything else is inconclusive and must
+         be reported as a cleanup failure, never as verified deletion. */
+      if (!isObjectGoneStatus(check.status)) {
+        throw new Error(`post-DELETE GET for ${key} returned ${check.status} (expected 404/403)`);
+      }
     } catch (error) {
       console.error(`⚠️  CLEANUP FAILED for ${key}: ${(error as Error).message}`);
       leftovers.push(key);
@@ -71,6 +97,18 @@ async function run() {
   const config = getObjectStorageConfig();
   console.log(`Config: bucket=${config.bucket}, endpoint=${config.endpoint || "(aws)"}, region=${config.region}, enabled=${config.enabled}`);
   console.log(`Live test enabled: ${process.env.OBJECT_STORAGE_LIVE_TEST === "true"}`);
+
+  /* F-1 guard: refuse the production bucket BEFORE any network request,
+     object creation, or deletion — even if live mode was requested. */
+  if (process.env.OBJECT_STORAGE_LIVE_TEST === "true" && config.enabled) {
+    try {
+      assertDisposableBucket(config.bucket);
+    } catch (error) {
+      console.error(`\n❌ ${(error as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   if (!shouldRunLive()) {
     console.log("\n⚠️  Live provider test SKIPPED — not enabled or not configured.");
