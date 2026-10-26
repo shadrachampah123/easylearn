@@ -159,6 +159,14 @@ Diff reviewed: no secrets, no migrations, no unrelated changes. **This PR must n
 
 ---
 
+## 7b. R2 live-harness size failure — diagnosis (main @ 6ded9fb)
+
+Operator ran the real-provider harness against the disposable bucket `easylearn-security-test`: **5 passed, 1 failed** (`object size is reported correctly`). R2 returned `Content-Range: bytes 0-1023/2048`.
+
+**Diagnosis: test defect, not production code.** The failing assertion preferred `Content-Length` (1024 — correct for a partial body) and then searched `Content-Range` for `2048/` *with a trailing slash*; the header ends in `/2048`, so both checks failed on a correctly reported size. The production parser in `src/lib/object-storage.ts` (`/\/(\d+)\s*$/` → 2048) was independently proven in the same live run by the SEC-9 test, which asserts `totalSize === 5000` through `readObjectPrefix` and passed.
+
+**Fix (test-only + offline regression):** the live size test now asserts through `readObjectPrefix` (`totalSize === 2048`, bounded 1024-byte prefix) plus a corrected raw-header regex; a mocked-fetch unit test in `object-storage-content-policy` (15/15) pins the R2 header shape permanently. `cleanupKeys` now verifies each deletion (DELETE status + GET must 404/403) and fails the run listing leftovers — the previous version swallowed all errors, so cleanup of the earlier live run is **UNVERIFIED**; the operator should list the bucket for any `__easylearn-test/` prefixes and delete only those. Live re-run of the fixed harness is **BLOCKED in this environment** (no `OBJECT_STORAGE_*` credentials present, and none were requested or printed): the operator re-runs `OBJECT_STORAGE_LIVE_TEST=true npx tsx tests/object-storage-real-provider-harness.test.ts` with the disposable bucket credentials to confirm 6/6 + verified cleanup.
+
 ## 8. Independent review addendum (separate from author's self-review) — main @ fb31b39
 
 Reviewer stance: PR #57 (`security/issue54-current-state-2026-10-25` @ `d9db71d`, docs-only, 44-line addendum) was checked against actual source, not trusted. Its claims reconcile: PR #57 CI run `40243684780` tested exactly `d9db71d` and passed; main's code files are byte-identical to the reviewed PR #55 final head except `src/lib/tenant.ts`, whose only delta is the additive designated-public-school resolver; PR #56 (`fb31b39`) scopes `?public=true` announcements to the `cbism` school and fails closed to an empty feed. PR #57's "no local execution" disclaimer is accurate — the local results below are this review's own.

@@ -42,14 +42,28 @@ function shouldRunLive(): boolean {
   return process.env.OBJECT_STORAGE_LIVE_TEST === "true" && getObjectStorageConfig().enabled;
 }
 
-async function cleanupKeys(keys: string[]) {
+async function cleanupKeys(keys: string[]): Promise<string[]> {
+  /* Cleanup is VERIFIED, not assumed: a swallowed DELETE error would
+     leave test objects (and their cost) behind while the suite reports
+     success. Each key is deleted via presigned DELETE and then probed
+     with a presigned GET that must answer 404/403. Anything left over
+     is returned so the run fails loudly. Keys are always under this
+     run's unique __easylearn-test/<id>/ prefix; nothing else is touched. */
   const config = getObjectStorageConfig();
+  const leftovers: string[] = [];
   for (const key of keys) {
     try {
       const { url } = presignUrl(config, { method: "DELETE", key, expiresSeconds: 60 });
-      await fetch(url, { method: "DELETE" });
-    } catch {}
+      const del = await fetch(url, { method: "DELETE" });
+      if (!del.ok && del.status !== 404) throw new Error(`DELETE ${key} -> ${del.status}`);
+      const check = await fetch(presignUrl(config, { method: "GET", key, expiresSeconds: 60 }).url);
+      if (check.ok) throw new Error(`object still readable after DELETE: ${key}`);
+    } catch (error) {
+      console.error(`⚠️  CLEANUP FAILED for ${key}: ${(error as Error).message}`);
+      leftovers.push(key);
+    }
   }
+  return leftovers;
 }
 
 async function run() {
@@ -140,10 +154,21 @@ async function run() {
     const content = Buffer.alloc(2048, "a");
     const { url, headers } = presignedUploadUrl(config, key, "application/pdf");
     await fetch(url, { method: "PUT", headers, body: content });
+    /* The production path: readObjectPrefix parses the total from
+       Content-Range ("bytes 0-1023/2048"). (The previous raw assertion
+       was itself the defect: it preferred Content-Length — 1024 for a
+       partial body — and then looked for "2048/" with a trailing slash
+       that the header value never has, so a correctly reported size
+       failed. Production parsing was proven fine by the SEC-9 test
+       below, which asserts totalSize via the same function.) */
+    const prefix = await (await import("@/lib/object-storage")).readObjectPrefix(config, key, 1024);
+    assert.ok(prefix, "prefix should be readable");
+    assert.strictEqual(prefix!.totalSize, 2048, `totalSize wrong: ${prefix!.totalSize}`);
+    assert.strictEqual(prefix!.bytes.length, 1024, `prefix bytes wrong: ${prefix!.bytes.length}`);
     const res = await fetch(presignUrl(config, { method: "GET", key, expiresSeconds: 60 }).url, { headers: { Range: "bytes=0-1023" } });
     assert.ok(res.ok);
-    const len = res.headers.get("content-length") || res.headers.get("content-range") || "";
-    assert.ok(len.includes("2048") || res.headers.get("content-range")?.includes("2048/"), `size not reported, headers: ${JSON.stringify([...res.headers.entries()])}`);
+    const range = res.headers.get("content-range") || "";
+    assert.ok(/\/2048\s*$/.test(range), `content-range total not reported: ${range}`);
   });
 
   // Test 5: Response overrides — content-type, disposition, cache-control are applied; non-allowlisted rejected
@@ -184,7 +209,13 @@ async function run() {
     assert.ok(prefix!.totalSize === 5000, `totalSize wrong: ${prefix!.totalSize}`);
   });
 
-  await cleanupKeys(createdKeys);
+  const leftovers = await cleanupKeys(createdKeys);
+  if (leftovers.length > 0) {
+    console.error(`\n❌ CLEANUP INCOMPLETE: ${leftovers.length} test object(s) remain under ${PREFIX}/ — delete them manually: ${leftovers.join(", ")}`);
+    failed++;
+  } else {
+    console.log(`\n🧹 Cleanup verified: all ${createdKeys.length} test objects under ${PREFIX}/ deleted`);
+  }
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exitCode = 1;

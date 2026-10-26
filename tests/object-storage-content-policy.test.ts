@@ -31,6 +31,7 @@ import {
   objectDownloadUrl,
   presignedUploadUrl,
   presignUrl,
+  readObjectPrefix,
 } from "@/lib/object-storage";
 import { ruleForExtension, SCRIPTABLE_CONTENT_TYPES } from "@/lib/upload-content";
 
@@ -273,6 +274,33 @@ async function main() {
         !SCRIPTABLE_CONTENT_TYPES.has(rule.contentType.split(";")[0].trim()),
         `.${extension} must not be served with a scriptable type`
       );
+    }
+  });
+
+  await test("readObjectPrefix reports totalSize from Content-Range (R2 'bytes 0-1023/2048')", async () => {
+    /* Regression for the live-harness failure: R2 answers a ranged GET
+       with Content-Length: 1024 (partial body) and
+       Content-Range: bytes 0-1023/2048. The total lives after the slash
+       at the END of Content-Range. A previous live assertion looked for
+       "2048/" and failed on a correctly reported size; the production
+       parser must yield 2048. Mocked fetch: no network, no credentials. */
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(Buffer.alloc(1024, "a"), {
+        status: 206,
+        headers: {
+          "Content-Length": "1024",
+          "Content-Range": "bytes 0-1023/2048",
+          "Content-Type": "application/pdf",
+        },
+      })) as typeof fetch;
+    try {
+      const prefix = await readObjectPrefix(CONFIG, "uploads/size-test.pdf", 1024);
+      assert.ok(prefix, "prefix must be returned");
+      assert.strictEqual(prefix.totalSize, 2048, "totalSize must come from Content-Range");
+      assert.strictEqual(prefix.bytes.length, 1024, "prefix must be bounded to maxBytes");
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 
