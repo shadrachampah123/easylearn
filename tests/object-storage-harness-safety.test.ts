@@ -68,6 +68,31 @@ async function main() {
       assert.doesNotThrow(() => assertDisposableBucket(undefined));
     });
 
+    await test("importing harness helpers has no execution side effects", () => {
+      const result = spawnSync(
+        path.join(process.cwd(), "node_modules", ".bin", "tsx"),
+        ["-e", "import './tests/object-storage-real-provider-harness.test.ts'"],
+        {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          timeout: 60_000,
+          env: {
+            ...process.env,
+            OBJECT_STORAGE_LIVE_TEST: "true",
+            OBJECT_STORAGE_BUCKET: PRODUCTION_BUCKET,
+            OBJECT_STORAGE_ACCESS_KEY_ID: "dummy-access-key",
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: "dummy-secret-key",
+            OBJECT_STORAGE_ENDPOINT: "http://127.0.0.1:9",
+            OBJECT_STORAGE_REGION: "auto",
+          },
+        }
+      );
+      const out = `${result.stdout ?? ""}\\n${result.stderr ?? ""}`;
+      assert.strictEqual(result.status, 0, `import should exit cleanly, got ${result.status}: ${out}`);
+      assert.ok(!out.includes("SEC-2: Real provider verification harness"), `import must not execute harness: ${out}`);
+      assert.ok(!out.includes("REFUSED"), `import must not run production-bucket guard: ${out}`);
+    });
+
     await test("live harness process exits 1 and refuses production bucket before any live test", () => {
       const result = spawnSync(
         path.join(process.cwd(), "node_modules", ".bin", "tsx"),

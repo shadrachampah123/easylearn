@@ -260,7 +260,11 @@ async function run() {
   else console.log("✅ All live provider tests passed — bucket and presigning verified against real store");
 }
 
-run().catch((e) => {
-  console.error(e);
-  process.exitCode = 1;
-});
+// Importing exported safety helpers must never launch live provider tests.
+// Only execute the harness when this file is the entry point (tsx file.ts).
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  run().catch((e) => {
+    console.error(e);
+    process.exitCode = 1;
+  });
+}
