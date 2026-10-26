@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
 import { apiFetch } from "../../../../lib/api-client";
@@ -19,15 +19,21 @@ export default function ParentAttendancePage() {
   const [records, setRecords] = useState<AttendanceRow[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    apiFetch("/api/auth/me")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.success) loadChildren(data.data.user.id);
-      });
+  const loadAttendance = useCallback(async (learnerId: string) => {
+    setChildId(learnerId);
+    setLoading(true);
+    try {
+      const res = await apiFetch(`/api/attendance?learnerId=${learnerId}`);
+      const data = await res.json();
+      if (data.success) setRecords(data.data);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  async function loadChildren(parentId: string) {
+  const loadChildren = useCallback(async (parentId: string) => {
     try {
       const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
       const data = await res.json();
@@ -44,21 +50,15 @@ export default function ParentAttendancePage() {
     } catch (err) {
       console.error(err);
     }
-  }
+  }, [loadAttendance]);
 
-  async function loadAttendance(learnerId: string) {
-    setChildId(learnerId);
-    setLoading(true);
-    try {
-      const res = await apiFetch(`/api/attendance?learnerId=${learnerId}`);
-      const data = await res.json();
-      if (data.success) setRecords(data.data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  }
+  useEffect(() => {
+    apiFetch("/api/auth/me")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.success) loadChildren(data.data.user.id);
+      });
+  }, [loadChildren]);
 
   const present = records.filter((r) => r.isPresent).length;
   const absent = records.length - present;

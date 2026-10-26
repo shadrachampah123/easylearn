@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
 import { apiFetch } from "../../../../lib/api-client";
@@ -37,13 +37,21 @@ export default function ParentAssignmentsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [resultDetails, setResultDetails] = useState<any>(null);
 
-  useEffect(() => {
-    apiFetch("/api/auth/me")
-      .then((r) => r.json())
-      .then((data) => { if (data.success) loadChildren(data.data.user.id); });
+  const loadAssignments = useCallback(async (learnerId: string) => {
+    setChildId(learnerId);
+    setLoading(true);
+    try {
+      const res = await apiFetch("/api/assignments?status=published");
+      const data = await res.json();
+      if (data.success) setAssignments(data.data);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  async function loadChildren(parentId: string) {
+  const loadChildren = useCallback(async (parentId: string) => {
     try {
       const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
       const data = await res.json();
@@ -60,21 +68,13 @@ export default function ParentAssignmentsPage() {
     } catch (err) {
       console.error(err);
     }
-  }
+  }, [loadAssignments]);
 
-  async function loadAssignments(learnerId: string) {
-    setChildId(learnerId);
-    setLoading(true);
-    try {
-      const res = await apiFetch("/api/assignments?status=published");
-      const data = await res.json();
-      if (data.success) setAssignments(data.data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  }
+  useEffect(() => {
+    apiFetch("/api/auth/me")
+      .then((r) => r.json())
+      .then((data) => { if (data.success) loadChildren(data.data.user.id); });
+  }, [loadChildren]);
 
   async function viewResults(assignmentId: string) {
     if (!childId) return;

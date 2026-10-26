@@ -1,9 +1,10 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { use, useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import QuestionImagePicker from "@/components/dashboard/QuestionImagePicker";
+import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { apiFetch } from "../../../../../lib/api-client";
@@ -73,6 +74,18 @@ const teacherNav = [
   { name: "Attendance", href: "/dashboard/teacher/attendance", icon: "✅" },
 ];
 
+/** next/image needs a root-relative or absolute http(s) URL; anything else
+ *  (e.g. a partially typed URL) is not rendered as an image. */
+function isUsableImageUrl(url: string): boolean {
+  if (url.startsWith("/")) return true;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 const questionTypeLabels: Record<QuestionType, string> = {
   mcq: "Multiple Choice",
   true_false: "True/False",
@@ -128,11 +141,7 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
   const [editForm, setEditForm] = useState<QuizEditForm | null>(null);
   const [editQuestions, setEditQuestions] = useState<EditableQuestion[]>([]);
 
-  useEffect(() => {
-    void loadQuiz();
-  }, [resolvedParams.id]);
-
-  async function loadQuiz(showSpinner = true) {
+  const loadQuiz = useCallback(async (showSpinner = true) => {
     if (showSpinner) setLoading(true);
     try {
       const [quizRes, classRes, subjectRes] = await Promise.all([
@@ -154,7 +163,18 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
     } finally {
       setLoading(false);
     }
-  }
+  }, [resolvedParams.id]);
+
+  useEffect(() => {
+    // The loader only writes state after its requests resolve.
+    let cancelled = false;
+    void (async () => {
+      if (!cancelled) await loadQuiz();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadQuiz]);
 
   function openEditForm() {
     if (!quiz) return;
@@ -492,9 +512,13 @@ export default function TeacherQuizDetailPage({ params }: { params: Promise<{ id
                 </span>
               </div>
 
-              {question.imageUrl && (
+              {question.imageUrl && isUsableImageUrl(question.imageUrl) && (
                 <div className="mb-4 rounded-xl overflow-hidden max-h-64 bg-slate-100 border border-slate-200">
-                  <img src={question.imageUrl} alt="Question banner" className="w-full h-full object-cover" />
+                  {/* Question images come from external stock providers or a
+                      pasted URL, so hosts are arbitrary: next/image is used
+                      unoptimized instead of allowing broad remotePatterns
+                      (which would let the optimizer fetch arbitrary URLs). */}
+                  <Image src={question.imageUrl} alt="Question banner" width={1600} height={900} unoptimized className="w-full h-full object-cover" />
                 </div>
               )}
 

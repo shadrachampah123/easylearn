@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import {
   CATEGORY_ICONS,
   CATEGORY_LABELS,
@@ -41,11 +42,16 @@ export default function AttachmentList({
           <div key={attachment.fileId}>
             {category === "image" && (
               <div className="rounded-xl overflow-hidden border border-slate-200 bg-slate-50">
-                <img
+                {/* /api/files URLs need the viewer's session cookie, which
+                    the image optimizer cannot present server-side, so the
+                    browser must load the file directly (unoptimized). */}
+                <Image
                   src={fileUrl(attachment)}
                   alt={attachment.name}
+                  width={1280}
+                  height={720}
+                  unoptimized
                   className="w-full max-h-72 object-contain"
-                  loading="lazy"
                 />
               </div>
             )}

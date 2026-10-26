@@ -4,7 +4,7 @@ import DashboardShell from "@/components/dashboard/DashboardShell";
 import StatCard from "@/components/dashboard/StatCard";
 import TodaysSchedule from "@/components/dashboard/TodaysSchedule";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { parentNav } from "@/lib/parent-nav";
 import { apiFetch } from "@/lib/api-client";
 
@@ -25,11 +25,7 @@ export default function ParentDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [selectedChildId, setSelectedChildId] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadData();
-  }, [selectedChildId]);
-
-  async function loadData(childId?: string) {
+  const loadData = useCallback(async (childId?: string) => {
     const idToUse = childId || selectedChildId;
     const url = idToUse ? `/api/dashboard/parent?learnerId=${idToUse}` : "/api/dashboard/parent";
 
@@ -50,7 +46,18 @@ export default function ParentDashboard() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [selectedChildId]);
+
+  useEffect(() => {
+    // The loader only writes state after its requests resolve.
+    let cancelled = false;
+    void (async () => {
+      if (!cancelled) await loadData();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadData]);
 
   function handleChildSwitch(childId: string) {
     setSelectedChildId(childId);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { parentNav } from "@/lib/parent-nav";
 import { apiFetch } from "../../../../lib/api-client";
@@ -11,32 +11,7 @@ export default function ParentReportsPage() {
   const [data, setData] = useState<{ grades: unknown[]; overall: { average: number }; attendance: { rate: number } } | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    apiFetch("/api/auth/me")
-      .then((r) => r.json())
-      .then((data) => { if (data.success) loadChildren(data.data.user.id); });
-  }, []);
-
-  async function loadChildren(parentId: string) {
-    try {
-      const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
-      const rel = await res.json();
-      if (rel.success) {
-        const learnerIds = rel.data.map((c: { learnerId: string }) => c.learnerId);
-        const userRes = await apiFetch("/api/users?role=learner&limit=100");
-        const userData = await userRes.json();
-        if (userData.success) {
-          const kids = userData.data.users.filter((l: { id: string }) => learnerIds.includes(l.id));
-          setChildren(kids);
-          if (kids.length > 0) loadReport(kids[0].id);
-        }
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  }
-
-  async function loadReport(learnerId: string) {
+  const loadReport = useCallback(async (learnerId: string) => {
     setChildId(learnerId);
     setLoading(true);
     try {
@@ -60,7 +35,32 @@ export default function ParentReportsPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  const loadChildren = useCallback(async (parentId: string) => {
+    try {
+      const res = await apiFetch(`/api/parent-learners?parentId=${parentId}`);
+      const rel = await res.json();
+      if (rel.success) {
+        const learnerIds = rel.data.map((c: { learnerId: string }) => c.learnerId);
+        const userRes = await apiFetch("/api/users?role=learner&limit=100");
+        const userData = await userRes.json();
+        if (userData.success) {
+          const kids = userData.data.users.filter((l: { id: string }) => learnerIds.includes(l.id));
+          setChildren(kids);
+          if (kids.length > 0) loadReport(kids[0].id);
+        }
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  }, [loadReport]);
+
+  useEffect(() => {
+    apiFetch("/api/auth/me")
+      .then((r) => r.json())
+      .then((data) => { if (data.success) loadChildren(data.data.user.id); });
+  }, [loadChildren]);
 
   function printReport() {
     window.print();
