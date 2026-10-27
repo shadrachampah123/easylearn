@@ -2,35 +2,36 @@
 
 ## Scope and evidence
 
-This is a follow-up snapshot against `main` at `c93c60a4bcea1a88a39f20a19e7e18d8a117338f` (PR #62). It supplements, rather than replaces, the earlier Issue #54 report and the historical `security/audit-pr40-49-final` report. No production database, secrets, object storage, or Neon resources were changed.
+This follow-up supplements the earlier Issue #54 report and historical `security/audit-pr40-49-final` report. The documentation-only PR #63 was merged as `7da7de9c60eea1197d2a834f0b4b291492306b94`; its CI passed on the PR head. No production database writes, migrations, secrets, object storage, or Neon resources were changed during this follow-up.
 
 ## Current verification matrix
 
 | Area | Current evidence | Status |
 |---|---|---|
-| Current `main` and deployment | `main` points to `c93c60a4bcea1a88a39f20a19e7e18d8a117338f`. GitHub combined status is success; Vercel reports deployment completed: https://vercel.com/shadrachampah123s-projects/easylearn/FphxhwbJH78Jt1pMn3BLmuqLS8Vi | Verified status only; live HTTP smoke test not independently performed |
-| PR #62 | Test-only change in `tests/membership-auth-db.test.ts`: logout route now receives `postJson("/api/auth/logout", {})` | Merged |
-| Session-revocation migration runner | `run-migration.js` lists `0019_session_revocation.sql` before gated `0018_composite_school_foreign_keys.sql`; comments explain ordering and fail-closed risk | Code presence verified |
-| Migration definition | `drizzle/0019_session_revocation.sql` adds `users.session_version integer NOT NULL DEFAULT 0` if absent and creates `users_session_version_idx` if absent | Code presence verified; production application not verified |
-| CI on current main | Run #40503738064, job “Tests, PostgreSQL isolation, typecheck, build, lint”, completed successfully on this exact SHA. The run includes unit/source security tests, CSRF/cookie suites, TLS tests, PostgreSQL-backed database/migration/membership/tenant suites, typecheck, production build and lint. | Pass |
-| Live R2/S3 upload/download | Test harness exists at `tests/object-storage-real-provider-harness.test.ts`; no disposable non-production provider credentials/bucket were available for this verification | Infrastructure-blocked / unverified |
-| Browser verification | Browser binaries/manual Chromium, Firefox and WebKit probes unavailable in this environment per prior Issue #54 follow-up | Infrastructure-blocked / unverified |
-| Production migration ledger and `users.session_version` | No production DB connection was attempted; must be checked by owner/DBA using read-only access | Unverified |
-| Legacy NULL `school_id` attribution and video Range 206 | Automated/disposable coverage is reported in the prior Issue #54 follow-up; staging/live confirmation remains outstanding | Partially covered; staging/live unverified |
-| Neon deleted Preview branch recovery | No Neon/Vercel control-plane credentials available in the prior follow-up; no restore or recovery was confirmed | Unverified; no changes made |
-| Independent security review | This report is authored by the project owner; it is not an independent review | Still required |
+| CI/source verification | PR #62 passed the GitHub CI suite on `c93c60a4bcea1a88a39f20a19e7e18d8a117338f`; documentation PR #63 CI also passed. Source includes security, tenant/membership, migration, TLS, typecheck, production build and lint coverage. | CI pass on tested commits; does not establish live production schema/route health |
+| Migration runner and migration file | `run-migration.js` registers `0019_session_revocation.sql` before gated `0018_composite_school_foreign_keys.sql`. Migration 0019 adds `users.session_version` and its index if missing. | Source verified only |
+| **Production schema: session revocation** | Read-only Neon catalog query against project `easylearn`, primary/default branch `production`, database `neondb`: `public.users` exists, but `users.session_version` is absent. | **BLOCKER — production schema does not match current source expectation** |
+| **Production migration ledger** | `public.easylearn_schema_migrations` does not exist. Read-only inventory found no public base table with a migration/drizzle-related name. | **BLOCKER — migration history cannot be verified from the expected ledger** |
+| **Production tenant-isolation constraints** | Read-only catalog inventory found **0 of 26** expected named composite tenant foreign-key constraints from migration 0018. All 24 expected `UNIQUE (school_id, id)` indexes were present, unique, valid, ready, and had the expected definition. The `schools` table and 26 `school_id` columns exist. | **CRITICAL BLOCKER — production catalog does not show the composite tenant foreign keys expected by current source** |
+| Production remediation | No migration, repair, baseline, or schema change was attempted. The discrepancy must be reconciled by the owner/DBA against a verified backup and the approved runbook before any writes. | Required; NO-GO |
+| Live R2/S3 upload/download | `tests/object-storage-real-provider-harness.test.ts` exists and has a production-bucket guard. No disposable non-production provider credentials/bucket were available for a live test. | Infrastructure-blocked / unverified |
+| Browser verification | Chromium, Firefox and WebKit live browser probes have not been run in this environment. | Infrastructure-blocked / unverified |
+| Live HTTP smoke test | Earlier attempts could not resolve the preview host because of environment DNS failure. Vercel deployment metadata is not proof that routes respond. | Unverified |
+| Legacy NULL school attribution and video Range 206 | Automated/disposable coverage exists in the prior follow-up; staging/live confirmation remains outstanding. | Partially covered |
+| Neon deleted Preview branch recovery | Current branch listing (including deleted branches) showed the production branch and active preview branches, but no deleted audit/historical preview branch. The only listed snapshot is a manual production snapshot from 2026-09-12. No snapshot schedule is configured for production or the current Issue #54 preview branch. No restore was attempted because the available snapshot is production-origin and does not prove it contains the deleted preview state. | Recovery unverified; no changes made |
+| Independent review | The project owner explicitly waived an independent reviewer for merging the documentation-only report. No independent review is claimed; this waiver does not approve production security sign-off. | Waiver applies to documentation-only report only |
 
 ## Safe next actions
 
-1. Ask an owner/DBA to verify the production migration ledger and `users.session_version` using a read-only connection. Do not run migrations as part of this check.
-2. With non-production credentials and a disposable test bucket only, run:
+1. **Stop before any production write.** Owner/DBA should investigate why the production `users.session_version` column and `easylearn_schema_migrations` ledger are absent, and why none of migration 0018's 26 expected composite tenant foreign keys are present. Reconcile against a verified backup and `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md` / `docs/OPERATIONS_DATABASE_TLS_AND_MIGRATIONS.md`. Do not run `drizzle-kit push`, migration, baseline, or repair until the actual schema and migration history have been independently established and an approved remediation is reviewed.
+2. With non-production credentials and a disposable bucket only, run:
    `OBJECT_STORAGE_LIVE_TEST=true npx tsx tests/object-storage-real-provider-harness.test.ts`
-   Capture results for presign → upload → download, expiry, content type, tampered signature, range limits, cross-school access, and deletion safeguards. Never point this harness at the production bucket.
-3. Run documented browser probes in browser-capable CI/QA with Chromium, Firefox and WebKit; attach results.
-4. Inspect Neon console/support restore options for the deleted Preview branch. Do not delete, restore over, or modify any branch until the target and recovery point are confirmed.
-5. Run a non-destructive live HTTP smoke test against the intended EasyLearn deployment when access is available.
-6. Obtain an independent security review of the updated source and this report. Keep this PR unmerged until independent review and required CI are successful.
+   Capture presign → upload → download, expiry, content type, tampered signature, range limits, cross-school access and deletion-safeguard results. Never use production bucket `easylearn-uploads`.
+3. Run browser probes in browser-capable CI/QA with Chromium, Firefox and WebKit.
+4. Retry a non-destructive HTTP smoke test against the intended deployment from an environment with working DNS and deployment access.
+5. For Neon recovery, ask Neon support/console for the deleted branch's recovery/retention state. Do not restore the production snapshot as if it were the deleted preview branch.
+6. Keep Issue #54 open until production schema/history are reconciled and remaining infrastructure checks are complete or explicitly risk-accepted.
 
 ## Go / no-go
 
-**NO-GO for production security sign-off at this time.** The current GitHub CI and deployment status pass, and the migration runner/file are present in current source. However, CI success does not prove the production migration ledger/schema, live object-storage behavior, browser behavior, live route health, or Neon Preview recovery. Those checks remain outstanding or infrastructure-blocked. No claim of production recovery or independent review is made.
+**NO-GO for production security sign-off.** Read-only production catalog checks found three critical discrepancies: `users.session_version` is absent, the expected `easylearn_schema_migrations` ledger is absent, and 0 of the 26 composite tenant foreign keys expected from migration 0018 are present. The 24 expected unique `(school_id, id)` indexes are present and valid, but they do not replace the foreign keys. This creates a serious risk that database-enforced cross-school referential isolation is missing. CI passing does not resolve this. Do not run migrations, schema sync, baseline, or repair until an owner/DBA reconciles the actual schema and history against a verified backup and approved remediation. Live storage, browser behavior, HTTP route health, and deleted Preview recovery remain unverified. No production or Neon resources were changed.
