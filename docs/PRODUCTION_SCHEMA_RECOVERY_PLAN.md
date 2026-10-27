@@ -45,17 +45,22 @@ of 0017 cannot be excluded, but there is no evidence for it. **Do not
 state H2 as the cause.**
 
 **H3 — runtime lazy repair should already have added `session_version`.
-(Open question, must be answered in P0.)** Current code probes/repairs the
-column on token verification (`ensureSessionRevocationColumn`, default
-`AUTO_SCHEMA_REPAIR=true`) and fails closed (503) if it cannot. A working
-production site + absent column implies one of: the deployed commit
-predates the fail-closed revocation code, `AUTO_SCHEMA_REPAIR=false` with
-repair impossible (auth would then 503 — visibly broken), or the runtime
-role cannot perform the DDL and the deployed code predates fail-closed.
-**Which commit is deployed to production, and whether authenticated flows
-currently succeed, must be established before remediation** — the answer
-changes the risk picture (e.g. deploying current code to an unrepaired DB
-with `AUTO_SCHEMA_REPAIR=false` would fail all authentication closed).
+(Narrowed by evidence 2026-10-27; final resolution needs one owner
+check.)** GitHub's deployment record shows production runs current
+`main` (`4134d23`, deployed 2026-10-27T18:02:46Z), so "old code
+deployed" is refuted, and code inspection shows the repair path has
+no silent skip (probe → idempotent DDL → re-probe; `verifyToken`
+fails closed with 503 if still unavailable). Exactly three
+possibilities remain: (1) the runtime `DATABASE_URL` targets a
+different Neon branch/database than the inspected one (repair
+already succeeded there); (2) `AUTO_SCHEMA_REPAIR=false` or the
+runtime role cannot ALTER — in which case **every authenticated
+request currently fails closed**; (3) no authenticated request has
+occurred since deployment. `docs/PRODUCTION_PREFLIGHT_0019_0018.md`
+§2 resolves which in ~5 minutes via the read-only `/api/health`
+probe plus one login. **Do not start P2 until H3 is resolved** —
+under possibility (1) the drift may not exist in the runtime
+database at all.
 
 Missing ledger ≠ proof migrations were not applied; equally, present
 schema objects ≠ proof of *how* they got there. The plan therefore treats
@@ -108,16 +113,24 @@ appears in the console. Test-restore it to a scratch branch and run the
 entire §3 sequence there first (this is the rehearsal that sizes the
 window and proves rollback).
 
-**P2 — Baseline (first write, low risk).** On production, in the window:
-`CONFIRM_MIGRATION_BASELINE=I_HAVE_VERIFIED_THESE_MIGRATIONS node run-migration.js --baseline 0000_wet_legion.sql,...,0017_school_id_not_null.sql`
-(the 18-file verified prefix). This creates the ledger and records the
-operator-verified prefix; it executes no schema SQL. Verify: 18 rows,
-checksums match the files at the deployed commit.
+**P2 — Baseline (first write, low risk).** On production, in the window,
+generate the exact 18-file verified prefix from the runner itself (no
+hand-typed list) and baseline it:
+`PREFIX=$(node -e "const {MIGRATIONS}=require('./run-migration.js');console.log(MIGRATIONS.slice(0,MIGRATIONS.indexOf('0019_session_revocation.sql')).join(','))")`
+`CONFIRM_MIGRATION_BASELINE=I_HAVE_VERIFIED_THESE_MIGRATIONS node run-migration.js --baseline "$PREFIX"`
+This creates the ledger and records the operator-verified prefix; it
+executes no schema SQL. Verify: 18 rows, checksums match the files at
+the deployed commit.
 
 **P3 — Apply 0019.** `node run-migration.js` (ordinary run). Applies only
-0019, announces the gated 0018 skip. Verify `users.session_version`
-exists, `NOT NULL DEFAULT 0`, index present; logins/logouts work;
-session revocation behaves (logout invalidates prior token).
+0019, announces the gated 0018 skip. Note the runner wraps 0019 in one
+transaction and its `CREATE INDEX` is non-concurrent, so writes to
+`users` pause while the index builds — time it on the restored copy
+if `users` is large. Verify `users.session_version` exists,
+`NOT NULL DEFAULT 0`, index present; logins/logouts work; session
+revocation behaves (logout invalidates prior token). If §2 of the
+preflight showed lazy repair already created the column, 0019 still
+runs cleanly (idempotent) and simply becomes ledger-official.
 
 **P4 — Apply gated 0018.** Only with P0 mismatch counts all zero:
 `CONFIRM_MIGRATION_0018=I_HAVE_VERIFIED_THE_COMPOSITE_TENANT_FOREIGN_KEYS node run-migration.js 0018_composite_school_foreign_keys.sql`
