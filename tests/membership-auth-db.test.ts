@@ -1042,7 +1042,7 @@ async function main() {
     });
 
     await test("Logout: clears the session cookie", async () => {
-      const response = await logoutRoute.POST();
+      const response = await logoutRoute.POST(postJson("/api/auth/logout", {}));
       assertEq(response.status, 200, "logout status");
       const cookie = response.cookies.get("el_token");
       assert(cookie, "cookie header present");
