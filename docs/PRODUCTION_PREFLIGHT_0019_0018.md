@@ -41,42 +41,64 @@ under `docs/PRODUCTION_SCHEMA_RECOVERY_PLAN.md` after explicit approval.
      fail-closed code deployed (repair is lazy, on first token
      verification).
 
-## 2. Step A — resolve H3 (5 minutes, no DB access needed)
+## 2. Step A — resolve H3 (owner-observed evidence 2026-10-27 21:41 UTC + remaining check)
 
-1. From any browser/curl **outside** the agent sandbox:
-   `curl -s https://easylearn-six.vercel.app/api/health`
-   The endpoint is unauthenticated, read-only (it never runs DDL), and
-   reports against the **runtime** database:
-   `checks.optionalMigrations.session_revocation`,
-   `checks.optionalMigrations.composite_tenant_foreign_keys`, and
-   `migrationWarnings[]` whose wording reveals the repair mode
-   ("EasyLearn creates it on demand…" = repair enabled;
-   "AUTO_SCHEMA_REPAIR is off…" = repair disabled).
-2. Interpret:
-   - `session_revocation: true` → **H3-1**: runtime DB already has the
-     column; the inspected Neon branch is not the (only) runtime DB.
-     Redirect all further preflight at the runtime database identity
-     (confirm which Neon branch `DATABASE_URL` targets — by project/
-     branch **name only**, never paste the connection string).
-   - `session_revocation: false` + "AUTO_SCHEMA_REPAIR is off" →
-     **H3-2**: auth is currently failing closed. Confirm by logging in
-     and loading any dashboard (expect 503-style errors), and search
-     Vercel function logs for
-     `[auth] session-revocation column unavailable`.
-   - `session_revocation: false` + "creates it on demand" → **H3-3 or
-     a failing repair**: log in once (one authenticated request), wait
-     a minute, re-run the health check. If it flips to `true`, the
-     repair worked and the incident was "no traffic yet". If it stays
-     `false`, search Vercel logs for
-     `[schema] could not auto-apply part of session_revocation`
-     (DDL privilege problem) — treat like H3-2.
-3. Record the outcome + the deployed SHA from the Vercel dashboard
-   (expected `4134d23` per the GitHub deployment record).
+**Owner-observed:** `GET https://easylearn-six.vercel.app/api/health`
+→ HTTP 200: `databaseUrlConfigured`, `jwtSecretConfigured`,
+`databaseConnected`, `schemaReady` all true;
+`optional_user_columns: true`; `composite_tenant_foreign_keys: false`
+with the warning that 0018 "has not been applied" and is never applied
+automatically.
 
-**Stop condition:** if H3 resolves to "runtime database ≠ inspected
-database", do **not** proceed against the inspected branch. Re-run
-§3–§4 against the runtime database's branch instead; the drift may not
-exist there at all.
+**What this establishes (verified against the endpoint's code):**
+- The runtime deployment is configured, connected, and its core
+  `users` table shape is compatible (`schemaReady` checks 9 core
+  columns — **not** `session_version`).
+- The **runtime database itself lacks the 0018 composite FKs**
+  (the composite probe runs against the runtime DB). The 0018 drift
+  is therefore real in the application's own database, not only in
+  an inspected side branch.
+- `composite_tenant_foreign_keys: false` + its warning also proves
+  `probeSchemaFeatures` executed against production successfully.
+
+**What it does NOT establish — correction of this document's earlier
+claim:** the deployed `/api/health` does **not** probe
+`session_version` at all. `probeSchemaFeatures()`' default list
+omitted `session_revocation`, and `optional_user_columns: true`
+only proves `users(username, must_change_password)` exist (0006) — a
+broader, older check. So the health response says **nothing** about
+whether the runtime DB has `session_version`, and its static
+"Login and registration services are ready" message is not evidence
+that authentication succeeds. (Fix in flight: `session_revocation`
+has been added to the health probe's default list with a DB-backed
+regression test; once that is merged and deployed, this endpoint
+*will* report it.)
+
+**Remaining H3 verification (owner, ~5 minutes):**
+1. Log in normally, then load any authenticated page (or request
+   `/api/auth/me` with the session cookie). Record the outcome:
+   - **Login + authenticated page works** → `verifyToken` passed,
+     so the runtime DB has `session_version` *now* (it either always
+     did, or lazy repair created it during that request — repair is
+     enabled unless `AUTO_SCHEMA_REPAIR=false`). Next: re-run the
+     §3 catalog check on the previously inspected Neon branch. If it
+     still lacks the column there, the runtime DB differs from that
+     branch (H3-1) — identify the runtime branch by name before any
+     remediation planning. If it now has the column, H3-3/repair is
+     confirmed and 0019 becomes a ledger-formality (still apply via
+     the runner for history integrity).
+   - **Login returns a session but authenticated pages/APIs 503** →
+     H3-2: repair is off or DDL is denied; auth is currently failing
+     closed. Confirm in Vercel function logs:
+     `[auth] session-revocation column unavailable`. This raises the
+     priority of P3 (0019) — it is the fix — but P0–P2 discipline
+     still applies.
+   - **Cannot log in at all** → record the exact error/status; do
+     not conflate with H3-2 (login itself does not verify tokens).
+2. Report: login outcome, one authenticated request outcome,
+   `/api/auth/me` status if used, and the re-checked branch catalog
+   result for `users.session_version` only. No credentials, cookies,
+   or tokens in the report.
 
 ## 3. Step B — re-verify drift (read-only, runtime database)
 

@@ -57,10 +57,17 @@ already succeeded there); (2) `AUTO_SCHEMA_REPAIR=false` or the
 runtime role cannot ALTER — in which case **every authenticated
 request currently fails closed**; (3) no authenticated request has
 occurred since deployment. `docs/PRODUCTION_PREFLIGHT_0019_0018.md`
-§2 resolves which in ~5 minutes via the read-only `/api/health`
-probe plus one login. **Do not start P2 until H3 is resolved** —
-under possibility (1) the drift may not exist in the runtime
-database at all.
+Owner evidence 2026-10-27 21:41 UTC: `/api/health` returned 200
+with `composite_tenant_foreign_keys: false` from the **runtime**
+database — the 0018 drift is real in the application's own DB,
+weakening possibility (1) for 0018. However, the deployed health
+endpoint does not probe `session_version` (its default list omitted
+it; `optional_user_columns: true` only proves the 0006 columns), so
+`session_version` in the runtime DB and current authentication
+success remain **unverified** pending the owner's login test in
+`docs/PRODUCTION_PREFLIGHT_0019_0018.md` §2. (The probe list has
+since been fixed in PR #65; it takes effect after merge/deploy.)
+**Do not start P2 until H3 is resolved.**
 
 Missing ledger ≠ proof migrations were not applied; equally, present
 schema objects ≠ proof of *how* they got there. The plan therefore treats
