@@ -576,6 +576,12 @@ export async function probeSchemaFeatures(
     "dashboard_card_overrides",
     "activity_logs_enrichment",
     "optional_user_columns",
+    /* Session revocation is security-critical, not optional polish: the health
+       probe must report users.session_version explicitly. Without this entry
+       /api/health could show green while verifyToken is failing closed
+       (2026-10-27 production preflight finding). Read-only, like every probe
+       here — it never runs the repair DDL. */
+    "session_revocation",
     "quiz_question_images",
     "uploaded_files",
     "assignment_file_uploads",
