@@ -20,13 +20,17 @@ This document distinguishes three evidence classes honestly:
 | 4 | Schema columns | 351 columns / 38 tables, match exactly |
 | 5 | Index definitions | All 117 match exactly |
 | 6 | PK/FK/UNIQUE constraint reports | Match (query limitation on composite-UNIQUE column ordering — see §3 fix) |
-| 7 | Row counts | 10 selected tables match; **remaining 28 tables outstanding** |
+| 7 | Row counts | **All 38 public tables match production** (completed 2026-10-30) |
 | 8 | Production modified? | No |
+| 9 | Sequences (definition, ownership, state) | Match (completed 2026-10-30) |
+| 10 | Enum types | All 12 enum types and 58 enum values match (completed 2026-10-30) |
+| 11 | Public functions (restored DB inventory) | Query returned none (completed 2026-10-30) |
 
-**SHA-256: NOT VERIFIED.** No hash value has been provided in evidence. Until
-the complete hash in §2 step 1 is recorded, file integrity is unproven — a
-restore that "succeeded" shows the file was readable once, not that the copy
-held off-Neon is bit-identical to what was dumped.
+**SHA-256 (owner-recorded 2026-10-30, not Arena-recomputed — the agent has no
+copy of the file):**
+`A9300EA7382DF3A1C4CE71FBC0A57448E7F3EDE2F945E4E0D0BE786E4381B669`
+This proves the owner holds a recorded hash; bit-identity of every stored copy
+still requires re-running `sha256sum` on each copy and comparing (§2 step 1).
 
 ## 2. Remaining verification — exact read-only operator steps
 
@@ -163,9 +167,12 @@ data written to production **after** 2026-10-29 (the dump is already ageing).
 | Restore mechanics (dump → `restore_test`) | PASS (owner-reported) |
 | Columns / indexes | PASS (owner-reported) |
 | Constraints | PASS with ordering caveat → Step 5 to close (owner-reported) |
-| Row counts (all 38) | **NOT VERIFIED** (10/38 owner-reported PASS) |
-| Sequences, enums, functions, triggers, RLS, extensions, grants | **NOT VERIFIED** |
-| Backup-file SHA-256 integrity | **NOT VERIFIED** |
+| Row counts (all 38) | PASS (owner-reported 2026-10-30) |
+| Sequences (definition/ownership/state) | PASS (owner-reported 2026-10-30) |
+| Enums (12 types / 58 values) | PASS (owner-reported 2026-10-30) |
+| Public functions | Restored inventory empty (owner-reported); production-side empty-inventory confirmation still required for a two-sided PASS |
+| Triggers, RLS policies, extensions, grants | **NOT VERIFIED** |
+| Backup-file SHA-256 | Hash recorded (owner-reported); per-copy recomputation **NOT VERIFIED**; Arena recomputation not possible |
 | Object-storage (file bytes) coverage | **FAIL as a complete-recovery claim** — dump does not cover it; corrective step 5 required |
 | Independent (Arena) verification of Neon-side items | **NOT POSSIBLE** — no Neon credentials/access in the agent sandbox; all Neon-side results above are owner-reported |
 
@@ -176,3 +183,31 @@ object-storage coverage are unproven. Production recovery stays NO-GO until
 §2 is executed and diffed clean, §4 items 1–6 are closed with recorded
 evidence, and an independent reviewer (human, or an agent with read-only Neon
 access) confirms the outputs.
+
+## 6. Consolidated outstanding-items list (2026-10-30)
+
+**Verified (Arena, from source/GitHub):** dump coverage limits (§3 — file bytes,
+secrets, Neon/Vercel config not covered); repo/PR/CI state. Nothing Neon-side
+is Arena-verified: the sandbox holds no Neon credentials or file copy.
+
+**Owner-reported PASS:** restore into `restore_test`; 351 columns/38 tables;
+117/117 index definitions; PK/FK/UNIQUE reports; **all 38 table row counts**;
+sequences (definition/ownership/state); **12 enum types / 58 values**;
+SHA-256 recorded (`A9300EA7…81B669`); production unmodified.
+
+**Partially verified:** public functions — restored inventory returned none;
+a two-sided PASS still needs the production inventory shown empty with the
+same query. Composite-UNIQUE column ordering still needs the §2 Step 5
+canonical `pg_get_constraintdef` diff (the original query's limitation).
+
+**NOT VERIFIED (outstanding):**
+1. Triggers, RLS enablement/policies, extensions, grants — §2 Step 4 grouped queries, diffed.
+2. Composite-UNIQUE ordering — §2 Step 5.
+3. SHA-256 recomputation on every stored copy (incl. off-Neon) against the recorded hash.
+4. Object-storage backup/coverage — bucket versioning/sync + count reconciliation vs `uploaded_files` by `storage_backend` (§4 item 5). The DB dump alone cannot restore file bytes.
+5. App-level smoke test against `restore_test` (Preview deployment; login + authenticated read).
+6. Backup retention/schedule — ≥2 encrypted copies (one off-Neon), recorded source branch/time; Neon auto-snapshots still unconfigured.
+7. Independent confirmation by a reviewer with read-only Neon access (all Neon-side items above are single-source owner reports).
+
+**Recommendation unchanged: NO-GO.** Items 1–4 are quick grouped-query checks;
+item 4 (object storage) is the largest real recovery gap.
