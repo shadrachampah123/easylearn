@@ -130,7 +130,7 @@ users_session_version_idx` (**non-concurrent** — blocks writes to
 change beyond the new defaulted column. Rehearse timing on the
 restored copy if `users` is large.
 
-**0018 (`drizzle/0018_composite_school_foreign_keys.sql`, one `DO`
+**0018 (`0018_composite_school_foreign_keys.sql` (repo root — only 0019 lives in `drizzle/`; the runner resolves root first), one `DO`
 block, one transaction via the runner):** for each of the 26
 relationships it (i) verifies the parent `UNIQUE (school_id, id)`
 index exists, (ii) counts cross-school/orphan violations and **raises

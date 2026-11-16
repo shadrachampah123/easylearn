@@ -59,11 +59,22 @@ export async function GET() {
 
     // Read-only probe of the migrations that add optional objects, so an operator can see
     // "overrides are disabled because 0004 was never applied" from one URL. Never runs DDL.
+    let sessionRevocationUnavailable = false;
     try {
       const { probeSchemaFeatures } = await import("@/lib/schema-resilience");
       const optional = await probeSchemaFeatures();
       for (const item of optional) {
         checks.optionalMigrations[item.feature] = item.present;
+        /* Session revocation is security-critical, not optional polish. If the column is
+           missing AND automatic repair is disabled, verifyToken fails closed and every
+           authenticated request answers 503 — while this endpoint was reporting "ready"
+           (Issue #54 production finding, 2026-10-27). When repair is enabled the next
+           authenticated request will attempt the idempotent repair DDL, so that case
+           stays a warning: this read-only probe cannot know whether the runtime role
+           may execute DDL. */
+        if (item.feature === "session_revocation" && !item.present && !item.repairEnabled) {
+          sessionRevocationUnavailable = true;
+        }
         if (!item.present) {
           const remedy = item.autoRepairable
             ? item.repairEnabled
@@ -100,6 +111,22 @@ export async function GET() {
           service: "EasyLearn API",
           checks,
           message: jwtProblem,
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    if (sessionRevocationUnavailable) {
+      return Response.json(
+        {
+          ok: false,
+          service: "EasyLearn API",
+          checks,
+          message:
+            "Database is connected, but session revocation is unavailable: users.session_version " +
+            "is missing (drizzle/0019_session_revocation.sql) and AUTO_SCHEMA_REPAIR is off, so " +
+            "token verification fails closed and authenticated requests will return 503. " +
+            "Apply the migration or re-enable automatic schema repair.",
         },
         { status: 503, headers: { "Cache-Control": "no-store" } }
       );

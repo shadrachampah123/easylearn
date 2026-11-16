@@ -35,7 +35,6 @@
  */
 import assert from "assert";
 import path from "path";
-import os from "os";
 import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
@@ -113,28 +112,19 @@ async function main() {
   let adminUrl = process.env.TEST_DATABASE_URL;
 
   if (!adminUrl) {
-    let EmbeddedPostgres: any = null;
-    try {
-      EmbeddedPostgres = requireFromRepo("embedded-postgres");
-      EmbeddedPostgres = EmbeddedPostgres.default ?? EmbeddedPostgres;
-    } catch {
-      console.log("⏭️  SKIP: no TEST_DATABASE_URL and embedded-postgres is not installed.");
-      console.log("   Install with `npm i --no-save embedded-postgres` and re-run.");
-      return;
-    }
+    /* Shared bootstrap (PR #66 follow-up): one credential pair, a startup watchdog,
+       guaranteed stop + cleanup, and a hard failure instead of a silent skip when CI
+       requires this suite (EASY_LEARN_REQUIRE_DRIFT_REHEARSAL=true). */
+    const { startEmbeddedPostgres } = requireFromRepo("./tests/helpers/embedded-postgres.js");
     const port = 56929 + (crypto.randomBytes(2).readUInt16BE(0) % 1000);
-    const pg = new EmbeddedPostgres({
-      databaseDir: path.join(os.tmpdir(), `${DB_NAME}-data`),
-      user: "easylearn",
-      password: "easylearn",
+    const embedded = await startEmbeddedPostgres({
+      dbName: DB_NAME,
       port,
-      persistent: false,
+      requireEnv: "EASY_LEARN_REQUIRE_DRIFT_REHEARSAL",
     });
-    await pg.initialise();
-    await pg.start();
-    stopServer = () => pg.stop();
-    adminUrl = `postgres://easylearn:easylearn@localhost:${port}/postgres`;
-    console.log(`📦 Embedded PostgreSQL started on port ${port}`);
+    if (!embedded) return; // SKIP printed by the helper (only when the suite is not required)
+    adminUrl = embedded.adminUrl;
+    stopServer = embedded.stop;
   }
 
   const admin = new Client({ connectionString: adminUrl });
@@ -280,10 +270,14 @@ async function main() {
       assertEq(await ledgerCount(), MIGRATIONS.length, "ledger must record the full chain");
     });
   } finally {
+    /* Cleanup on every outcome: verified scratch-DB drop (never swallowed), then stop
+       the embedded cluster + remove its data dir. */
     await db.end().catch(() => {});
-    await admin.query(`DROP DATABASE IF EXISTS "${DB_NAME}" WITH (FORCE)`).catch(() => {});
+    const { dropScratchDatabase, assertCleanupSucceeded } = requireFromRepo("./tests/helpers/scratch-db.js");
+    const scratchCleanup = await dropScratchDatabase(admin, DB_NAME, { label: "production-drift-remediation-rehearsal" });
     await admin.end().catch(() => {});
-    if (stopServer) await stopServer().catch(() => {});
+    if (stopServer) await stopServer();
+    assertCleanupSucceeded(scratchCleanup, failed > 0 ? new Error(`${failed} test(s) failed`) : null);
   }
 
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed`);

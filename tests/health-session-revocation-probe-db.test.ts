@@ -22,8 +22,6 @@
  */
 import assert from "assert";
 import path from "path";
-import os from "os";
-import fs from "fs";
 import crypto from "crypto";
 import { createRequire } from "module";
 
@@ -46,27 +44,19 @@ async function main() {
   let stopServer: (() => Promise<void>) | null = null;
   let adminUrl = process.env.TEST_DATABASE_URL;
   if (!adminUrl) {
-    let EmbeddedPostgres: any = null;
-    try {
-      EmbeddedPostgres = requireFromRepo("embedded-postgres");
-      EmbeddedPostgres = EmbeddedPostgres.default ?? EmbeddedPostgres;
-    } catch {
-      console.log("⏭️  SKIP: no TEST_DATABASE_URL and no embedded-postgres");
-      return;
-    }
+    /* Shared bootstrap (PR #66 follow-up): one credential pair, a startup watchdog,
+       guaranteed stop + cleanup, and a hard failure instead of a silent skip when CI
+       requires this suite. */
+    const { startEmbeddedPostgres } = requireFromRepo("./tests/helpers/embedded-postgres.js");
     const port = 59901 + (crypto.randomBytes(2).readUInt16BE(0) % 500);
-    const pg = new EmbeddedPostgres({
-      databaseDir: path.join(os.tmpdir(), `${DB_NAME}-data`),
-      user: "easylearn",
-      password: "easylearn",
+    const embedded = await startEmbeddedPostgres({
+      dbName: DB_NAME,
       port,
-      persistent: false,
+      requireEnv: "EASY_LEARN_REQUIRE_HEALTH_SESSION_PROBE",
     });
-    await pg.initialise();
-    await pg.start();
-    stopServer = () => pg.stop();
-    adminUrl = `postgres://easylearn:easylearn@127.0.0.1:${port}/postgres`;
-    console.log(`📦 Embedded PG ${port}`);
+    if (!embedded) return; // SKIP printed by the helper (only when the suite is not required)
+    adminUrl = embedded.adminUrl;
+    stopServer = embedded.stop;
   }
   const scratchUrl = (() => {
     const u = new URL(adminUrl as string);
@@ -122,13 +112,23 @@ async function main() {
       assert.strictEqual(entry!.present, true);
     });
   } finally {
+    /* Cleanup on every outcome: terminate lingering pool backends, drop the scratch DB
+       (verified, not swallowed), stop the embedded cluster + remove its data dir. */
     await db.end().catch(() => undefined);
-    const cleanup = new Client({ connectionString: adminUrl });
-    await cleanup.connect().catch(() => undefined);
-    await cleanup.query(`DROP DATABASE IF EXISTS "${DB_NAME}"`).catch(() => undefined);
-    await cleanup.end().catch(() => undefined);
-    if (stopServer) await stopServer().catch(() => undefined);
-    fs.rmSync(path.join(os.tmpdir(), `${DB_NAME}-data`), { recursive: true, force: true });
+    let scratchCleanup: { ok: boolean; error: Error | null } = { ok: true, error: null };
+    const cleanupClient = new Client({ connectionString: adminUrl });
+    try {
+      await cleanupClient.connect();
+      const { dropScratchDatabase } = requireFromRepo("./tests/helpers/scratch-db.js");
+      scratchCleanup = await dropScratchDatabase(cleanupClient, DB_NAME, { label: "health-session-revocation-probe" });
+    } catch (cleanupError) {
+      scratchCleanup = { ok: false, error: cleanupError as Error };
+    } finally {
+      await cleanupClient.end().catch(() => undefined);
+    }
+    if (stopServer) await stopServer();
+    const { assertCleanupSucceeded } = requireFromRepo("./tests/helpers/scratch-db.js");
+    assertCleanupSucceeded(scratchCleanup, failed > 0 ? new Error(`${failed} test(s) failed`) : null);
   }
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exitCode = 1;
