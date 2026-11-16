@@ -71,6 +71,17 @@ jobs:
           EASY_LEARN_REQUIRE_SEED_MEMBERSHIP: "true"
           # A skip must fail this job: the seed-atomicity assertions have to actually run.
           EASY_LEARN_REQUIRE_SEED_ATOMICITY: "true"
+          # A skip must fail this job (PR #66): the drift-remediation rehearsal, the health
+          # session-revocation probe/route suites and the four session-revocation suites must
+          # actually run — they previously skipped (exit 0) without TEST_DATABASE_URL.
+          EASY_LEARN_REQUIRE_DRIFT_REHEARSAL: "true"
+          EASY_LEARN_REQUIRE_HEALTH_SESSION_PROBE: "true"
+          EASY_LEARN_REQUIRE_HEALTH_SESSION_ROUTE: "true"
+          EASY_LEARN_REQUIRE_SESSION_REVOCATION_DB: "true"
+          # A skip must fail this job: the embedded-PostgreSQL lifecycle hygiene
+          # assertions (confirmed shutdown, no orphan postmasters, no leftover data
+          # dirs) have to actually run.
+          EASY_LEARN_REQUIRE_EMBEDDED_PG_LIFECYCLE: "true"
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth

@@ -35,6 +35,10 @@ function runMigrations({ databaseUrl, env = {}, fileName }) {
       cwd: REPO_ROOT,
       env: childEnv || baseEnv,
       encoding: "utf8",
+      /* A migration run is seconds on a disposable database; without a timeout a wedged
+         child (lock wait, network stall) would hang the suite forever (PR #66). The
+         rehearsal suite uses the same bound for its own runner invocations. */
+      timeout: 240_000,
     });
 
   const steps = [];
