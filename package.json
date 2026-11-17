@@ -36,6 +36,8 @@
     "test:jwt-policy": "npx tsx tests/jwt-secret-policy.test.ts",
     "test:csrf": "npx tsx tests/csrf-policy.test.ts",
     "test:cookie-auth": "npx tsx tests/cookie-auth.test.ts",
+    "test:csp-hydration": "npx tsx tests/csp-hydration-dynamic-rendering.test.ts",
+    "probe:csp-hydration": "node tests/manual/csp-nonce-hydration-probe.js",
     "test:uploads": "npx tsx tests/upload-content.test.ts && npx tsx tests/object-storage-content-policy.test.ts && npx tsx tests/object-storage-harness-safety.test.ts",
     "test:object-live": "EASY_LEARN_TEST_DATABASE=true npx tsx tests/object-storage-live.test.ts",
     "test:auth-security": "npm run test:jwt-policy && npm run test:csrf && npm run test:cookie-auth && npm run test:uploads",

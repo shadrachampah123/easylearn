@@ -54,6 +54,11 @@ jobs:
         run: test -n "$TEST_DATABASE_URL"
       - name: Unit and source-security tests
         run: npm test
+      # Guards the af4fd93 production login outage: a prerendered interactive route
+      # carries no CSP nonce, so 'strict-dynamic' blocks every chunk and the page
+      # never hydrates. Fast, no build/server/database required.
+      - name: CSP nonce / dynamic-rendering invariants
+        run: npm run test:csp-hydration
       - name: Authentication security suites (JWT secret policy, CSRF, cookie auth)
         run: npm run test:auth-security
       - name: End-to-end PostgreSQL TLS tests (TLS-enabled PostgreSQL 16 required)
