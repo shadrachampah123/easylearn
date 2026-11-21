@@ -131,8 +131,10 @@ export async function POST(request: NextRequest) {
       return errorResponse("Invalid email or password", 401);
     }
 
-    // Successful login — clear the account bucket *and* this source IP's bucket, so a
-    // legitimate user behind a shared school NAT releases the budget they consumed.
+    // Successful login — release only *this account's* recorded failures (H-R1). Clearing
+    // by source IP as well would let anyone holding one valid credential wipe another
+    // account's pending failures from the same NAT, making the throttle repeatable to
+    // bypass; see clearFailedLoginAttempts.
     await clearFailedLoginAttempts(identifier, clientIp);
 
     // Phase 2B — school context. Resolved from `school_users` on the server; a client

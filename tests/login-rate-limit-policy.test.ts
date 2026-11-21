@@ -176,12 +176,32 @@ async function main() {
 
   /* ── 3. The login route wires all three layers together ──────────────────────── */
 
-  await test("the login route passes the source IP when clearing a successful login", () => {
-    const content = readFile("src/app/api/auth/login/route.ts");
+  /* REWRITTEN for independent review finding H-R1 (2026-11-19). The old assertion pinned
+     only the call site, and its stated rationale — "release both the account bucket and the
+     source bucket" — described the vulnerability itself. It now pins the *scope of the
+     DELETE*, so the widened form cannot be reintroduced by a future refactor. */
+  await test("a successful login clears only the signing-in account's failures (H-R1)", () => {
+    const route = readFile("src/app/api/auth/login/route.ts");
     assert(
-      content.includes("clearFailedLoginAttempts(identifier, clientIp)"),
-      "a successful login must release both the account bucket and the source bucket"
+      route.includes("clearFailedLoginAttempts(identifier, clientIp)"),
+      "a successful login must still release the signing-in account's own recorded failures"
     );
+
+    const lib = readFile("src/lib/rate-limit.ts");
+    const start = lib.indexOf("export async function clearFailedLoginAttempts");
+    assert(start > -1, "clearFailedLoginAttempts must still exist");
+    const clear = lib.slice(start);
+    assert(
+      clear.includes(".where(eq(loginAttempts.identifier, normalizedIdentifier))"),
+      "the reset DELETE must be scoped to the signing-in identifier"
+    );
+    assert(
+      !clear.includes("loginAttempts.ipAddress"),
+      "the reset DELETE must never be widened by the source IP: that erases other accounts' failures"
+    );
+    assert(!lib.includes("or(eq(loginAttempts.identifier"), "no OR-scoped login_attempts delete may come back");
+    const importLine = lib.split("\n").find((line) => line.includes('from "drizzle-orm"')) ?? "";
+    assert(!/\bor\b/.test(importLine), "the drizzle `or` operator is unused now and must not be imported");
   });
 
   await test("the login route refuses a login it could not throttle, instead of allowing it", () => {

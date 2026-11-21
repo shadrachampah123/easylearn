@@ -1,7 +1,7 @@
 /**
  * H-1 (login rate limiting) regression — database backed.
  *
- * Proves the four properties the remediation had to deliver:
+ * Proves the five properties the remediation had to deliver:
  *
  *   1. **fails safely** — a database the throttle cannot read refuses the login instead of
  *      waving it through, and an un-migrated database self-heals rather than losing
@@ -13,7 +13,10 @@
  *      distinct sources to trip;
  *   4. **legitimate login is preserved** — a correct password still returns 200 with an
  *      httpOnly cookie, including with no source header at all, and a successful login
- *      releases both the account bucket and the source bucket.
+ *      releases that account's own recorded failures;
+ *   5. **a successful login is not a throttle-reset oracle (H-R1)** — signing in as account
+ *      A leaves account B's recorded failures intact even when both share a source IP, so
+ *      one valid low-privilege credential cannot make the guess budget repeatable.
  *
  * Run: EASY_LEARN_TEST_DATABASE=true npx tsx tests/login-rate-limit-db.test.ts
  * (CI hard-requires execution via EASY_LEARN_REQUIRE_LOGIN_RATE_LIMIT_DB=true; a silent skip fails the job)
@@ -254,20 +257,37 @@ async function main() {
 
     /* ── 5. Clearing on success ────────────────────────────────────────────────── */
 
-    await test("clearing releases the account bucket and the source bucket together", async () => {
+    /* REVERSED by independent review finding H-R1 (2026-11-19). This test used to assert
+       that a successful login emptied the whole source — `attemptRows() === 0` and the
+       colleague "gets its budget back" — which is precisely the vulnerability: it is an
+       amnesty for *other accounts'* recorded failures. The assertions are now inverted. */
+    await test("clearing releases the signing-in account only, never other accounts on the same source", async () => {
       await reset();
+      const COLLEAGUE = `colleague-${DB_NAME}@test.test`;
       await seedFailures(ADMIN_EMAIL, OWNER_IP, MAX_ATTEMPTS - 1);
-      await seedFailures(`colleague-${DB_NAME}@test.test`, OWNER_IP, MAX_ATTEMPTS - 1);
+      await seedFailures(COLLEAGUE, OWNER_IP, MAX_ATTEMPTS - 1);
 
       const before = await checkLoginRateLimit(ADMIN_EMAIL, OWNER_IP);
       assert.strictEqual(before.allowed, true, "one attempt short of the budget must still be allowed");
       assert.strictEqual(before.remainingAttempts, 1);
+      const colleagueBefore = await checkLoginRateLimit(COLLEAGUE, OWNER_IP);
+      assert.strictEqual(colleagueBefore.remainingAttempts, 1, "fixture: the colleague is one attempt short too");
 
       await clearFailedLoginAttempts(ADMIN_EMAIL, OWNER_IP);
 
-      assert.strictEqual(await attemptRows(), 0, "both buckets for that source must be cleared");
-      const colleague = await checkLoginRateLimit(`colleague-${DB_NAME}@test.test`, OWNER_IP);
-      assert.strictEqual(colleague.remainingAttempts, MAX_ATTEMPTS, "a shared NAT source gets its budget back");
+      const adminRows = Number(
+        (await db.query(`SELECT count(*)::int AS count FROM login_attempts WHERE identifier = lower($1)`, [ADMIN_EMAIL]))
+          .rows[0].count
+      );
+      assert.strictEqual(adminRows, 0, "the signing-in account's own failures must be released");
+      assert.strictEqual(
+        await attemptRows(),
+        MAX_ATTEMPTS - 1,
+        `only the colleague's ${MAX_ATTEMPTS - 1} rows may survive — a shared source is NOT an amnesty (H-R1)`
+      );
+      const colleague = await checkLoginRateLimit(COLLEAGUE, OWNER_IP);
+      assert.strictEqual(colleague.remainingAttempts, 1, "another account on the same source keeps the budget it consumed");
+      assert.strictEqual(colleague.allowed, true, "and is still one guess short of its own block, not reset to full");
     });
 
     await test("clearing still works with the historical single-argument signature", async () => {
@@ -328,7 +348,11 @@ async function main() {
       assert.strictEqual(payload.success, true);
       assert.strictEqual(payload.data?.user?.email, ADMIN_EMAIL);
 
-      assert.strictEqual(await attemptRows(), 0, "a successful login clears both buckets");
+      assert.strictEqual(
+        await attemptRows(),
+        0,
+        "a successful login clears every recorded failure for that account, from any source"
+      );
     });
 
     await test("an over-long x-forwarded-for can no longer switch throttling off", async () => {
@@ -358,6 +382,64 @@ async function main() {
       assert.strictEqual(denied.status, 401);
       const granted = await POST(loginRequest(rightPassword));
       assert.strictEqual(granted.status, 200, "a missing source header must not break legitimate login");
+    });
+
+    /* ── 7b. H-R1 regression: a successful login must not reset another account ───── */
+
+    await test("a successful login by account A cannot clear account B's failures from the same IP (H-R1)", async () => {
+      await reset();
+      const INSIDER_EMAIL = `insider-${DB_NAME}@test.test`;
+      const INSIDER_PASSWORD = "Insider-Horse-1!";
+      const SHARED_IP = "203.0.113.88";
+      await db.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, is_active)
+         VALUES ($1, $2, 'learner', 'Ins', 'Ider', true)`,
+        [INSIDER_EMAIL, await bcrypt.hash(INSIDER_PASSWORD, 4)]
+      );
+
+      /* The attack as measured by the independent review: guess against the administrator
+         from the school's exit IP, then erase the accumulated evidence by signing in with
+         the insider's own perfectly valid low-privilege credential from that same IP.
+         Three cycles must yield ONE budget of guesses, not three. */
+      const cycles = 3;
+      const statuses: number[] = [];
+      for (let cycle = 0; cycle < cycles; cycle += 1) {
+        for (let guess = 0; guess < MAX_ATTEMPTS - 1; guess += 1) {
+          statuses.push((await POST(loginRequest(wrongPassword, SHARED_IP))).status);
+        }
+        const insider = await POST(
+          loginRequest({ email: INSIDER_EMAIL, password: INSIDER_PASSWORD }, SHARED_IP)
+        );
+        assert.strictEqual(insider.status, 200, `the insider must still be able to sign in (cycle ${cycle + 1})`);
+      }
+      const afterAllCycles = (await POST(loginRequest(wrongPassword, SHARED_IP))).status;
+
+      const attempted = statuses.filter((status) => status === 401).length;
+      const throttled = statuses.filter((status) => status === 429).length;
+      assert.strictEqual(attempted + throttled, statuses.length, "every guess must be answered 401 or 429");
+      assert.strictEqual(
+        attempted,
+        MAX_ATTEMPTS,
+        `H-R1: ${cycles} insider sign-ins must release at most one budget of ${MAX_ATTEMPTS} guesses, got ${attempted}`
+      );
+      assert(throttled > 0, "the later cycles must be refused rather than waved through by the insider's reset");
+      assert.strictEqual(afterAllCycles, 429, "the administrator's budget must still be exhausted after three insider sign-ins");
+
+      const victim = await checkLoginRateLimit(ADMIN_EMAIL, SHARED_IP);
+      assert.strictEqual(victim.allowed, false, "H-R1: the victim account must still be blocked");
+      const victimRows = Number(
+        (await db.query(`SELECT count(*)::int AS count FROM login_attempts WHERE identifier = lower($1)`, [ADMIN_EMAIL]))
+          .rows[0].count
+      );
+      assert(victimRows >= MAX_ATTEMPTS, `the victim's recorded failures must survive (found ${victimRows})`);
+
+      /* The insider's own account is still released, so the fix did not simply disable
+         clearing: the legitimate user who mistypes and then succeeds is not punished. */
+      const insiderRows = Number(
+        (await db.query(`SELECT count(*)::int AS count FROM login_attempts WHERE identifier = lower($1)`, [INSIDER_EMAIL]))
+          .rows[0].count
+      );
+      assert.strictEqual(insiderRows, 0, "the signing-in account's own failures are still released");
     });
 
     /* ── 8. Fail safely: self-heal, then fail closed ───────────────────────────── */

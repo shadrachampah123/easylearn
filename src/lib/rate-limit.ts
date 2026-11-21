@@ -1,6 +1,6 @@
 import { db } from "@/db";
 import { loginAttempts } from "@/db/schema";
-import { eq, or, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { ensureLoginAttemptSchema, inspectDbError, isMissingRelation } from "@/lib/schema-resilience";
 
 /**
@@ -27,6 +27,12 @@ import { ensureLoginAttemptSchema, inspectDbError, isMissingRelation } from "@/l
  *     an attacker locks *themselves* out of that account, not the legitimate owner. The
  *     account-wide bucket survives only as a much higher aggregate backstop against
  *     genuinely distributed guessing, with a shorter cooldown.
+ *
+ * Corrected the same day after independent security review (**H-R1**): a successful login
+ * now releases only the failures recorded for *that identifier*. The first version of this
+ * remediation also deleted every row sharing the source IP, which turned one valid
+ * low-privilege credential into a repeatable throttle-reset oracle against other accounts.
+ * See `clearFailedLoginAttempts` for the measured impact.
  *
  * Deliberate non-goal: no role-specific thresholds. The account's role is not known
  * before the password is verified, and looking it up on every unauthenticated request
@@ -461,27 +467,45 @@ async function pruneExpiredAttempts(): Promise<void> {
 }
 
 /**
- * Clear failed attempts after a successful login.
+ * Clear the failed attempts recorded for **one identifier** after it authenticates.
  *
- * Clears **both** the account bucket and the source bucket: a legitimate user who finally
- * signs in should also release the source-level budget they consumed (important for a
- * school behind one NAT). A failure here is logged but never blocks the login — the user
- * has already authenticated, and stale rows only make throttling stricter.
+ * Scoped by account, never by source. Signing in proves the caller controls *that
+ * account*, so it releases that account's own recorded failures — including the rows it
+ * wrote from this IP, which lowers the whole-source budget by exactly the rows removed.
+ *
+ * It must never release failures recorded for **other** accounts that share the source IP.
+ * That wider `OR ip_address = $2` DELETE was the behaviour before this fix, added so a
+ * school behind one NAT would get its whole-source budget back on a successful sign-in.
+ * Independent security review (**H-R1**, 2026-11-19) measured it as a throttle-reset
+ * oracle: anyone holding one valid low-privilege credential could sign in from the
+ * school's exit IP and erase every failure an attacker had accumulated against
+ * administrator accounts, which made the guess budget *repeatable* rather than bounded —
+ * 108 unthrottled guesses across three sign-in cycles in the reproducing probe, with the
+ * victim's pair bucket returning to a full budget after every cycle. It also deleted the
+ * rows the account-wide aggregate backstop counts, defeating that layer too.
+ *
+ * The NAT concern stays covered without it: the source budget is deliberately generous
+ * (`MAX_ATTEMPTS_PER_IP` failures / `MAX_IDENTIFIERS_PER_IP` identifiers per window) and
+ * it self-heals as rows age out of the sliding window.
+ *
+ * `ipAddress` is accepted so existing call sites keep their shape and is used only to
+ * attribute the reset in the log — it can never widen the DELETE.
+ *
+ * A failure here is logged but never blocks the login: the user has already authenticated,
+ * and stale rows only make throttling stricter.
  */
 export async function clearFailedLoginAttempts(
   identifier: string,
   ipAddress?: string | null
 ): Promise<void> {
   const normalizedIdentifier = normalizeIdentifier(identifier);
-  const ip = normalizeLoginIp(ipAddress);
+  const source = normalizeLoginIp(ipAddress);
   try {
-    await db
-      .delete(loginAttempts)
-      .where(
-        ip === null
-          ? eq(loginAttempts.identifier, normalizedIdentifier)
-          : or(eq(loginAttempts.identifier, normalizedIdentifier), eq(loginAttempts.ipAddress, ip))
-      );
+    await db.delete(loginAttempts).where(eq(loginAttempts.identifier, normalizedIdentifier));
+    console.log(
+      `[rate-limit] released recorded failures for one identifier after a successful login ` +
+        (source === null ? "from an unattributable source" : `from ${source}`)
+    );
   } catch (error) {
     console.error("[rate-limit] could not clear login attempts:", inspectDbError(error).text);
   }
