@@ -1,17 +1,79 @@
 # EasyLearn — Canonical Nine-Phase Roadmap
 
-**Roadmap updated:** 2026-10-18 · **Repository:** `shadrachampah123/easylearn`
-**Verified `main`:** `851156cac0403f1b9e268c0c3584543852399c48` (PR #33 merged).
-**Latest application/security checkpoint:** PR #32 merged at `90ec04363cbec3222232c6f912fcad69ab038dba`; PR #33 follow-up merged at `851156cac0403f1b9e268c0c3584543852399c48`.
+**Roadmap updated:** 2026-11-19 · **Repository:** `shadrachampah123/easylearn`
+**Verified `main`:** `4069584e99574a4fe2af7d4317a8bcbf13f9bf73` (PR #68 merged; live Production deployment 2026-11-17T21:20:13Z, alias `https://easylearn-six.vercel.app`).
+**Latest application/security checkpoint:** full production readiness & security audit of 2026-11-19 — `FULL_PRODUCTION_AUDIT_2026-11-19.md`, with `R2_CONFIG_AUDIT_2026-11-19.md` and `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` (all committed at the repository root). Earlier checkpoints: PR #32 merged at `90ec04363cbec3222232c6f912fcad69ab038dba`; PR #33 follow-up merged at `851156cac0403f1b9e268c0c3584543852399c48`.
 **Overall roadmap estimate: 46% complete.** This is a planning estimate across the nine product phases, not a test score or production-readiness certification. Phase 2 code hardening has advanced substantially, but production database state and safe migration gates remain unresolved.
 
-This current roadmap supersedes the historical architecture audit retained below, including its proposed numbering, table counts, future migration numbers and old “remaining” lists. Status distinguishes **implemented**, **merged**, **deployed**, **production DB migrated**, and **production behavior verified** as independent gates. No production connections, migrations, deployments, secrets, or settings were accessed or changed for this roadmap update.
+This current roadmap supersedes the historical architecture audit retained below, including its proposed numbering, table counts, future migration numbers and old “remaining” lists. Status distinguishes **implemented**, **merged**, **deployed**, **production DB migrated**, and **production behavior verified** as independent gates. No production connections, migrations, deployments, secrets, or settings were accessed or changed for this roadmap update. The 2026-11-19 update below is likewise documentation-only on the Production side: no deployment, migration, backup operation, environment-variable change, or Cloudflare/Vercel setting was performed.
 
-## Current progress dashboard — 2026-10-18
+## Production status update — 2026-11-19
+
+This section is the current owner-facing truth about the deployed application. It records the outcome of the full production readiness & security audit of 2026-11-19 (`FULL_PRODUCTION_AUDIT_2026-11-19.md`) against `main` at `4069584`, which **is** the live Production build (deployment 2026-11-17T21:20:13Z, alias `https://easylearn-six.vercel.app`, Vercel project `easylearn`). Supporting reports: `R2_CONFIG_AUDIT_2026-11-19.md` (read-only storage configuration audit) and `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` (upload-failure root-cause analysis).
+
+### Closed — Cloudflare R2 object storage: COMPLETED
+
+R2 integration is **complete and verified in Production**. The owner confirmed that all three production paths work end to end after the bucket CORS correction was applied:
+
+| Production path | Status |
+| --- | --- |
+| Assignment file uploads (teacher browser → R2 presigned `PUT`) | Verified working |
+| Learner submission uploads | Verified working |
+| Assignment and submission downloads from R2 | Verified working |
+
+- The former **C-1** active finding ("the browser cannot complete the presigned `PUT` to R2") is **closed and removed** from every outstanding-work list in this roadmap. Root cause: the missing Cloudflare R2 bucket CORS policy. The earlier `amazonaws.com`-endpoint hypothesis recorded in `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` was investigated and rejected; that report is retained for the record.
+- No application change was required. The code-side configuration was audited read-only and is correct: `OBJECT_STORAGE_PROVIDER=cloudflare-r2`, account-ID-based endpoint construction, `forcePathStyle: true`, `public-read` ACL, and `s3:GetObject`-only presigned download URLs with `OBJECT_STORAGE_URL_EXPIRES_SECONDS=900` (`src/lib/object-storage.ts`).
+- **Standing dependency:** the bucket CORS policy lives in Cloudflare, which the application and its CI cannot read or version. Record its exact allowed origins, methods and headers alongside the environment variables so a future bucket rebuild does not silently reintroduce C-1.
+
+### Pending — migration `0018_composite_school_foreign_keys.sql`
+
+**Status: PREPARED, NOT EXECUTED — deliberately pending.** The R2 completion does not change this gate.
+
+- Production is confirmed drifted: **0/26** composite foreign keys present and **no `easylearn_schema_migrations` ledger** (owner-verified read-only on 2026-10-27, see `docs/PRODUCTION_SCHEMA_RECOVERY_PLAN.md`), while **24/24** migration 0017 objects are present.
+- The migration itself is **ready to run**: Production PostgreSQL is 18.6 (≥ 15, so `ADD CONSTRAINT … NOT VALID` is supported), the migration is gated behind `EASY_LEARN_APPLY_COMPOSITE_TENANT_FOREIGN_KEYS=true`, and both the preflight (`docs/PRODUCTION_PREFLIGHT_0019_0018.md`) and the documented `DROP CONSTRAINT` rollback path are written.
+- `drizzle-kit push` remains **banned** against Production (`docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md`).
+- The application already fails closed without 0018 (`users.session_version` enforcement and the SQL tenant predicates live in code), so this is parity and defence-in-depth rather than an outage risk. It stays open until the reviewed preflight and a restored-copy rehearsal have been executed.
+- The related **26 missing child-side FK indexes** also remain outstanding. They have deliberately **not** been written as a migration (no such file exists in `drizzle/` as of 2026-11-19); the analysis and the low-lock approach live in `docs/PRODUCTION_MIGRATION_SAFETY_REVIEW_PR32.md` §"The 26 missing child-side indexes", and they still require their own reviewed, separately authorised gated migration.
+
+### Paused — backup and disaster recovery
+
+**Status: PAUSED.** No backup or disaster-recovery work is scheduled, in progress, or authorised in this cycle, and the 2026-11-19 audit performed no backup operations.
+
+- The verification runbook `docs/BACKUP_RESTORE_VERIFICATION.md` (2026-11-04) stays **prepared and unused**. Its four gates — documented RPO/RTO, a restore rehearsal into a scratch database, object-store versioning or replication for R2, and a point-in-time-recovery test — are all still unmet.
+- Storage hardening that belongs to the same workstream is paused with it rather than closed (audit finding M-3): bucket versioning, lifecycle policy, an explicit `OBJECT_STORAGE_PUBLIC_URL` check, and cleanup of orphaned `uploaded_files` rows left by historically failed uploads.
+- Resumption requires an explicit owner decision. Until then treat restore capability as **unverified** and do not schedule destructive migrations or bulk data operations on the assumption that a restore is available.
+
+### Outstanding findings from the 2026-11-19 audit (preserved)
+
+Only C-1 was closed above. Every other audit finding remains open, with `FULL_PRODUCTION_AUDIT_2026-11-19.md` as the source of truth. File and line references below are against the audited commit `4069584`; the H-1 fix shifts the line numbers in `src/app/api/auth/login/route.ts` and `src/lib/rate-limit.ts`.
+
+| ID | Finding | Status |
+| --- | --- | --- |
+| **H-1** | Login rate limiting fails **open** on any database error; the client IP is recorded but never used in a limit; the per-identifier lockout lets anyone lock any account, including administrators | **Fix implemented 2026-11-19 — under review in a separate PR** |
+| **H-2** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage | Open |
+| **C-2** | Production schema drift (0/26 composite FKs) and absent migration ledger; 0018 prepared but unexecuted | Pending — see above |
+| **M-1** | Inconsistent password policy: 6-character minimum on admin user create/reset versus 8 on `change-password`; `generatedPassword` echoed in the API response | Open |
+| **M-2** | Missing database-level uniqueness for `submissions(assignment_id, learner_id)`, `parent_learners(school_id, parent_id, learner_id)` and `quiz_attempts(quiz_id, learner_id)` — application-layer or advisory-lock only today | Open |
+| **M-3** | R2 hardening backlog (versioning, lifecycle, `OBJECT_STORAGE_PUBLIC_URL` check, orphaned `uploaded_files` rows) | Paused with backup/DR |
+| **M-4** | Legacy duplicate Vercel project `easylearnn` (`prj_UMJnGXOIWQzDRnCMiM5bM1kKTlBo`) still exists next to the active `easylearn` project | Open — owner must confirm it is disconnected |
+| **M-5** | Mobile-navigation bug is live in Production: PR #61 (Navbar fix, head `e682503`) is open and unmerged | Open |
+| **L-1** | Service worker caches authenticated HTML under the fixed `easylearn-v1` cache key (`public/sw.js`) | Open |
+| **L-2** | `images/search` reuses a stale claim without re-checking `isActive` (the only route that does) | Open |
+| **L-3** | Login error asymmetry (`login/route.ts:81–95`) discloses whether an account exists | Open |
+| **L-4** | Unauthenticated `/api/health` exposes schema-feature state | Open |
+| **L-5** | `school_users.role` enum still admits `super_admin`; exclusion is application-layer only | Open |
+| **L-6** | `npm test` is not hermetic — it fails without CI's `JWT_SECRET` and `DATABASE_URL` | Open |
+| **L-7** | `messages` and `notifications` lack per-user and per-conversation indexes | Open |
+
+Controls re-verified as working at `4069584` are listed in §3.1 of the audit report: the JWT chokepoint (HS256 pinned, strict secret policy), fail-closed session revocation, cookie-only sessions, the single CSRF chokepoint in `src/proxy.ts`, nonce CSP plus the file-response sandbox CSP, database-re-read membership roles, SQL tenant predicates on all 60 API routes, enrollment-gated submit/attempt, teacher-own-submission grading, parent-link predicates, magic-byte upload validation, server-derived download content type, seed 404 and registration 403 in Production, verified-TLS Postgres, the gated migration runner, and bcrypt cost 12. The 60-route sweep found **no new IDOR, privilege-escalation, injection, or tenant-isolation defect**.
+
+**Audit verdict:** CONDITIONAL NO-GO for formal production sign-off, with the Issue #54 posture retained. H-1, H-2 and M-4 are the blocking items; H-1 is now addressed in code and awaiting review.
+
+## Current progress dashboard — 2026-11-19 production status
 
 | Phase | Estimated completion | Status | Main work still outstanding |
 | --- | ---: | --- | --- |
-| 1. Critical Security & Access Control | **100%** | Complete for bounded Phase 1 scope | Verify live role-denial, rate-limit and DB prerequisites; broader session/CSRF security is later scope. |
+| 1. Critical Security & Access Control | **100%** | Complete for bounded Phase 1 scope; the H-1 login-throttle fix is under review (2026-11-19) | Review and merge the H-1 rate-limit fix, then verify throttling live; verify live role-denial and DB prerequisites; broader session/CSRF security is later scope. |
 | 2. Multi-School / Multi-Tenant Architecture | **78%** | Code hardening merged; production gate blocked | Read-only production evidence for migrations 0013–0017 and tenant behavior; safely rehearse migration 0018 against a restored production copy; plan and validate 26 missing child-side FK indexes; separately authorize any production change. |
 | 3. School Management & Administration | **25%** | Legacy LMS baseline exists; SaaS workflows not started | Platform school onboarding/provisioning, invitations, membership administration, school lifecycle/settings, safe offboarding and independent-school E2E. |
 | 4. Academic & Results Management | **45%** | Core teaching workflows exist | Configurable grading/scales, moderation and result publication, report cards, promotion/rollover, historical-year handling and school-specific configuration. |
@@ -23,22 +85,30 @@ This current roadmap supersedes the historical architecture audit retained below
 
 **How to read the percentages:** estimates reflect delivered scope against each phase’s full roadmap, not the share of code merged. The overall 46% is a rounded planning estimate across the nine phases. Merged code and passing disposable-database tests do **not** count as production migration or behavior verification.
 
+**What changed in the 2026-11-19 update:** no phase percentage was revised. Two gates moved: Cloudflare R2 object storage went from *deployed, production behaviour unverified* to **production behaviour verified** (assignment uploads, learner submissions and downloads — see "Closed" above), and Phase 1 gained one open review item, the H-1 login-throttle fix. Migration 0018, the 26 child-side FK indexes, and every backup/disaster-recovery gate are unchanged.
+
 ### Confirmed progress since the previous roadmap checkpoint
 
+- **2026-11-19 — Cloudflare R2 object storage verified in Production (owner-confirmed).** Assignment uploads, learner submissions and downloads all work end to end after the bucket CORS correction. The C-1 active upload failure is closed and removed from this roadmap; the audit reports are committed at the repository root.
+- **2026-11-19 — deployed build identity confirmed.** The GitHub deployments API records a Production deployment of `4069584e99574a4fe2af7d4317a8bcbf13f9bf73` at 2026-11-17T21:20:13Z for the Vercel project `easylearn` (alias `https://easylearn-six.vercel.app`), with CI green on that commit (PostgreSQL isolation suites, typecheck, build, lint) and a successful Vercel build. The legacy duplicate project `easylearnn` still exists and is audit finding M-4.
+- **2026-11-19 — full production readiness & security audit completed read-only** (`FULL_PRODUCTION_AUDIT_2026-11-19.md`). A 60-route sweep found no new IDOR, privilege-escalation, injection or tenant-isolation defect, and the existing controls were re-verified in code at HEAD. Verdict: CONDITIONAL NO-GO for formal sign-off, blocked on H-1 (fix now under review), H-2 (observability) and M-4.
+- **2026-11-19 — H-1 login throttling remediated in code, in a separate review PR.** The throttle no longer fails open, client IPs are now limited (per-source volume and credential-spraying budgets), the five-attempt budget is scoped to (identifier, source) so one attacker can no longer lock an administrator out, and two regression suites were added (`tests/login-rate-limit-policy.test.ts`, `tests/login-rate-limit-db.test.ts`). Migration 0018 and backup/DR were untouched by this work.
 - **PR #32 merged** at `90ec04363cbec3222232c6f912fcad69ab038dba`. It integrated the migration-runner/schema-resilience safeguards and the migration-0018 composite-FK work, plus regression evidence. It did not apply migration 0018 to production.
 - **PR #33 merged** at `851156cac0403f1b9e268c0c3584543852399c48`. CI succeeded; scratch database teardown is now shared and asserted, and the LOW-1/2/3 findings were addressed. LOW-4 was deliberately not changed because the proposed change weakened fail-closed authorization.
 - The scratch-database leak was reproduced before the fix (four databases left behind by the worst suites); the PR reports repeated suite runs and the complete CI sequence leaving zero scratch databases.
-- **Still not confirmed:** production execution of migrations 0013–0017, current production schema/data integrity, intended deployed build identity, and post-change live tenant-isolation behavior.
-- **Still outstanding:** 26 child-side FK indexes identified as a performance/locking risk. They require a separate reviewed and gated migration; PR #32/#33 did not add them.
-- No production connection, migration, data/settings change, manual deployment, or branch-protection change was performed as part of these merges or this roadmap update.
+- **Still not confirmed:** production execution of migrations 0013–0017 (no `easylearn_schema_migrations` ledger exists in Production), current production schema/data integrity beyond the owner-verified 2026-10-27 read-only checkpoint (**0/26** composite FKs from 0018, **24/24** objects from 0017), and post-change live tenant-isolation behavior.
+- **Still outstanding:** 26 child-side FK indexes identified as a performance/locking risk. They require a separate reviewed and gated migration; PR #32/#33 did not add them, and no such migration exists as of 2026-11-19.
+- No production connection, migration, data/settings change, manual deployment, backup operation, or branch-protection change was performed as part of these merges, the 2026-11-19 audit, or this roadmap update.
 
 ## Immediate remaining work (ordered)
 
-1. **Read-only production checkpoint:** an authorized operator verifies the intended Vercel project/alias and production build identity, then captures sanitized catalog/data evidence for migrations 0013–0017, required NULLs, orphan/cross-school rows, FK validation and indexes, and post-repair role/dual-school behavior. Do not expose secrets.
-2. **Restored-copy rehearsal for migration 0018:** use a restored copy of production only. Check PostgreSQL version (migration syntax requires PostgreSQL 15+), row/table sizes, preflight results, lock duration and rollback behavior. Record results and review them before any production application.
-3. **Index plan and separate migration:** enumerate the 26 missing child-side FK indexes, inspect query plans and table sizes, design a low-lock/concurrent-index approach compatible with the migration runner, and test it on the restored copy. Do not bundle this into an unreviewed production action.
-4. **Decision gate:** reconcile the evidence. If production is already at the expected state, do not rerun migrations. If there is a gap, prepare a narrowly scoped remediation plan for explicit authorization, with backup/recovery and post-checks.
-5. **Only after Phase 2 gates:** complete independent-school onboarding/lifecycle workflows and proceed with the remaining Phase 3–9 product scope. Phase 3 is not launch-ready while the tenancy production gate is unresolved.
+1. **Review and merge the H-1 login-throttle fix (2026-11-19 PR).** It is the only code-level blocker with a finished implementation. After merging and deploying, verify in Production that a throttled login returns 429 with a `Retry-After` header, that a degraded throttle returns 503 rather than signing anyone in, and that legitimate users — including administrators signing in from a different network than an attacker — are unaffected. Also confirm `/api/health` reports the `login_attempts` feature.
+2. **Read-only production checkpoint:** an authorized operator verifies the intended Vercel project/alias and production build identity (both now recorded above for 2026-11-19), then captures sanitized catalog/data evidence for migrations 0013–0017, required NULLs, orphan/cross-school rows, FK validation and indexes, and post-repair role/dual-school behavior. Do not expose secrets.
+3. **Restored-copy rehearsal for migration 0018:** use a restored copy of production only. Check PostgreSQL version (confirmed 18.6, and the migration syntax requires PostgreSQL 15+), row/table sizes, preflight results, lock duration and rollback behavior. Record results and review them before any production application. **Blocked in practice while backup/disaster recovery stays paused** — there is no verified restore to rehearse against, so this step needs the DR workstream to resume first or an explicitly authorized alternative source copy.
+4. **Index plan and separate migration:** enumerate the 26 missing child-side FK indexes, inspect query plans and table sizes, design a low-lock/concurrent-index approach compatible with the migration runner, and test it on the restored copy. Do not bundle this into an unreviewed production action. The H-1 fix adds one more candidate for the same reviewed migration: an `(ip_address, created_at)` index on `login_attempts`, which the new per-source throttle counts with and which migration 0012 does not create.
+5. **Decision gate:** reconcile the evidence. If production is already at the expected state, do not rerun migrations. If there is a gap, prepare a narrowly scoped remediation plan for explicit authorization, with backup/recovery and post-checks.
+6. **Close the remaining audit blockers:** H-2 (no `error.tsx`/`global-error.tsx`/`not-found.tsx`, no instrumentation, `/api/health` blind to object storage) and M-4 (confirm the legacy Vercel project `easylearnn` is disconnected or delete it). M-5 (the mobile-navigation fix in PR #61) is still open and live in Production, and the M/L findings in the table above remain scheduled behind these.
+7. **Only after Phase 2 gates:** complete independent-school onboarding/lifecycle workflows and proceed with the remaining Phase 3–9 product scope. Phase 3 is not launch-ready while the tenancy production gate is unresolved.
 
 This current roadmap supersedes the historical architecture audit retained below, including
 its proposed numbering, table counts, future migration numbers and old “remaining” lists.
@@ -311,16 +381,22 @@ actual PRs used 2D direct access and 2E hardening. The table above is authoritat
   proof, recovery exercises and pilot acceptance before general availability. Deploy operational changes;
   migrations only for reviewed supporting schema, never as an audit side effect.
 
-## Single next action — read-only production tenancy checkpoint before migration rehearsal
+## Single next action — review the H-1 login-throttle PR, then the read-only production tenancy checkpoint
 
-**Request an authorized, read-only production tenancy verification checkpoint** for the intended
-Vercel project/alias and migrations 0013–0017. Capture timestamped sanitized build identity,
-column/nullability/catalog FK/index evidence, required NULL/orphan/cross-school counts and
-post-repair role/dual-school smoke-test results. Establish the actual production state before
-planning any execution. Then rehearse migration 0018 and the separate child-side-index plan on a
-restored production copy. If production is missing/partial, stop and prepare a separately approved,
-backup-rehearsed remediation; do not blindly rerun migrations. No production migration or deploy
-is authorized by this roadmap update.
+**Updated 2026-11-19.** Two actions are outstanding, and only the first needs no production access:
+
+1. **Review and merge the H-1 login-throttle fix.** It is complete, covered by two new regression suites, and is the only finished blocker from the 2026-11-19 production audit. Merging it does not deploy anything by itself and does not touch migration 0018, the database, or backup/DR.
+2. **Request an authorized, read-only production tenancy verification checkpoint** for the intended
+   Vercel project/alias (identity confirmed 2026-11-19: project `easylearn`, `4069584`, deployed
+   2026-11-17) and migrations 0013–0017. Capture timestamped sanitized build identity,
+   column/nullability/catalog FK/index evidence, required NULL/orphan/cross-school counts and
+   post-repair role/dual-school smoke-test results. Establish the actual production state before
+   planning any execution. Then rehearse migration 0018 and the separate child-side-index plan on a
+   restored production copy — noting that restore capability is **unverified while backup and
+   disaster recovery stay paused**, so that rehearsal needs the DR workstream to resume first.
+   If production is missing/partial, stop and prepare a separately approved,
+   backup-rehearsed remediation; do not blindly rerun migrations. No production migration or deploy
+   is authorized by this roadmap update.
 
 ---
 
