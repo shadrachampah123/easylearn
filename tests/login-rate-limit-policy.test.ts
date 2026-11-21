@@ -11,10 +11,21 @@
  *   3. the only bucket was the identifier, so five guesses from one attacker **locked the
  *      account for everybody**, administrators included.
  *
+ * The same review then produced four further findings, all pinned here as well:
+ *
+ *   4. **M-R1** the source address was taken from the *leftmost* `x-forwarded-for` entry,
+ *      which is the element the client writes;
+ *   5. **M-R2** the check and the record were separate steps, so a concurrent burst all read
+ *      the same empty table and every request got a real guess;
+ *   6. **M-R3** email and username were separate identifiers, so one account had two budgets;
+ *   7. **M-R4a** `/api/health` reported "ready" whenever repair was merely *enabled*, even if
+ *      repair had failed or the runtime role could not run DDL at all.
+ *
  * The database-backed behaviour is asserted in tests/login-rate-limit-db.test.ts. This
  * suite covers what can be checked without a server: IP normalization (the real
- * fail-open vector), the fail-closed decision path's shape, and the cross-file contract
- * that keeps the self-heal DDL a superset of migration 0012.
+ * fail-open vector) and the header trust model, the fail-closed decision path's shape, the
+ * cross-file contract that keeps the self-heal DDL a superset of migration 0012, and the
+ * structural invariants behind M-R1/M-R2/M-R3/M-R4a.
  *
  * Run: npx tsx tests/login-rate-limit-policy.test.ts
  */
@@ -72,11 +83,112 @@ async function main() {
     assert.strictEqual(getClientIp(requestWithHeaders({ "x-forwarded-for": "203.0.113.7" })), "203.0.113.7");
   });
 
-  await test("getClientIp takes the first entry of a proxy chain (unchanged behaviour)", () => {
+  /* M-R1. This test used to pin the OPPOSITE behaviour — "takes the first entry of a proxy
+     chain (unchanged behaviour)" — which is the element the client writes. Every proxy appends
+     to x-forwarded-for, so the leftmost entry is attacker-controlled and unfit for a security
+     decision. The trust position is now declared, counted from the end of the chain. */
+  await test("M-R1: a spoofed prefix in x-forwarded-for is ignored, the trusted hop is used", () => {
+    /* What an attacker sends through one honest proxy: their own forged victim address first,
+       then the address the proxy actually observed. */
+    assert.strictEqual(
+      getClientIp(requestWithHeaders({ "x-forwarded-for": "203.0.113.9, 198.51.100.7" })),
+      "198.51.100.7",
+      "the rightmost entry (what the trusted hop saw) must win, never the client-written prefix"
+    );
     assert.strictEqual(
       getClientIp(requestWithHeaders({ "x-forwarded-for": "203.0.113.7, 70.41.3.18, 150.172.238.178" })),
-      "203.0.113.7"
+      "150.172.238.178",
+      "with one trusted hop the client-supplied prefix must never be attributed"
     );
+  });
+
+  await test("M-R1: junk at the trusted position does not fall back towards the client", () => {
+    assert.strictEqual(
+      getClientIp(requestWithHeaders({ "x-forwarded-for": "203.0.113.9, not-an-ip" })),
+      null,
+      "scanning left would hand the attacker the address they wrote"
+    );
+  });
+
+  await test("M-R1: the trusted hop count is configurable and clamped", () => {
+    const previous = process.env.EASY_LEARN_CLIENT_IP_TRUSTED_HOPS;
+    try {
+      process.env.EASY_LEARN_CLIENT_IP_TRUSTED_HOPS = "2";
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "spoofed, 203.0.113.7, 198.51.100.9" })),
+        "203.0.113.7",
+        "two trusted hops means the second entry from the end"
+      );
+      process.env.EASY_LEARN_CLIENT_IP_TRUSTED_HOPS = "5";
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "203.0.113.7, 198.51.100.9" })),
+        null,
+        "more declared hops than the chain has entries must be unattributable, not leftmost"
+      );
+      for (const junk of ["abc", "0", "-3", ""]) {
+        process.env.EASY_LEARN_CLIENT_IP_TRUSTED_HOPS = junk;
+        assert.strictEqual(
+          getClientIp(requestWithHeaders({ "x-forwarded-for": "203.0.113.7, 198.51.100.9" })),
+          "198.51.100.9",
+          `an unusable hop count (${JSON.stringify(junk)}) must fall back to the default of 1`
+        );
+      }
+    } finally {
+      if (previous === undefined) delete process.env.EASY_LEARN_CLIENT_IP_TRUSTED_HOPS;
+      else process.env.EASY_LEARN_CLIENT_IP_TRUSTED_HOPS = previous;
+    }
+  });
+
+  await test("M-R1: a declared platform header is authoritative and used exclusively", () => {
+    const previous = process.env.EASY_LEARN_CLIENT_IP_HEADER;
+    try {
+      process.env.EASY_LEARN_CLIENT_IP_HEADER = "x-vercel-forwarded-for";
+      assert.strictEqual(
+        getClientIp(
+          requestWithHeaders({
+            "x-vercel-forwarded-for": "203.0.113.44",
+            "x-forwarded-for": "198.51.100.7",
+          })
+        ),
+        "203.0.113.44",
+        "the declared header wins over x-forwarded-for"
+      );
+      assert.strictEqual(
+        getClientIp(
+          requestWithHeaders({
+            "x-vercel-forwarded-for": "junk",
+            "x-forwarded-for": "198.51.100.7",
+            "x-real-ip": "198.51.100.8",
+          })
+        ),
+        null,
+        "an operator-declared source must not silently fall back to a header the client writes"
+      );
+    } finally {
+      if (previous === undefined) delete process.env.EASY_LEARN_CLIENT_IP_HEADER;
+      else process.env.EASY_LEARN_CLIENT_IP_HEADER = previous;
+    }
+  });
+
+  await test("M-R1: x-vercel-forwarded-for is only consulted when actually running on Vercel", () => {
+    const previous = process.env.VERCEL;
+    try {
+      delete process.env.VERCEL;
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "junk", "x-vercel-forwarded-for": "203.0.113.9" })),
+        null,
+        "off-platform the header is client-writable, so it must not be trusted"
+      );
+      process.env.VERCEL = "1";
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "junk", "x-vercel-forwarded-for": "203.0.113.9" })),
+        "203.0.113.9",
+        "on Vercel the platform writes it, so it is a legitimate fallback"
+      );
+    } finally {
+      if (previous === undefined) delete process.env.VERCEL;
+      else process.env.VERCEL = previous;
+    }
   });
 
   await test("getClientIp skips junk and falls back to the first valid entry", () => {
@@ -147,13 +259,41 @@ async function main() {
     assert(rateLimit.UNAVAILABLE_RETRY_SECONDS > 0, "a fail-closed retry window must be defined");
   });
 
-  await test("the fail-open branch is gone: exactly one `allowed: true` remains", () => {
+  await test("the fail-open branch is gone: nothing allows a login except decide()'s success path", () => {
     const content = readFile("src/lib/rate-limit.ts");
     /* Doc comments quote the old fail-open return value when explaining the fix, so count
-       code only: block comments are stripped before matching. */
+       code only: block comments are stripped before matching. Since M-R2 there are exactly two
+       permissive literals: decide()'s own verdict, and the recorder echoing that verdict after
+       its transaction commits. Anything else — above all anything inside a catch — is fail-open. */
     const code = content.replace(/\/\*[\s\S]*?\*\//g, "");
-    const permissive = (code.match(/allowed:\s*true/g) ?? []).length;
-    assert.strictEqual(permissive, 1, "only the success path of decide() may allow a login");
+    const matches = [...code.matchAll(/allowed:\s*true/g)];
+    assert.strictEqual(
+      matches.length,
+      2,
+      "exactly two permissive literals may exist: decide()'s verdict and the recorder echoing it"
+    );
+
+    const decideStart = code.indexOf("function decide(");
+    const decideEnd = code.indexOf("function unavailableDecision");
+    assert(decideStart > -1 && decideEnd > decideStart, "decide() must be locatable");
+    assert(
+      matches.some((match) => match.index! > decideStart && match.index! < decideEnd),
+      "one permissive literal must be decide()'s allowed verdict"
+    );
+
+    const recordStart = code.indexOf("export async function recordFailedLoginAttempt");
+    const commitAt = code.indexOf('await client.query("COMMIT")', recordStart);
+    assert(recordStart > -1 && commitAt > recordStart, "the recorder must commit explicitly");
+    assert(
+      matches.some((match) => match.index! > commitAt),
+      "the recorder may only report allowed:true after its transaction has committed"
+    );
+
+    for (const catchMatch of code.matchAll(/\}\s*catch\s*(\([^)]*\))?\s*\{/g)) {
+      const body = code.slice(catchMatch.index!, catchMatch.index! + 200);
+      assert(!/allowed:\s*true/.test(body), "an error path must never allow a login");
+    }
+
     assert(content.includes("FAILING CLOSED"), "the catch path must document that it fails closed");
     assert(!content.includes("allow the attempt but log"), "the old fail-open comment must not come back");
     assert(content.includes("rateLimitUnavailable"), "a dedicated unavailable result must exist");
@@ -183,7 +323,7 @@ async function main() {
   await test("a successful login clears only the signing-in account's failures (H-R1)", () => {
     const route = readFile("src/app/api/auth/login/route.ts");
     assert(
-      route.includes("clearFailedLoginAttempts(identifier, clientIp)"),
+      route.includes("clearFailedLoginAttempts(aliases, clientIp)"),
       "a successful login must still release the signing-in account's own recorded failures"
     );
 
@@ -192,8 +332,8 @@ async function main() {
     assert(start > -1, "clearFailedLoginAttempts must still exist");
     const clear = lib.slice(start);
     assert(
-      clear.includes(".where(eq(loginAttempts.identifier, normalizedIdentifier))"),
-      "the reset DELETE must be scoped to the signing-in identifier"
+      clear.includes(".where(inArray(loginAttempts.identifier, aliases))"),
+      "the reset DELETE must be scoped to the signing-in account's aliases"
     );
     assert(
       !clear.includes("loginAttempts.ipAddress"),
@@ -206,11 +346,60 @@ async function main() {
 
   await test("the login route refuses a login it could not throttle, instead of allowing it", () => {
     const content = readFile("src/app/api/auth/login/route.ts");
-    assert(content.includes("recorded.recorded"), "every recorded failure must be checked");
+    assert(content.includes("attempt.allowed"), "the atomic decision must be checked");
+    assert(content.includes("rateLimitResponse(attempt.decision)"), "exhausted is 429, unevaluable is 503");
+    assert(content.includes("attempt.recorded"), "an unstorable attempt must still be caught");
     assert(content.includes("degradedThrottleResponse"), "an unstorable failure must produce a degraded response");
     assert(content.includes("503"), "the degraded response must be a 503, not a 401");
-    const guarded = (content.match(/if \(!recorded\.recorded\) return degradedThrottleResponse\(\);/g) ?? []).length;
-    assert.strictEqual(guarded, 3, "all three failure branches (unknown user, deactivated, wrong password) must be guarded");
+    /* M-R2: enforcement must happen BEFORE the password hash is computed. Enforcing after
+       verification is what let a concurrent burst buy extra guesses. */
+    const enforceAt = content.indexOf("await recordFailedLoginAttempt(aliases, clientIp)");
+    const verifyAt = content.indexOf("await verifyPassword(password, user.passwordHash)");
+    assert(enforceAt > -1, "the route must enforce through recordFailedLoginAttempt");
+    assert(verifyAt > -1, "the route must still verify the password");
+    assert(enforceAt < verifyAt, "the attempt must be enforced and recorded before the password is verified");
+    const preCheckAt = content.indexOf("await checkLoginRateLimit(suppliedIdentifier, clientIp)");
+    assert(preCheckAt > -1 && preCheckAt < enforceAt, "the cheap read-only filter still runs first");
+  });
+
+  await test("M-R2: the record is atomic — advisory lock, insert, then a self-inclusive count", () => {
+    const lib = readFile("src/lib/rate-limit.ts");
+    assert(lib.includes("pg_advisory_xact_lock"), "enforcement must hold a PostgreSQL advisory lock");
+    assert(lib.includes("hashtextextended"), "the lock key must derive from the source/account, not one global lock");
+    for (const token of ['client.query("BEGIN")', 'client.query("COMMIT")', 'client.query("ROLLBACK")']) {
+      assert(lib.includes(token), `enforcement must run in an explicit transaction (${token})`);
+    }
+    const insertAt = lib.indexOf("run(INSERT_ATTEMPT_SQL, [primary, ip])");
+    const countAt = lib.indexOf("countRecentFailures(run, aliases, ip), ip, { countedSelf: true }");
+    assert(insertAt > -1 && countAt > -1, "the insert and the self-inclusive count must both exist");
+    assert(insertAt < countAt, "the insert must precede the count, or the count cannot see the in-flight attempt");
+    assert(lib.includes("MAX_ATTEMPTS + self"), "decide() must compensate so the observable limit is unchanged");
+    assert(
+      /if \(!decision\.allowed\) \{\s*await client\.query\("ROLLBACK"\)/.test(lib),
+      "a refused attempt must be rolled back so it cannot extend its own cooldown"
+    );
+    assert(!lib.includes("verifyPassword"), "the throttle module must never verify a password inside the lock");
+    /* Two locks, always in the same order, so concurrent attempts cannot form a wait cycle. */
+    const sourceKeyAt = lib.indexOf('ip === null ? `identifier:${primary}` : `source:${ip}`');
+    const accountKeyAt = lib.indexOf("`account:${[...aliases].sort().join(\"|\")}`");
+    assert(sourceKeyAt > -1 && accountKeyAt > -1 && sourceKeyAt < accountKeyAt, "source lock first, then account lock");
+  });
+
+  await test("M-R3: budgets are keyed on the account's alias set, not on one identifier", () => {
+    const lib = readFile("src/lib/rate-limit.ts");
+    assert(lib.includes("identifier = ANY($1::text[])"), "the count must cover every alias of the account");
+    assert(lib.includes("function normalizeAliases"), "aliases must be normalized and de-duplicated");
+    assert(lib.includes("inArray(loginAttempts.identifier, aliases)"), "clearing must cover every alias too");
+    const route = readFile("src/app/api/auth/login/route.ts");
+    assert(
+      route.includes("[suppliedIdentifier, user.email, user.username]"),
+      "the route must feed both aliases of the resolved account, supplied identifier first"
+    );
+    assert(route.includes(": [suppliedIdentifier];"), "an unknown account keeps a budget of its own");
+    const lookupAt = route.indexOf("findAuthUser(eq(users.email, normalizedEmail)");
+    const enforceAt = route.indexOf("await recordFailedLoginAttempt(aliases, clientIp)");
+    assert(lookupAt > -1 && lookupAt < enforceAt, "the account must be resolved before alias-aware enforcement");
+    assert(route.includes("await clearFailedLoginAttempts(aliases, clientIp)"), "a success releases every alias");
   });
 
   await test("throttle responses tell the client when to stop retrying", () => {
@@ -263,10 +452,40 @@ async function main() {
     const content = readFile("src/app/api/health/route.ts");
     assert(content.includes("loginThrottleUnavailable"), "health must track the throttle state");
     assert(
-      content.includes('item.feature === "login_attempts" && !item.present && !item.repairEnabled'),
-      "a missing login_attempts table with repair disabled must be treated as unavailable"
+      content.includes('item.feature === "login_attempts" && item.repairBlocked'),
+      "a missing login_attempts table that cannot be repaired must be treated as unavailable"
     );
     assert(content.includes("0012_login_attempts.sql"), "the health message must name the migration");
+  });
+
+  await test("M-R4a: 'repair is enabled' is no longer mistaken for 'repair worked'", () => {
+    const resilience = readFile("src/lib/schema-resilience.ts");
+    assert(resilience.includes("SchemaRepairFailure"), "a failed repair attempt must be recorded");
+    assert(resilience.includes("getSchemaRepairFailure"), "and be readable by the health endpoint");
+    assert(resilience.includes("repairFailures().set(feature"), "the ledger must be written when repair does not deliver");
+    assert(
+      resilience.includes("has_schema_privilege(current_user, 'public', 'CREATE')"),
+      "the DDL capability probe must be read-only catalog SQL"
+    );
+    assert(
+      resilience.includes("repairBlocked: !present && (!repairEnabled || ddlCapable === false || repairFailed)"),
+      "a missing feature is blocked when repair is off, unprivileged, or already failed"
+    );
+    assert(resilience.includes("ddlCapable === false"), "an unknown capability (null) must NOT escalate on its own");
+
+    const health = readFile("src/app/api/health/route.ts");
+    assert(
+      health.includes('item.feature === "session_revocation" && item.repairBlocked'),
+      "the same blind spot must be closed for session revocation"
+    );
+    /* The public message must stay a fixed string: no role name, no database error text. */
+    const branchStart = health.indexOf("if (loginThrottleUnavailable) {");
+    assert(branchStart > -1, "the escalation branch must exist");
+    const branch = health.slice(branchStart, branchStart + 1200);
+    const messagePart = branch.slice(branch.indexOf("message:"), branch.indexOf("{ status: 503"));
+    assert(messagePart.length > 0, "the branch must build a message");
+    assert(!messagePart.includes("${"), "no runtime detail may be interpolated into the public message");
+    assert(health.includes("console.error"), "the cause is logged server-side instead");
   });
 
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed\n`);

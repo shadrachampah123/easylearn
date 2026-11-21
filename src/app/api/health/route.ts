@@ -62,7 +62,7 @@ export async function GET() {
     let sessionRevocationUnavailable = false;
     let loginThrottleUnavailable = false;
     try {
-      const { probeSchemaFeatures } = await import("@/lib/schema-resilience");
+      const { probeSchemaFeatures, getSchemaRepairFailure } = await import("@/lib/schema-resilience");
       const optional = await probeSchemaFeatures();
       for (const item of optional) {
         checks.optionalMigrations[item.feature] = item.present;
@@ -73,7 +73,12 @@ export async function GET() {
            authenticated request will attempt the idempotent repair DDL, so that case
            stays a warning: this read-only probe cannot know whether the runtime role
            may execute DDL. */
-        if (item.feature === "session_revocation" && !item.present && !item.repairEnabled) {
+        /* M-R4a: escalate on `repairBlocked`, not on "repair is switched off". A
+           security-critical feature fails CLOSED when it is missing, and repair being enabled is
+           not reassurance — the runtime role may have no CREATE privilege on `public`, or a
+           repair may already have been attempted and failed. Before this, all three states
+           reported ok:true while every login answered 503. */
+        if (item.feature === "session_revocation" && item.repairBlocked) {
           sessionRevocationUnavailable = true;
         }
         /* Same reasoning for login throttling since the H-1 fix (2026-11-19): the throttle
@@ -81,14 +86,27 @@ export async function GET() {
            repair refuses every login with 503. This endpoint must not answer "Login and
            registration services are ready" in that state. When repair is enabled the next
            login recreates the table, so that case stays a warning. */
-        if (item.feature === "login_attempts" && !item.present && !item.repairEnabled) {
+        if (item.feature === "login_attempts" && item.repairBlocked) {
           loginThrottleUnavailable = true;
+          /* The cause belongs in the server log, never in this unauthenticated response: the
+             endpoint already discloses more schema state than is ideal (finding L-4). */
+          const failure = getSchemaRepairFailure("login_attempts");
+          const cause = [
+            item.repairEnabled ? null : "AUTO_SCHEMA_REPAIR is disabled",
+            item.ddlCapable === false ? "the runtime role has no CREATE privilege on schema public" : null,
+            failure
+              ? `the last repair attempt applied ${failure.appliedStatements}/${failure.totalStatements} statements and failed: ${failure.reason}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join("; ");
+          console.error(`[health] login throttling is unavailable and cannot be repaired automatically (${cause || "cause unknown"})`);
         }
         if (!item.present) {
           const remedy = item.autoRepairable
-            ? item.repairEnabled
-              ? "EasyLearn creates it on demand, but run `node run-migration.js` to make it official."
-              : "AUTO_SCHEMA_REPAIR is off, so the related dashboard sections stay disabled."
+            ? item.repairBlocked
+              ? "Automatic repair cannot create it in this deployment; run `node run-migration.js` to apply it."
+              : "EasyLearn creates it on demand, but run `node run-migration.js` to make it official."
             : "EasyLearn never creates this automatically. An administrator must run " +
               "`node run-migration.js` under the documented preflight, because the tenant " +
               "boundary must not change without review.";
@@ -133,9 +151,9 @@ export async function GET() {
           checks,
           message:
             "Database is connected, but session revocation is unavailable: users.session_version " +
-            "is missing (drizzle/0019_session_revocation.sql) and AUTO_SCHEMA_REPAIR is off, so " +
-            "token verification fails closed and authenticated requests will return 503. " +
-            "Apply the migration or re-enable automatic schema repair.",
+            "is missing (drizzle/0019_session_revocation.sql) and automatic schema repair cannot " +
+            "create it in this deployment, so token verification fails closed and authenticated " +
+            "requests will return 503. Apply the migration with `node run-migration.js`.",
         },
         { status: 503, headers: { "Cache-Control": "no-store" } }
       );
@@ -149,9 +167,9 @@ export async function GET() {
           checks,
           message:
             "Database is connected, but login throttling is unavailable: the login_attempts table " +
-            "is missing (drizzle/0012_login_attempts.sql) and AUTO_SCHEMA_REPAIR is off, so login " +
-            "fails closed and every sign-in attempt will return 503. Apply the migration or " +
-            "re-enable automatic schema repair.",
+            "is missing (drizzle/0012_login_attempts.sql) and automatic schema repair cannot " +
+            "create it in this deployment, so login fails closed and every sign-in attempt will " +
+            "return 503. Apply the migration with `node run-migration.js`.",
         },
         { status: 503, headers: { "Cache-Control": "no-store" } }
       );

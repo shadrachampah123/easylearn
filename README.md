@@ -163,7 +163,14 @@ Notes:
   shows a warning banner on the admin dashboard, it no longer returns a 500 blank page.
 - On request, EasyLearn will try to create the *optional* objects above itself using idempotent
   DDL (logged as "created automatically"). Set `AUTO_SCHEMA_REPAIR=false` if your database role is
-  not allowed to run DDL.
+  not allowed to run DDL. **Absent means enabled.**
+- Repair being *enabled* is not repair *working*, and the login throttle fails **closed**: with
+  `login_attempts` missing nobody can sign in, not even with a correct password. `GET /api/health`
+  therefore answers **503** whenever that table is missing and automatic repair cannot create it —
+  repair disabled, no `CREATE` privilege on `public`, or a repair attempt that already failed —
+  and names the migration to apply (`node run-migration.js`). The underlying reason (privilege
+  probe, how many DDL statements were applied, the database error) is written to the server log
+  only, because the endpoint is unauthenticated.
 - `0004`/`0005` used to contain shell-escaped `\"` quotes, so they failed with a syntax error that
   the old runner swallowed. The files are fixed and `run-migration.js` now exits non-zero whenever
   a statement genuinely could not be applied.

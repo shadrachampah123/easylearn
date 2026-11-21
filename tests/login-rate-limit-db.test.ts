@@ -16,7 +16,14 @@
  *      releases that account's own recorded failures;
  *   5. **a successful login is not a throttle-reset oracle (H-R1)** — signing in as account
  *      A leaves account B's recorded failures intact even when both share a source IP, so
- *      one valid low-privilege credential cannot make the guess budget repeatable.
+ *      one valid low-privilege credential cannot make the guess budget repeatable;
+ *   6. **concurrency cannot buy extra guesses (M-R2)** — a burst of simultaneous wrong
+ *      passwords is enforced inside an advisory-locked transaction that inserts first and
+ *      re-decides, so the number of real guesses never exceeds the configured budget;
+ *   7. **one account has ONE budget across its aliases (M-R3)** — email and username
+ *      attempts against the same account share it, while unknown accounts keep their own;
+ *   8. **a failed repair is observable (M-R4a)** — when automatic repair is enabled but does
+ *      not deliver the table, `/api/health` stops claiming that login services are ready.
  *
  * Run: EASY_LEARN_TEST_DATABASE=true npx tsx tests/login-rate-limit-db.test.ts
  * (CI hard-requires execution via EASY_LEARN_REQUIRE_LOGIN_RATE_LIMIT_DB=true; a silent skip fails the job)
@@ -442,6 +449,196 @@ async function main() {
       assert.strictEqual(insiderRows, 0, "the signing-in account's own failures are still released");
     });
 
+    /* ── 7c. M-R2 regression: concurrency must not buy extra guesses ───────────── */
+
+    await test("M-R2: a concurrent burst from one source yields at most MAX_ATTEMPTS real guesses", async () => {
+      await reset();
+      const BURST_IP = "203.0.113.140";
+      const burst = 25;
+      /* The review measured this exactly: 30 simultaneous wrong-password requests all read an
+         empty table before any of them wrote, so all 30 were answered 401 — six times the
+         configured budget. Step 1 of the route is still a cheap read-only pre-check, so the
+         burst does reach step 3 together; enforcement there is serialized by two advisory
+         locks and re-decided on a count that already includes the in-flight row. */
+      const responses = await Promise.all(
+        Array.from({ length: burst }, () => POST(loginRequest(wrongPassword, BURST_IP)))
+      );
+      const statuses = await Promise.all(responses.map((response) => response.status));
+      const guessed = statuses.filter((status) => status === 401).length;
+      const refused = statuses.filter((status) => status === 429).length;
+      assert.strictEqual(
+        guessed + refused,
+        statuses.length,
+        `every response must be 401 or 429, got [${statuses.join(", ")}]`
+      );
+      assert.strictEqual(
+        guessed,
+        MAX_ATTEMPTS,
+        `concurrency must not raise the pair budget above ${MAX_ATTEMPTS}: ${guessed} guesses were allowed`
+      );
+      assert.strictEqual(refused, burst - MAX_ATTEMPTS, "every request past the budget must be refused");
+
+      /* A refused attempt is rolled back, so it cannot extend its own cooldown (finding L-R1
+         is about the window, not about refusals multiplying it): exactly the counted guesses
+         are stored. */
+      const stored = Number(
+        (await db.query(`SELECT count(*)::int AS count FROM login_attempts WHERE ip_address = $1`, [BURST_IP])).rows[0]
+          .count
+      );
+      assert.strictEqual(stored, MAX_ATTEMPTS, `only the ${MAX_ATTEMPTS} counted guesses may be stored, found ${stored}`);
+
+      const after = await checkLoginRateLimit(ADMIN_EMAIL, BURST_IP);
+      assert.strictEqual(after.allowed, false, "the source must still be exhausted once the burst settles");
+      assert.strictEqual(after.reason, "identifier_source");
+      assert.strictEqual(after.remainingAttempts, 0);
+    });
+
+    await test("M-R2: a concurrent burst across many sources still respects the account backstop", async () => {
+      await reset();
+      /* Rotating the source defeats the pair budget, so the per-account backstop is the only
+         limit left — and it is the one a parallel spray would blow through first. The account
+         advisory lock is taken in a fixed order after the source lock, so 24 writers serialize
+         instead of deadlocking. */
+      const spray = MAX_ATTEMPTS_PER_IDENTIFIER + 9;
+      const sources = Array.from({ length: spray }, (_, index) => `203.0.113.${160 + index}`);
+      const responses = await Promise.all(
+        sources.map((source) => POST(loginRequest(wrongPassword, source)))
+      );
+      const statuses = await Promise.all(responses.map((response) => response.status));
+      const guessed = statuses.filter((status) => status === 401).length;
+      const refused = statuses.filter((status) => status === 429).length;
+      assert.strictEqual(guessed + refused, statuses.length, `unexpected statuses [${statuses.join(", ")}]`);
+      assert.strictEqual(
+        guessed,
+        MAX_ATTEMPTS_PER_IDENTIFIER,
+        `a parallel spray must not exceed the ${MAX_ATTEMPTS_PER_IDENTIFIER}-failure account backstop, got ${guessed}`
+      );
+      assert(refused > 0, "the rest of the spray must be refused");
+      assert.strictEqual(
+        await attemptRows(),
+        MAX_ATTEMPTS_PER_IDENTIFIER,
+        "refused attempts must not leave rows behind"
+      );
+    });
+
+    /* ── 7d. M-R3 regression: one account, ONE budget across its aliases ───────── */
+
+    await test("M-R3: email and username share one budget instead of two", async () => {
+      await reset();
+      const ADMIN_USERNAME = `admin-${DB_NAME}`;
+      await db.query(`UPDATE users SET username = $1 WHERE email = $2`, [ADMIN_USERNAME, ADMIN_EMAIL]);
+      /* Before the fix each alias carried its own MAX_ATTEMPTS_PER_IDENTIFIER budget, so the
+         same account could be guessed 30 times over by alternating the identifier. Sources
+         rotate so the pair budget (5 per identifier+source) never fires first. */
+      const budget = MAX_ATTEMPTS_PER_IDENTIFIER;
+      const wrongUsername = { username: ADMIN_USERNAME, password: "not-the-password" };
+      const statuses: number[] = [];
+      for (let index = 0; index < budget; index += 1) {
+        const body = index % 2 === 1 ? wrongUsername : wrongPassword;
+        statuses.push((await POST(loginRequest(body, `203.0.114.${index + 1}`))).status);
+      }
+      assert.strictEqual(
+        statuses.filter((status) => status === 401).length,
+        budget,
+        `the first ${budget} guesses across both aliases must be allowed, got [${statuses.join(", ")}]`
+      );
+
+      const refusedByEmail = await POST(loginRequest(wrongPassword, "203.0.114.201"));
+      assert.strictEqual(
+        refusedByEmail.status,
+        429,
+        "once the shared account budget is gone, the email alias must be refused too"
+      );
+      const refusedByUsername = await POST(loginRequest(wrongUsername, "203.0.114.202"));
+      assert.strictEqual(refusedByUsername.status, 429, "and so must the username alias");
+
+      const grouped = (
+        await db.query(
+          `SELECT identifier, count(*)::int AS count FROM login_attempts GROUP BY identifier ORDER BY identifier`
+        )
+      ).rows as { identifier: string; count: number }[];
+      assert.strictEqual(grouped.length, 2, `both aliases must have been used, got ${JSON.stringify(grouped)}`);
+      const total = grouped.reduce((sum, row) => sum + row.count, 0);
+      assert.strictEqual(
+        total,
+        budget,
+        `the two aliases must share ONE budget of ${budget} stored failures, found ${total}`
+      );
+
+      /* The authoritative count needs the resolved account, which only the route knows: the
+         alias-aware check is what refuses the next guess. */
+      const shared = await checkLoginRateLimit([ADMIN_EMAIL, ADMIN_USERNAME], "203.0.114.203");
+      assert.strictEqual(shared.allowed, false, "the alias set must be refused");
+      assert.strictEqual(
+        shared.reason,
+        "identifier_total",
+        "the shared account budget is what refused it, not the per-source one"
+      );
+      assert.strictEqual(shared.remainingAttempts, 0);
+
+      /* The shared backstop is a real account lockout: it refuses the correct password too,
+         through either alias. That is the intended trade (finding L-R1 tracks the length of
+         the window), and it is precisely why the budget must not be duplicated per alias. */
+      const ownerLockedOut = await POST(loginRequest({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }, OWNER_IP));
+      assert.strictEqual(
+        ownerLockedOut.status,
+        429,
+        `the exhausted shared budget must hold against the correct password too, got ${ownerLockedOut.status}`
+      );
+    });
+
+    await test("M-R3: a successful sign-in releases every alias of that account, and nobody else's", async () => {
+      await reset();
+      const ADMIN_USERNAME = `admin-${DB_NAME}`;
+      const COLLEAGUE = `colleague-${DB_NAME}@test.test`;
+      /* A few failures spread over both aliases of one account, plus a different account on
+         the same source, all far below every budget. */
+      await seedFailure(ADMIN_EMAIL, OWNER_IP);
+      await seedFailure(ADMIN_EMAIL, ATTACKER_IP);
+      await seedFailure(ADMIN_USERNAME, ATTACKER_IP);
+      await seedFailure(COLLEAGUE, OWNER_IP);
+      assert.strictEqual(await attemptRows(), 4, "the fixture must be in place");
+
+      const owner = await POST(loginRequest({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }, OWNER_IP));
+      assert.strictEqual(owner.status, 200, `the legitimate owner must still get in, got ${owner.status}`);
+
+      const survivors = (
+        await db.query(`SELECT identifier, count(*)::int AS count FROM login_attempts GROUP BY identifier ORDER BY identifier`)
+      ).rows as { identifier: string; count: number }[];
+      assert.strictEqual(
+        survivors.length,
+        1,
+        `only the colleague's rows may survive, got ${JSON.stringify(survivors)}`
+      );
+      assert.strictEqual(survivors[0].identifier, COLLEAGUE.toLowerCase(), "a different account is untouched (H-R1)");
+      assert.strictEqual(survivors[0].count, 1, "and it keeps its own single recorded failure");
+      /* The provisional row the successful attempt inserted was removed with the rest. */
+      assert.strictEqual(await attemptRows(), 1, "exactly the colleague's failure remains");
+    });
+
+    await test("M-R3: unknown accounts keep their own budget and cannot borrow a real account's", async () => {
+      await reset();
+      const UNKNOWN = `nobody-${DB_NAME}@test.test`;
+      const ENUMERATOR_IP = "203.0.115.7";
+      for (let index = 0; index < MAX_ATTEMPTS; index += 1) {
+        const response = await POST(loginRequest({ email: UNKNOWN, password: "not-the-password" }, ENUMERATOR_IP));
+        assert.strictEqual(response.status, 401, `enumeration attempt ${index + 1} must be counted normally`);
+      }
+      const refused = await POST(loginRequest({ email: UNKNOWN, password: "not-the-password" }, ENUMERATOR_IP));
+      assert.strictEqual(
+        refused.status,
+        429,
+        "alias-aware counting must not weaken the protection for accounts that do not resolve"
+      );
+      const unknownRows = Number(
+        (await db.query(`SELECT count(*)::int AS count FROM login_attempts WHERE identifier = lower($1)`, [UNKNOWN]))
+          .rows[0].count
+      );
+      assert.strictEqual(unknownRows, MAX_ATTEMPTS, "the unknown account's own failures must be stored");
+      const realAccount = await checkLoginRateLimit(ADMIN_EMAIL, ENUMERATOR_IP);
+      assert.strictEqual(realAccount.allowed, true, "a different account from the same source keeps its own budget");
+    });
+
     /* ── 8. Fail safely: self-heal, then fail closed ───────────────────────────── */
 
     await test("a missing login_attempts table is repaired instead of disabling throttling", async () => {
@@ -531,6 +728,122 @@ async function main() {
       assert.strictEqual(body.ok, true);
       const warned = (body.checks?.migrationWarnings ?? []).some((warning) => warning.includes("0012_login_attempts.sql"));
       assert(warned, "the missing table must still be surfaced as a warning");
+    });
+
+    /* ── 9. M-R4a regression: a failed repair must be visible to /api/health ───── */
+
+    await test("M-R4a: an enabled-but-failing repair makes /api/health unhealthy, not 'ready'", async () => {
+      /* Production evidence (2026-11-19): the runtime role is neondb_owner and
+         has_schema_privilege(current_user, 'public', 'CREATE') is true, so repair *can* work
+         there. This suite's role is the database owner too, which no REVOKE can demote, so
+         the failure is injected instead: DDL statements are blocked while read-only probes
+         still answer. That is exactly the state Production would be in if the privilege were
+         ever revoked, the disk were full, or a statement were invalid — and it is the state
+         in which /api/health used to answer 200 "Login and registration services are ready"
+         while every single login answered 503. */
+      /* The previous scenario left the table dropped on purpose (health stays "ready" while
+         repair is merely enabled), so this one starts from that same missing-table state. */
+      await db.query(`DROP TABLE IF EXISTS login_attempts`);
+      delete process.env.AUTO_SCHEMA_REPAIR; // repair stays ENABLED: that was the blind spot
+      resilience.resetSchemaFeatureCache();
+
+      const { pool } = await import("@/db");
+      const poolForStub = pool as unknown as { query: (...args: never[]) => Promise<unknown> };
+      const realQuery = poolForStub.query;
+      const boundQuery = realQuery.bind(pool) as (text: unknown, ...args: unknown[]) => Promise<unknown>;
+      const denial = Object.assign(new Error("permission denied for schema public"), { code: "42501" });
+      poolForStub.query = ((sql: unknown, ...rest: unknown[]) => {
+        if (/^\s*CREATE/i.test(String(sql))) return Promise.reject(denial);
+        return boundQuery(sql, ...rest);
+      }) as typeof poolForStub.query;
+
+      try {
+        /* A login attempt is what exercises the repair, so this is the order the failure
+           becomes observable in: the first sign-in 503s and records the failed repair. */
+        const login = await POST(loginRequest(wrongPassword, OWNER_IP));
+        assert.strictEqual(login.status, 503, `the throttle must fail closed, got ${login.status}`);
+
+        /* THE regression. Before the fix this answered 200 "Login and registration services
+           are ready" — because the escalation branch only fired when repair was DISABLED, and
+           here repair is enabled, privileged, and still broken. */
+        const { GET } = await import("@/app/api/health/route");
+        const response = await GET();
+        assert.strictEqual(response.status, 503, `a failed repair must be unhealthy, got ${response.status}`);
+        const body = (await response.json()) as {
+          ok: boolean;
+          message?: string;
+          checks?: { optionalMigrations?: Record<string, boolean> };
+        };
+        assert.strictEqual(body.ok, false, "health must not claim readiness while every login answers 503");
+        assert.match(body.message ?? "", /login throttling/i, "the message must name login throttling");
+        assert.match(body.message ?? "", /0012_login_attempts/, "and the migration that fixes it");
+        assert.strictEqual(body.checks?.optionalMigrations?.login_attempts, false, "the probe must report the feature missing");
+
+        /* The mechanism behind that verdict. */
+        const capabilities = await resilience.probeSchemaFeatures(["login_attempts"]);
+        const throttledFeature = capabilities.find((item) => item.feature === "login_attempts");
+        assert(throttledFeature, "the probe must report the throttle feature");
+        assert.strictEqual(throttledFeature!.present, false, "the table is gone");
+        assert.strictEqual(throttledFeature!.repairEnabled, true, "repair is enabled — the old check stopped here");
+        assert.strictEqual(
+          throttledFeature!.ddlCapable,
+          true,
+          "this role can create in public (matching Production's neondb_owner), so the capability probe alone must not escalate"
+        );
+
+        const failure = resilience.getSchemaRepairFailure("login_attempts");
+        assert(failure, "the failed repair must be recorded, not only logged");
+        assert.strictEqual(failure!.feature, "login_attempts");
+        assert.strictEqual(failure!.appliedStatements, 0, "no statement may be reported as applied");
+        assert.strictEqual(failure!.totalStatements, 5, "the ledger must know the size of the repair");
+        assert.match(failure!.reason, /permission denied/, "the recorded reason must be the database error");
+        assert(failure!.at <= Date.now() && failure!.at > Date.now() - 60_000, "the failure must be timestamped now");
+
+        const blocked = await resilience.probeSchemaFeatures(["login_attempts"]);
+        const item = blocked.find((entry) => entry.feature === "login_attempts")!;
+        assert.strictEqual(item.repairFailed, true, "the probe must expose the recorded failure");
+        assert.strictEqual(
+          item.repairBlocked,
+          true,
+          "repair enabled + repair failed must be treated as blocked, even though the role is privileged"
+        );
+
+        /* Finding L-4: the endpoint is unauthenticated, so the cause stays in the server log.
+           The recorded reason and the privilege wording must not appear in the response. */
+        const text = JSON.stringify(body);
+        assert(!text.includes(failure!.reason), "the database error text must not be echoed to clients");
+        assert(
+          !/permission denied|42501|has_schema_privilege|appliedStatements|statements applied/i.test(text),
+          `the response must not disclose the cause: ${text}`
+        );
+      } finally {
+        poolForStub.query = realQuery;
+      }
+    });
+
+    await test("M-R4a: a successful repair clears the failure and health recovers", async () => {
+      /* The ledger must not be sticky: once repair delivers the object, health goes green
+         again without a restart, otherwise the first incident would alert forever. */
+      resilience.resetSchemaFeatureCache();
+      const repaired = await resilience.ensureLoginAttemptSchema();
+      assert.strictEqual(repaired.available, true, "with DDL unblocked the table must come back");
+      assert.strictEqual(repaired.repaired, true);
+      assert.strictEqual(resilience.getSchemaRepairFailure("login_attempts"), null, "the recorded failure must be cleared");
+
+      const capabilities = await resilience.probeSchemaFeatures(["login_attempts"]);
+      const item = capabilities.find((entry) => entry.feature === "login_attempts")!;
+      assert.strictEqual(item.present, true);
+      assert.strictEqual(item.repairFailed, false);
+      assert.strictEqual(item.repairBlocked, false);
+
+      const { GET } = await import("@/app/api/health/route");
+      const response = await GET();
+      assert.strictEqual(response.status, 200, `health must recover, got ${response.status}`);
+      const body = (await response.json()) as { ok: boolean };
+      assert.strictEqual(body.ok, true);
+
+      const login = await POST(loginRequest(wrongPassword, OWNER_IP));
+      assert.strictEqual(login.status, 401, "throttling must be live again (a normal 401, not a degraded 503)");
     });
 
     /* Restore the table so cleanup and any later suite state stay conventional. */
