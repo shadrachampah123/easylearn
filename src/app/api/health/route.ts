@@ -60,6 +60,7 @@ export async function GET() {
     // Read-only probe of the migrations that add optional objects, so an operator can see
     // "overrides are disabled because 0004 was never applied" from one URL. Never runs DDL.
     let sessionRevocationUnavailable = false;
+    let loginThrottleUnavailable = false;
     try {
       const { probeSchemaFeatures } = await import("@/lib/schema-resilience");
       const optional = await probeSchemaFeatures();
@@ -74,6 +75,14 @@ export async function GET() {
            may execute DDL. */
         if (item.feature === "session_revocation" && !item.present && !item.repairEnabled) {
           sessionRevocationUnavailable = true;
+        }
+        /* Same reasoning for login throttling since the H-1 fix (2026-11-19): the throttle
+           now fails CLOSED, so a database without login_attempts and without automatic
+           repair refuses every login with 503. This endpoint must not answer "Login and
+           registration services are ready" in that state. When repair is enabled the next
+           login recreates the table, so that case stays a warning. */
+        if (item.feature === "login_attempts" && !item.present && !item.repairEnabled) {
+          loginThrottleUnavailable = true;
         }
         if (!item.present) {
           const remedy = item.autoRepairable
@@ -127,6 +136,22 @@ export async function GET() {
             "is missing (drizzle/0019_session_revocation.sql) and AUTO_SCHEMA_REPAIR is off, so " +
             "token verification fails closed and authenticated requests will return 503. " +
             "Apply the migration or re-enable automatic schema repair.",
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    if (loginThrottleUnavailable) {
+      return Response.json(
+        {
+          ok: false,
+          service: "EasyLearn API",
+          checks,
+          message:
+            "Database is connected, but login throttling is unavailable: the login_attempts table " +
+            "is missing (drizzle/0012_login_attempts.sql) and AUTO_SCHEMA_REPAIR is off, so login " +
+            "fails closed and every sign-in attempt will return 503. Apply the migration or " +
+            "re-enable automatic schema repair.",
         },
         { status: 503, headers: { "Cache-Control": "no-store" } }
       );

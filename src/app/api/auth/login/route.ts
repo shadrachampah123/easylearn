@@ -10,11 +10,47 @@ import {
   recordFailedLoginAttempt,
   clearFailedLoginAttempts,
   getClientIp,
+  RATE_LIMIT_UNAVAILABLE_MESSAGE,
+  UNAVAILABLE_RETRY_SECONDS,
+  type RateLimitResult,
 } from "@/lib/rate-limit";
 import { SESSION_COOKIE_NAME } from "@/lib/session-cookie";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/**
+ * Throttle responses carry `Retry-After` so a well-behaved client (and any intermediary)
+ * stops hammering the endpoint, and `no-store` so a shared cache never replays a 429/503.
+ */
+function throttleResponse(message: string, status: number, retryAfterSeconds?: number) {
+  const response = errorResponse(message, status);
+  if (typeof retryAfterSeconds === "number" && retryAfterSeconds > 0) {
+    response.headers.set("Retry-After", String(Math.ceil(retryAfterSeconds)));
+  }
+  response.headers.set("Cache-Control", "no-store");
+  return response;
+}
+
+function rateLimitResponse(rateLimit: RateLimitResult) {
+  // A refused *check* is a service problem (503), not a client abuse problem (429): the
+  // caller is not necessarily over any budget, the throttle simply could not be evaluated.
+  const status = rateLimit.reason === "unavailable" ? 503 : 429;
+  return throttleResponse(
+    rateLimit.message || "Too many failed login attempts. Please try again later.",
+    status,
+    rateLimit.retryAfterSeconds
+  );
+}
+
+/**
+ * A failed attempt that could not be stored leaves the throttle blind to it. Answering 401
+ * anyway would hand an attacker free guesses — that is precisely the fail-open behaviour
+ * audit finding H-1 describes — so the login is paused until recording works again.
+ */
+function degradedThrottleResponse() {
+  return throttleResponse(RATE_LIMIT_UNAVAILABLE_MESSAGE, 503, UNAVAILABLE_RETRY_SECONDS);
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -45,15 +81,13 @@ export async function POST(request: NextRequest) {
 
     const { db } = await import("@/db");
 
-    // Rate limiting - DB-backed, works across Vercel instances
+    // Rate limiting — DB-backed so it works across Vercel instances, and layered per
+    // source IP as well as per account (see src/lib/rate-limit.ts for the H-1 rationale).
     const identifier = normalizedEmail || normalizedUsername;
     const clientIp = getClientIp(request);
     const rateLimit = await checkLoginRateLimit(identifier, clientIp);
     if (!rateLimit.allowed) {
-      return errorResponse(
-        rateLimit.message || "Too many failed login attempts. Please try again later.",
-        429
-      );
+      return rateLimitResponse(rateLimit);
     }
 
     // Search by email first, then by username. Both reads go through findAuthUser so that a
@@ -77,22 +111,29 @@ export async function POST(request: NextRequest) {
     }
 
     if (!user) {
-      await recordFailedLoginAttempt(identifier, clientIp);
+      const recorded = await recordFailedLoginAttempt(identifier, clientIp);
+      if (!recorded.recorded) return degradedThrottleResponse();
       return errorResponse("Invalid email/username or password", 401);
     }
 
     if (!user.isActive) {
+      // Counted as a failed attempt on purpose: deactivated accounts are a favourite
+      // enumeration target, so those guesses should consume the source IP budget too.
+      const recorded = await recordFailedLoginAttempt(identifier, clientIp);
+      if (!recorded.recorded) return degradedThrottleResponse();
       return errorResponse("Account is deactivated. Contact the school administrator.", 403);
     }
 
     const isValid = await verifyPassword(password, user.passwordHash);
     if (!isValid) {
-      await recordFailedLoginAttempt(identifier, clientIp);
+      const recorded = await recordFailedLoginAttempt(identifier, clientIp);
+      if (!recorded.recorded) return degradedThrottleResponse();
       return errorResponse("Invalid email or password", 401);
     }
 
-    // Successful login - clear failed attempts
-    await clearFailedLoginAttempts(identifier);
+    // Successful login — clear the account bucket *and* this source IP's bucket, so a
+    // legitimate user behind a shared school NAT releases the budget they consumed.
+    await clearFailedLoginAttempts(identifier, clientIp);
 
     // Phase 2B — school context. Resolved from `school_users` on the server; a client
     // supplied school id is never read or trusted (see src/lib/tenant.ts). This helper

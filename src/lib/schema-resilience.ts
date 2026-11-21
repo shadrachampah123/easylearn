@@ -237,6 +237,7 @@ export function clientSafeErrorMessage(error: unknown, fallback = "The database 
 
 export type SchemaFeature =
   | "session_revocation"
+  | "login_attempts"
   | "dashboard_card_overrides"
   | "activity_logs_enrichment"
   | "optional_user_columns"
@@ -250,6 +251,7 @@ const FEATURE_STATUS_TTL_MS = 60_000;
 
 const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   session_revocation: "drizzle/0019_session_revocation.sql",
+  login_attempts: "drizzle/0012_login_attempts.sql",
   dashboard_card_overrides: "drizzle/0004_dashboard_overrides.sql",
   activity_logs_enrichment: "drizzle/0005_activity_enhancements.sql",
   optional_user_columns: "drizzle/0006_user_identity_columns.sql",
@@ -349,6 +351,27 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
     `ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "session_version" integer DEFAULT 0 NOT NULL;`,
     `CREATE INDEX IF NOT EXISTS "users_session_version_idx" ON "users" USING btree ("session_version");`,
   ],
+  /* Login throttling is security-critical, not optional polish: without `login_attempts`
+     src/lib/rate-limit.ts has nothing to count, and before 2026-11-19 it failed OPEN in
+     that situation (audit finding H-1) - a database without migration 0012 simply had no
+     brute-force protection at all. Mirrors drizzle/0012_login_attempts.sql so an
+     un-migrated database self-heals into a throttled state instead of an unprotected one.
+     The final index is ADDITIVE to 0012: the per-source throttle introduced with the H-1
+     fix counts failures by (ip_address, created_at), which 0012 does not index. It is
+     created here only when the table itself is missing; an existing deployment gets it
+     from a reviewed follow-up migration (recorded in the roadmap as an H-1 follow-up). */
+  login_attempts: [
+    `CREATE TABLE IF NOT EXISTS "login_attempts" (
+       "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+       "identifier" varchar(255) NOT NULL,
+       "ip_address" varchar(50),
+       "created_at" timestamp DEFAULT now() NOT NULL
+     );`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_identifier_idx" ON "login_attempts" ("identifier");`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_created_at_idx" ON "login_attempts" ("created_at");`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_identifier_created_at_idx" ON "login_attempts" ("identifier", "created_at");`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_ip_created_at_idx" ON "login_attempts" ("ip_address", "created_at");`,
+  ],
   /* The composite tenant foreign keys are intentionally NOT auto-repairable. Migration
      0018 is gated: it needs a reviewed read-only preflight against a restored copy
      before it may touch a database, and it aborts atomically on legacy cross-school
@@ -396,6 +419,7 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     table: "uploaded_files",
     columns: ["storage_backend"],
   },
+  login_attempts: { mode: "relation", relation: "login_attempts" },
   session_revocation: {
     mode: "columns",
     table: "users",
@@ -554,6 +578,17 @@ export function ensureSessionRevocationColumn(): Promise<FeatureStatus> {
   return ensureSchemaFeature("session_revocation");
 }
 
+/**
+ * The `login_attempts` table is declared in src/db/schema.ts but only ever created by
+ * drizzle/0012_login_attempts.sql. Login throttling reads and writes it on every login,
+ * so src/lib/rate-limit.ts calls this when a throttle query fails with "relation does not
+ * exist": an un-migrated database repairs itself into a *throttled* state instead of
+ * silently losing brute-force protection (audit finding H-1, 2026-11-19).
+ */
+export function ensureLoginAttemptSchema(): Promise<FeatureStatus> {
+  return ensureSchemaFeature("login_attempts");
+}
+
 export interface OptionalSchemaStatus {
   feature: SchemaFeature;
   present: boolean;
@@ -582,6 +617,11 @@ export async function probeSchemaFeatures(
        (2026-10-27 production preflight finding). Read-only, like every probe
        here — it never runs the repair DDL. */
     "session_revocation",
+    /* Login throttling is security-critical for the same reason: without login_attempts
+       there is no brute-force protection, and since the H-1 fix the throttle fails CLOSED
+       rather than open, so /api/health must be able to say whether the table is there.
+       Read-only probe, like every entry here. */
+    "login_attempts",
     "quiz_question_images",
     "uploaded_files",
     "assignment_file_uploads",

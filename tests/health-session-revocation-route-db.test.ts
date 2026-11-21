@@ -99,6 +99,22 @@ async function main() {
       )
     `);
 
+    /* The fixture must also carry login_attempts. Since the H-1 remediation
+       (2026-11-19) the login throttle fails CLOSED, and /api/health reports 503 when the
+       throttle table is missing while AUTO_SCHEMA_REPAIR is off — otherwise it would
+       claim "Login and registration services are ready" while every sign-in returns 503,
+       which is the exact mistake this suite exists to prevent for session revocation.
+       Creating it here keeps this suite's subject (session_version) the only drift under
+       test; the throttle gate itself is asserted in tests/login-rate-limit-db.test.ts. */
+    await db.query(`
+      CREATE TABLE login_attempts (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        identifier varchar(255) NOT NULL,
+        ip_address varchar(50),
+        created_at timestamp NOT NULL DEFAULT now()
+      )
+    `);
+
     const { GET } = await import("@/app/api/health/route");
     const call = async (): Promise<{ status: number; body: HealthBody }> => {
       const res = await GET();
