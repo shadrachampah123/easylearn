@@ -49,7 +49,7 @@ Only C-1 was closed above. Every other audit finding remains open, with `FULL_PR
 
 | ID | Finding | Status |
 | --- | --- | --- |
-| **H-1** | Login rate limiting fails **open** on any database error; the client IP is recorded but never used in a limit; the per-identifier lockout lets anyone lock any account, including administrators | **Fix implemented 2026-11-19 — under review in a separate PR** |
+| **H-1** | Login rate limiting fails **open** on any database error; the client IP is recorded but never used in a limit; the per-identifier lockout lets anyone lock any account, including administrators | **Fixed in code 2026-11-19 — PR #69, open for review** (verified locally; see "H-1 remediation" below) |
 | **H-2** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage | Open |
 | **C-2** | Production schema drift (0/26 composite FKs) and absent migration ledger; 0018 prepared but unexecuted | Pending — see above |
 | **M-1** | Inconsistent password policy: 6-character minimum on admin user create/reset versus 8 on `change-password`; `generatedPassword` echoed in the API response | Open |
@@ -65,9 +65,55 @@ Only C-1 was closed above. Every other audit finding remains open, with `FULL_PR
 | **L-6** | `npm test` is not hermetic — it fails without CI's `JWT_SECRET` and `DATABASE_URL` | Open |
 | **L-7** | `messages` and `notifications` lack per-user and per-conversation indexes | Open |
 
+### H-1 remediation — PR #69 (implemented and verified 2026-11-19)
+
+The login-throttle fix is **complete, verified locally, and open for review as PR #69** (branch `arena/4416888f-easylearn`, base `main` @ `4069584`). It changes no Production system: merging it does not deploy, migrate, or back up anything by itself.
+
+**What was wrong.** Three defects from the audit, plus a **fourth found while implementing the fix**:
+
+1. `checkLoginRateLimit` caught any database error and returned `{ allowed: true }` — every throttle failure handed out unlimited guesses.
+2. The client IP was recorded but never used in a limit.
+3. The only bucket was the identifier, so five failures locked an account for everybody for 30 minutes: anyone could lock an administrator out with one request.
+4. *(new)* `ip_address` is `varchar(50)` and `getClientIp` returned the raw leftmost `x-forwarded-for` token. A longer header made the INSERT throw, which `recordFailedLoginAttempt` swallowed — an attacker could switch throttling off **for themselves** with a single header while every check kept succeeding.
+
+**What it does now.**
+
+- **Fails closed.** An unevaluable check refuses the login for 60 seconds (`reason: "unavailable"`) and logs it. This costs no real availability: a database that cannot answer the throttle query cannot answer the user lookup either.
+- **Three buckets, one round trip** over a single windowed scan (`WINDOW_MINUTES = 15`, unchanged):
+
+  | Bucket | Threshold | Cooldown | Purpose |
+  | --- | --- | --- | --- |
+  | (identifier, source IP) | `MAX_ATTEMPTS = 5` (unchanged) | `BLOCK_MINUTES = 30` (unchanged) | The familiar limit, now scoped to the **guesser**, so the account owner is unaffected |
+  | source IP | `MAX_ATTEMPTS_PER_IP = 40` failures **or** `MAX_IDENTIFIERS_PER_IP = 10` distinct identifiers | `IP_BLOCK_MINUTES = 15` | Volume abuse and credential spraying |
+  | identifier, any source | `MAX_ATTEMPTS_PER_IDENTIFIER = 15` | `IDENTIFIER_BLOCK_MINUTES = 15` | Distributed-guessing backstop — unreachable from one source |
+
+- **A failure that cannot be stored is no longer silent:** `recordFailedLoginAttempt` returns `{ recorded, reason }` and the route answers 503 instead of 401, so a degraded throttle cannot become free guesses.
+- **`clearFailedLoginAttempts(identifier, ip)`** also releases the source bucket, so a school behind one NAT gets its budget back on a successful sign-in.
+- **`getClientIp` validates** (first syntactically valid `x-forwarded-for` entry, then `x-real-ip`, else `null`; octet ranges, IPv6 character set, 45-character cap) and never stores the legacy `"unknown"` sentinel again.
+- **`login_attempts` is now a self-healing schema feature** (`src/lib/schema-resilience.ts`), so an un-migrated database becomes *throttled* instead of silently unprotected, and **`/api/health` reports 503** when the table is missing while `AUTO_SCHEMA_REPAIR` is off — the same Issue #54 lesson already applied to `session_revocation`.
+- **No role-specific thresholds**, deliberately: the role is unknown before the password verifies, and looking it up per unauthenticated request would create an oracle and add a query to the hottest unauthenticated path. Attributing failures to their **source** protects administrators without leaking anything.
+
+**Verification (local mirror of `.github/workflows/ci.yml`, same environment shape: shared PostgreSQL service as `TEST_DATABASE_URL`, deliberately unreachable `DATABASE_URL`, random `JWT_SECRET`, all `EASY_LEARN_REQUIRE_*` flags set).**
+
+| CI step | Result |
+| --- | --- |
+| `security:check-secret`, `npm audit --omit=dev` | pass · 0 vulnerabilities |
+| `npm test` | pass — includes the new 20-assertion policy suite |
+| `test:csp-hydration`, `test:auth-security` | pass |
+| `test:db` | pass — 22 suites, including the new 19-assertion database suite |
+| `test:tenant-auth`, `test:review-pr45`, `test:mutation`, `test:integration`, `test:tenant-integrity` | pass |
+| `typecheck`, `build`, `lint` | pass · `✓ Compiled successfully` |
+| `test:tls-e2e` | not run locally (needs TLS-enabled PostgreSQL 16) — CI only |
+
+The regression assertions that pin the four requirements: *the legitimate owner on another source is NOT locked out (H-1 admin lockout)*, *an over-long x-forwarded-for can no longer switch throttling off*, *with repair disabled the throttle FAILS CLOSED*, *the correct password is still refused while the throttle is degraded*, *the administrator can still sign in from their own source afterwards* (200 + `HttpOnly` cookie), and *login still works with no source header at all*.
+
+**Residual risk, recorded rather than hidden:** a botnet can still trip the account-wide backstop (15 failures from ≥3 sources ⇒ 15-minute cooldown). The application cannot distinguish that from a busy school NAT, so the mitigations are the high threshold, the short cooldown, a loud server-side log carrying the distinct-source count, and — recommended as an owner-side layer — a Cloudflare WAF rate rule on `/api/auth/login`.
+
+**Follow-ups created by this work:** add the `(ip_address, created_at)` index on `login_attempts` to the next reviewed, gated migration (it currently ships only in the self-heal DDL, which runs when the table itself is missing — see item 4 below); re-verify throttling live after deployment; decide on the WAF rate rule. L-3 (login error asymmetry) was **not** fixed here, and the fix takes care not to widen it.
+
 Controls re-verified as working at `4069584` are listed in §3.1 of the audit report: the JWT chokepoint (HS256 pinned, strict secret policy), fail-closed session revocation, cookie-only sessions, the single CSRF chokepoint in `src/proxy.ts`, nonce CSP plus the file-response sandbox CSP, database-re-read membership roles, SQL tenant predicates on all 60 API routes, enrollment-gated submit/attempt, teacher-own-submission grading, parent-link predicates, magic-byte upload validation, server-derived download content type, seed 404 and registration 403 in Production, verified-TLS Postgres, the gated migration runner, and bcrypt cost 12. The 60-route sweep found **no new IDOR, privilege-escalation, injection, or tenant-isolation defect**.
 
-**Audit verdict:** CONDITIONAL NO-GO for formal production sign-off, with the Issue #54 posture retained. H-1, H-2 and M-4 are the blocking items; H-1 is now addressed in code and awaiting review.
+**Audit verdict:** CONDITIONAL NO-GO for formal production sign-off, with the Issue #54 posture retained. H-1, H-2 and M-4 are the blocking items; H-1 is now addressed in code in PR #69 and awaits review.
 
 ## Current progress dashboard — 2026-11-19 production status
 
@@ -92,7 +138,7 @@ Controls re-verified as working at `4069584` are listed in §3.1 of the audit re
 - **2026-11-19 — Cloudflare R2 object storage verified in Production (owner-confirmed).** Assignment uploads, learner submissions and downloads all work end to end after the bucket CORS correction. The C-1 active upload failure is closed and removed from this roadmap; the audit reports are committed at the repository root.
 - **2026-11-19 — deployed build identity confirmed.** The GitHub deployments API records a Production deployment of `4069584e99574a4fe2af7d4317a8bcbf13f9bf73` at 2026-11-17T21:20:13Z for the Vercel project `easylearn` (alias `https://easylearn-six.vercel.app`), with CI green on that commit (PostgreSQL isolation suites, typecheck, build, lint) and a successful Vercel build. The legacy duplicate project `easylearnn` still exists and is audit finding M-4.
 - **2026-11-19 — full production readiness & security audit completed read-only** (`FULL_PRODUCTION_AUDIT_2026-11-19.md`). A 60-route sweep found no new IDOR, privilege-escalation, injection or tenant-isolation defect, and the existing controls were re-verified in code at HEAD. Verdict: CONDITIONAL NO-GO for formal sign-off, blocked on H-1 (fix now under review), H-2 (observability) and M-4.
-- **2026-11-19 — H-1 login throttling remediated in code, in a separate review PR.** The throttle no longer fails open, client IPs are now limited (per-source volume and credential-spraying budgets), the five-attempt budget is scoped to (identifier, source) so one attacker can no longer lock an administrator out, and two regression suites were added (`tests/login-rate-limit-policy.test.ts`, `tests/login-rate-limit-db.test.ts`). Migration 0018 and backup/DR were untouched by this work.
+- **2026-11-19 — H-1 login throttling remediated in code: PR #69, open for review.** The throttle no longer fails open, client IPs are now limited (per-source volume and credential-spraying budgets), the five-attempt budget is scoped to (identifier, source) so one attacker can no longer lock an administrator out, and two regression suites were added (`tests/login-rate-limit-policy.test.ts`, `tests/login-rate-limit-db.test.ts`). Migration 0018 and backup/DR were untouched by this work.
 - **PR #32 merged** at `90ec04363cbec3222232c6f912fcad69ab038dba`. It integrated the migration-runner/schema-resilience safeguards and the migration-0018 composite-FK work, plus regression evidence. It did not apply migration 0018 to production.
 - **PR #33 merged** at `851156cac0403f1b9e268c0c3584543852399c48`. CI succeeded; scratch database teardown is now shared and asserted, and the LOW-1/2/3 findings were addressed. LOW-4 was deliberately not changed because the proposed change weakened fail-closed authorization.
 - The scratch-database leak was reproduced before the fix (four databases left behind by the worst suites); the PR reports repeated suite runs and the complete CI sequence leaving zero scratch databases.
@@ -102,7 +148,7 @@ Controls re-verified as working at `4069584` are listed in §3.1 of the audit re
 
 ## Immediate remaining work (ordered)
 
-1. **Review and merge the H-1 login-throttle fix (2026-11-19 PR).** It is the only code-level blocker with a finished implementation. After merging and deploying, verify in Production that a throttled login returns 429 with a `Retry-After` header, that a degraded throttle returns 503 rather than signing anyone in, and that legitimate users — including administrators signing in from a different network than an attacker — are unaffected. Also confirm `/api/health` reports the `login_attempts` feature.
+1. **Review and merge the H-1 login-throttle fix — PR #69.** It is the only code-level blocker with a finished implementation. After merging and deploying, verify in Production that a throttled login returns 429 with a `Retry-After` header, that a degraded throttle returns 503 rather than signing anyone in, and that legitimate users — including administrators signing in from a different network than an attacker — are unaffected. Also confirm `/api/health` reports the `login_attempts` feature.
 2. **Read-only production checkpoint:** an authorized operator verifies the intended Vercel project/alias and production build identity (both now recorded above for 2026-11-19), then captures sanitized catalog/data evidence for migrations 0013–0017, required NULLs, orphan/cross-school rows, FK validation and indexes, and post-repair role/dual-school behavior. Do not expose secrets.
 3. **Restored-copy rehearsal for migration 0018:** use a restored copy of production only. Check PostgreSQL version (confirmed 18.6, and the migration syntax requires PostgreSQL 15+), row/table sizes, preflight results, lock duration and rollback behavior. Record results and review them before any production application. **Blocked in practice while backup/disaster recovery stays paused** — there is no verified restore to rehearse against, so this step needs the DR workstream to resume first or an explicitly authorized alternative source copy.
 4. **Index plan and separate migration:** enumerate the 26 missing child-side FK indexes, inspect query plans and table sizes, design a low-lock/concurrent-index approach compatible with the migration runner, and test it on the restored copy. Do not bundle this into an unreviewed production action. The H-1 fix adds one more candidate for the same reviewed migration: an `(ip_address, created_at)` index on `login_attempts`, which the new per-source throttle counts with and which migration 0012 does not create.
@@ -385,7 +431,7 @@ actual PRs used 2D direct access and 2E hardening. The table above is authoritat
 
 **Updated 2026-11-19.** Two actions are outstanding, and only the first needs no production access:
 
-1. **Review and merge the H-1 login-throttle fix.** It is complete, covered by two new regression suites, and is the only finished blocker from the 2026-11-19 production audit. Merging it does not deploy anything by itself and does not touch migration 0018, the database, or backup/DR.
+1. **Review and merge the H-1 login-throttle fix (PR #69).** It is complete, covered by two new regression suites (39 assertions, both green locally), and is the only finished blocker from the 2026-11-19 production audit. Merging it does not deploy anything by itself and does not touch migration 0018, the database, or backup/DR.
 2. **Request an authorized, read-only production tenancy verification checkpoint** for the intended
    Vercel project/alias (identity confirmed 2026-11-19: project `easylearn`, `4069584`, deployed
    2026-11-17) and migrations 0013–0017. Capture timestamped sanitized build identity,
