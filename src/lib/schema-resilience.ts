@@ -237,6 +237,7 @@ export function clientSafeErrorMessage(error: unknown, fallback = "The database 
 
 export type SchemaFeature =
   | "session_revocation"
+  | "login_attempts"
   | "dashboard_card_overrides"
   | "activity_logs_enrichment"
   | "optional_user_columns"
@@ -250,6 +251,7 @@ const FEATURE_STATUS_TTL_MS = 60_000;
 
 const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   session_revocation: "drizzle/0019_session_revocation.sql",
+  login_attempts: "drizzle/0012_login_attempts.sql",
   dashboard_card_overrides: "drizzle/0004_dashboard_overrides.sql",
   activity_logs_enrichment: "drizzle/0005_activity_enhancements.sql",
   optional_user_columns: "drizzle/0006_user_identity_columns.sql",
@@ -349,6 +351,27 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
     `ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "session_version" integer DEFAULT 0 NOT NULL;`,
     `CREATE INDEX IF NOT EXISTS "users_session_version_idx" ON "users" USING btree ("session_version");`,
   ],
+  /* Login throttling is security-critical, not optional polish: without `login_attempts`
+     src/lib/rate-limit.ts has nothing to count, and before 2026-11-19 it failed OPEN in
+     that situation (audit finding H-1) - a database without migration 0012 simply had no
+     brute-force protection at all. Mirrors drizzle/0012_login_attempts.sql so an
+     un-migrated database self-heals into a throttled state instead of an unprotected one.
+     The final index is ADDITIVE to 0012: the per-source throttle introduced with the H-1
+     fix counts failures by (ip_address, created_at), which 0012 does not index. It is
+     created here only when the table itself is missing; an existing deployment gets it
+     from a reviewed follow-up migration (recorded in the roadmap as an H-1 follow-up). */
+  login_attempts: [
+    `CREATE TABLE IF NOT EXISTS "login_attempts" (
+       "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+       "identifier" varchar(255) NOT NULL,
+       "ip_address" varchar(50),
+       "created_at" timestamp DEFAULT now() NOT NULL
+     );`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_identifier_idx" ON "login_attempts" ("identifier");`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_created_at_idx" ON "login_attempts" ("created_at");`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_identifier_created_at_idx" ON "login_attempts" ("identifier", "created_at");`,
+    `CREATE INDEX IF NOT EXISTS "login_attempts_ip_created_at_idx" ON "login_attempts" ("ip_address", "created_at");`,
+  ],
   /* The composite tenant foreign keys are intentionally NOT auto-repairable. Migration
      0018 is gated: it needs a reviewed read-only preflight against a restored copy
      before it may touch a database, and it aborts atomically on legacy cross-school
@@ -396,6 +419,7 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     table: "uploaded_files",
     columns: ["storage_backend"],
   },
+  login_attempts: { mode: "relation", relation: "login_attempts" },
   session_revocation: {
     mode: "columns",
     table: "users",
@@ -446,6 +470,86 @@ function featureStates(): Map<SchemaFeature, FeatureState> {
 }
 
 /**
+ * A repair that was **attempted** and did not deliver the object (M-R4a).
+ *
+ * "Automatic repair is enabled" is not the same statement as "automatic repair worked". A
+ * security-critical feature that cannot be repaired fails CLOSED — since the H-1 fix a missing
+ * `login_attempts` table refuses *every* login with 503 — so an endpoint that reported "ready"
+ * merely because repair was switched on would hide a total login outage behind a green light.
+ * This record is what makes the difference observable.
+ */
+export interface SchemaRepairFailure {
+  feature: SchemaFeature;
+  /** Sanitized database error text. For logs and diagnostics only — never a public response. */
+  reason: string;
+  at: number;
+  /** How many of the feature's DDL statements applied before the failure. */
+  appliedStatements: number;
+  totalStatements: number;
+}
+
+/**
+ * Whether the runtime role may create objects in `public`, from a **read-only** catalog
+ * function. `roleName` is for server-side logs only; it must never reach a response body.
+ */
+export interface DdlCapability {
+  canCreateInPublic: boolean;
+  roleName: string;
+  at: number;
+}
+
+const globalForSchemaRepair = globalThis as typeof globalThis & {
+  __easylearnSchemaRepairFailures?: Map<SchemaFeature, SchemaRepairFailure>;
+  __easylearnDdlCapability?: DdlCapability | null;
+};
+
+function repairFailures(): Map<SchemaFeature, SchemaRepairFailure> {
+  if (!globalForSchemaRepair.__easylearnSchemaRepairFailures) {
+    globalForSchemaRepair.__easylearnSchemaRepairFailures = new Map();
+  }
+  return globalForSchemaRepair.__easylearnSchemaRepairFailures;
+}
+
+/** The most recent failed repair attempt for a feature, or `null`. */
+export function getSchemaRepairFailure(feature: SchemaFeature): SchemaRepairFailure | null {
+  return repairFailures().get(feature) ?? null;
+}
+
+/**
+ * Read-only: can the runtime role create objects in the `public` schema?
+ *
+ * `has_schema_privilege` consults the catalog and creates nothing. The verdict is cached for the
+ * same TTL as feature probes so `/api/health` does not pay for it on every call. `null` means
+ * "could not determine" (the probe itself failed) — callers must NOT escalate on `null`, only on
+ * a definite `false`, or a database blip would turn into a false alarm.
+ *
+ * Since PostgreSQL 15 the `public` schema grants CREATE only to its owner, so this is a real
+ * question rather than a formality: a deployment that runs the application under a restricted
+ * role would have it false even with `AUTO_SCHEMA_REPAIR` enabled.
+ */
+export const DDL_CAPABILITY_SQL =
+  "SELECT current_user AS role_name, has_schema_privilege(current_user, 'public', 'CREATE') AS can_create";
+
+export async function probeDdlCapability(): Promise<DdlCapability | null> {
+  const cached = globalForSchemaRepair.__easylearnDdlCapability;
+  if (cached && Date.now() - cached.at < FEATURE_STATUS_TTL_MS) return cached;
+  try {
+    const result = await pool.query(DDL_CAPABILITY_SQL);
+    const row = result.rows[0] as { role_name?: string; can_create?: boolean } | undefined;
+    const capability: DdlCapability = {
+      canCreateInPublic: Boolean(row?.can_create),
+      roleName: String(row?.role_name ?? "unknown"),
+      at: Date.now(),
+    };
+    globalForSchemaRepair.__easylearnDdlCapability = capability;
+    return capability;
+  } catch (error) {
+    console.error("[schema] could not probe DDL capability:", inspectDbError(error).text);
+    return null;
+  }
+}
+
+/**
  * Auto-repair can be switched off (e.g. a locked-down DB role with no DDL rights, or a
  * strict migration policy) with `AUTO_SCHEMA_REPAIR=false`. When disabled we only probe.
  */
@@ -488,6 +592,7 @@ export async function ensureSchemaFeature(feature: SchemaFeature): Promise<Featu
     const statements = FEATURE_SQL[feature];
     const recheckSql = probeSql(spec);
     const executed: string[] = [];
+    let lastError = "no DDL statement could be applied";
     for (const statement of statements) {
       try {
         await pool.query(statement);
@@ -495,7 +600,8 @@ export async function ensureSchemaFeature(feature: SchemaFeature): Promise<Featu
       } catch (error) {
         // Permissive DDL is expected to be re-runnable; log and keep going so a single
         // blocked statement (e.g. no FK privileges) does not disable the whole feature.
-        console.warn(`[schema] could not auto-apply part of ${feature}:`, inspectDbError(error).text);
+        lastError = inspectDbError(error).text;
+        console.warn(`[schema] could not auto-apply part of ${feature}:`, lastError);
       }
     }
     if (executed.length > 0) {
@@ -503,10 +609,32 @@ export async function ensureSchemaFeature(feature: SchemaFeature): Promise<Featu
         const recheck = await pool.query(recheckSql);
         available = probeSatisfied(spec, recheck.rows);
         repaired = available;
-      } catch {
+        if (!available) lastError = "DDL applied, but the object is still not present";
+      } catch (error) {
         available = false;
+        lastError = inspectDbError(error).text;
       }
     }
+
+    /* M-R4a: remember whether the repair actually delivered the object, so /api/health can tell
+       "repair is enabled" apart from "repair worked". */
+    if (available) {
+      repairFailures().delete(feature);
+    } else {
+      repairFailures().set(feature, {
+        feature,
+        reason: lastError,
+        at: Date.now(),
+        appliedStatements: executed.length,
+        totalStatements: statements.length,
+      });
+      console.error(
+        `[schema] automatic repair of ${feature} FAILED ` +
+          `(${executed.length}/${statements.length} statements applied): ${lastError}`
+      );
+    }
+  } else if (available) {
+    repairFailures().delete(feature);
   }
 
   states.set(feature, { available, repaired, at: Date.now() });
@@ -554,6 +682,17 @@ export function ensureSessionRevocationColumn(): Promise<FeatureStatus> {
   return ensureSchemaFeature("session_revocation");
 }
 
+/**
+ * The `login_attempts` table is declared in src/db/schema.ts but only ever created by
+ * drizzle/0012_login_attempts.sql. Login throttling reads and writes it on every login,
+ * so src/lib/rate-limit.ts calls this when a throttle query fails with "relation does not
+ * exist": an un-migrated database repairs itself into a *throttled* state instead of
+ * silently losing brute-force protection (audit finding H-1, 2026-11-19).
+ */
+export function ensureLoginAttemptSchema(): Promise<FeatureStatus> {
+  return ensureSchemaFeature("login_attempts");
+}
+
 export interface OptionalSchemaStatus {
   feature: SchemaFeature;
   present: boolean;
@@ -565,6 +704,21 @@ export interface OptionalSchemaStatus {
    * preflight. A caller must not tell an operator that these are "created on demand".
    */
   autoRepairable: boolean;
+  /**
+   * M-R4a: whether the runtime role may create objects in `public`. `null` means the read-only
+   * capability probe itself failed, i.e. unknown — callers must not escalate on `null`.
+   */
+  ddlCapable: boolean | null;
+  /** M-R4a: a repair was already attempted for this feature and did not deliver the object. */
+  repairFailed: boolean;
+  /**
+   * M-R4a: the feature is missing AND cannot be relied on to appear by itself — repair is off,
+   * the runtime role may not create objects, or a repair attempt already failed. A
+   * security-critical feature in this state must be reported as unhealthy, because the code path
+   * that needs it fails CLOSED. Deliberately carries no error text: the reason belongs in the
+   * server log (`getSchemaRepairFailure`), never in an unauthenticated response (finding L-4).
+   */
+  repairBlocked: boolean;
 }
 
 /**
@@ -582,6 +736,11 @@ export async function probeSchemaFeatures(
        (2026-10-27 production preflight finding). Read-only, like every probe
        here — it never runs the repair DDL. */
     "session_revocation",
+    /* Login throttling is security-critical for the same reason: without login_attempts
+       there is no brute-force protection, and since the H-1 fix the throttle fails CLOSED
+       rather than open, so /api/health must be able to say whether the table is there.
+       Read-only probe, like every entry here. */
+    "login_attempts",
     "quiz_question_images",
     "uploaded_files",
     "assignment_file_uploads",
@@ -590,6 +749,8 @@ export async function probeSchemaFeatures(
   ]
 ): Promise<OptionalSchemaStatus[]> {
   const repairEnabled = autoSchemaRepairEnabled();
+  const capability = await probeDdlCapability();
+  const ddlCapable = capability === null ? null : capability.canCreateInPublic;
   return Promise.all(
     features.map(async (feature) => {
       const spec = FEATURE_PROBE[feature];
@@ -601,20 +762,30 @@ export async function probeSchemaFeatures(
         console.error(`[schema] health probe for ${feature} failed:`, inspectDbError(error).text);
         present = false;
       }
+      const repairFailed = getSchemaRepairFailure(feature) !== null;
       return {
         feature,
         present,
         migration: FEATURE_MIGRATIONS[feature],
         repairEnabled,
         autoRepairable: FEATURE_SQL[feature].length > 0,
+        ddlCapable,
+        repairFailed,
+        repairBlocked: !present && (!repairEnabled || ddlCapable === false || repairFailed),
       };
     })
   );
 }
 
-/** Reset cached verdicts — used by tests and after running migrations by hand. */
+/**
+ * Reset cached verdicts — used by tests and after running migrations by hand. Also clears the
+ * repair-failure ledger and the DDL-capability verdict, so a repaired database is not reported
+ * unhealthy from a stale failure.
+ */
 export function resetSchemaFeatureCache(): void {
   featureStates().clear();
+  repairFailures().clear();
+  globalForSchemaRepair.__easylearnDdlCapability = null;
 }
 
 export function schemaWarningForFeature(status: FeatureStatus, area: string): SchemaWarning {

@@ -87,6 +87,10 @@ jobs:
           # assertions (confirmed shutdown, no orphan postmasters, no leftover data
           # dirs) have to actually run.
           EASY_LEARN_REQUIRE_EMBEDDED_PG_LIFECYCLE: "true"
+          # A skip must fail this job (H-1, 2026-11-19): the login-throttle regressions —
+          # fail-closed on a database error, per-source budgets, and "an attacker cannot
+          # lock an administrator out" — have to actually run.
+          EASY_LEARN_REQUIRE_LOGIN_RATE_LIMIT_DB: "true"
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth

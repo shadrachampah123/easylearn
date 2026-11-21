@@ -781,6 +781,8 @@ noise on direct navigation only, not on an `<img>` in a page.
 | Object storage, against a **real** S3-compatible server | `tests/object-storage-live.test.ts` | The full round trip (presign → PUT → `GET /api/files/<id>` → 307 → the store serves the object) against a real S3 API server and a real PostgreSQL; that the store **applies** the signed content type, disposition and private cache directive; that the store **cannot** apply `nosniff` or a CSP and **rejects** any `response-*` override outside the S3-documented set; that the presigned URL is a bearer credential; and that the application refuses an object whose bytes do not match its key, an object over the size limit, and an object that no longer exists. **Its stated limits:** the store is `s3rver`, not AWS S3, and it does **not** verify SigV4 signatures — so the suite says nothing about whether a forged signature would be accepted by a real store (§7, "What has and has not been verified against the storage provider"). |
 | Uploaded-file tenant attribution | `tests/tenant-file-attribution-db.test.ts` | One school, multiple schools, unauthorized users, cross-school access, the delete route, membership revocation, the legacy `NULL school_id` fallback and the per-file submission rules — each against the real route handlers. |
 | Membership and session | `tests/membership-auth-db.test.ts` | The login flow, the school-selection flow and the session, read from the cookie the way a browser does, and asserting that the response body carries no token. |
+| Login throttling, policy (no database) | `tests/login-rate-limit-policy.test.ts` | Source attribution (**M-R1**): a forged leftmost `x-forwarded-for` prefix is never attributed, junk at the trusted position does not fall back towards the client, the trusted-hop count is configurable and clamped, a declared platform header is used exclusively, and `x-vercel-forwarded-for` is only consulted on Vercel. Also: IP normalization (the original fail-open vector), the shape of the fail-closed decision, the structural invariants behind atomic enforcement (**M-R2**) and alias budgets (**M-R3**), the H-R1 DELETE scope, and the health escalation for a blocked repair (**M-R4a**). |
+| Login throttling, against a real database | `tests/login-rate-limit-db.test.ts` | The real route handler against a disposable PostgreSQL: per-source and per-account budgets, an attacker cannot lock an administrator out, unattributable sources are throttled rather than exempt, self-heal and fail-closed behaviour, the H-R1 reset oracle, **25 concurrent wrong passwords from one source yielding exactly 5 guesses** (M-R2), a 24-request parallel spray yielding exactly the 15-failure account backstop, **email and username sharing one budget** (M-R3), and `/api/health` answering **503** when repair is enabled but fails (M-R4a). |
 | The existing suites | `tests/security.test.js`, `tests/tenant-*.test.ts`, `tests/membership-*.test.ts`, … | The tenant isolation and authorization boundaries are unchanged. |
 
 The `test:auth-security` script runs the first four suites on their own, and
@@ -837,7 +839,10 @@ binary; the instructions are in each file's header.
 | 3 | Browser-level verification of the cookie, the CSP and the upload flows. | **Closed for Chromium 153** — 34/34 browser checks, 0/9 sniffing combinations, 0 preview failures (§8). **Still open for Firefox and Safari**, which were not available. |
 | 4 | The bearer path lets a non-browser client act without an origin check. | **Accepted.** Deliberately supported; it is the only way a script or a service authenticates. It cannot be exercised by a browser cross-site (§4). |
 | 5 | `EASY_LEARN_ALLOWED_ORIGINS` widens the set of origins that may make state-changing requests. | **Accepted.** Empty by default. It must be set deliberately, and each entry is a full trust decision. |
-| 6 | The rate limit on the login route is in-process. | **Closed.** `src/lib/rate-limit.ts` now uses DB-backed `login_attempts` (5/15min, block 30min, shared across Vercel instances); verified via `checkLoginRateLimit`/`recordFailedLoginAttempt` in `src/app/api/auth/login/route.ts`. |
+| 6 | The rate limit on the login route is in-process. | **Closed.** `src/lib/rate-limit.ts` uses DB-backed `login_attempts` (5/15min per account+source, 15/15min per account, 40/15min per source, shared across Vercel instances); enforced in `src/app/api/auth/login/route.ts`. The three weaknesses an independent review then found in that design — client-controlled source attribution (**M-R1**), a check-then-record race (**M-R2**) and one budget per alias (**M-R3**) — are closed in §11, with the concurrency measured rather than argued. |
+| 6b | The throttle fails **closed**: if `login_attempts` cannot be read or written, nobody can sign in — including with a correct password. | **Accepted, deliberate.** Unlimited guessing is the worse failure. It makes the *observability* of that state the safety requirement: `/api/health` answers 503 whenever the table is missing and automatic repair cannot create it — repair disabled, no `CREATE` privilege on `public`, or a repair attempt that already failed (**M-R4a**, §11). |
+| 6c | The documented 30-minute cooldown is unreachable: every count is windowed at 15 minutes, so a blocked pair is released when its rows age out. | **Open (finding L-R1).** Real ceilings are 5 per 15 min per (account, source), 15 per 15 min per account and 40 per 15 min per source — about 1,440 guesses per account per day, with bcrypt cost 12 as the only other brake. Either the constants or the documentation must change. |
+| 6d | Automatic schema repair has never been observed running in Production. | **Open, and unverifiable from the repository.** Production evidence (2026-11-19) shows `public.login_attempts` exists and the runtime role (`neondb_owner`) holds `CREATE` on `public`, so repair *can* work there; it has not been *seen* to work. Repair is exercised by the regression suite against a disposable database instead (§11). |
 | 7 | No MFA, and no account lockout beyond the login rate limit. | **Open.** Out of scope. |
 | 8 | No database-level row security (RLS). | **Open.** Out of scope; tenant isolation is enforced in the application layer and covered by the tenant test suites. |
 | 9 | In the object-storage path the bytes never reach the application, so they are not content-validated. | **Closed for the retrievable object.** The application now reads the object's first bytes back from the store and applies the same content policy the local path applies, measures the real size against the limits, and refuses anything that does not match (§7). The upload itself is still a direct browser→bucket PUT, so a **quarantined** object can exist in the bucket; it is inert, but it is stored. |
@@ -868,3 +873,127 @@ binary; the instructions are in each file's header.
 | The guard for objects that live in the bucket | `src/lib/object-guard.ts` |
 | The upload and file-serving routes | `src/app/api/uploads/route.ts`, `src/app/api/uploads/presign/route.ts`, `src/app/api/files/[id]/route.ts` |
 | The operator secret checker | `scripts/check-jwt-secret.mjs` |
+| The login throttle: budgets, source attribution, atomic enforcement | `src/lib/rate-limit.ts` |
+| The login route's four-step throttle order | `src/app/api/auth/login/route.ts` |
+| Optional-schema probing, self-heal DDL and the repair-failure ledger | `src/lib/schema-resilience.ts` |
+| The health endpoint that reports a blocked repair | `src/app/api/health/route.ts` |
+
+---
+
+## 11. Login throttling: attribution, atomicity, budgets and observability
+
+The throttle exists to bound password guessing. Four properties decide whether it actually
+does; each one was found wanting by an independent review of PR #69 (2026-11-19) and each is
+now pinned by a regression test that was **validated against the vulnerable code** — it fails
+there and passes here.
+
+### The budgets
+
+One 15-minute sliding window, three budgets, evaluated in a single aggregate query:
+
+| Budget | Limit | Refusal |
+|---|---|---|
+| (account, source) pair | 5 failures | 429 + `Retry-After` |
+| account, across all sources | 15 failures | 429 |
+| source, across all accounts | 40 failures **or** 10 distinct accounts | 429 |
+
+Anything the throttle cannot evaluate — a database error, a missing table it could not repair —
+is a **503**, never a pass. `Cache-Control: no-store` is set on every throttle response.
+
+### Source attribution (M-R1): a declared trust position, not a guess
+
+`getClientIp` is a security decision, so it takes one explicitly:
+
+1. **`EASY_LEARN_CLIENT_IP_HEADER`** — if the operator names the header the platform sets
+   (`x-vercel-forwarded-for` on Vercel), that header is used **exclusively**: no fallback to a
+   header the client can also write.
+2. **`EASY_LEARN_CLIENT_IP_TRUSTED_HOPS`** (default `1`, ceiling `8`) — otherwise the address is
+   the entry that many positions from the **right** of `x-forwarded-for`. Every honest proxy
+   *appends* what it observed, so the rightmost entries are the trustworthy ones and the
+   leftmost entry is the one the client wrote. If the trusted position holds junk, the result is
+   `null` — it never scans left towards the attacker's value.
+3. `x-vercel-forwarded-for`, but only while `process.env.VERCEL` is set.
+4. `x-real-ip`.
+
+`null` is a normal outcome, not an error: it means the source budgets cannot be applied, and the
+account budgets still are. This module cannot use the CSRF module's "refuse forwarded headers
+entirely" answer (§4) — a route handler has no socket address to fall back to.
+
+Before this, the leftmost valid entry was used, so behind any appending proxy a client chose its
+own bucket: forged addresses kept the per-source budgets from ever filling, and 15 requests
+carrying 15 forged addresses tripped the account backstop — an administrator lockout from one
+request each.
+
+### Atomic enforcement (M-R2): insert first, then decide
+
+`recordFailedLoginAttempt` is called **before** the password is verified, and it does the whole
+job in one transaction:
+
+```
+BEGIN
+  pg_advisory_xact_lock(hash(source))      -- or hash(identifier) when the source is unknown
+  pg_advisory_xact_lock(hash(account))     -- always in this order, so no wait cycle
+  INSERT the attempt
+  re-count the budgets, INCLUDING the row just inserted
+  refused  -> ROLLBACK  (a refused attempt never extends its own cooldown)
+  allowed  -> COMMIT
+```
+
+Counting the in-flight row is compensated for in `decide`, so the observable limits are
+unchanged: 5 guesses, and the 6th refused. bcrypt stays outside the transaction, so locks are
+held for two short statements and never across a hash; the connection is released before the
+optional self-heal and the expired-row prune, because Production allows the pool only two
+connections.
+
+Measured: **25 concurrent wrong-password requests from one source now yield exactly 5 guesses
+and 20 refusals**; the same code before the fix yielded **25 guesses**. A 24-request spray
+across 24 sources yields exactly the 15-failure account backstop; before, all 24 were guessed.
+
+### One account, one budget (M-R3): aliases share it
+
+The identifier is whatever the caller supplied, but an account is usually reachable by **email
+and username**. The route resolves the account first and hands the throttle the whole alias set;
+the counting query matches `identifier = ANY(aliases)`, so the account budget covers both, and a
+successful sign-in releases both. An account that does not resolve keeps a budget of its own —
+enumeration against unknown addresses is still counted and still throttled.
+
+Before: 10 real guesses against a documented budget of 5, and `N` aliases meant `N × 15`
+distributed guesses per window.
+
+Clearing stays scoped to **that account's aliases** and never to the source IP. Widening it by
+source was finding **H-R1**: one valid low-privilege credential signing in from a school's exit
+IP erased other accounts' accumulated failures — a repeatable throttle-reset oracle, measured at
+108 unthrottled guesses against an administrator across three sign-in cycles.
+
+### Observability (M-R4a): "repair is enabled" is not "repair worked"
+
+Because the throttle fails closed, a missing `login_attempts` table is a total login outage.
+`/api/health` therefore treats the feature as **blocked** — and answers 503 — when it is missing
+and any of these hold:
+
+- `AUTO_SCHEMA_REPAIR` is disabled (`false`/`0`/`off`; **absent means enabled**);
+- the runtime role has no `CREATE` privilege on `public`, from a read-only
+  `has_schema_privilege(current_user, 'public', 'CREATE')` probe;
+- a repair attempt has already **failed**, recorded in an in-process ledger with how many of the
+  DDL statements were applied and why the rest were not.
+
+Before, only the first case escalated, so a deployment with repair enabled and repair broken
+answered **200 "Login and registration services are ready"** while every login answered 503 —
+and the only signal was a `console.warn` nobody collected. The cause is logged server-side; the
+public response stays a fixed string naming the migration, because the endpoint is
+unauthenticated (finding L-4). A later successful repair clears the ledger, so health recovers
+without a restart.
+
+### What is still not verified
+
+- **Automatic repair has never been observed running in Production** (risk 6d). Production
+  evidence says it *can*: the table exists, the effective role is `neondb_owner`, and
+  `has_schema_privilege(..., 'public', 'CREATE')` is `true`. The repair path itself is exercised
+  only against disposable databases.
+- The 30-minute cooldown is unreachable (risk 6c / finding L-R1).
+- `MAX_IDENTIFIERS_PER_IP = 10` can throttle a whole school NAT for the window when ten
+  different people mistype passwords (finding L-R2); no test pins the acceptable blast radius.
+- The `(ip_address, created_at)` index exists only in the self-heal DDL, never on a normally
+  migrated database (finding L-R5).
+- Full source IPs are written to the log and to `login_attempts.ip_address` (finding I-R1),
+  which matters once log shipping (H-2) exists.
