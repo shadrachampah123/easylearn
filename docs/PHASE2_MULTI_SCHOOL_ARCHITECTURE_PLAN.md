@@ -7,6 +7,268 @@
 
 This current roadmap supersedes the historical architecture audit retained below, including its proposed numbering, table counts, future migration numbers and old “remaining” lists. Status distinguishes **implemented**, **merged**, **deployed**, **production DB migrated**, and **production behavior verified** as independent gates. No production connections, migrations, deployments, secrets, or settings were accessed or changed for this roadmap update. The 2026-11-19 update below is likewise documentation-only on the Production side: no deployment, migration, backup operation, environment-variable change, or Cloudflare/Vercel setting was performed.
 
+## Observability update — 2026-11-22 (H-2, branch `arena/3be79ab3-easylearn`, PR pending)
+
+This section records the remediation of audit finding **H-2** — *no error boundaries, no
+instrumentation, no monitoring; the C-1 outage produced zero server-side signal*.
+
+**Status vocabulary, stated because the brief requires the three states to be
+distinguished and it is easy to blur them:**
+
+| State | H-2 |
+| --- | --- |
+| **Implemented** | **Yes** — on branch `arena/3be79ab3-easylearn`. |
+| **Merged** | **No.** The branch is open as a pull request and has not been merged. |
+| **Deployed** | **No.** Nothing from this branch is on Vercel; Production still runs `main` at `9068057` (the PR #69 merge) and therefore still has the H-2 gap described below. |
+| **Production-verified** | **No, and it cannot be until it is deployed.** The verification below is local and CI-side only. |
+
+That table is the honest reading of this work. Everything in the "Evidence" subsection was
+measured in this sandbox against disposable PostgreSQL; **no Production connection,
+deployment, migration, environment-variable change, permission change, Cloudflare or
+Vercel setting was made.**
+
+### What was wrong
+
+The audit's finding was one line, and every part of it was verified before anything was
+written:
+
+- no `error.tsx`, `global-error.tsx` or `not-found.tsx` anywhere under `src/`, so a
+  server-render failure produced Next.js's default "Application error" page with no route,
+  no reference and no recovery action;
+- no `instrumentation.ts`, so an error that escaped a route reached the log as an
+  unstructured stack trace — or reached nobody;
+- no structured logging and no request correlation, so two simultaneous failures could not
+  be told apart in Vercel's log view, and a user's screenshot could not be tied to a line;
+- `/api/health` was **blind to object storage**. The C-1 upload outage answered 201 from
+  presign while every browser upload failed, and nothing server-side recorded it.
+
+### What was built
+
+**Boundaries.** `src/app/error.tsx` (segment), `src/app/global-error.tsx` (root, renders
+its own `<html>`/`<body>`) and `src/app/not-found.tsx` (server component, no client
+JavaScript). The two error boundaries report `{ digest, name, route }` — never the message,
+never a stack — to `POST /api/internal/client-error`, fire-and-forget with `keepalive`, so
+the failure lands in the server log even if the user navigates away. `digest` is shown to
+the user because it is the correlation handle Vercel also records; the error message is
+not shown, because a server-rendered message can contain data the user should not
+re-transmit.
+
+**Instrumentation.** `src/instrumentation.ts` uses the supported lifecycle:
+`register()` (one structured `server.startup` line, guarded on `NEXT_RUNTIME === "nodejs"`,
+with **no** network I/O and **no** database query) and `onRequestError()` (one
+`request.error` line per escaped error, carrying `routePath`, `routeType`, `routerKind`,
+method, path and the error's `name`/`message`/`code`). Request headers are never logged
+wholesale — only `x-vercel-id` and `user-agent` are read, through an allow-list helper.
+Neither hook can throw: a diagnostic that breaks boot or turns one error into two is worse
+than no diagnostic.
+
+**Structured logging with correlation.** `src/lib/logger.ts` emits one JSON object per
+event to stdout/stderr — the runtime log *is* the transport, so **no monitoring
+dependency, no vendor SDK and no network call was added** (an explicit constraint of this
+task; a test asserts the dependency set is unchanged). Every line carries `level`, `time`,
+`service`, `env`, `msg` and the event's fields. `src/lib/request-context.ts` carries a
+request id across `await` boundaries with `AsyncLocalStorage`, so a `catch` deep inside a
+route can log the id without it being threaded through every signature.
+
+**Redaction.** `src/lib/log-redaction.ts` applies two passes, because a log line is built
+from three kinds of input and only one of them is a known object shape: a **key** pass
+over object graphs (so `password`, `password_hash`, `authorization`, `cookie`, `*token*`,
+`*secret*`, `*api_key*`, `email`, `firstName`, `ip_address` and their spellings become a
+fixed `[redacted]` marker while the key is kept), and a **text** pass over every resulting
+string (connection strings, JWTs, `Bearer`/`Basic` credentials, cookie headers and bare
+`name=value` session cookies, `AKIA…` key ids, presigned-URL signatures, email addresses,
+and a 32-character high-entropy fallback for a secret that arrives with no key name next
+to it). Both passes are bounded in depth, breadth and string length, treat cycles as
+`[circular]`, and never throw.
+
+**Health.** `/api/health` gained a `checks.objectStorage` section with a deliberate split
+between **configuration** and **availability**: `configured` (a boolean over the three
+required variables), `missingVariables` (names only), `mode` (`object-storage` or
+`local-disk`), `state` (`disabled` | `misconfigured` | `configured-unverified` |
+`verified` | `error`) and `reachable` (`null` unless a request actually succeeded). The
+default response is `configured-unverified` with `checked: false` — the honest answer for
+an endpoint that performed no I/O. A live check runs only on `?deep=1`, is bounded by a
+clamped timeout (`EASY_LEARN_STORAGE_PROBE_TIMEOUT_MS`, default 2500 ms), and performs one
+signed `HEAD` for a reserved key: `200` and `404` both prove the store answered and
+accepted the signature, `403`/`5xx`/a redirect do not. What a success does **not** prove is
+stated in the code and below. The section is additionally passed through
+`assertNoSecretsInStorageSection`, which collapses it to a safe value if any configured
+value or an infrastructure-shaped string appears in it — so "the bucket name never leaks"
+is a property of the running code, not a promise in a comment.
+
+Every health response now carries `X-Request-Id` and `checks.requestId`, and the endpoint's
+own failure paths write structured lines instead of four `console.error` calls.
+
+### Evidence
+
+All local. PostgreSQL suites ran against disposable embedded databases created and dropped
+per suite.
+
+| Check | Result |
+| --- | --- |
+| `tests/observability-h2.test.ts` (new) | **49 assertions**, below |
+| `npm run typecheck` | pass |
+| `npm run lint` | pass, no new warnings |
+| `npm run build` | pass (the three boundaries and `instrumentation.ts` are compiled by a real production build) |
+| `npm test` / `test:db` / `test:tenant-auth` / `test:review-pr45` / `test:mutation` / `test:integration` / `test:tenant-integrity` | see the PR report; all green |
+| No migration added, no `drizzle-kit push`, no dependency added | asserted by three tests in the new suite |
+
+The new suite covers, in nine sections: the boundaries' existence, their required props,
+their reporting contract and the absence of message rendering; the instrumentation
+lifecycle, its runtime guard, its no-I/O property and its header allow-list; every secret
+class in the brief **plus a positive control that fails on unredacted input**; that
+logging survives a throwing `console`, an unserialisable field and a cyclic graph; that a
+forged request id is replaced rather than echoed; that the health section distinguishes
+configuration from availability and never discloses the bucket, endpoint, key or region;
+that the intake endpoint answers 204 to junk and cannot 500; that CSRF, session
+revocation, the throttle constants, the F-1a repair ordering and the cookie flags are
+unchanged; and that this document states its own verification state.
+
+### Operator configuration — exact instructions
+
+These are the steps that turn the log lines into alerting. **They are operator actions;
+none of them was performed here.** They require no paid service: Vercel's log drains and
+its built-in notifications are on the current plan, and the uptime check can be any free
+external monitor (or a Vercel cron job that fetches the URL).
+
+#### 1. Log alerts in Vercel (Project → Logs → Filters / Notifications)
+
+The lines are JSON, so filter on the `event` field rather than on prose. Create one
+notification per row below; "notify: email" is sufficient, and the owner's address should
+be a mailbox that is actually read.
+
+| # | Severity | Filter on the log line | What it means / action |
+| --- | --- | --- | --- |
+| 1 | **Page now** | `"event":"request.error"` | An error escaped a route. Quote the `requestId` and `routePath`; fix the cause. |
+| 2 | **Page now** | `"event":"server.startup"` AND `"level":"error"` | The instance booted with a configuration problem (JWT secret or database URL). Sign-in will fail; check `/api/health`. |
+| 3 | **Page now** | `"event":"health.login_throttle_unavailable"` | Every sign-in answers 503. Apply `drizzle/0012` with `node run-migration.js`. |
+| 4 | **Page now** | `"event":"health.session_revocation_unavailable"` | Every authenticated request answers 503. Apply `drizzle/0019`. |
+| 5 | **Page now** | `"event":"health.schema_probe_failed"` | The schema probe itself is failing, so the security state is unknown. |
+| 6 | **Notify** | `"event":"client_error.fatal"` | The root layout failed for a real user. |
+| 7 | **Notify (digest)** | `"event":"client_error.rate_limited"` | Error reports are being dropped for a source — either a loop or an attack. |
+| 8 | **Notify** | `"event":"health.object_storage.suppressed"` | The safety net fired: a storage field would have leaked configuration. Treat as a bug. |
+| 9 | **Watch** | `"event":"health.object_storage.probe_failed"` | Only appears for `?deep=1`; the store is unreachable from the function. |
+| 10 | **Watch** | `"level":"error"` on `"event":"health.check_failed"` | The health endpoint itself is failing. Correlate with rows 3–5. |
+
+A worked filter expression for row 1, for the dashboard's filter box:
+
+```
+event:"request.error"
+```
+
+and for a combined "any security-critical degradation" search, used when triaging:
+
+```
+event:"health.login_throttle_unavailable" OR event:"health.session_revocation_unavailable" OR event:"request.error"
+```
+
+#### 2. Uptime monitoring
+
+Point an external monitor (or Vercel cron) at **`https://<production-host>/api/health`**
+every 60 seconds, alerting on **any non-200** and on a **body without `"ok":true`**.
+
+- **Do not** use `?deep=1` for the 60-second check. It performs a network request to the
+  object store on every poll and is slower by design; a monitor that stresses a
+  dependency is its own incident.
+- Use **`https://<production-host>/api/health?deep=1`** at a **lower frequency** (every
+  15–30 minutes) if object storage is configured, and treat `state: "error"` as an alert.
+  Treat `state: "configured-unverified"` as **not** an error — it means the deep check was
+  not asked for, which is the default the 60-second monitor sees.
+- The response includes `checks.requestId`; quote it when escalating, and search the logs
+  for that exact value to find the same request's lines.
+- Ignore a single 502/504 immediately after a deployment; alert on **two consecutive**
+  failures. Serverless cold starts are not incidents.
+
+#### 3. What alerting cannot see (state this to the reviewer)
+
+- Every counter is **per warm instance**. Vercel functions are short-lived, so a rate is
+  only ever an approximation; the alerting above is on log *lines*, not on aggregated
+  metrics, and that is deliberate — a metrics backend is the expensive dependency this
+  work was not authorised to add.
+- The repair-failure ledger (`getSchemaRepairFailure`) is process-local; it is now
+  *visible* on `/api/health` and in the log, but it is still forgotten on redeploy.
+- Nothing here replaces a real uptime SLA. It makes failures **visible and attributable**,
+  which is what H-2 asked for.
+
+### Remaining limitations (deliberately not closed)
+
+1. **A deep storage check proves reachability, not writability.** A `HEAD` that returns
+   404 proves the host answered and the signature verified. It does **not** prove the
+   bucket's CORS allows a browser `PUT`, that the application can read an object it wrote,
+   or that a write succeeds. Those need a real upload; the R2 incident (C-1) was a
+   *browser-to-bucket CORS/behaviour* failure, so a green `?deep=1` must never be read as
+   "uploads work". This is the single most important caveat in this section.
+2. **Client-boundary reporting is best-effort.** `keepalive` improves the odds; a browser
+   that is closed, offline or blocking the request loses the report. The server-side
+   `request.error` line is the authoritative record.
+3. **The intake endpoint is unauthenticated by necessity.** It is rate-limited per source
+   (20/minute, first suppression logged, the rest counted), size-capped at 2 KB, validates
+   every field and echoes nothing, but a determined attacker can still add log noise from
+   many sources. It is not exempted from the CSRF policy — it is a normal `POST`.
+4. **Email redaction is heuristic.** A value that is not address-shaped survives; the key
+   pass catches the `email` field, and the text pass catches sentence-embedded addresses.
+   It is not a DLP system and does not claim to be.
+5. **`X-Request-Id` on an unauthenticated endpoint** means a client can choose the id it
+   sees. It is validated (8–128 chars, a restricted alphabet) and replaced if malformed, so
+   it cannot forge a log line, but it is not an anti-forgery token and nothing depends on
+   it being unguessable.
+6. **H-2 remains open until this is merged, deployed and observed.** Specifically:
+   Production log alerts (step 1) and the uptime monitor (step 2) have not been configured
+   by anyone, because that requires Production access this work is not authorised to use.
+
+### H-2 review round 2 — two defects found in the first PR head, and how they were proven
+
+The reviewer inspected `157bf66` (the first H-2 head) and found two defects. Both were
+real, both are fixed on the branch, and both now have a test that fails if the fix is
+reverted. The negative controls are recorded here because "the fix works" is only half the
+evidence; "the test would have caught it" is the other half.
+
+**Defect 1 — the object-storage probe signed one HTTP verb and sent another.**
+`checkObjectStorageReachability()` passed `method: "GET"` to `presignUrl()` and then
+dispatched `fetch(url, { method: "HEAD" })`. SigV4 puts the method in the canonical
+request, so the two signatures differ: over identical key and timestamp, the GET signature
+is `6ed18d4f40e5976a…` and the HEAD signature is `f87fa944c7ededd0…`. A correctly
+configured bucket would therefore have answered **403 SignatureDoesNotMatch**, and the
+health endpoint would have reported a healthy store as unreachable. The fix is one
+exported constant, `OBJECT_STORAGE_PROBE_METHOD`, used for both signing and dispatch;
+`PresignRequest.method` was widened to accept `"HEAD"`.
+
+**Defect 2 — the correlation context was never entered by anything.**
+`runWithRequestContext()` had **zero production callers** and `emit()` never consulted the
+ambient store, so every line produced deep inside a request had no correlation id unless
+the author threaded one through by hand. The unit test that "covered" correlation called
+the helper directly, which proves `AsyncLocalStorage` works but not that a request is ever
+wrapped in it. The fix wires the chain end to end: `src/proxy.ts` resolves one id per
+request and publishes it as `x-request-id`; route handlers and `onRequestError()` call
+`runWithCurrentRequest()`; `emit()` fills `requestId` from the ambient context when the
+caller did not supply one.
+
+**Evidence.** `tests/observability-correlation.test.ts` — 12 assertions, all through real
+entry points (the proxy's default export, the real route handlers, the real
+`onRequestError`, the real readiness check with a fake transport). Against the previous
+head `157bf66` the same file reports **4 passed / 8 failed** and exits non-zero. Two
+surgical controls against the *fixed* tree isolate each defect:
+
+| Control | Mutation | Result |
+|---|---|---|
+| NC-A | sign `GET`, dispatch `HEAD` (the original defect) | exactly **1** failure — the method-equality test; all 3 storage assertions otherwise green |
+| NC-B | remove the proxy publication **and** the logger's ambient read | exactly **5** failures — the correlation assertions; all 3 storage assertions pass |
+
+The two controls fail disjoint sets of tests, so neither fix can be credited by the
+other's test. An end-to-end check against a real `next start` production build confirmed
+what the unit-level tests only model: three requests returned `x-request-id` values
+`e2e-corr-abcdef12`, `89040ee7-1f98-42c9-b362-b2f79f94818a` and
+`9ecfab40-b077-4c83-a135-302cfbc618dd`, and each appeared as `requestId` on exactly the
+matching server log line; the deliberately malformed id was replaced, never echoed. The
+startup line reported `requestCorrelationAvailable: true`, which also proves
+`node:async_hooks` survived the Next 16 middleware bundle.
+
+**A gap found while fixing this.** Neither `tests/observability-h2.test.ts` (52 assertions,
+shipped in `157bf66`) nor the new suite was referenced by `npm test`, `npm run test:all` or
+`.github/workflows/ci.yml` — CI never ran them. Both are now part of `npm test` and a new
+`npm run test:observability` script, so a regression fails the build instead of being
+found by a reviewer.
+
 ## Production status update — 2026-11-22 (PR #69)
 
 This update records the merge and owner-observed Production verification after PR #69. It does not change the historical 2026-11-19 audit findings below; those remain a point-in-time record.
@@ -94,7 +356,7 @@ Only C-1 was closed above. Every other audit finding remains open, with `FULL_PR
 | **M-R3** | *(same review)* One account = two budgets, because email and username were separate identifiers — 10 real guesses against a documented budget of 5, and N aliases ⇒ N × 15 distributed guesses | **Fixed in code 2026-11-19 — in PR #69**; the resolved account's alias set shares one budget, unknown accounts keep their own |
 | **M-R4** | *(same review, **merge gate**)* Failing closed turns "table missing" into "nobody can sign in", and there was no runtime evidence that `login_attempts` exists in Production or that `AUTO_SCHEMA_REPAIR` is enabled there | **Substantially resolved 2026-11-19** by operator-supplied read-only evidence: table present, role `neondb_owner`, `CREATE` on `public` = true, `AUTO_SCHEMA_REPAIR` absent ⇒ enabled. **Qualification kept: runtime repair has never been exercised in Production** |
 | **M-R4a** | *(found while investigating M-R4)* `/api/health` reported 200 "Login and registration services are ready" whenever repair was merely *enabled*, even with repair broken — while every login answered 503. Setting `AUTO_SCHEMA_REPAIR=false` was safer to operate than leaving it absent | **Fixed in code 2026-11-19 — in PR #69**; `repairBlocked` (repair off, no `CREATE` privilege, or a recorded repair failure) escalates to 503 for `login_attempts` and `session_revocation`, cause logged server-side |
-| **H-2** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage | Open — M-R4a makes a failed *schema repair* visible, but nothing collects it: no alerting exists |
+| **H-2** | **High** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage — the C-1 outage produced no server-side signal at all | **Implemented on branch `arena/3be79ab3-easylearn`; NOT merged, NOT deployed, NOT Production-verified.** Three boundaries (segment, root, 404) with digest-only reporting to a bounded `POST /api/internal/client-error`; `src/instrumentation.ts` with `register()` and `onRequestError()` (Node-only, no I/O at boot, allow-listed headers); structured JSON logging with `AsyncLocalStorage` request correlation and a two-pass redactor covering passwords, JWTs, cookies, authorization headers, database URLs, API keys and personal data; `/api/health` reports object-storage **configuration** and, only on `?deep=1`, real **availability** — `configured-unverified` is the default and `verified` requires a successful signed request; every health response carries `X-Request-Id`. 49 new assertions in `tests/observability-h2.test.ts` plus 12 in `tests/observability-correlation.test.ts` (the review-round-2 end-to-end correlation suite), including a positive control that fails on unredacted input and a counterweight proving identifiers survive. **The live check proves reachability, not writability** — it does not exercise a browser `PUT` or the bucket's CORS, which is what the R2 incident actually involved. Log alerting and the uptime monitor are operator actions and **have not been configured** |
 | **C-2** | Production schema drift (0/26 composite FKs) and absent migration ledger; 0018 prepared but unexecuted | Pending — see above |
 | **M-1** | Inconsistent password policy: 6-character minimum on admin user create/reset versus 8 on `change-password`; `generatedPassword` echoed in the API response | Open |
 | **M-2** | Missing database-level uniqueness for `submissions(assignment_id, learner_id)`, `parent_learners(school_id, parent_id, learner_id)` and `quiz_attempts(quiz_id, learner_id)` — application-layer or advisory-lock only today | Open |

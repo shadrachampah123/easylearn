@@ -1,11 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { evaluateCsrfRequestForRequest } from "@/lib/csrf";
+import { resolveIncomingRequestId } from "@/lib/request-context";
 
 function generateNonce(): string {
   // CSP nonces must come from a cryptographically secure random source.
   const cryptoApi = globalThis.crypto;
   if (!cryptoApi || typeof cryptoApi.getRandomValues !== "function") {
-    throw new Error("Secure randomness is unavailable; refusing to generate a weak CSP nonce.");
+    throw new Error(
+      "Secure randomness is unavailable; refusing to generate a weak CSP nonce.",
+    );
   }
   const bytes = new Uint8Array(16);
   cryptoApi.getRandomValues(bytes);
@@ -18,7 +21,9 @@ function buildCsp(nonce: string, isProduction: boolean): string {
   const scriptSrc = isProduction
     ? `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' 'unsafe-inline' blob:`
     : `script-src 'self' 'unsafe-eval' 'nonce-${nonce}' 'strict-dynamic' 'unsafe-inline' blob:`;
-  const connectSrc = isProduction ? "connect-src 'self' https:" : "connect-src 'self' https: wss: ws:";
+  const connectSrc = isProduction
+    ? "connect-src 'self' https:"
+    : "connect-src 'self' https: wss: ws:";
   return [
     "default-src 'self'",
     scriptSrc,
@@ -77,6 +82,16 @@ export default function proxy(request: NextRequest) {
 
   // Pass nonce to downstream handlers/layouts via request header
   const requestHeaders = new Headers(request.headers);
+
+  /* H-2 correlation (PR #70 review): resolve ONE id per request here — the single point
+     every matched request passes through — and publish it on the request headers so a
+     route handler that runs `runWithCurrentRequest` inherits the same value the proxy
+     computed. A platform header is reused only when well-formed, so a client cannot
+     inject text into the log or claim another request's id.
+     Resolved synchronously and without I/O; it cannot fail the request (the helper
+     generates a UUID if anything goes wrong). */
+  requestHeaders.set("x-request-id", resolveIncomingRequestId(request.headers));
+
   requestHeaders.set("x-nonce", nonce);
   requestHeaders.set("x-csp-nonce", nonce);
   // Next.js reads the forwarded request CSP to nonce its generated scripts.
@@ -89,12 +104,23 @@ export default function proxy(request: NextRequest) {
       return NextResponse.json(
         {
           success: false,
-          error: decision.reason || "This request was refused by the cross-site request policy.",
+          error:
+            decision.reason ||
+            "This request was refused by the cross-site request policy.",
         },
-        { status: 403, headers: { "Cache-Control": "no-store", "Content-Security-Policy": csp, "x-nonce": nonce } }
+        {
+          status: 403,
+          headers: {
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": csp,
+            "x-nonce": nonce,
+          },
+        },
       );
     }
-    const response = NextResponse.next({ request: { headers: requestHeaders } });
+    const response = NextResponse.next({
+      request: { headers: requestHeaders },
+    });
     /* Uploaded-file responses carry their own sandbox policy
        (FILE_RESPONSE_CSP in src/lib/upload-content.ts, set by both the
        /api/files route handler and next.config.ts). Setting the global

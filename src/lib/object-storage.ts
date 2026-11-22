@@ -199,7 +199,16 @@ export function isPublicUrlSafeForPurpose(purpose: string | null | undefined): b
 /* ── AWS Signature Version 4 presigner (no SDK dependency) ── */
 
 interface PresignRequest {
-  method: "GET" | "PUT" | "DELETE";
+  /**
+   * The HTTP method that will ACTUALLY be sent.
+   *
+   * This value is placed verbatim into the SigV4 canonical request, so it is not
+   * advisory: signing `GET` and sending `HEAD` produces a different signature and the
+   * store answers 403 SignatureDoesNotMatch. `HEAD` was added for the H-2 health probe,
+   * which must ask "does this bucket answer with our credentials" without reading bytes
+   * (review finding on PR #70).
+   */
+  method: "GET" | "HEAD" | "PUT" | "DELETE";
   key: string;
   expiresSeconds: number;
   /** Optional extra header to sign (PUT content type). */
