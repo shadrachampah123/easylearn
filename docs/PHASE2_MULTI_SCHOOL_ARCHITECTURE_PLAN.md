@@ -1,11 +1,49 @@
 # EasyLearn — Canonical Nine-Phase Roadmap
 
-**Roadmap updated:** 2026-11-19 · **Repository:** `shadrachampah123/easylearn`
+**Roadmap updated:** 2026-11-22 · **Repository:** `shadrachampah123/easylearn`
 **Verified `main`:** `4069584e99574a4fe2af7d4317a8bcbf13f9bf73` (PR #68 merged; live Production deployment 2026-11-17T21:20:13Z, alias `https://easylearn-six.vercel.app`).
 **Latest application/security checkpoint:** full production readiness & security audit of 2026-11-19 — `FULL_PRODUCTION_AUDIT_2026-11-19.md`, with `R2_CONFIG_AUDIT_2026-11-19.md` and `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` (all committed at the repository root). Earlier checkpoints: PR #32 merged at `90ec04363cbec3222232c6f912fcad69ab038dba`; PR #33 follow-up merged at `851156cac0403f1b9e268c0c3584543852399c48`.
 **Overall roadmap estimate: 46% complete.** This is a planning estimate across the nine product phases, not a test score or production-readiness certification. Phase 2 code hardening has advanced substantially, but production database state and safe migration gates remain unresolved.
 
 This current roadmap supersedes the historical architecture audit retained below, including its proposed numbering, table counts, future migration numbers and old “remaining” lists. Status distinguishes **implemented**, **merged**, **deployed**, **production DB migrated**, and **production behavior verified** as independent gates. No production connections, migrations, deployments, secrets, or settings were accessed or changed for this roadmap update. The 2026-11-19 update below is likewise documentation-only on the Production side: no deployment, migration, backup operation, environment-variable change, or Cloudflare/Vercel setting was performed.
+
+## Production status update — 2026-11-22 (PR #69)
+
+This update records the merge and owner-observed Production verification after PR #69. It does not change the historical 2026-11-19 audit findings below; those remain a point-in-time record.
+
+### H-1 — login rate limiting: merged and Production behavior observed
+
+- **PR #69** (`fix(auth): close audit finding H-1 — login throttling fails closed, per-source limits, no admin lockout`) was merged into `main` on 2026-11-22.
+- Merge commit: `906805745cf279c78bb40e3dad271abe2008b313`.
+- Vercel Production deployment for that commit was observed as **Ready**, source branch `main`, alias `https://easylearn-six.vercel.app`.
+- The owner opened `/api/health` on Production. It returned `ok: true`, `schemaReady: true`, and `optionalMigrations.login_attempts: true`; the health message stated that login and registration services are ready.
+- The owner then signed in successfully to the existing administrator account and reached the Admin Dashboard.
+- A controlled failed-login test displayed the rate-limit message, **“Too many failed login attempts”**, with a retry time. This is direct browser evidence that the throttle response is being surfaced. The browser Network response/status and `Retry-After` header were not captured, so the exact HTTP 429 contract is **not independently confirmed by this manual Production test**.
+- The owner subsequently signed in to the administrator account again from the **same Wi-Fi**. This confirms administrator access was restored, but it is **not** a different-network isolation test; the timing relative to the cooldown was not recorded.
+- No deliberate database-failure test was run against Production. Fail-closed behavior remains covered by the PR's automated regression tests, not a live Production fault injection.
+
+**H-1 status:** merged, deployed, and materially smoke-tested in Production. Keep the HTTP 429/\`Retry-After\` capture and different-network isolation as optional follow-up verification rather than claiming those exact checks have passed.
+
+### Current Production health and remaining database gate
+
+- `/api/health` reports the `login_attempts` feature present and login/registration ready.
+- `composite_tenant_foreign_keys: false`; health explicitly warns that `0018_composite_school_foreign_keys.sql` has not been applied.
+- Migration 0018 remains **PREPARED, NOT EXECUTED**. No migration, `drizzle-kit push`, database write, backup operation, or Production setting change was performed during this verification.
+- The administrator's active user, active CBISM school, and active `school_users` membership were confirmed by read-only Production queries while investigating a transient membership message. Signing out and signing back in restored the dashboard; no membership record was changed.
+
+### Verification ledger
+
+| Gate | Status |
+|---|---|
+| PR #69 merged to `main` | **PASS** |
+| Matching Vercel Production deployment Ready | **PASS** |
+| Production `/api/health`: `login_attempts: true` | **PASS** |
+| Existing administrator reaches dashboard | **PASS** |
+| Rate-limit message/retry time visible after failed attempts | **OBSERVED**; HTTP status/header not captured |
+| Administrator can sign in again from same Wi-Fi | **PASS** |
+| Different-network isolation | **NOT TESTED** |
+| Production database-failure injection | **NOT TESTED** (intentionally) |
+| Migration 0018 composite tenant foreign keys | **PENDING — NOT EXECUTED** |
 
 ## Production status update — 2026-11-19
 
