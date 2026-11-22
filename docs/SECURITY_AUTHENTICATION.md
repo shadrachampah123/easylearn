@@ -1148,3 +1148,11 @@ suffixed username on the other), and no advisory lock outlives the requests.
   empty database, so it is not a Production collision path.
 - Full source IPs are written to the log and to `login_attempts.ip_address` (finding I-R1),
   which matters once log shipping (H-2) exists.
+- **One branch of the health escalation cannot be driven by a test through the normal probe path**
+  (F-7 follow-up). `featureProbeUnavailable` exists for the case where the schema probe module
+  cannot be imported at all — every per-feature throw is caught inside `probeSchemaFeatures` and
+  surfaces through `repairBlocked` instead. A test that stubs `pool.query` exercises the second path
+  only, so the first is asserted by a source pin on the guard expression. Mutation showed why that
+  pin matters: the original version (`health.includes("featureProbeUnavailable")`) stayed green with
+  the guard deleted, because the name also appears in the declaration and in the `catch` that sets
+  it. The pin now matches the condition, and deleting the guard fails the policy suite.

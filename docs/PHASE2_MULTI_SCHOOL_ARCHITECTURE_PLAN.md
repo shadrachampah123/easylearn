@@ -473,6 +473,54 @@ difference — what is lost is the atomic rollback of account + membership, whic
 catches. **MUT-G5 is a performance regression, not a correctness one**, and is likewise caught only
 by the pin. Both are recorded rather than presented as behavioural kills.
 
+**The earlier 21-mutation harness was re-run against the rewritten code, and it found two things.**
+Its `MUT-F6` anchor (`if (aliasCollision) { … }`) no longer existed after the route was restructured,
+so the harness would have reported a phantom `BAD-PATCH`; the anchor was re-pointed at the guard
+inside the transaction and all 16 code mutations were re-verified to have exactly one match before
+the run. The run then detected **14 of 16** and left two survivors, both of which were investigated
+rather than filed:
+
+| Mutation | Verdict on re-run | What it turned out to be |
+| --- | --- | --- |
+| MUT-F7 — `if (featureProbeUnavailable \|\| securityCriticalMissing)` becomes `if (securityCriticalMissing)` | **survived** — policy 42/0 · db 41/0 | a **real test gap**, now closed |
+| MUT-F9d — the `F-9` *narrative* heading loses its marker | **survived** — policy 42/0 | a **stale anchor**, not a gap |
+
+*MUT-F7 was a genuine gap, and it is worth stating exactly why, because the obvious explanation is
+wrong.* The obvious explanation is that `securityCriticalMissing` already covers the probe-error
+case, because `probeSchemaFeatures` records a failed probe as `present: false`. It does not: that is
+only true for a **security-critical** feature, and it does not cover the case the clause exists for —
+`await import("@/lib/schema-resilience")` throwing, i.e. the probe module cannot be loaded at all. In
+that case nothing sets any `optionalMigrations` entry, `securityCriticalMissing` is `false`, and the
+remaining guard is the only thing standing between an unreadable schema state and `ok:true`. Deleting
+it survived everything, including the database test written for F-7, because that test stubs
+`pool.query` and so the module always imports. That the policy pin did not catch it either is the
+instructive half: the pin was `health.includes("featureProbeUnavailable")`, and the flag is
+*declared* in the route and *set* in the `catch`, so the assertion was satisfied by the two places
+that do not matter and said nothing about the guard that reads it. A name appearing in a file is not
+a behaviour. The pin is now a regex on the condition itself —
+`/if\s*\(\s*featureProbeUnavailable\s*\|\|\s*securityCriticalMissing\s*\)/` — and the mutation
+is now caught (policy **41/1**) with the assertion message saying that the guard must *read* the flag,
+not merely declare it. This is the second time in this review that a static pin was satisfied by an
+irrelevant occurrence of the string it was looking for; the first was MUT-F9d.
+
+*MUT-F9d was not a gap at all.* The register-row pin it was supposed to exercise
+(`| **F-9** | <severity> | … locked out … EASY_LEARN_CLIENT_IP_TRUSTED_HOPS`) was added in the
+previous round and does fire: stripping the row marker alone turns the suite **41/1**. What the
+harness was mutating was a *prose* heading elsewhere in the roadmap that no assertion reads, which is
+a harmless edit. The mutation was re-pointed at the register row, where it represents the claim the
+finding is actually recorded by, and it is detected. Nothing in the documentation changed as a
+result — this is an artefact of a harness written against an older revision, and it is recorded in
+the table above rather than quietly deleted so that the "14/16" is not mistaken for a defect in the
+fixes.
+
+After both corrections the same 16 mutations were re-run against the final tree and **16 of 16 are
+detected**, with `HARNESS_EXIT=0`. The per-mutation results are reproducible from `mutate.py`; the
+two that changed are MUT-F7 (policy **41/1**) and MUT-F9d (policy **41/1**). One incidental
+confirmation: MUT-F7's database suite now *passes* while the policy suite fails, which is exactly the
+asymmetry described above — the behaviour is unreachable through the stubbed-probe path, so the
+source pin is what protects it, and the roadmap says so rather than implying the database test covers
+it.
+
 **A defect found in the new test code itself, and fixed.** The Production-pool suite's liveness
 sampler stopped only on the success path, so a FAILED assertion inside the sampled block left the
 sampler looping forever and the process never exited: measured, the NC-B run **hung for 900 s**

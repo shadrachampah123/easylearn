@@ -630,9 +630,15 @@ async function main() {
       health.includes("securityCriticalMissing"),
       "the endpoint must refuse to say ready while a security-critical flag is false"
     );
+    /* A bare `includes("featureProbeUnavailable")` is satisfied by the declaration and by the
+       `catch` block that sets it, so deleting the guard that READS it left the pin green — found
+       by mutation, not by review. The clause is the only escalation for the case where the probe
+       module cannot be imported at all (a per-feature throw is caught inside
+       `probeSchemaFeatures` and reported through `repairBlocked` instead), so its shape is the
+       only cheap observable and it must be pinned as a condition, not as a name. */
     assert(
-      health.includes("featureProbeUnavailable"),
-      "F-7: a schema state that could not be read at all must not be reported as ready"
+      /if\s*\(\s*featureProbeUnavailable\s*\|\|\s*securityCriticalMissing\s*\)/.test(health),
+      "F-7: a schema state that could not be read at all must not be reported as ready — the guard must READ the flag, not merely declare it"
     );
     assert(
       resilience.includes("probeError"),
