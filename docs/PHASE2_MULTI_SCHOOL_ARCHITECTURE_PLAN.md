@@ -255,7 +255,13 @@ surgical controls against the *fixed* tree isolate each defect:
 | NC-B | remove the proxy publication **and** the logger's ambient read | exactly **5** failures — the correlation assertions; all 3 storage assertions pass |
 
 The two controls fail disjoint sets of tests, so neither fix can be credited by the
-other's test. An end-to-end check against a real `next start` production build confirmed
+other's test.
+
+**A gap found while fixing this.** Neither `tests/observability-h2.test.ts` (52 assertions,
+shipped in `157bf66`) nor the new suite was referenced by `npm test`, `npm run test:all` or
+`.github/workflows/ci.yml` — CI never ran them. Both are now part of `npm test` and a new
+`npm run test:observability` script, so a regression fails the build instead of being
+found by a reviewer. An end-to-end check against a real `next start` production build confirmed
 what the unit-level tests only model: three requests returned `x-request-id` values
 `e2e-corr-abcdef12`, `89040ee7-1f98-42c9-b362-b2f79f94818a` and
 `9ecfab40-b077-4c83-a135-302cfbc618dd`, and each appeared as `requestId` on exactly the
@@ -263,11 +269,86 @@ matching server log line; the deliberately malformed id was replaced, never echo
 startup line reported `requestCorrelationAvailable: true`, which also proves
 `node:async_hooks` survived the Next 16 middleware bundle.
 
-**A gap found while fixing this.** Neither `tests/observability-h2.test.ts` (52 assertions,
-shipped in `157bf66`) nor the new suite was referenced by `npm test`, `npm run test:all` or
-`.github/workflows/ci.yml` — CI never ran them. Both are now part of `npm test` and a new
-`npm run test:observability` script, so a regression fails the build instead of being
-found by a reviewer.
+## Post-deployment review — 2026-11-19 (Production `ead529a`)
+
+PR #70 was merged and deployed. This section records what Production actually showed,
+what was fixed as a result, and what remains an operator action. **Read the three statuses
+separately**: the code shipped, the monitoring did not, and no real incident has yet
+exercised the alerting.
+
+### Edge Runtime warning — fixed
+
+Vercel's build reported `src/instrumentation.ts:60:20 — process.version is not supported in
+the Edge Runtime`. Root cause: Next compiles `instrumentation.ts` a second time for the
+Edge runtime and its build-time checker flags any `process.<member>` member-chain in that
+graph. The access was behind `if (process.env.NEXT_RUNTIME !== "nodejs") return`, which the
+checker cannot see, and the Edge entry for `register()` is tree-shaken to
+`async function t(){}` — verified in `.next/server/edge/chunks/`. Next's Edge `process`
+polyfill also only throws for *function*-valued members, so `version` would have resolved to
+`undefined` rather than crashing. The warning was therefore cosmetic, but the right fix is
+to remove the expression from the Edge graph rather than suppress the warning: the read now
+goes through `getNodeRuntimeVersion()` in `src/lib/env.ts`, which the Edge graph does not
+import. **Measured: 1 Edge warning before, 0 after, and 0 warnings of any kind.** The
+startup line still reports `nodeVersion: "22.22.3"` on a real server.
+
+### Two correlation defects — found and fixed in this review
+
+1. **An empty caller `requestId` erased the ambient one.** `emit()` spread the caller's
+   fields *after* the resolved id, so `requestId: ""` overwrote a valid context id with an
+   empty string — the line lost its correlation entirely. Traced on a real call. Fixed by
+   deleting the key from the spread and re-attaching the resolved value afterwards, so the
+   field is either a non-empty string or absent, never `""` or `undefined`.
+2. **The client-error intake could log an undefined id.** `currentRequestId()` is typed
+   `string | undefined` (it answers `undefined` when `node:async_hooks` is unavailable). The
+   intake logged that value directly, so on a degraded runtime a browser-visible failure
+   would have produced an uncorrelated line — defeating the endpoint's only purpose. Fixed
+   with a `?? randomUUID()` fallback.
+
+Both have regressions in `tests/observability-correlation.test.ts`; both fail the suite when
+the fix is reverted (measured: 2 failures with the defect reintroduced).
+
+### `/api/health` — migration progress, not just a boolean
+
+Production reported `composite_tenant_foreign_keys: false` for 0018. A bare `false` cannot
+distinguish **0 of 26** (never ran) from **25 of 26** (partially applied — a different and
+more alarming situation that an operator must inspect before re-running anything). The probe
+already computed `expected`/`present`/`valid`; they are now reported as
+`checks.migrationDetail.composite_tenant_foreign_keys` and the warning text names the case:
+
+- `0 of 26 constraints present, so the migration has not run`
+- `only 23 of 26 constraints present (23 validated) — the schema is PARTIALLY migrated, inspect before re-running`
+
+Verified against disposable databases in all three states (0/26, 23/26, 26/26). The derived
+boolean is unchanged, so nothing that consumed it breaks. The probe remains strictly
+read-only: a test asserts it never adds a constraint, because 0018 changes the tenant
+boundary and is administrator-gated.
+
+### 0018 — what is unapplied, and what is safe to say about it
+
+Unapplied in Production: the 26 composite `(school_id, id)` foreign keys listed in
+`src/lib/tenant-constraints.js`, no more and no less. The migration file itself is
+transactional: it verifies the PostgreSQL version, the presence of every table and column,
+the 24 parent `UNIQUE (school_id, id)` targets, and then **counts cross-school or orphan
+references, raising and retaining nothing if any exist**. It adds each constraint
+`NOT VALID` and validates it in the same transaction.
+
+Verified in this review: **0018 applies cleanly and validates 26/26 on a full replica of the
+schema** (all 19 prior migrations, PostgreSQL 18). That is evidence the migration's own
+preflight passes on a schema of this shape; it is *not* evidence that Production's data is
+clean, because Production may contain cross-school references that a fresh replica does not.
+The data condition that must be checked before application is exactly the migration's own
+count — run read-only, per `docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md`, and stop on
+any nonzero. **0018 was not applied and no Production database was touched.**
+
+### What remains an operator action
+
+Alerting and uptime monitoring. Vercel's built-in alerts are **error-rate anomalies on HTTP
+status groups**, not log-content matching — verified against Vercel's documentation on
+2026-11-19. Log-pattern alerting requires a Log Drain to an external tool, which is a paid
+capability and an owner decision. Exact steps for both, plus the uptime-monitor
+configuration and how to invoke the storage deep probe, are in
+`docs/POST_DEPLOYMENT_H2_OPERATIONS.md`. **Neither has been configured.**
+
 
 ## Production status update — 2026-11-22 (PR #69)
 
@@ -356,7 +437,7 @@ Only C-1 was closed above. Every other audit finding remains open, with `FULL_PR
 | **M-R3** | *(same review)* One account = two budgets, because email and username were separate identifiers — 10 real guesses against a documented budget of 5, and N aliases ⇒ N × 15 distributed guesses | **Fixed in code 2026-11-19 — in PR #69**; the resolved account's alias set shares one budget, unknown accounts keep their own |
 | **M-R4** | *(same review, **merge gate**)* Failing closed turns "table missing" into "nobody can sign in", and there was no runtime evidence that `login_attempts` exists in Production or that `AUTO_SCHEMA_REPAIR` is enabled there | **Substantially resolved 2026-11-19** by operator-supplied read-only evidence: table present, role `neondb_owner`, `CREATE` on `public` = true, `AUTO_SCHEMA_REPAIR` absent ⇒ enabled. **Qualification kept: runtime repair has never been exercised in Production** |
 | **M-R4a** | *(found while investigating M-R4)* `/api/health` reported 200 "Login and registration services are ready" whenever repair was merely *enabled*, even with repair broken — while every login answered 503. Setting `AUTO_SCHEMA_REPAIR=false` was safer to operate than leaving it absent | **Fixed in code 2026-11-19 — in PR #69**; `repairBlocked` (repair off, no `CREATE` privilege, or a recorded repair failure) escalates to 503 for `login_attempts` and `session_revocation`, cause logged server-side |
-| **H-2** | **High** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage — the C-1 outage produced no server-side signal at all | **Implemented on branch `arena/3be79ab3-easylearn`; NOT merged, NOT deployed, NOT Production-verified.** Three boundaries (segment, root, 404) with digest-only reporting to a bounded `POST /api/internal/client-error`; `src/instrumentation.ts` with `register()` and `onRequestError()` (Node-only, no I/O at boot, allow-listed headers); structured JSON logging with `AsyncLocalStorage` request correlation and a two-pass redactor covering passwords, JWTs, cookies, authorization headers, database URLs, API keys and personal data; `/api/health` reports object-storage **configuration** and, only on `?deep=1`, real **availability** — `configured-unverified` is the default and `verified` requires a successful signed request; every health response carries `X-Request-Id`. 49 new assertions in `tests/observability-h2.test.ts` plus 12 in `tests/observability-correlation.test.ts` (the review-round-2 end-to-end correlation suite), including a positive control that fails on unredacted input and a counterweight proving identifiers survive. **The live check proves reachability, not writability** — it does not exercise a browser `PUT` or the bucket's CORS, which is what the R2 incident actually involved. Log alerting and the uptime monitor are operator actions and **have not been configured** |
+| **H-2** | **High** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage — the C-1 outage produced no server-side signal at all | **MERGED and DEPLOYED; operational monitoring NOT complete and NOT Production-verified by incident.** PR #70 merged; Production runs `ead529a`. Three boundaries (segment, root, 404) with digest-only reporting to a bounded `POST /api/internal/client-error`; `src/instrumentation.ts` with `register()` and `onRequestError()` (Node-only, no I/O at boot, allow-listed headers); structured JSON logging with `AsyncLocalStorage` request correlation and a two-pass redactor covering passwords, JWTs, cookies, authorization headers, database URLs, API keys and personal data; `/api/health` reports object-storage **configuration** and, only on `?deep=1`, real **availability** — `configured-unverified` is the default and `verified` requires a successful signed request; every health response carries `X-Request-Id`. Assertions: 56 in `tests/observability-h2.test.ts`, 14 in `tests/observability-correlation.test.ts` (end-to-end correlation), 4 in `tests/health-migration-detail-db.test.ts` (migration progress against a disposable database), including a positive control that fails on unredacted input and a counterweight proving identifiers survive. **The live check proves reachability, not writability** — it does not exercise a browser `PUT` or the bucket's CORS, which is what the R2 incident actually involved. Log alerting and the uptime monitor are operator actions and **have not been configured**; see `docs/POST_DEPLOYMENT_H2_OPERATIONS.md` |
 | **C-2** | Production schema drift (0/26 composite FKs) and absent migration ledger; 0018 prepared but unexecuted | Pending — see above |
 | **M-1** | Inconsistent password policy: 6-character minimum on admin user create/reset versus 8 on `change-password`; `generatedPassword` echoed in the API response | Open |
 | **M-2** | Missing database-level uniqueness for `submissions(assignment_id, learner_id)`, `parent_learners(school_id, parent_id, learner_id)` and `quiz_attempts(quiz_id, learner_id)` — application-layer or advisory-lock only today | Open |

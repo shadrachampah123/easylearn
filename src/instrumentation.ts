@@ -41,8 +41,11 @@ export async function register(): Promise<void> {
       import("@/lib/logger"),
       import("@/lib/request-context"),
     ]);
-    const { getDatabaseConfigurationProblem, getJwtConfigurationProblem } =
-      await import("@/lib/env");
+    const {
+      getDatabaseConfigurationProblem,
+      getJwtConfigurationProblem,
+      getNodeRuntimeVersion,
+    } = await import("@/lib/env");
     const { inspectObjectStorageConfiguration } =
       await import("@/lib/object-storage-readiness");
 
@@ -57,7 +60,11 @@ export async function register(): Promise<void> {
     const fields = {
       event: "server.startup",
       runtime: process.env.NEXT_RUNTIME,
-      nodeVersion: process.version,
+      /* Indirect on purpose: reading the Node version inline in this file makes Next's
+         build-time Edge checker warn, because it sees the expression in the Edge copy of
+         this module and cannot tell that the branch above already returned. See
+         `getNodeRuntimeVersion` in `@/lib/env` for the full reasoning. */
+      nodeVersion: getNodeRuntimeVersion(),
       deployment:
         process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "development",
       /* Vercel's git metadata is not secret and is the first thing anyone asks. */

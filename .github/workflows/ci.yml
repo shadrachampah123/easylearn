@@ -95,6 +95,10 @@ jobs:
           # shape (max: 2) regressions — bounded advisory-lock waits, a backend killed
           # mid-transaction, and the M-R2 budgets under 200-way concurrency — have to run.
           EASY_LEARN_REQUIRE_PRODUCTION_POOL_DB: "true"
+          # A skip must fail this job (post-deployment H-2 review, 2026-11-19): the
+          # /api/health migration-progress reporting (0018 composite tenant FK counts)
+          # has to actually run against a database.
+          EASY_LEARN_REQUIRE_HEALTH_MIGRATION_DETAIL: "true"
         run: npm run test:db
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth

@@ -313,6 +313,39 @@ async function main() {
     });
   });
 
+  await test("H-2: an empty or undefined requestId falls back to the ambient id", async () => {
+    /* POST-DEPLOYMENT REVIEW (2026-11-19). The resolved id used to be spread into the
+       record BEFORE the caller's fields, so `requestId: ""` overwrote it with an empty
+       string and the line lost its correlation. Both shapes are asserted because they
+       failed for the same reason and would fail again the same way. */
+    await withLogs(async (lines) => {
+      await runWithCurrentRequest(requestWithForwardedId(GOOD_ID), async () => {
+        log.error("empty id", { event: "test.empty_id", requestId: "" });
+        log.error("undefined id", { event: "test.undefined_id", requestId: undefined });
+      });
+
+      const empty = jsonLines(lines).find((entry) => entry.event === "test.empty_id");
+      const undef = jsonLines(lines).find((entry) => entry.event === "test.undefined_id");
+      assert.strictEqual(empty?.requestId, GOOD_ID, "an empty caller id must not erase the ambient one");
+      assert.strictEqual(undef?.requestId, GOOD_ID, "an undefined caller id must not erase it either");
+    });
+  });
+
+  await test("H-2: requestId is never emitted as an empty string or undefined", async () => {
+    /* A log store groups and filters on this field. `"requestId":""` and
+       `"requestId":undefined` (dropped by JSON.stringify) are both hostile to that, and
+       an empty value is worse than an absent one because it looks like a real id. */
+    await withLogs(async (lines) => {
+      log.error("outside a request, explicit empty id", { event: "test.empty_outside", requestId: "" });
+      const record = jsonLines(lines).find((entry) => entry.event === "test.empty_outside");
+      assert.ok(record, "the line must still be emitted");
+      assert.ok(
+        !("requestId" in (record as object)),
+        "with no ambient id and an empty caller id, the field must be absent rather than empty",
+      );
+    });
+  });
+
   /* ══ 7. a path with NO id variable still gets one ════════════════════════ */
 
   await test("H-2: the instrumentation error hook correlates without being told the id", async () => {

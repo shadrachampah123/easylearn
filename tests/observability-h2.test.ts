@@ -259,6 +259,82 @@ async function main() {
     assert(/safeHeader\(/.test(source), "header access must go through the allow-list helper");
   });
 
+  /* ── Edge-runtime compatibility (post-deployment follow-up, 2026-11-19) ─────
+     Vercel reported: "src/instrumentation.ts:60:20 — `process.version` is not supported
+     in the Edge Runtime". The warning is a build-time static-analysis artifact: the access
+     was behind `NEXT_RUNTIME !== "nodejs"` and the Edge entry is tree-shaken to an empty
+     function. The fix removes the *expression* from the Edge graph rather than suppressing
+     the warning. These tests pin the property, not the implementation detail. */
+
+  await test("H-2: instrumentation.ts contains no process member the Edge checker rejects", () => {
+    const source = readFile("src/instrumentation.ts");
+    /* Next's middleware-plugin flags `process.<member>` for any member other than `env`.
+       Comments are stripped by the parser, but the source is checked here as text — so a
+       doc comment that *quotes* the offending expression would also be worth avoiding. */
+    const offenders = source.match(/process\s*\.\s*(?!env\b)[A-Za-z_$][\w$]*/g) ?? [];
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `instrumentation.ts must not reference process members other than env; found: ${offenders.join(", ")}`,
+    );
+    assert(
+      /process\.env\.NEXT_RUNTIME/.test(source),
+      "the runtime guard itself must remain — the fix is not to drop the guard",
+    );
+  });
+
+  await test("H-2: the Node version is read through env.ts, and env.ts is not in the Edge graph", async () => {
+    /* The information must be preserved: an operator still gets nodeVersion at boot. */
+    const source = readFile("src/instrumentation.ts");
+    assert(/getNodeRuntimeVersion\(\)/.test(source), "register() must still report the Node version");
+    assert(/nodeVersion:/.test(source), "the startup line must still carry the nodeVersion field");
+
+    /* And the helper must live outside the Edge-reachable graph. The proxy pulls in
+       request-context -> logger -> log-redaction; none of those may reach env.ts, or the
+       `process.versions` read would simply move into the Edge bundle instead. */
+    const edgeGraph = [
+      "src/proxy.ts",
+      "src/lib/csrf.ts",
+      "src/lib/request-context.ts",
+      "src/lib/logger.ts",
+      "src/lib/log-redaction.ts",
+      "src/lib/session-cookie.ts",
+    ];
+    for (const file of edgeGraph) {
+      assert(
+        !/"@\/lib\/env"|'@\/lib\/env'/.test(readFile(file)),
+        `${file} is compiled for the Edge runtime and must not import env.ts`,
+      );
+    }
+  });
+
+  await test("H-2: getNodeRuntimeVersion returns a version for nodejs and null elsewhere", async () => {
+    const env = await importOrMissing<typeof import("@/lib/env")>("@/lib/env", () => {
+      throw new Error("env.ts is missing");
+    });
+
+    const previous = process.env.NEXT_RUNTIME;
+    try {
+      process.env.NEXT_RUNTIME = "nodejs";
+      const version = env.getNodeRuntimeVersion();
+      assert.strictEqual(typeof version, "string", "a Node.js server must report its version");
+      assert.match(version as string, /^\d+\.\d+\.\d+/, `unexpected shape: ${version}`);
+
+      /* The Edge pass must get `null`, never a value invented from an absent API. */
+      process.env.NEXT_RUNTIME = "edge";
+      assert.strictEqual(env.getNodeRuntimeVersion(), null, "the Edge runtime must report null");
+      delete process.env.NEXT_RUNTIME;
+      assert.strictEqual(
+        env.getNodeRuntimeVersion(),
+        null,
+        "an unknown runtime must report null rather than guessing",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = previous;
+    }
+  });
+
   await test("H-2: register() performs no network I/O", () => {
     const source = readFile("src/instrumentation.ts");
     /* A boot hook that calls out is billed, slow and can fail the function. */
@@ -854,6 +930,25 @@ async function main() {
       assert.strictEqual(typeof storageSection.configured, "boolean");
       assert(response.headers.get("X-Request-Id"), "every response carries the correlation header");
       assert.strictEqual(body.checks.requestId, response.headers.get("X-Request-Id"), "body and header must agree");
+    });
+
+    await test("H-2: /api/health reports migration PROGRESS, not only a boolean", async () => {
+      /* POST-DEPLOYMENT REVIEW (2026-11-19). Production answered
+         `composite_tenant_foreign_keys: false` for migration 0018, and a bare `false`
+         cannot distinguish "never ran" from "half-applied" — different situations with
+         different remedies. The counts come from the same probe that produced the
+         boolean, so they cost nothing extra; this asserts the field is present in the
+         shape an operator can act on. The database in this suite is unreachable, so
+         `migrationDetail` will be empty here — what is pinned is that the field EXISTS
+         and is an object, i.e. the contract cannot be dropped by a refactor. The real
+         counting behaviour is exercised by `tests/health-migration-detail-db.test.ts`. */
+      const { GET } = await import("@/app/api/health/route");
+      const response = await GET(new Request("http://localhost/api/health"));
+      const body = (await response.json()) as {
+        checks: { migrationDetail?: Record<string, { expected: number; present: number; valid: number }> };
+      };
+      assert(body.checks.migrationDetail, "the response must carry checks.migrationDetail");
+      assert.strictEqual(typeof body.checks.migrationDetail, "object");
     });
 
     await test("H-2: /api/health echoes a well-formed caller request id and ignores a forged one", async () => {
