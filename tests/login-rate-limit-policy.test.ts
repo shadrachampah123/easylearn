@@ -191,17 +191,79 @@ async function main() {
     }
   });
 
-  await test("getClientIp skips junk and falls back to the first valid entry", () => {
+  await test("getClientIp uses the trusted position even when a leftward entry is junk", () => {
+    /* Renamed 2026-11-19 (review round 2): the old name described the pre-M-R1 behaviour,
+       "skip junk and fall back to the first valid entry", which is exactly the leftmost scan
+       M-R1 removed. What this asserts is the trusted *position* in a two-entry chain. */
     assert.strictEqual(
       getClientIp(requestWithHeaders({ "x-forwarded-for": "not-an-ip, 203.0.113.7" })),
       "203.0.113.7"
     );
   });
 
-  await test("getClientIp falls back to x-real-ip when the chain holds nothing usable", () => {
-    assert.strictEqual(
-      getClientIp(requestWithHeaders({ "x-forwarded-for": "junk", "x-real-ip": "198.51.100.4" })),
-      "198.51.100.4"
+  await test("F-3: getClientIp does NOT fall back to x-real-ip when the chain holds nothing usable", () => {
+    /* This assertion was the opposite before review finding F-3: it *required* the fall-through.
+       `x-real-ip` is written by the client on every platform this deployment runs on, so it made
+       the whole attribution chain forgeable — measured: a junk trusted position plus
+       `x-real-ip: 203.0.113.66` returned the attacker's address, and every forged address is a
+       fresh per-source budget (15 guesses per account against unlimited accounts). */
+    const previousVercel = process.env.VERCEL;
+    try {
+      delete process.env.VERCEL;
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "junk", "x-real-ip": "198.51.100.4" })),
+        null,
+        "a junk trusted position must yield an unattributable source, not the client's own header"
+      );
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-real-ip": "198.51.100.4" })),
+        null,
+        "with no forwarded chain at all the client must not be able to name its own source"
+      );
+      process.env.VERCEL = "1";
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "junk", "x-real-ip": "198.51.100.4" })),
+        null,
+        "running on Vercel does not make a client-written header trustworthy"
+      );
+    } finally {
+      if (previousVercel === undefined) delete process.env.VERCEL;
+      else process.env.VERCEL = previousVercel;
+    }
+
+    const source = readFile("src/lib/rate-limit.ts");
+    assert(
+      !source.includes('headers.get("x-real-ip")'),
+      "no code path may read x-real-ip any more"
+    );
+    assert(
+      source.includes("EASY_LEARN_CLIENT_IP_HEADER"),
+      "an operator whose edge really sets x-real-ip must declare it explicitly, where it is used exclusively"
+    );
+  });
+
+  await test("F-3: the platform marker is an exact environment check, never a header", () => {
+    const previousVercel = process.env.VERCEL;
+    try {
+      process.env.VERCEL = "true";
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "junk", "x-vercel-forwarded-for": "203.0.113.9" })),
+        null,
+        "only the exact marker the Vercel runtime sets may enable the platform header"
+      );
+      process.env.VERCEL = "1";
+      assert.strictEqual(
+        getClientIp(requestWithHeaders({ "x-forwarded-for": "junk", "x-vercel-forwarded-for": "203.0.113.9" })),
+        "203.0.113.9",
+        "on Vercel the platform writes the header, so it is a legitimate last resort"
+      );
+    } finally {
+      if (previousVercel === undefined) delete process.env.VERCEL;
+      else process.env.VERCEL = previousVercel;
+    }
+    assert(
+      readFile("src/lib/rate-limit.ts").includes('process.env.VERCEL === "1"'),
+      "the provenance signal must stay an environment variable a client cannot write"
     );
   });
 
@@ -235,6 +297,41 @@ async function main() {
     assert.strictEqual(normalizeLoginIp("::ffff:203.0.113.7"), "::ffff:203.0.113.7");
     assert.strictEqual(normalizeLoginIp("999.1.1.1"), null);
     assert.strictEqual(normalizeLoginIp("203.0.113.7; DROP TABLE users"), null);
+  });
+
+  await test("F-10: IPv6 junk is rejected instead of minting a fresh source key", () => {
+    /* The previous rule was "at least two colons and only hex/dot/colon characters", which
+       accepted every string below. A reviewer probe minted 5 000 distinct "source addresses"
+       from 5 000 junk strings, and each one was a fresh per-source budget. */
+    for (const junk of [
+      ":::", "a:b:c", "1:::1", "....::", "1:2", "1::2::3", ":1:2:3:4:5:6:7",
+      "1:2:3:4:5:6:7:8:9", "::ffff:999.1.1.1", "2001:db8::g", "1.2.3.4::", "-1::1",
+    ]) {
+      assert.strictEqual(normalizeLoginIp(junk), null, `${junk} must not be accepted as a source address`);
+    }
+    const minted = new Set<string>();
+    for (let i = 0; i < 5000; i += 1) {
+      const value = normalizeLoginIp(`ab:${i.toString(16)}z::${(i * 7).toString(16)}`);
+      if (value) minted.add(value);
+    }
+    assert.strictEqual(minted.size, 0, "no junk string may mint a distinct source key");
+  });
+
+  await test("F-10: equivalent spellings of one address collapse onto one source key", () => {
+    assert.strictEqual(normalizeLoginIp("2001:0db8:0000:0000:0000:0000:0000:0001"), "2001:db8::1");
+    assert.strictEqual(normalizeLoginIp("2001:DB8:0:0:0:0:0:1"), "2001:db8::1");
+    assert.strictEqual(normalizeLoginIp("0:0:0:0:0:ffff:203.0.113.7"), "::ffff:203.0.113.7");
+    assert.strictEqual(normalizeLoginIp("::"), "::");
+    assert.strictEqual(normalizeLoginIp("2001:db8::"), "2001:db8::");
+  });
+
+  await test("F-10: zero-padded IPv4 octets are rejected rather than reinterpreted", () => {
+    /* `010.001.001.001` is octal on some stacks and decimal on others. Accepting it would give
+       one host two source keys, and the two would disagree about which address was punished. */
+    assert.strictEqual(normalizeLoginIp("010.001.001.001"), null);
+    assert.strictEqual(normalizeLoginIp("203.0.113.07"), null);
+    assert.strictEqual(normalizeLoginIp("0.0.0.0"), "0.0.0.0");
+    assert.strictEqual(normalizeLoginIp("10.1.1.1"), "10.1.1.1");
   });
 
   await test("every normalized source fits the ip_address column", () => {
@@ -422,7 +519,12 @@ async function main() {
     const content = readFile("src/lib/schema-resilience.ts");
     assert(content.includes('| "login_attempts"'), "the feature must be in the SchemaFeature union");
     assert(content.includes('login_attempts: "drizzle/0012_login_attempts.sql"'), "the feature must point at its migration");
-    assert(content.includes('login_attempts: { mode: "relation", relation: "login_attempts" }'), "the probe must check the relation");
+    /* F-1: relation-mode was not enough — a relation that exists without the columns the
+       throttle reads is unusable, and relation-mode reported it as present. */
+    assert(
+      /login_attempts:\s*{[^}]*mode: "columns"[^}]*table: "login_attempts"[^}]*columns: \["identifier", "ip_address", "created_at"\]/.test(content),
+      "the probe must check the three columns the throttle actually reads and writes"
+    );
     assert(content.includes("export function ensureLoginAttemptSchema"), "a wrapper must exist for the rate limiter");
     const probeStart = content.indexOf("export async function probeSchemaFeatures");
     assert(probeStart > -1, "probeSchemaFeatures must exist");
@@ -468,8 +570,8 @@ async function main() {
       "the DDL capability probe must be read-only catalog SQL"
     );
     assert(
-      resilience.includes("repairBlocked: !present && (!repairEnabled || ddlCapable === false || repairFailed)"),
-      "a missing feature is blocked when repair is off, unprivileged, or already failed"
+      /repairBlocked:\s*!present && \(securityCritical \|\| !repairEnabled \|\| ddlCapable === false \|\| repairFailed\)/.test(resilience),
+      "a missing feature is blocked when it is security-critical, or repair is off, unprivileged, or already failed"
     );
     assert(resilience.includes("ddlCapable === false"), "an unknown capability (null) must NOT escalate on its own");
 
@@ -486,6 +588,206 @@ async function main() {
     assert(messagePart.length > 0, "the branch must build a message");
     assert(!messagePart.includes("${"), "no runtime detail may be interpolated into the public message");
     assert(health.includes("console.error"), "the cause is logged server-side instead");
+  });
+
+  /* ── 8. F-1 / F-4 / F-7: health must not be green while a control is broken ───── */
+
+  await test("F-1: the self-heal can repair a drifted relation, not only a missing one", () => {
+    const resilience = readFile("src/lib/schema-resilience.ts");
+    for (const column of ["identifier", "ip_address", "created_at"]) {
+      assert(
+        resilience.includes(`ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "${column}"`),
+        `a dropped ${column} used to be an unrecoverable outage: CREATE TABLE IF NOT EXISTS cannot repair drift`
+      );
+    }
+    /* Additive only. The word "drop" appears in this file's comments (the composite-FK
+       feature must never drop its constraints), so scope the check to the login_attempts DDL. */
+    const blockStart = resilience.indexOf("login_attempts: [");
+    const block = resilience.slice(blockStart, resilience.indexOf("composite_tenant_foreign_keys: []", blockStart));
+    assert(blockStart > -1 && block.length > 0, "the login_attempts self-heal DDL must exist");
+    assert(
+      !/DROP\s+(TABLE|COLUMN|INDEX|CONSTRAINT)/i.test(block),
+      "repairing drift must be additive: nothing may be dropped"
+    );
+  });
+
+  await test("F-1/F-4: a missing security-critical feature is unhealthy without a prior failed repair", () => {
+    const resilience = readFile("src/lib/schema-resilience.ts");
+    assert(resilience.includes("SECURITY_CRITICAL_FEATURES"), "the two fail-closed features must be named");
+    for (const feature of ["login_attempts", "session_revocation"]) {
+      assert(
+        new RegExp(`SECURITY_CRITICAL_FEATURES[\\s\\S]{0,200}"${feature}"`).test(resilience),
+        `${feature} must be in the security-critical set`
+      );
+    }
+    assert(
+      resilience.includes("!present && (securityCritical ||"),
+      "escalation must not depend on a failure that only a request path can record"
+    );
+
+    const health = readFile("src/app/api/health/route.ts");
+    assert(
+      health.includes("securityCriticalMissing"),
+      "the endpoint must refuse to say ready while a security-critical flag is false"
+    );
+    assert(
+      health.includes("featureProbeUnavailable"),
+      "F-7: a schema state that could not be read at all must not be reported as ready"
+    );
+    assert(
+      resilience.includes("probeError"),
+      "F-7: an errored probe must be distinguishable from a probe that says 'absent'"
+    );
+  });
+
+  /* ── 9. F-2 / F-5: the enforcement transaction must not take the process down ─── */
+
+  await test("F-2: the checked-out client carries an error listener for the whole transaction", () => {
+    const source = readFile("src/lib/rate-limit.ts");
+    assert(
+      source.includes('client.on("error", onClientError)'),
+      "pg-pool detaches its own listener on checkout, so an error mid-transaction was unhandled and killed the isolate"
+    );
+    assert(
+      source.includes('client.removeListener("error", onClientError)'),
+      "the listener must be removed again so it cannot fire after the client is pooled"
+    );
+    assert(source.includes("isConnectionLevelError"), "a broken connection must be classified, not guessed");
+    assert(
+      source.includes("client.release(broken"),
+      "a connection-level failure must destroy the client instead of pooling a dead one"
+    );
+    const checkout = source.indexOf("await pool.connect()");
+    const listener = source.indexOf('client.on("error"');
+    assert(checkout > -1 && listener > checkout, "the listener must be attached after checkout");
+    assert(listener - checkout < 900, "and immediately after it, before any statement runs");
+  });
+
+  await test("F-5: the advisory-lock wait is bounded, transaction-scoped and fails closed", () => {
+    assert.strictEqual(rateLimit.loginLockTimeoutMs(), 2000, "the default bound is two seconds");
+    const previous = process.env.EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS;
+    try {
+      process.env.EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS = "1";
+      assert.strictEqual(rateLimit.loginLockTimeoutMs(), 250, "clamped to a usable floor");
+      process.env.EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS = "999999";
+      assert.strictEqual(rateLimit.loginLockTimeoutMs(), 10000, "clamped to a ceiling");
+      process.env.EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS = "junk";
+      assert.strictEqual(rateLimit.loginLockTimeoutMs(), 2000, "junk falls back to the default");
+      process.env.EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS = "1500";
+      assert.strictEqual(rateLimit.loginLockTimeoutMs(), 1500, "an operator value inside the bounds is used");
+    } finally {
+      if (previous === undefined) delete process.env.EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS;
+      else process.env.EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS = previous;
+    }
+
+    const source = readFile("src/lib/rate-limit.ts");
+    assert(source.includes("SET LOCAL lock_timeout"), "the bound must be applied inside the transaction");
+    assert(!/SET\s+lock_timeout/i.test(source), "SET LOCAL only: a session-wide setting would leak to other requests");
+    assert(source.includes('"55P03"'), "a lock timeout must be recognised as contention and logged as such");
+    assert(
+      source.includes("unavailableDecision()"),
+      "a lock timeout is an unevaluable throttle, which fails closed with 503"
+    );
+  });
+
+  /* ── 10. F-6: one identifier string belongs to one account ───────────────────── */
+
+  await test("F-6: email format is validated and cross-account alias collisions are refused", async () => {
+    const identity = await import("@/lib/login-identity");
+    assert.strictEqual(identity.isValidLoginEmail("name@school.edu"), true);
+    assert.strictEqual(identity.isValidLoginEmail("first.last+tag@sub.school.edu"), true);
+    assert.strictEqual(
+      identity.isValidLoginEmail("victim-admin"),
+      false,
+      "a bare username must not be storable as an email: that is the collision"
+    );
+    for (const bad of ["", "   ", "a@b", "a b@c.edu", "a@b c.edu", "a,@b.edu", "a@b;edu",
+      "plainaddress", "@school.edu", "a@.edu", "a@b.", "a@@b.edu", null, undefined, 42]) {
+      assert.strictEqual(identity.isValidLoginEmail(bad), false, `${JSON.stringify(bad)} must be rejected`);
+    }
+
+    /* Behavioural: the invariant in both directions, with an injected lookup so it needs no
+       database. `victim-admin` is an existing USERNAME; `collider@school.edu` an existing EMAIL. */
+    const store: Record<string, Set<string>> = {
+      email: new Set(["victim-admin"]),
+      username: new Set(["collider@school.edu"]),
+    };
+    const exists = async (column: "email" | "username", identifier: string) =>
+      (store[column]?.has(identifier) ?? false);
+    const emailClash = await identity.findLoginAliasCollision(exists, {
+      email: "collider@school.edu",
+      username: "someone",
+    });
+    assert.strictEqual(emailClash?.kind, "email_matches_existing_username");
+    const usernameClash = await identity.findLoginAliasCollision(exists, {
+      email: "ok@school.edu",
+      username: "victim-admin",
+    });
+    assert.strictEqual(usernameClash?.kind, "username_matches_existing_email");
+    assert.strictEqual(
+      await identity.findLoginAliasCollision(exists, { email: "ok@school.edu", username: "someone" }),
+      null,
+      "an ordinary account must not be refused"
+    );
+    assert.match(
+      identity.loginAliasCollisionMessage(emailClash!),
+      /guess budget/,
+      "the operator must be told why the creation was refused"
+    );
+
+    const route = readFile("src/app/api/users/route.ts");
+    assert(route.includes("isValidLoginEmail("), "the only account-creation path must validate the format");
+    assert(route.includes("findLoginAliasCollision("), "and must check both directions of the invariant");
+    assert(route.includes("loginAliasCollisionMessage("), "and must explain a refusal");
+  });
+
+  /* ── 11. F-8 / F-9: the documentation must match the measurements ────────────── */
+
+  await test("F-8: an unattributable source is no longer described as 'stricter, not looser'", () => {
+    const source = readFile("src/lib/rate-limit.ts");
+    assert(!source.includes("which is stricter, not looser"), "the disproved claim must be gone");
+    assert(
+      !source.includes("*stricter* than a per-source budget"),
+      "so must the claim that a null source is stricter than a per-source budget"
+    );
+    assert(source.includes("F-8"), "the measured behaviour must be recorded in its place");
+    assert(
+      source.includes("deliberately rejected"),
+      "the decision NOT to add a global cap for unattributable traffic must be recorded, with its reason"
+    );
+    assert(
+      source.includes("12 accounts"),
+      "the measurement (40 refused for an attributed source, 60 for an unattributable one) must be quoted"
+    );
+  });
+
+  await test("F-9: the shared-proxy lockout risk is documented next to the hop-count decision", () => {
+    const roadmap = readFile("docs/PHASE2_MULTI_SCHOOL_ARCHITECTURE_PLAN.md");
+    const security = readFile("docs/SECURITY_AUTHENTICATION.md");
+    assert(roadmap.includes("F-9"), "the roadmap register must carry the finding");
+    assert(
+      /Cloudflare[\s\S]{0,900}EASY_LEARN_CLIENT_IP_TRUSTED_HOPS|EASY_LEARN_CLIENT_IP_TRUSTED_HOPS[\s\S]{0,900}Cloudflare/.test(roadmap),
+      "the WAF recommendation must be cross-referenced with the hop-count decision it silently changes"
+    );
+    assert(
+      security.includes("locked out"),
+      "section 11 must say that a shared edge address turns five attacker guesses into an owner lockout"
+    );
+    /* A marker somewhere in the file is not evidence. The register ROW must carry the finding,
+       its severity, the lockout consequence and the remedy that prevents it — otherwise the
+       claim can be deleted from the row and still satisfy `includes("F-9")`. */
+    assert(
+      /\| \*\*F-9\*\* \| (Low|Medium|High) \|[\s\S]{0,1500}locked out[\s\S]{0,1500}EASY_LEARN_CLIENT_IP_TRUSTED_HOPS/.test(
+        roadmap
+      ),
+      "the F-9 register row must state the lockout consequence next to the hop-count remedy"
+    );
+    assert(
+      /EASY_LEARN_CLIENT_IP_TRUSTED_HOPS[\s\S]{0,600}locked out|locked out[\s\S]{0,600}EASY_LEARN_CLIENT_IP_TRUSTED_HOPS/.test(
+        security
+      ),
+      "section 11 must tie the hop count to the lockout it can cause, not list them apart"
+    );
   });
 
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed\n`);

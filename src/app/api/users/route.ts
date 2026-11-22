@@ -6,6 +6,11 @@ import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, ilike, or, desc } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
 import {
+  findLoginAliasCollision,
+  isValidLoginEmail,
+  loginAliasCollisionMessage,
+} from "@/lib/login-identity";
+import {
   addSchoolMembership,
   guardSchoolContext,
   hasSchoolAdminRole,
@@ -173,6 +178,13 @@ export async function POST(request: NextRequest) {
       return errorResponse("Email is required for teachers and administrators");
     }
 
+    /* F-6: an email address is also a login-throttle bucket key, so it has to be an email
+       address. Before this, any string was accepted — including another account's username,
+       which makes the two accounts share one guess budget (see src/lib/login-identity.ts). */
+    if (email !== undefined && email !== null && email !== "" && !isValidLoginEmail(email)) {
+      return errorResponse("Enter a valid email address, for example name@school.edu");
+    }
+
     if (password.length < 6) {
       return errorResponse("Password must be at least 6 characters");
     }
@@ -186,22 +198,29 @@ export async function POST(request: NextRequest) {
     const baseUsername = (firstName.charAt(0).toLowerCase() + lastName.toLowerCase().replace(/\s+/g, ""));
     let generatedUsername = baseUsername;
     let suffix = 1;
-    
-    try {
-      let existingUser = await db
+
+    const identifierExists = async (column: "email" | "username", identifier: string) => {
+      const rows = await db
         .select({ id: users.id })
         .from(users)
-        .where(eq(users.username, generatedUsername))
+        .where(column === "email" ? eq(users.email, identifier) : eq(users.username, identifier))
         .limit(1);
-      
-      while (existingUser.length > 0) {
+      return rows.length > 0;
+    };
+
+    /* F-6: a generated username must be unique in BOTH columns. It was only checked against
+       `users.username`, so a generated username that happened to be an existing account's email
+       created two accounts the login throttle cannot tell apart. */
+    const usernameIsTaken = async (candidate: string) =>
+      (await identifierExists("username", candidate)) ||
+      (await findLoginAliasCollision(identifierExists, { username: candidate })) !== null;
+
+    try {
+      let guard = 0;
+      while ((await usernameIsTaken(generatedUsername)) && guard < 1000) {
         generatedUsername = `${baseUsername}${suffix}`;
         suffix++;
-        existingUser = await db
-          .select({ id: users.id })
-          .from(users)
-          .where(eq(users.username, generatedUsername))
-          .limit(1);
+        guard++;
       }
     } catch (err) {
       console.error("Username check error:", err);
@@ -218,6 +237,19 @@ export async function POST(request: NextRequest) {
       if (existingEmail.length > 0) {
         return errorResponse("Email already registered");
       }
+    }
+
+    /* F-6: the other direction — the supplied email must not already be some account's
+       username. Measured before this guard: signing in to an account whose email equalled a
+       second account's username erased the second account's four recorded failures to zero,
+       because `clearFailedLoginAttempts` releases every alias string of the account that
+       authenticated. 409 rather than 400 because it is a conflict with existing state. */
+    const aliasCollision = await findLoginAliasCollision(identifierExists, {
+      email: email ?? null,
+      username: generatedUsername,
+    });
+    if (aliasCollision) {
+      return errorResponse(loginAliasCollisionMessage(aliasCollision), 409);
     }
 
     const passwordHash = await hashPassword(password);

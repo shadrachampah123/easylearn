@@ -249,6 +249,27 @@ export type SchemaFeature =
 
 const FEATURE_STATUS_TTL_MS = 60_000;
 
+/**
+ * Features whose absence makes a security control **fail closed** (F-1, F-4).
+ *
+ * `login_attempts`: since the H-1 fix the throttle refuses every login it cannot evaluate, so a
+ * database without a usable `login_attempts` relation answers 503 for every sign-in — correct
+ * passwords included. `session_revocation`: `verifyToken` fails closed without
+ * `users.session_version`, so every authenticated request answers 503.
+ *
+ * For these two, "the object is missing" and "the service is not ready" are the same sentence,
+ * and `/api/health` must say so *immediately*. Everything else in the list degrades a feature
+ * (a dashboard section, an upload path) and stays a warning.
+ */
+export const SECURITY_CRITICAL_FEATURES: ReadonlySet<SchemaFeature> = new Set<SchemaFeature>([
+  "login_attempts",
+  "session_revocation",
+]);
+
+export function isSecurityCriticalFeature(feature: SchemaFeature): boolean {
+  return SECURITY_CRITICAL_FEATURES.has(feature);
+}
+
 const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   session_revocation: "drizzle/0019_session_revocation.sql",
   login_attempts: "drizzle/0012_login_attempts.sql",
@@ -371,6 +392,16 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
     `CREATE INDEX IF NOT EXISTS "login_attempts_created_at_idx" ON "login_attempts" ("created_at");`,
     `CREATE INDEX IF NOT EXISTS "login_attempts_identifier_created_at_idx" ON "login_attempts" ("identifier", "created_at");`,
     `CREATE INDEX IF NOT EXISTS "login_attempts_ip_created_at_idx" ON "login_attempts" ("ip_address", "created_at");`,
+    /* F-1: `CREATE TABLE IF NOT EXISTS` cannot repair a relation that exists but has drifted,
+       and nothing else in this list could either — which is why a dropped column used to be a
+       permanent, invisible outage. These are additive and idempotent, and they never drop or
+       rewrite anything. Defaults are required for the NOT NULL pair so an existing (ephemeral,
+       60-minute-retention) table can accept them: a back-filled `identifier` of '' matches no
+       real alias, and a back-filled `created_at` of now() makes throttling stricter, never
+       looser. PostgreSQL 11+ stores these as fast defaults without rewriting the table. */
+    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "identifier" varchar(255) NOT NULL DEFAULT '';`,
+    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "ip_address" varchar(50);`,
+    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "created_at" timestamp DEFAULT now() NOT NULL;`,
   ],
   /* The composite tenant foreign keys are intentionally NOT auto-repairable. Migration
      0018 is gated: it needs a reviewed read-only preflight against a restored copy
@@ -419,7 +450,17 @@ const FEATURE_PROBE: Record<SchemaFeature, FeatureProbe> = {
     table: "uploaded_files",
     columns: ["storage_backend"],
   },
-  login_attempts: { mode: "relation", relation: "login_attempts" },
+  /* F-1: relation-mode was not enough. The throttle reads and writes three specific columns,
+     so a relation that exists without them is *unusable*, and relation-mode reported it as
+     present: `ALTER TABLE login_attempts DROP COLUMN ip_address` was measured to leave every
+     login answering 503 while `/api/health` answered 200 `ok:true` "Login and registration
+     services are ready." — permanently, because the self-heal DDL below used to contain no
+     ALTER and so could never repair a drifted relation. */
+  login_attempts: {
+    mode: "columns",
+    table: "login_attempts",
+    columns: ["identifier", "ip_address", "created_at"],
+  },
   session_revocation: {
     mode: "columns",
     table: "users",
@@ -516,6 +557,59 @@ export function getSchemaRepairFailure(feature: SchemaFeature): SchemaRepairFail
 }
 
 /**
+ * **F-7** — why a health *probe* could not answer. Kept apart from `SchemaRepairFailure`
+ * on purpose: a probe that errored has applied no statements, so recording it as a failed
+ * repair would report `0/N statements applied` for a repair that was never attempted.
+ *
+ * Without this the failure was invisible. `probeSchemaFeatures` returned
+ * `{ present: false, probeError: true }` and nothing else, so the only trace of a database
+ * blip was one `console.error` line: `/api/health` said "login throttling is unavailable",
+ * an operator asking *why* got "(cause unknown)", and the next successful probe erased the
+ * evidence entirely. A cause that cannot be retrieved is not a cause, it is a rumour.
+ *
+ * Like every diagnostic here this stays server-side — the unauthenticated health body must
+ * not carry SQLSTATEs or query text (finding L-4).
+ */
+export interface SchemaProbeFailure {
+  feature: SchemaFeature;
+  /** SQLSTATE when PostgreSQL supplied one, otherwise `null`. */
+  code: string | null;
+  /** Sanitized diagnostic text. Logs and diagnostics only — never a public response. */
+  text: string;
+  at: number;
+}
+
+const globalForSchemaProbe = globalThis as typeof globalThis & {
+  __easylearnSchemaProbeFailures?: Map<SchemaFeature, SchemaProbeFailure>;
+};
+
+function probeFailures(): Map<SchemaFeature, SchemaProbeFailure> {
+  if (!globalForSchemaProbe.__easylearnSchemaProbeFailures) {
+    globalForSchemaProbe.__easylearnSchemaProbeFailures = new Map();
+  }
+  return globalForSchemaProbe.__easylearnSchemaProbeFailures;
+}
+
+/** The most recent failed health probe for a feature, or `null` once a probe has succeeded. */
+export function getSchemaProbeFailure(feature: SchemaFeature): SchemaProbeFailure | null {
+  return probeFailures().get(feature) ?? null;
+}
+
+function recordSchemaProbeFailure(feature: SchemaFeature, error: unknown): void {
+  const inspected = inspectDbError(error);
+  probeFailures().set(feature, {
+    feature,
+    code: inspected.code ?? null,
+    text: inspected.text,
+    at: Date.now(),
+  });
+}
+
+function clearSchemaProbeFailure(feature: SchemaFeature): void {
+  probeFailures().delete(feature);
+}
+
+/**
  * Read-only: can the runtime role create objects in the `public` schema?
  *
  * `has_schema_privilege` consults the catalog and creates nothing. The verdict is cached for the
@@ -583,7 +677,17 @@ export async function ensureSchemaFeature(feature: SchemaFeature): Promise<Featu
     const probe = await pool.query(probeSql(spec));
     available = probeSatisfied(spec, probe.rows);
   } catch (error) {
-    console.error(`[schema] unable to probe ${feature}:`, error);
+    console.error(`[schema] unable to probe ${feature}:`, inspectDbError(error).text);
+    /* F-7: without this, an errored probe left the feature "unavailable" with an empty ledger,
+       so `/api/health` could not say why and M-R4a's escalation had nothing to escalate on.
+       Recording it costs nothing and gives the operator the real cause in the server log. */
+    repairFailures().set(feature, {
+      feature,
+      reason: `the schema probe itself failed: ${inspectDbError(error).text}`,
+      at: Date.now(),
+      appliedStatements: 0,
+      totalStatements: FEATURE_SQL[feature].length,
+    });
     return { feature, available: false, repaired: false, migration: FEATURE_MIGRATIONS[feature] };
   }
 
@@ -712,11 +816,29 @@ export interface OptionalSchemaStatus {
   /** M-R4a: a repair was already attempted for this feature and did not deliver the object. */
   repairFailed: boolean;
   /**
-   * M-R4a: the feature is missing AND cannot be relied on to appear by itself — repair is off,
-   * the runtime role may not create objects, or a repair attempt already failed. A
-   * security-critical feature in this state must be reported as unhealthy, because the code path
-   * that needs it fails CLOSED. Deliberately carries no error text: the reason belongs in the
-   * server log (`getSchemaRepairFailure`), never in an unauthenticated response (finding L-4).
+   * F-7: the read-only probe for this feature raised, so its presence is **unknown** rather
+   * than known-absent. Reported as `present: false` (a control that cannot be verified is not
+   * available) but kept distinct, because the remedy is different: a database blip clears on
+   * its own, a missing object does not.
+   */
+  probeError: boolean;
+  /** F-1/F-4: whether this feature's absence makes a security control fail closed. */
+  securityCritical: boolean;
+  /**
+   * The feature is missing AND cannot be relied on to appear by itself. A security-critical
+   * feature in this state must be reported as unhealthy, because the code path that needs it
+   * fails CLOSED. Deliberately carries no error text: the reason belongs in the server log
+   * (`getSchemaRepairFailure`), never in an unauthenticated response (finding L-4).
+   *
+   * M-R4a made this true for "repair is off", "the role may not create objects" and "a repair
+   * attempt already failed". **F-1/F-4 add the case those three all missed:** a
+   * security-critical feature that is missing *right now* is unhealthy whatever the repair
+   * settings say, because escalation used to depend on a failure that only a request path can
+   * record. Measured before this change: `login_attempts` missing with repair enabled answered
+   * 200 `ok:true` until some login happened to attempt a repair, and `users.session_version`
+   * missing with repair enabled and DDL blocked answered 200 `ok:true` *forever*, because no
+   * login touches that column. `/api/health` never runs DDL itself, so waiting for a request to
+   * discover the failure means the endpoint cannot answer the question it exists to answer.
    */
   repairBlocked: boolean;
 }
@@ -754,13 +876,23 @@ export async function probeSchemaFeatures(
   return Promise.all(
     features.map(async (feature) => {
       const spec = FEATURE_PROBE[feature];
+      const securityCritical = isSecurityCriticalFeature(feature);
       let present = false;
+      let probeError = false;
       try {
         const probe = await pool.query(probeSql(spec));
         present = probeSatisfied(spec, probe.rows);
+        /* F-7: a probe that answers clears the previous failure, so the cause never outlives
+           the blip that produced it. */
+        clearSchemaProbeFailure(feature);
       } catch (error) {
+        /* F-7: an errored probe is "unknown", and unknown is reported as not present — but it
+           must not be allowed to produce a body that says ok:true while this flag says false.
+           For a security-critical feature that is what the rule below guarantees. The cause is
+           recorded so "unavailable" is never an unexplained verdict. */
+        probeError = true;
+        recordSchemaProbeFailure(feature, error);
         console.error(`[schema] health probe for ${feature} failed:`, inspectDbError(error).text);
-        present = false;
       }
       const repairFailed = getSchemaRepairFailure(feature) !== null;
       return {
@@ -771,7 +903,14 @@ export async function probeSchemaFeatures(
         autoRepairable: FEATURE_SQL[feature].length > 0,
         ddlCapable,
         repairFailed,
-        repairBlocked: !present && (!repairEnabled || ddlCapable === false || repairFailed),
+        probeError,
+        securityCritical,
+        /* F-1/F-4: a missing (or unverifiable) security-critical feature is blocked by
+           definition — it fails closed right now, and "repair is enabled" is a promise about
+           the future, not a statement about this request. Optional features keep the M-R4a
+           rule unchanged. */
+        repairBlocked:
+          !present && (securityCritical || !repairEnabled || ddlCapable === false || repairFailed),
       };
     })
   );
@@ -785,6 +924,7 @@ export async function probeSchemaFeatures(
 export function resetSchemaFeatureCache(): void {
   featureStates().clear();
   repairFailures().clear();
+  probeFailures().clear();
   globalForSchemaRepair.__easylearnDdlCapability = null;
 }
 

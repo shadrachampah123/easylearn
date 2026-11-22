@@ -715,19 +715,37 @@ async function main() {
       assert.strictEqual(body.checks?.optionalMigrations?.login_attempts, false, "the probe must report the feature");
     });
 
-    await test("/api/health stays ready when automatic repair can recreate the table", async () => {
+    await test("F-1: /api/health reports a missing throttle table even though repair could recreate it", async () => {
+      /* This assertion was the OPPOSITE before review findings F-1/F-4, and the change is
+         deliberate. "Automatic repair is enabled" is a promise about the future; the question
+         this endpoint answers is whether sign-in works *now*, and with login_attempts gone it
+         does not — every login answers 503, correct passwords included.
+
+         Escalation used to require a *recorded* repair failure, and only a request path ever
+         records one (/api/health never runs DDL). Measured on a fresh isolate: 200 ok:true
+         "Login and registration services are ready." before the first login, 503 after it. */
       delete process.env.AUTO_SCHEMA_REPAIR;
       resilience.resetSchemaFeatureCache();
       const { GET } = await import("@/app/api/health/route");
       const response = await GET();
-      assert.strictEqual(response.status, 200, `expected 200 while repair is enabled, got ${response.status}`);
+      assert.strictEqual(response.status, 503, `a missing throttle table is not "ready", got ${response.status}`);
       const body = (await response.json()) as {
         ok: boolean;
-        checks?: { migrationWarnings?: string[] };
+        checks?: { optionalMigrations?: Record<string, boolean>; migrationWarnings?: string[] };
       };
-      assert.strictEqual(body.ok, true);
+      assert.strictEqual(body.ok, false);
+      assert.strictEqual(body.checks?.optionalMigrations?.login_attempts, false);
       const warned = (body.checks?.migrationWarnings ?? []).some((warning) => warning.includes("0012_login_attempts.sql"));
       assert(warned, "the missing table must still be surfaced as a warning");
+
+      /* And it stays self-correcting: the moment repair actually delivers the table the
+         endpoint goes green again, with no restart and no operator action. */
+      const repaired = await resilience.ensureLoginAttemptSchema();
+      assert.strictEqual(repaired.available, true, "repair must still work when it is allowed to");
+      resilience.resetSchemaFeatureCache();
+      const recovered = await GET();
+      assert.strictEqual(recovered.status, 200, `health must recover once the table exists, got ${recovered.status}`);
+      assert.strictEqual(((await recovered.json()) as { ok: boolean }).ok, true);
     });
 
     /* ── 9. M-R4a regression: a failed repair must be visible to /api/health ───── */
@@ -741,8 +759,8 @@ async function main() {
          ever revoked, the disk were full, or a statement were invalid — and it is the state
          in which /api/health used to answer 200 "Login and registration services are ready"
          while every single login answered 503. */
-      /* The previous scenario left the table dropped on purpose (health stays "ready" while
-         repair is merely enabled), so this one starts from that same missing-table state. */
+      /* The previous scenario now repairs the table on its way out (F-1), so this one drops it
+         again to start from the missing-table state it needs. */
       await db.query(`DROP TABLE IF EXISTS login_attempts`);
       delete process.env.AUTO_SCHEMA_REPAIR; // repair stays ENABLED: that was the blind spot
       resilience.resetSchemaFeatureCache();
@@ -753,7 +771,13 @@ async function main() {
       const boundQuery = realQuery.bind(pool) as (text: unknown, ...args: unknown[]) => Promise<unknown>;
       const denial = Object.assign(new Error("permission denied for schema public"), { code: "42501" });
       poolForStub.query = ((sql: unknown, ...rest: unknown[]) => {
-        if (/^\s*CREATE/i.test(String(sql))) return Promise.reject(denial);
+        /* CREATE **and** ALTER: since F-1 the self-heal runs three additive
+           `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` repairs after the CREATE TABLE, and a
+           role that may not create in `public` may not alter it either. Denying only CREATE
+           let those three reach the real database and fail with a *different* error, so the
+           ledger recorded "relation does not exist" instead of the privilege denial this
+           scenario simulates. */
+        if (/^\s*(CREATE|ALTER)/i.test(String(sql))) return Promise.reject(denial);
         return boundQuery(sql, ...rest);
       }) as typeof poolForStub.query;
 
@@ -795,7 +819,9 @@ async function main() {
         assert(failure, "the failed repair must be recorded, not only logged");
         assert.strictEqual(failure!.feature, "login_attempts");
         assert.strictEqual(failure!.appliedStatements, 0, "no statement may be reported as applied");
-        assert.strictEqual(failure!.totalStatements, 5, "the ledger must know the size of the repair");
+        /* Eight since F-1: the original CREATE TABLE + four indexes, plus the three additive
+           ALTERs that let the self-heal repair a *drifted* relation and not only a missing one. */
+        assert.strictEqual(failure!.totalStatements, 8, "the ledger must know the size of the repair");
         assert.match(failure!.reason, /permission denied/, "the recorded reason must be the database error");
         assert(failure!.at <= Date.now() && failure!.at > Date.now() - 60_000, "the failure must be timestamped now");
 
@@ -844,6 +870,460 @@ async function main() {
 
       const login = await POST(loginRequest(wrongPassword, OWNER_IP));
       assert.strictEqual(login.status, 401, "throttling must be live again (a normal 401, not a degraded 503)");
+    });
+
+    /* ── 10. Second independent review (F-1 … F-10): behavioural regressions ─────
+       Each test below reproduces a state the reviewer measured by hand against e4c7b41 and
+       found the suites silent about. They are written to fail against that commit. */
+
+    const DRIFT_IP = "198.51.100.40";
+    const FORGED_IP = "198.51.100.41";
+    const LOCKWAIT_IP = "198.51.100.42";
+    const CRASH_IP = "198.51.100.43";
+    const { pool } = await import("@/db");
+    const { GET: healthGet } = await import("@/app/api/health/route");
+    const auth = await import("@/lib/auth");
+    type HealthBody = {
+      ok: boolean;
+      message?: string;
+      checks?: { optionalMigrations?: Record<string, boolean>; migrationWarnings?: string[] };
+    };
+    const healthBody = async (): Promise<{ status: number; body: HealthBody }> => {
+      const response = await healthGet();
+      return { status: response.status, body: (await response.json()) as HealthBody };
+    };
+    /** Stub `pool.query` for the statements matching `predicate`; always restored. */
+    const withPoolStub = async (
+      predicate: (sql: string) => boolean,
+      message: string,
+      code: string,
+      body: () => Promise<void>
+    ) => {
+      const poolForStub = pool as unknown as { query: (...args: never[]) => Promise<unknown> };
+      const realQuery = poolForStub.query;
+      const boundQuery = realQuery.bind(pool) as (text: unknown, ...args: unknown[]) => Promise<unknown>;
+      const denial = Object.assign(new Error(message), { code });
+      poolForStub.query = ((sql: unknown, ...rest: unknown[]) =>
+        predicate(String(sql)) ? Promise.reject(denial) : boundQuery(sql, ...rest)) as typeof poolForStub.query;
+      try {
+        await body();
+      } finally {
+        poolForStub.query = realQuery;
+      }
+    };
+
+    await test("F-1: a drifted login_attempts column is unhealthy AND self-heals (was a permanent silent outage)", async () => {
+      /* The reviewer's measurement against e4c7b41, three rounds with the CORRECT password:
+           login => 503; health => 200 ok=true "Login and registration services are ready."
+           ensureLoginAttemptSchema.available=true  repaired=false  ledger=empty
+         Relation-mode probing reported the feature present, the self-heal DDL contained no
+         ALTER, so nothing could ever repair it and nothing could ever escalate: a total login
+         outage that monitoring could not see. */
+      await reset();
+      await db.query(`ALTER TABLE login_attempts DROP COLUMN ip_address`);
+      resilience.resetSchemaFeatureCache();
+      delete process.env.AUTO_SCHEMA_REPAIR;
+
+      const before = await healthBody();
+      assert.strictEqual(before.status, 503, `a drifted throttle is not ready, got ${before.status}`);
+      assert.strictEqual(before.body.ok, false, "ok must not be true while login answers 503");
+      assert.strictEqual(
+        before.body.checks?.optionalMigrations?.login_attempts,
+        false,
+        "the probe must check the columns the throttle reads, not only the relation"
+      );
+
+      /* One login attempt is enough to repair it now: a missing column (42703) triggers the
+         same self-heal a missing relation does, and the additive ALTERs restore the column. */
+      const firstLogin = await POST(loginRequest(wrongPassword, DRIFT_IP));
+      assert.strictEqual(firstLogin.status, 401, `the throttle must be live again, got ${firstLogin.status}`);
+      const columns = (
+        await db.query(
+          `SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'login_attempts' ORDER BY column_name`
+        )
+      ).rows.map((row: { column_name: string }) => row.column_name);
+      for (const expected of ["created_at", "id", "identifier", "ip_address"]) {
+        assert(columns.includes(expected), `self-heal must restore ${expected} (found ${columns.join(", ")})`);
+      }
+      const after = await healthBody();
+      assert.strictEqual(after.status, 200, `health must recover, got ${after.status}`);
+      assert.strictEqual(after.body.ok, true);
+      assert.strictEqual(await attemptRows(), 1, "the attempt that triggered the repair must still be recorded");
+    });
+
+    await test("F-1: a fresh process with a blocked repair is unhealthy BEFORE any login attempt", async () => {
+      /* Measured on e4c7b41: health answered 200 ok:true until the first login happened to
+         attempt a repair and record the failure. Escalation that waits for a request is not a
+         health check. */
+      await reset();
+      await db.query(`DROP TABLE IF EXISTS login_attempts`);
+      delete process.env.AUTO_SCHEMA_REPAIR;
+      resilience.resetSchemaFeatureCache();
+
+      await withPoolStub(
+        (sql) => /^\s*(CREATE|ALTER)/i.test(sql),
+        "permission denied for schema public",
+        "42501",
+        async () => {
+          const first = await healthBody();
+          assert.strictEqual(first.status, 503, `no login has run yet, so nothing recorded a failure: got ${first.status}`);
+          assert.strictEqual(first.body.ok, false);
+          assert.strictEqual(resilience.getSchemaRepairFailure("login_attempts"), null, "the ledger is still empty — that was the blind spot");
+
+          const login = await POST(loginRequest(wrongPassword, DRIFT_IP));
+          assert.strictEqual(login.status, 503, "the throttle must fail closed");
+          const second = await healthBody();
+          assert.strictEqual(second.status, 503, "and health must stay unhealthy after the failed repair");
+          assert(resilience.getSchemaRepairFailure("login_attempts"), "the repair failure is recorded now");
+        }
+      );
+
+      /* Recovery: with DDL allowed again the table comes back and health goes green. */
+      resilience.resetSchemaFeatureCache();
+      const repaired = await resilience.ensureLoginAttemptSchema();
+      assert.strictEqual(repaired.available, true);
+      resilience.resetSchemaFeatureCache();
+      const recovered = await healthBody();
+      assert.strictEqual(recovered.status, 200, `health must recover, got ${recovered.status}`);
+    });
+
+    await test("F-4: a missing session_revocation column is unhealthy even with repair enabled and DDL blocked", async () => {
+      /* Measured on e4c7b41: 200 ok:true, ledger empty, forever — because no login touches
+         users.session_version, so nothing ever attempted (and therefore recorded) a repair.
+         The roadmap claimed "the same blind spot is closed for session_revocation". */
+      await reset();
+      await db.query(`ALTER TABLE users DROP COLUMN session_version`);
+      delete process.env.AUTO_SCHEMA_REPAIR;
+      resilience.resetSchemaFeatureCache();
+      try {
+        await withPoolStub(
+          (sql) => /^\s*(CREATE|ALTER)/i.test(sql),
+          "permission denied for schema public",
+          "42501",
+          async () => {
+            const { status, body } = await healthBody();
+            assert.strictEqual(status, 503, `session revocation failing closed is not "ready", got ${status}`);
+            assert.strictEqual(body.ok, false);
+            assert.strictEqual(body.checks?.optionalMigrations?.session_revocation, false);
+            assert.match(body.message ?? "", /session revocation/i, "the message must name the affected control");
+          }
+        );
+        /* And without the DDL block: still unhealthy, because the column is missing NOW. */
+        resilience.resetSchemaFeatureCache();
+        const stillMissing = await healthBody();
+        assert.strictEqual(stillMissing.status, 503, `a missing column is unhealthy whatever the repair settings, got ${stillMissing.status}`);
+      } finally {
+        await db.query(`ALTER TABLE users ADD COLUMN session_version integer DEFAULT 0 NOT NULL`);
+        resilience.resetSchemaFeatureCache();
+      }
+      const recovered = await healthBody();
+      assert.strictEqual(recovered.status, 200, `health must recover once the column is back, got ${recovered.status}`);
+      assert.strictEqual(recovered.body.ok, true);
+    });
+
+    await test("F-7: an errored probe cannot produce ok:true next to a false security-critical flag", async () => {
+      /* Measured on e4c7b41: a transient probe error produced `ok:true` with
+         `login_attempts: false` in the SAME body — a response that contradicts itself, so
+         flag-based alerting fires while `ok` says healthy. */
+      await reset();
+      resilience.resetSchemaFeatureCache();
+      await withPoolStub(
+        (sql) => /information_schema\.columns/.test(sql) && /login_attempts/.test(sql),
+        "connection reset by peer",
+        "08006",
+        async () => {
+          resilience.resetSchemaFeatureCache();
+          const { status, body } = await healthBody();
+          assert.notStrictEqual(
+            body.ok === true && body.checks?.optionalMigrations?.login_attempts === false,
+            true,
+            "the body must never claim readiness while reporting the throttle as absent"
+          );
+          assert.strictEqual(status, 503, `an unverifiable throttle state is not ready, got ${status}`);
+          assert.strictEqual(body.ok, false);
+          const cause = resilience.getSchemaProbeFailure("login_attempts");
+          assert(cause, "an errored probe must leave a retrievable cause instead of silence");
+          assert.match(cause!.text, /connection reset by peer/, "the cause must carry the database error");
+          assert.strictEqual(cause!.code, "08006", "and its SQLSTATE");
+          assert.strictEqual(
+            resilience.getSchemaRepairFailure("login_attempts"),
+            null,
+            "a probe that errored applied no statements, so it must not be recorded as a failed repair"
+          );
+        }
+      );
+      resilience.resetSchemaFeatureCache();
+      const recovered = await healthBody();
+      assert.strictEqual(recovered.status, 200, `a transient probe error must clear, got ${recovered.status}`);
+      assert.strictEqual(recovered.body.ok, true);
+      assert.strictEqual(
+        resilience.getSchemaProbeFailure("login_attempts"),
+        null,
+        "a probe that answers again must clear the recorded cause"
+      );
+    });
+
+    await test("F-3: forged x-real-ip values buy no extra guesses (route level)", async () => {
+      /* Attribution-level assertions existed only as unit tests; nothing drove the real route.
+         On e4c7b41 each forged x-real-ip was a fresh per-source bucket, so every request below
+         was a real guess. Now the chain ends at `null` and all of them share one per-account
+         bucket, exactly as an attributed source would. */
+      await reset();
+      const statuses: number[] = [];
+      for (let attempt = 0; attempt < MAX_ATTEMPTS + 1; attempt += 1) {
+        const response = await POST(
+          new NextRequest("http://localhost/api/auth/login", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-forwarded-for": "junk-at-the-trusted-position",
+              "x-real-ip": `203.0.113.${attempt + 1}`,
+            },
+            body: JSON.stringify(wrongPassword),
+          })
+        );
+        statuses.push(response.status);
+      }
+      assert.deepStrictEqual(
+        statuses.slice(0, MAX_ATTEMPTS),
+        Array<number>(MAX_ATTEMPTS).fill(401),
+        `the first ${MAX_ATTEMPTS} forged attempts are ordinary failures: ${statuses.join(",")}`
+      );
+      assert.strictEqual(statuses[MAX_ATTEMPTS], 429, `the forged header must not buy a sixth guess: ${statuses.join(",")}`);
+      assert.strictEqual(await attemptRows(), MAX_ATTEMPTS, "and every one of them must be stored");
+      const stored = (
+        await db.query(`SELECT count(*)::int AS count FROM login_attempts WHERE ip_address IS NULL`)
+      ).rows[0].count;
+      assert.strictEqual(stored, MAX_ATTEMPTS, "an unattributable source stores NULL, never a sentinel or a forged value");
+      assert.strictEqual(
+        rateLimit.getClientIp(
+          new NextRequest("http://localhost/api/auth/login", {
+            method: "POST",
+            headers: { "x-forwarded-for": "junk", "x-real-ip": FORGED_IP },
+          })
+        ),
+        null,
+        "the forged header must not be readable as a source at all"
+      );
+    });
+
+    await test("F-5: a lock held elsewhere fails closed within the bound and does not take the pool with it", async () => {
+      /* On e4c7b41 `pg_advisory_xact_lock` waited forever. With the Production pool at two
+         connections the reviewer measured two such waits making GET /api/health answer 503 and
+         `pool.query('SELECT 1')` error — the whole application, not just login. */
+      await reset();
+      const blocker = new Client({ connectionString: process.env.DATABASE_URL });
+      await blocker.connect();
+      const bound = rateLimit.loginLockTimeoutMs();
+      try {
+        await blocker.query("BEGIN");
+        await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [`source:${LOCKWAIT_IP}`]);
+
+        const started = Date.now();
+        const response = await POST(loginRequest(wrongPassword, LOCKWAIT_IP));
+        const elapsed = Date.now() - started;
+        assert.strictEqual(response.status, 503, `a lock wait that times out must fail closed, got ${response.status}`);
+        assert(response.headers.get("Retry-After"), "the degraded response must carry Retry-After");
+        assert(
+          elapsed < bound + 3000,
+          `the wait must be bounded by lock_timeout (${bound}ms), took ${elapsed}ms`
+        );
+        assert.strictEqual(await attemptRows(), 0, "a timed-out attempt must not be recorded");
+
+        /* The point of the bound: the connection came back, so the rest of the app still works. */
+        await pool.query("SELECT 1");
+        const during = await healthBody();
+        assert.strictEqual(during.status, 200, `/api/health must stay green while one login waits, got ${during.status}`);
+
+        await blocker.query("ROLLBACK");
+        const recovered = await POST(loginRequest(wrongPassword, LOCKWAIT_IP));
+        assert.strictEqual(recovered.status, 401, `the next login must work once the lock is free, got ${recovered.status}`);
+        assert.strictEqual(await attemptRows(), 1);
+      } finally {
+        await blocker.query("ROLLBACK").catch(() => undefined);
+        await blocker.end().catch(() => undefined);
+      }
+      /* Scoped to THIS database on purpose: `pg_locks` is cluster-wide, and an earlier run of
+         the mutation harness left three orphaned advisory locks in a scratch database whose
+         suite had been killed mid-wait. Counting them made this assertion fail on a healthy
+         run (3 !== 0) — the same false failure a shared CI PostgreSQL service could produce. */
+      const locks = Number(
+        (await db.query(`SELECT count(*)::int AS count FROM pg_locks
+                WHERE locktype = 'advisory'
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`)).rows[0].count
+      );
+      assert.strictEqual(locks, 0, "no advisory lock may outlive the request that took it");
+    });
+
+    await test("F-2: a backend killed mid-transaction degrades one login instead of killing the process", async () => {
+      /* On e4c7b41 the checked-out client had no 'error' listener (pg-pool detaches its own on
+         checkout), so a 57P01 during the transaction was an unhandled 'error' event: the
+         reviewer's probe process died. If this test regresses, the whole suite dies with it. */
+      await reset();
+      const blocker = new Client({ connectionString: process.env.DATABASE_URL });
+      await blocker.connect();
+      try {
+        /* Hold the SOURCE lock, which is the first of the two advisory locks the enforcement
+           transaction takes (`lockKeys` in src/lib/rate-limit.ts). The backend is then inside
+           an open transaction — BEGIN and `SET LOCAL lock_timeout` have both run — and waiting,
+           which is exactly the state in which a 57P01 is fatal to an unlistened client.
+           (Holding `account:<email>` instead does not work: that key is built from EVERY alias
+           of the resolved account, so it is `account:<sorted aliases joined by |>`, not the
+           supplied identifier — measured, the login sailed straight through.) */
+        await blocker.query("BEGIN");
+        await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
+          `source:${CRASH_IP}`,
+        ]);
+
+        const inFlight = POST(loginRequest(wrongPassword, CRASH_IP));
+        let pid: number | null = null;
+        for (let attempt = 0; attempt < 80 && pid === null; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          const waiting = await db.query(
+            `SELECT pid FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND wait_event_type = 'Lock' AND wait_event = 'advisory'
+                AND pid <> pg_backend_pid()
+              ORDER BY backend_start DESC LIMIT 1`
+          );
+          pid = waiting.rows[0] ? Number(waiting.rows[0].pid) : null;
+        }
+        assert(pid !== null, "the login must be observed waiting on the advisory lock");
+        await db.query("SELECT pg_terminate_backend($1)", [pid]);
+
+        const response = await inFlight;
+        assert.strictEqual(response.status, 503, `the killed attempt must fail closed, got ${response.status}`);
+        assert(response.headers.get("Retry-After"), "the degraded response must carry Retry-After");
+        assert.strictEqual(await attemptRows(), 0, "a killed attempt must not be recorded");
+
+        /* Reaching this line at all is the assertion that matters. The rest proves the pool is
+           not left holding a dead client or an orphaned lock. */
+        await pool.query("SELECT 1");
+        const locks = Number(
+          (await db.query(`SELECT count(*)::int AS count FROM pg_locks
+                WHERE locktype = 'advisory'
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`)).rows[0].count
+        );
+        assert(locks <= 1, `only the blocker's own lock may remain, found ${locks}`);
+        const stuck = Number(
+          (
+            await db.query(
+              `SELECT count(*)::int AS count FROM pg_stat_activity
+                WHERE datname = current_database() AND state = 'idle in transaction'`
+            )
+          ).rows[0].count
+        );
+        assert(stuck <= 1, `no app connection may be left idle in transaction, found ${stuck}`);
+
+        await blocker.query("ROLLBACK");
+        const recovered = await POST(loginRequest(wrongPassword, CRASH_IP));
+        assert.strictEqual(recovered.status, 401, `login must work again, got ${recovered.status}`);
+      } finally {
+        await blocker.query("ROLLBACK").catch(() => undefined);
+        await blocker.end().catch(() => undefined);
+      }
+    });
+
+    await test("F-6: an account cannot be created whose email is another account's username", async () => {
+      /* Measured on e4c7b41: signing in to an account whose email equalled a SECOND account's
+         username erased the second account's recorded failures, 4 -> 0, because the throttle
+         identifies accounts by string. Nothing in the schema can express cross-column
+         uniqueness, so the invariant is enforced at the only path that creates accounts. */
+      /* schools_slug_format_check allows only ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$, and the
+         scratch database name contains an underscore. */
+      const slugSafe = DB_NAME.replace(/[^a-z0-9-]/g, "-");
+      const school = (
+        await db.query(
+          `INSERT INTO schools (name, short_name, slug) VALUES ($1, 'F6S', $2) RETURNING id`,
+          [`Alias School ${DB_NAME}`, `alias-${slugSafe}`]
+        )
+      ).rows[0].id as string;
+      const adminRow = (
+        await db.query(
+          `INSERT INTO users (email, password_hash, role, first_name, last_name, is_active)
+           VALUES ($1, $2, 'school_admin', 'Alias', 'Admin', true) RETURNING id, session_version`,
+          [`alias-admin-${DB_NAME}@school.test`, await bcrypt.hash("Alias-Admin-1!", 4)]
+        )
+      ).rows[0] as { id: string; session_version: number };
+      await db.query(
+        `INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1, $2, 'school_admin', 'active')`,
+        [school, adminRow.id]
+      );
+      /* The victim: an account whose USERNAME is an email-shaped string. It has to be
+         email-shaped because the route now rejects a malformed `email` with 400 long before
+         the collision check runs — a bare username as an email is the `malformed` case below,
+         and this one is the legacy-data case the collision guard exists for. */
+      const victimUsername = `victim-${DB_NAME}@school.test`;
+      await db.query(
+        `INSERT INTO users (username, password_hash, role, first_name, last_name, is_active)
+         VALUES ($1, $2, 'learner', 'Vic', 'Tim', true)`,
+        [victimUsername, await bcrypt.hash("Victim-Password-1!", 4)]
+      );
+      /* Legacy data can also hold the reverse: an email that looks like a username. */
+      await db.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, is_active)
+         VALUES ($1, $2, 'learner', 'Legacy', 'Email', true)`,
+        [`jsmith-${DB_NAME}`, await bcrypt.hash("Legacy-Password-1!", 4)]
+      );
+
+      const token = await auth.createToken({
+        userId: adminRow.id,
+        role: "school_admin",
+        email: `alias-admin-${DB_NAME}@school.test`,
+        schoolId: school,
+        sessionVersion: Number(adminRow.session_version ?? 0),
+      });
+      const { POST: createUsers } = await import("@/app/api/users/route");
+      const createUser = (payload: Record<string, unknown>) =>
+        createUsers(
+          new NextRequest("http://localhost/api/users", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify(payload),
+          })
+        );
+
+      const collision = await createUser({
+        email: victimUsername,
+        password: "Collider-1!",
+        firstName: "Col",
+        lastName: "Lider",
+        role: "teacher",
+      });
+      assert.strictEqual(collision.status, 409, `an email that is another account's username must be refused, got ${collision.status}`);
+
+      const malformed = await createUser({
+        email: "not-an-email",
+        password: "Malformed-1!",
+        firstName: "Mal",
+        lastName: "Formed",
+        role: "teacher",
+      });
+      assert.strictEqual(malformed.status, 400, `a bare username must not be storable as an email, got ${malformed.status}`);
+
+      /* The reverse direction: the generated username must skip an existing email, so an
+         ordinary creation still succeeds instead of being refused. */
+      const generated = await createUser({
+        password: "Learner-1!",
+        firstName: "j",
+        lastName: `smith-${DB_NAME}`,
+        role: "learner",
+      });
+      assert.ok(generated.status === 200 || generated.status === 201, `an ordinary creation must succeed, got ${generated.status}`);
+      const createdUsername = String(
+        (await db.query(`SELECT username FROM users WHERE last_name = $1`, [`smith-${DB_NAME}`])).rows[0]?.username ?? ""
+      );
+      assert.notStrictEqual(createdUsername, `jsmith-${DB_NAME}`, "the generated username must not be an existing email");
+      assert(
+        createdUsername.startsWith(`jsmith-${DB_NAME}`.toLowerCase()),
+        `the generated username must be the suffixed form, got ${createdUsername}`
+      );
+
+      const rows = Number(
+        (await db.query(`SELECT count(*)::int AS count FROM users WHERE lower(email) = lower($1)`, [victimUsername])).rows[0].count
+      );
+      assert.strictEqual(rows, 0, "no account may hold another account's username as its email");
     });
 
     /* Restore the table so cleanup and any later suite state stay conventional. */

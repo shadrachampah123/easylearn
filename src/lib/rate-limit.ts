@@ -2,7 +2,12 @@ import { db, pool } from "@/db";
 import { loginAttempts } from "@/db/schema";
 import { inArray, sql } from "drizzle-orm";
 import type { PoolClient } from "pg";
-import { ensureLoginAttemptSchema, inspectDbError, isMissingRelation } from "@/lib/schema-resilience";
+import {
+  ensureLoginAttemptSchema,
+  inspectDbError,
+  isMissingColumn,
+  isMissingRelation,
+} from "@/lib/schema-resilience";
 
 /**
  * Login brute-force protection.
@@ -64,8 +69,53 @@ import { ensureLoginAttemptSchema, inspectDbError, isMissingRelation } from "@/l
  * `EASY_LEARN_CLIENT_IP_HEADER` at a header only the platform writes (for example
  * `x-vercel-forwarded-for` or `cf-connecting-ip`). Unlike the host/origin policy in
  * `src/lib/csrf.ts`, this cannot simply refuse the forwarded headers: a Next.js route handler
- * has no socket address, so without them there is no client IP at all — and an unattributable
- * source falls back to one shared bucket per identifier, which is stricter, not looser.
+ * has no socket address, so without them there is no client IP at all.
+ *
+ * **What an unattributable source costs (corrected 2026-11-19, review finding F-8).** An
+ * earlier revision of this header called the fallback "stricter, not looser". That was wrong in
+ * aggregate and the measurement is recorded here so it is not repeated: with no attributable
+ * source, the *(account, source)* budget still applies — `ip_address IS NOT DISTINCT FROM NULL`
+ * makes every unattributable attempt against one account share a single 5-attempt bucket, so
+ * **per account the limit is identical** (measured: 5 allowed, 6th refused). What is *absent* is
+ * the per-host cap (`MAX_ATTEMPTS_PER_IP` / `MAX_IDENTIFIERS_PER_IP`), because there is no host
+ * to cap: measured across 12 accounts from one machine, an attributed source was refused after
+ * 40 guesses while an unattributable one was refused after 60 (12 accounts x 5). A **global**
+ * budget for all unattributable traffic was considered and deliberately rejected — it would be
+ * one shared bucket for every request whose address cannot be determined, so a single attacker
+ * sending a junk `x-forwarded-for` could exhaust it and lock out every such user. That is the
+ * same denial-of-service shape H-1 was opened for. The residual risk is therefore accepted and
+ * documented rather than coded around, and the real remedy is operator-side: declare the
+ * platform header so attribution never fails (`.env.example`, `docs/SECURITY_AUTHENTICATION.md`
+ * section 11).
+ *
+ * A second independent review of the same remediation (findings **F-1** to **F-10**,
+ * 2026-11-19) produced four further changes in this file:
+ *
+ *  - **F-2** the checked-out client now carries an `'error'` listener for the whole
+ *    transaction. `pg-pool` removes its own listener on checkout (`node_modules/pg-pool/index.js`
+ *    `_acquireClient` -> `client.removeListener('error', idleListener)`) and re-attaches it only
+ *    on release, so the pool-level listener in `src/db/index.ts` covers *idle* clients only. A
+ *    backend failure mid-transaction was an unhandled `'error'` event and took the whole Node
+ *    isolate down; it is now logged, and a connection-level failure releases the client with the
+ *    error so `pg-pool` destroys it instead of pooling a dead one.
+ *  - **F-3** `getClientIp` no longer falls through to `x-real-ip`. That header is written by the
+ *    *client* on every platform except one that is explicitly configured to set it, so it made
+ *    the whole attribution chain forgeable (measured: a junk trusted position plus
+ *    `x-real-ip: 203.0.113.66` returned the attacker's value, and each forged address is a fresh
+ *    bucket). An operator who genuinely receives it from their edge declares it through
+ *    `EASY_LEARN_CLIENT_IP_HEADER`, which is used exclusively and is therefore an explicit
+ *    decision rather than a silent default.
+ *  - **F-5** the enforcement transaction sets a bounded `lock_timeout`. `pg_advisory_xact_lock`
+ *    otherwise waits forever, and with the Production pool limited to two connections two such
+ *    waits were measured to take the *whole application* down (`GET /api/health` answered 503
+ *    and `pool.query('SELECT 1')` errored while the lock was held by another backend). A timeout
+ *    turns that into one fail-closed 503 for the login and returns the connection to the pool.
+ *  - **F-10** `normalizeLoginIp` validates IPv6 properly (at most one `::`, 1-4 hex digits per
+ *    group, eight groups, a well-formed embedded IPv4 tail) and canonicalises the result, so
+ *    equivalent spellings collapse to one source key and junk such as `:::`, `a:b:c`, `1:::1` or
+ *    `....::` is rejected instead of being accepted as 5 000 distinct "addresses". Zero-padded
+ *    IPv4 octets are rejected outright: `010.001.001.001` is ambiguous (octal on some stacks)
+ *    and must not become a second key for `10.1.1.1`.
  */
 
 // ── Configuration ────────────────────────────────────────────────────────────────
@@ -101,6 +151,28 @@ export const IP_BLOCK_MINUTES = 15;
 export const MAX_ATTEMPTS_PER_IDENTIFIER = 15;
 /** Cooldown for the account-wide backstop — shorter than the scoped block on purpose. */
 export const IDENTIFIER_BLOCK_MINUTES = 15;
+
+/**
+ * F-5: how long the enforcement transaction may wait for its advisory locks, in milliseconds.
+ * Applied with `SET LOCAL`, so it is scoped to that one transaction and can never change the
+ * behaviour of any other statement that later reuses the pooled connection. A wait that exceeds
+ * it raises PostgreSQL `55P03` (lock_not_available), which is a database error like any other:
+ * the login **fails closed** with 503 and the connection goes straight back to the pool.
+ */
+export const LOGIN_LOCK_TIMEOUT_ENV = "EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS";
+export const DEFAULT_LOGIN_LOCK_TIMEOUT_MS = 2_000;
+const MIN_LOGIN_LOCK_TIMEOUT_MS = 250;
+const MAX_LOGIN_LOCK_TIMEOUT_MS = 10_000;
+
+/** Clamped, integer lock timeout in ms — safe to interpolate into `SET LOCAL`. */
+export function loginLockTimeoutMs(): number {
+  const raw = Number.parseInt((process.env[LOGIN_LOCK_TIMEOUT_ENV] ?? "").trim(), 10);
+  if (!Number.isFinite(raw)) return DEFAULT_LOGIN_LOCK_TIMEOUT_MS;
+  /* Clamped, not ignored: an operator who asks for a tighter bound than 250 ms wants less
+     waiting, and silently handing back the default would do the opposite of what was asked.
+     Junk (not a number) does fall back to the default. */
+  return Math.min(Math.max(Math.trunc(raw), MIN_LOGIN_LOCK_TIMEOUT_MS), MAX_LOGIN_LOCK_TIMEOUT_MS);
+}
 
 /** Rows older than this are pruned on every recorded failure (keeps the table small). */
 export const ATTEMPT_RETENTION_MINUTES = 60;
@@ -196,23 +268,105 @@ function normalizeIdentifier(identifier: string): string {
  * disabled throttling for that attacker), and it prevents one shared pseudo-source such
  * as `"unknown"` from becoming a bucket that locks out every unattributable user.
  */
+/**
+ * Canonical dotted-quad, or `null`.
+ *
+ * Zero-padded octets are **rejected**, not rewritten (F-10): `010.001.001.001` is octal on some
+ * stacks and decimal on others, so accepting it would let one host present two different source
+ * keys — and the two would disagree about which address the throttle punished.
+ */
+function canonicalizeIpv4(value: string): string | null {
+  const match = IPV4_PATTERN.exec(value);
+  if (!match) return null;
+  const octets: number[] = [];
+  for (const raw of match.slice(1)) {
+    if (raw.length > 1 && raw.startsWith("0")) return null;
+    const octet = Number(raw);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    octets.push(octet);
+  }
+  return octets.join(".");
+}
+
+/**
+ * Emit an already-parsed IPv6 address in canonical text form (RFC 5952): lower-case hex, no
+ * leading zeros, and the longest run of all-zero groups (at least two) compressed to `::`.
+ * An embedded IPv4 tail is preserved as dotted-quad text, because that is the form operators
+ * read in logs and the form the existing test suite pins (`::ffff:203.0.113.7`).
+ */
+function emitIpv6(groups: number[], embeddedIpv4: string | null): string {
+  const hexGroups = embeddedIpv4 === null ? 8 : 6;
+  const hex = groups.slice(0, hexGroups).map((group) => group.toString(16));
+  const parts = embeddedIpv4 === null ? hex : [...hex, embeddedIpv4];
+
+  let bestStart = -1;
+  let bestLength = 0;
+  for (let i = 0; i < hexGroups; i += 1) {
+    if (groups[i] !== 0) continue;
+    let length = 0;
+    while (i + length < hexGroups && groups[i + length] === 0) length += 1;
+    if (length > bestLength) {
+      bestLength = length;
+      bestStart = i;
+    }
+    i += length - 1;
+  }
+  if (bestLength < 2) return parts.join(":");
+  return `${parts.slice(0, bestStart).join(":")}::${parts.slice(bestStart + bestLength).join(":")}`;
+}
+
+/**
+ * Strict IPv6 parse + canonicalisation, or `null` (F-10).
+ *
+ * The previous rule was "at least two colons and only hex/dot/colon characters", which accepted
+ * `:::`, `a:b:c`, `1:::1` and `....::`: a probe minted 5 000 distinct "source addresses" from
+ * 5 000 junk strings, and every one of them was a fresh per-source budget. Validation now
+ * requires the real grammar, and equivalent spellings (`2001:0db8:0000::0001`,
+ * `0:0:0:0:0:ffff:203.0.113.7`) collapse onto one key.
+ */
+function canonicalizeIpv6(value: string): string | null {
+  if (!/^[0-9a-f:.]+$/.test(value)) return null;
+  if (value.includes(":::")) return null;
+
+  let text = value;
+  let embeddedIpv4: string | null = null;
+  const lastColon = text.lastIndexOf(":");
+  if (lastColon !== -1 && text.slice(lastColon + 1).includes(".")) {
+    embeddedIpv4 = canonicalizeIpv4(text.slice(lastColon + 1));
+    if (embeddedIpv4 === null) return null;
+    // The embedded quad occupies the final two 16-bit groups.
+    text = `${text.slice(0, lastColon + 1)}0:0`;
+  }
+
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const parseSide = (side: string): string[] | null => {
+    if (side === "") return [];
+    const groups = side.split(":");
+    return groups.every((group) => /^[0-9a-f]{1,4}$/.test(group)) ? groups : null;
+  };
+  const head = parseSide(halves[0]);
+  const tail = halves.length === 2 ? parseSide(halves[1]) : [];
+  if (head === null || tail === null) return null;
+  if (halves.length === 1 ? head.length !== 8 : head.length + tail.length > 7) return null;
+
+  const fill = 8 - head.length - tail.length;
+  const groups = [...head, ...Array<string>(fill).fill("0"), ...tail].map((g) => Number.parseInt(g, 16));
+  if (groups.length !== 8 || groups.some((g) => !Number.isInteger(g) || g < 0 || g > 0xffff)) return null;
+  return emitIpv6(groups, embeddedIpv4);
+}
+
 export function normalizeLoginIp(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
   const candidate = value.trim().toLowerCase();
   if (!candidate || candidate === UNKNOWN_IP || candidate.length > IP_MAX_LENGTH) return null;
 
-  const ipv4 = IPV4_PATTERN.exec(candidate);
-  if (ipv4) {
-    return ipv4.slice(1).every((octet) => Number(octet) <= 255) ? candidate : null;
+  if (candidate.includes(".")) {
+    // Either a dotted quad or an IPv6 address with an embedded quad; both are handled below.
+    if (!candidate.includes(":")) return canonicalizeIpv4(candidate);
   }
-
-  // IPv6 (including IPv4-mapped ::ffff:192.0.2.1). Deliberately permissive about form
-  // but strict about the character set, so a header can never smuggle SQL or newline junk
-  // into the column.
-  const colons = candidate.split(":").length - 1;
-  if (colons >= 2 && /^[0-9a-f:.]+$/.test(candidate)) return candidate;
-
-  return null;
+  if (!candidate.includes(":")) return null;
+  return canonicalizeIpv6(candidate);
 }
 
 /**
@@ -263,12 +417,26 @@ function clientIpTrustedHops(): number {
  *      the `x-forwarded-for` chain (default 1 ⇒ rightmost ⇒ what the nearest trusted hop saw).
  *      Entries further left are closer to the client and are never consulted, not even when
  *      the trusted position holds junk.
- *   3. Only then the platform-set single-value headers: `x-vercel-forwarded-for` (consulted
- *      only when actually running on Vercel, where the platform writes it) and `x-real-ip`.
+ *   3. Only then `x-vercel-forwarded-for`, and only while `process.env.VERCEL === "1"` — the
+ *      marker the Vercel runtime itself sets, so the *provenance signal* is an environment
+ *      variable a client cannot write, never a header. An environment variable is still not
+ *      proof of provenance: a deployment that copies Vercel's variables onto another platform
+ *      would be trusting a client-writable header, which is why the operator-declared header in
+ *      step 1 is the recommended configuration and why this step is last.
  *
- * `null` is the safe outcome: `decide` then buckets by identifier alone
- * (`ip_address IS NULL`), which is *stricter* than a per-source budget, and `normalizeLoginIp`
- * keeps such values inside the `varchar(50)` column.
+ * There is deliberately **no step 4** (F-3). This function used to fall through to `x-real-ip`,
+ * which no platform in this deployment sets and which any client may send, so the chain ended
+ * on a client-writable header: a junk trusted position plus `x-real-ip: 203.0.113.66` returned
+ * the attacker's address, and so did a request with no `x-forwarded-for` at all — each forged
+ * value a fresh per-source budget, i.e. 15 guesses per account against unlimited accounts.
+ * Returning `null` instead costs nothing that matters: the per-account budgets still apply
+ * (see the F-8 note in the module header), and an operator whose edge really does set
+ * `x-real-ip` declares it with `EASY_LEARN_CLIENT_IP_HEADER=x-real-ip`, where it is used
+ * exclusively and is therefore a recorded decision.
+ *
+ * `null` is the safe outcome: `decide` then buckets by identifier alone (`ip_address IS NULL`),
+ * so every unattributable attempt against one account shares that account's 5-attempt budget,
+ * and `normalizeLoginIp` keeps such values inside the `varchar(50)` column.
  */
 export function getClientIp(request: Request): string | null {
   const headers = request.headers;
@@ -291,12 +459,16 @@ export function getClientIp(request: Request): string | null {
     }
   }
 
-  if (process.env.VERCEL) {
+  if (process.env.VERCEL === "1") {
     const vercelForwarded = normalizeLoginIp(headers.get("x-vercel-forwarded-for"));
     if (vercelForwarded) return vercelForwarded;
   }
 
-  return normalizeLoginIp(headers.get("x-real-ip"));
+  /* F-3: no `x-real-ip` fall-through. Every remaining header on a request is client-writable
+     unless this deployment's own edge sets it, and an edge that does is covered by
+     EASY_LEARN_CLIENT_IP_HEADER above. An unattributable source is a normal, fail-safe
+     outcome; a client-chosen source is not. */
+  return null;
 }
 
 // ── Counting ─────────────────────────────────────────────────────────────────────
@@ -487,16 +659,23 @@ function rateLimitUnavailable(error: unknown): RateLimitResult {
 }
 
 /**
- * Self-heal a missing `login_attempts` relation (drizzle/0012 never applied) so an
- * un-migrated database becomes *throttled* instead of unprotected. Returns false for
- * every other error — a dead connection must not trigger a second round of queries.
+ * Self-heal an unusable `login_attempts` relation so an un-migrated (or drifted) database
+ * becomes *throttled* instead of unprotected. Returns false for every other error — a dead
+ * connection must not trigger a second round of queries.
+ *
+ * **F-1:** a missing *column* is the same class of failure as a missing relation. The throttle
+ * reads `identifier`, `ip_address` and `created_at`, so a relation that exists without one of
+ * them cannot count anything, and the self-heal DDL is additive (`ADD COLUMN IF NOT EXISTS`),
+ * so it can put the column back. Before this, only `42P01` triggered a repair, which made a
+ * drifted column a permanent, invisible outage: every login answered 503 while `/api/health`
+ * answered 200 "Login and registration services are ready."
  */
 async function repairLoginAttemptSchema(error: unknown): Promise<boolean> {
-  if (!isMissingRelation(error)) return false;
+  if (!isMissingRelation(error) && !isMissingColumn(error)) return false;
   const status = await ensureLoginAttemptSchema();
   if (status.available) {
     console.warn(
-      `[rate-limit] login_attempts was missing; ${status.migration} has been auto-applied so login throttling stays active.`
+      `[rate-limit] login_attempts was missing or incomplete; ${status.migration} has been auto-applied so login throttling stays active.`
     );
   } else {
     console.error(
@@ -571,6 +750,31 @@ export async function checkLoginRateLimit(
 
 /** Advisory locks are keyed by bigint; a fixed seed maps the same text to the same lock. */
 const ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))";
+
+/** PostgreSQL `lock_not_available` — what F-5's bounded `lock_timeout` raises. */
+const LOCK_TIMEOUT_SQLSTATE = "55P03";
+
+/** Connection-class SQLSTATEs plus the socket errors `pg` surfaces without one. */
+const CONNECTION_ERROR_CODES = new Set([
+  "57P01", "57P02", "57P03", "57P04",
+  "08000", "08001", "08003", "08004", "08006", "08007", "08P01",
+  "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "ENOTFOUND", "UND_ERR_SOCKET",
+]);
+
+/**
+ * True when the *connection* (not the statement) is unusable, so the client must be destroyed
+ * rather than handed back to the pool. A SQL error — a missing column, a lock timeout, a
+ * constraint violation — leaves the connection perfectly usable.
+ */
+function isConnectionLevelError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && (CONNECTION_ERROR_CODES.has(code) || code.startsWith("08"))) return true;
+  const message = (error as { message?: unknown } | null)?.message;
+  return (
+    typeof message === "string" &&
+    /connection (terminated|lost|reset|closed)|server closed the connection|unexpected (end of file|message)|ECONNRESET|EPIPE/i.test(message)
+  );
+}
 const INSERT_ATTEMPT_SQL =
   "INSERT INTO login_attempts (identifier, ip_address) VALUES ($1, $2) RETURNING id";
 
@@ -593,8 +797,18 @@ const INSERT_ATTEMPT_SQL =
  * empty table and all got a real guess — measured at **30 concurrent wrong-password requests
  * from one IP producing 30 guesses against a budget of 5**. Because enforcement now happens
  * before the hash is computed, concurrency cannot buy extra guesses; the password check (the
- * expensive part, bcrypt cost 12) stays *outside* the transaction, so locks are held for two
- * short statements and never across a hash.
+ * expensive part, bcrypt cost 12) stays *outside* the transaction, so no lock is ever held
+ * across a hash.
+ *
+ * The honest cost, measured rather than described: the transaction is `BEGIN`, `SET LOCAL
+ * lock_timeout` (F-5), two advisory-lock statements, the `INSERT`, the windowed count and
+ * `COMMIT`/`ROLLBACK` — about seven short round trips, not the "two short statements" an
+ * earlier revision of this comment claimed. On a disposable local PostgreSQL that measured 3 ms
+ * per attempt against an empty table and 40 ms against 200 001 rows (the windowed count is the
+ * only part that grows, and finding L-R5's missing `(ip_address, created_at)` index is what
+ * makes it grow); 600 parallel wrong-password requests from one source completed in 2.2 s
+ * against the Production pool shape (`max: 2`) with exactly 5 guesses allowed, no deadlocks and
+ * `GET /api/health` answering 200 throughout.
  *
  * Two locks are taken, always in the same order — source, then account — so concurrent attempts
  * can never form a wait cycle. The source lock makes the per-source and (account, source)
@@ -624,12 +838,35 @@ export async function recordFailedLoginAttempt(
   let client: PoolClient | null = null;
   let outcome: LoginAttemptRecordResult;
   let repairCandidate: unknown = null;
+  let failure: unknown = null;
+  /** F-2: set by the client's own 'error' event while it is checked out to us. */
+  let clientError: Error | null = null;
+  let onClientError: ((error: Error) => void) | null = null;
 
   try {
     client = await pool.connect();
+    /* F-2. `pg-pool` detaches its idle listener the moment a client is checked out and only
+       re-attaches it on release, so the pool-level handler in `src/db/index.ts` cannot see
+       errors that arrive *during* this transaction. Without a listener of our own, a backend
+       termination (an administrator command, a pooler restart, a dropped socket) is an
+       unhandled 'error' event on an EventEmitter and Node takes the whole isolate down — which
+       on a serverless deployment means every in-flight request in it. */
+    onClientError = (error: Error) => {
+      clientError = error;
+      console.error(
+        "[rate-limit] PostgreSQL client error during login-throttle enforcement:",
+        inspectDbError(error).text
+      );
+    };
+    client.on("error", onClientError);
+
     const run: SqlRunner = (text, params) => client!.query(text, params);
 
     await client.query("BEGIN");
+    /* F-5: bound the lock wait. `SET LOCAL` is transaction-scoped, so this can never leak into
+       another request's use of the same pooled connection, and `loginLockTimeoutMs()` is a
+       clamped integer — there is no string to inject. */
+    await client.query(`SET LOCAL lock_timeout = ${loginLockTimeoutMs()}`);
     for (const key of lockKeys) await client.query(ADVISORY_LOCK_SQL, [key]);
 
     await run(INSERT_ATTEMPT_SQL, [primary, ip]);
@@ -644,6 +881,7 @@ export async function recordFailedLoginAttempt(
     }
   } catch (error) {
     repairCandidate = error;
+    failure = error;
     outcome = recordFailure(error);
     try {
       await client?.query("ROLLBACK");
@@ -651,7 +889,14 @@ export async function recordFailedLoginAttempt(
       // The connection is already unusable; releasing it below is what matters.
     }
   } finally {
-    client?.release();
+    if (client) {
+      if (onClientError) client.removeListener("error", onClientError);
+      /* Release *with* the error when the connection itself is broken: `pg-pool` then removes
+         and destroys the client instead of pooling a dead one. A statement-level error (a
+         missing column, a lock timeout) keeps the connection, which is what makes F-5 cheap. */
+      const broken = clientError !== null || isConnectionLevelError(failure);
+      client.release(broken ? (clientError ?? (failure as Error) ?? new Error("login throttle lost its connection")) : undefined);
+    }
     client = null;
   }
 
@@ -667,6 +912,17 @@ export async function recordFailedLoginAttempt(
 
 function recordFailure(error: unknown): LoginAttemptRecordResult {
   const reason = inspectDbError(error).text;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (code === LOCK_TIMEOUT_SQLSTATE) {
+    /* F-5: the lock wait was bounded and the bound was hit. This is contention, not a broken
+       schema: the login fails closed exactly like any other unevaluable attempt, the connection
+       is already back in the pool, and the operator sees why. */
+    console.error(
+      `[rate-limit] login-throttle lock wait exceeded ${loginLockTimeoutMs()}ms — FAILING CLOSED for this request:`,
+      reason
+    );
+    return { recorded: false, allowed: false, decision: unavailableDecision(), reason };
+  }
   console.error(
     "[rate-limit] could NOT record a failed login attempt — throttling is degraded for this request:",
     reason

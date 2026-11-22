@@ -912,12 +912,56 @@ is a **503**, never a pass. `Cache-Control: no-store` is set on every throttle r
    *appends* what it observed, so the rightmost entries are the trustworthy ones and the
    leftmost entry is the one the client wrote. If the trusted position holds junk, the result is
    `null` — it never scans left towards the attacker's value.
-3. `x-vercel-forwarded-for`, but only while `process.env.VERCEL` is set.
-4. `x-real-ip`.
+3. `x-vercel-forwarded-for`, but only when `process.env.VERCEL === "1"` — the exact marker Vercel
+   sets, so a request carrying `VERCEL=true` cannot claim platform provenance.
+
+**That is the end of the chain.** An earlier revision had a fourth step, `x-real-ip`. Finding
+**F-3** removed it: `x-real-ip` is an ordinary request header that any client can set on a direct
+request, and reading it *after* the trusted position had already been rejected meant the value the
+chain had just refused to trust decided the bucket anyway. Measured against the code that had it,
+five requests carrying `x-real-ip: 203.0.113.66` plus a forged `x-forwarded-for` prefix were
+attributed to the forged address and bought a fresh budget of five guesses each. A header the
+client can write is never platform provenance; if an operator's edge really does publish one,
+`EASY_LEARN_CLIENT_IP_HEADER` names it explicitly and it is then used exclusively.
+
+**Validation and canonicalisation (F-10).** An address is accepted only if it is a real address:
+IPv4 octets may not be zero-padded (`010.001.001.001` is rejected — a proxy that parses it as
+octal sees a different host than the throttle would), and IPv6 must parse as an address rather
+than merely consist of colons and hex digits (`:::`, `a:b:c`, `1:::1`, `....::` are all rejected).
+Accepted addresses are canonicalised before use — RFC 5952 for IPv6 (`2001:0db8:0000::0001` →
+`2001:db8::1`), dotted-quad for IPv4-mapped forms (`0:0:0:0:0:ffff:203.0.113.7` →
+`::ffff:203.0.113.7`) — because the address is a bucket key and a storage value, and one address
+spelled two ways is two buckets.
 
 `null` is a normal outcome, not an error: it means the source budgets cannot be applied, and the
 account budgets still are. This module cannot use the CSRF module's "refuse forwarded headers
 entirely" answer (§4) — a route handler has no socket address to fall back to.
+
+**F-9 — the hop count is a lockout decision, not just an attribution one.** The default of one
+trusted hop is correct for a single honest proxy. Put a second appending proxy in front of it —
+Cloudflare in front of Vercel is the realistic case, and a Cloudflare WAF rate rule on
+`/api/auth/login` is already recommended in the roadmap — and the rightmost entry becomes the
+*edge's* address, shared by every visitor. Two consequences at the shipped constants:
+
+* five attacker guesses from that shared address exhaust the `(identifier, source)` pair budget,
+  so the **account owner is locked out** of their own account by somebody else's guessing — the
+  exact harm §11 exists to prevent;
+* 40 guesses from it trip `MAX_ATTEMPTS_PER_IP` and every user behind that edge is **locked out**
+  for `IP_BLOCK_MINUTES`, correct passwords included.
+
+So the hop count and any edge rate-limiting must be decided together: raise
+`EASY_LEARN_CLIENT_IP_TRUSTED_HOPS` to `2`, or set
+`EASY_LEARN_CLIENT_IP_HEADER=x-vercel-forwarded-for`, and record the choice. Setting that header
+is the single change that removes the class, because nothing is then unattributable. This is an
+owner-side decision — the code cannot see the real edge, and no repository-side test can settle
+it.
+
+**F-8 — and unattributable traffic is *less* volume-limited, not more.** With `null` as the
+source neither source budget applies, so only the per-account limits remain: four accounts from
+one unattributable source absorbed **60** guesses before any refusal, where the same four from an
+attributed source are capped at **40**. A single global bucket for unattributable traffic was
+considered and rejected — one shared counter is the same denial-of-service shape as H-1, since
+whoever can make traffic unattributable could then exhaust it for everybody.
 
 Before this, the leftmost valid entry was used, so behind any appending proxy a client chose its
 own bucket: forged addresses kept the per-source budgets from ever filling, and 15 requests
@@ -931,6 +975,7 @@ job in one transaction:
 
 ```
 BEGIN
+  SET LOCAL lock_timeout = <bound>         -- F-5: transaction-scoped, cannot leak to another request
   pg_advisory_xact_lock(hash(source))      -- or hash(identifier) when the source is unknown
   pg_advisory_xact_lock(hash(account))     -- always in this order, so no wait cycle
   INSERT the attempt
@@ -941,9 +986,32 @@ BEGIN
 
 Counting the in-flight row is compensated for in `decide`, so the observable limits are
 unchanged: 5 guesses, and the 6th refused. bcrypt stays outside the transaction, so locks are
-held for two short statements and never across a hash; the connection is released before the
-optional self-heal and the expired-row prune, because Production allows the pool only two
-connections.
+never held across a hash; the connection is released before the optional self-heal and the
+expired-row prune, because Production allows the pool only two connections. The transaction is
+**seven statements** — `BEGIN`, `SET LOCAL lock_timeout`, the two advisory locks, the `INSERT`,
+the windowed count and the `COMMIT`/`ROLLBACK` — so the locks are held across the last three.
+
+**F-5 — the lock wait is bounded, and the bound fails closed.** `pg_advisory_xact_lock` waits
+forever by default. With the Production pool at two connections that was measured to be an
+application-wide outage, not a login problem: two logins wedged on a lock held elsewhere consumed
+both connections, `GET /api/health` answered **503** and a bare `pool.query('SELECT 1')` errored.
+`lock_timeout` now bounds the wait — `EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS`, default **2000 ms**,
+clamped to 250–10000, non-numeric junk falling back to the default rather than being silently
+ignored, and injected as an integer so there is no string to escape. `SET LOCAL` keeps it
+transaction-scoped. SQLSTATE `55P03` is treated as contention rather than a broken schema: the
+login fails closed with **503** and `Retry-After`, the connection returns to the pool at once, and
+no advisory lock survives the request.
+
+**F-2 — the checked-out client has its own `error` listener.** `pg-pool` detaches its idle
+listener the moment a client is checked out and re-attaches it only on release, so a backend
+termination *during* the transaction (an administrator command, a pooler restart, a dropped
+socket) was an unhandled `'error'` event — Node takes the whole isolate down, which on a
+serverless deployment means every in-flight request in it. Measured: killing the backend with
+`pg_terminate_backend` crashed the probe process. The enforcement path now listens for the whole
+lifetime of the checkout, removes its listener before releasing, and releases *with* the error
+when the connection is broken so `pg-pool` destroys it instead of pooling a dead client. A
+statement-level error (a missing column, a lock timeout) keeps the connection, which is what makes
+the F-5 bound cheap.
 
 Measured: **25 concurrent wrong-password requests from one source now yield exactly 5 guesses
 and 20 refusals**; the same code before the fix yielded **25 guesses**. A 24-request spray

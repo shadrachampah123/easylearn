@@ -11,9 +11,15 @@
  *   1. missing users.session_version + AUTO_SCHEMA_REPAIR=false
  *      → GET /api/health answers 503, ok:false, and names the migration;
  *   2. missing users.session_version + repair enabled (default)
- *      → still 200 (the next authenticated request self-heals the idempotent
- *      DDL — a read-only probe cannot know whether the role may run it), but
- *      the response names the drift in optionalMigrations/migrationWarnings;
+ *      → 503 as well (changed 2026-11-19 by independent review finding F-4).
+ *      This used to answer 200 ok:true on the reasoning that the next
+ *      authenticated request would self-heal the column. Measured instead:
+ *      no login touches users.session_version, so nothing ever attempted a
+ *      repair, nothing recorded a failure, and the endpoint answered
+ *      "Login and registration services are ready." indefinitely while token
+ *      verification was failing closed. "Repair is enabled" is a promise about
+ *      the future; this endpoint answers whether the service works now. The
+ *      drift is still named in optionalMigrations/migrationWarnings;
  *   3. column present + AUTO_SCHEMA_REPAIR=false
  *      → healthy 200 (behaviour preserved when the schema is healthy).
  *
@@ -132,11 +138,15 @@ async function main() {
       assert.strictEqual(body.checks.optionalMigrations.session_revocation, false);
     });
 
-    await test("missing column + repair enabled: health stays 200 but reports the drift", async () => {
+    await test("F-4: missing column + repair enabled: health answers 503 and reports the drift", async () => {
+      /* The assertion below was 200/ok:true before review finding F-4 — see the header. A
+         security-critical feature that is missing NOW is unhealthy whatever the repair
+         settings say, because the code path that needs it fails closed in the meantime. */
       delete process.env.AUTO_SCHEMA_REPAIR;
       const { status, body } = await call();
-      assert.strictEqual(status, 200, `expected 200, got ${status}`);
-      assert.strictEqual(body.ok, true, "ok stays true while repair can self-heal the column");
+      assert.strictEqual(status, 503, `a missing session_version is not "ready", got ${status}`);
+      assert.strictEqual(body.ok, false, "ok must not be true while token verification fails closed");
+      assert.match(body.message, /session revocation/i, "message must still name session revocation");
       assert.strictEqual(body.checks.optionalMigrations.session_revocation, false, "the drift must be reported, not hidden");
       assert(
         body.checks.migrationWarnings.some((warning) => warning.includes("0019_session_revocation.sql")),
