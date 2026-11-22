@@ -781,8 +781,8 @@ noise on direct navigation only, not on an `<img>` in a page.
 | Object storage, against a **real** S3-compatible server | `tests/object-storage-live.test.ts` | The full round trip (presign → PUT → `GET /api/files/<id>` → 307 → the store serves the object) against a real S3 API server and a real PostgreSQL; that the store **applies** the signed content type, disposition and private cache directive; that the store **cannot** apply `nosniff` or a CSP and **rejects** any `response-*` override outside the S3-documented set; that the presigned URL is a bearer credential; and that the application refuses an object whose bytes do not match its key, an object over the size limit, and an object that no longer exists. **Its stated limits:** the store is `s3rver`, not AWS S3, and it does **not** verify SigV4 signatures — so the suite says nothing about whether a forged signature would be accepted by a real store (§7, "What has and has not been verified against the storage provider"). |
 | Uploaded-file tenant attribution | `tests/tenant-file-attribution-db.test.ts` | One school, multiple schools, unauthorized users, cross-school access, the delete route, membership revocation, the legacy `NULL school_id` fallback and the per-file submission rules — each against the real route handlers. |
 | Membership and session | `tests/membership-auth-db.test.ts` | The login flow, the school-selection flow and the session, read from the cookie the way a browser does, and asserting that the response body carries no token. |
-| Login throttling, policy (no database) | `tests/login-rate-limit-policy.test.ts` | Source attribution (**M-R1**): a forged leftmost `x-forwarded-for` prefix is never attributed, junk at the trusted position does not fall back towards the client, the trusted-hop count is configurable and clamped, a declared platform header is used exclusively, and `x-vercel-forwarded-for` is only consulted on Vercel. Also: IP normalization (the original fail-open vector), the shape of the fail-closed decision, the structural invariants behind atomic enforcement (**M-R2**) and alias budgets (**M-R3**), the H-R1 DELETE scope, and the health escalation for a blocked repair (**M-R4a**). |
-| Login throttling, against a real database | `tests/login-rate-limit-db.test.ts` | The real route handler against a disposable PostgreSQL: per-source and per-account budgets, an attacker cannot lock an administrator out, unattributable sources are throttled rather than exempt, self-heal and fail-closed behaviour, the H-R1 reset oracle, **25 concurrent wrong passwords from one source yielding exactly 5 guesses** (M-R2), a 24-request parallel spray yielding exactly the 15-failure account backstop, **email and username sharing one budget** (M-R3), and `/api/health` answering **503** when repair is enabled but fails (M-R4a). |
+| Login throttling, policy (no database) | `tests/login-rate-limit-policy.test.ts` | Source attribution (**M-R1**): a forged leftmost `x-forwarded-for` prefix is never attributed, junk at the trusted position does not fall back towards the client, the trusted-hop count is configurable and clamped, a declared platform header is used exclusively, and `x-vercel-forwarded-for` is only consulted on Vercel. Also: IP normalization (the original fail-open vector), the shape of the fail-closed decision, the structural invariants behind atomic enforcement (**M-R2**) and alias budgets (**M-R3**), the H-R1 DELETE scope, the health escalation for a blocked repair (**M-R4a**), the executed `login_attempts` repair order and its idempotency (**F-1a**), and the shape of the identity transaction — bounded advisory lock, membership inside it, bcrypt outside it, no compensating delete (**F-6a**). |
+| Login throttling, against a real database | `tests/login-rate-limit-db.test.ts` | The real route handler against a disposable PostgreSQL: per-source and per-account budgets, an attacker cannot lock an administrator out, unattributable sources are throttled rather than exempt, self-heal and fail-closed behaviour, the H-R1 reset oracle, **25 concurrent wrong passwords from one source yielding exactly 5 guesses** (M-R2), a 24-request parallel spray yielding exactly the 15-failure account backstop, **email and username sharing one budget** (M-R3), `/api/health` answering **503** when repair is enabled but fails (M-R4a), a repair pass that restores **every required column and all four indexes** after each of them is dropped independently plus its own idempotency (F-1a), and **exactly one holder** of a contested email/username string under two-request and eight-request concurrent creation, with no advisory lock left behind (F-6a). |
 | The existing suites | `tests/security.test.js`, `tests/tenant-*.test.ts`, `tests/membership-*.test.ts`, … | The tenant isolation and authorization boundaries are unchanged. |
 
 The `test:auth-security` script runs the first four suites on their own, and
@@ -1052,6 +1052,79 @@ public response stays a fixed string naming the migration, because the endpoint 
 unauthenticated (finding L-4). A later successful repair clears the ledger, so health recovers
 without a restart.
 
+### Repair order (F-1a): the self-heal must build a table before it indexes it
+
+`ALTER TABLE … DROP COLUMN` also drops every index that depends on the column, and
+`ensureSchemaFeature` **logs and skips** a statement that fails rather than aborting the feature.
+The repair list for `login_attempts` therefore runs strictly *relation → columns → indexes*: a
+statement may only depend on statements before it.
+
+The list shipped in the wrong order first, and the effect was silent. On a drifted table the four
+`CREATE INDEX` statements ran before the three additive `ADD COLUMN` repairs, so they referenced
+columns that did not exist yet, failed with 42703 and were skipped; the columns were restored
+afterwards. The columns-mode probe then reported the feature **available**, and because it was
+available the repair never ran again — the table stayed "healthy" with 1, 2 or 3 of its four indexes
+permanently missing, with no error, no health signal and no ledger entry:
+
+| Column dropped | Indexes PostgreSQL took with it | Left missing permanently |
+| --- | --- | --- |
+| `identifier` | `identifier_idx`, `identifier_created_at_idx` | **2** |
+| `ip_address` | `ip_created_at_idx` | **1** |
+| `created_at` | `created_at_idx`, `identifier_created_at_idx`, `ip_created_at_idx` | **3** |
+
+All eight statements are `IF NOT EXISTS`, so the corrected list is re-runnable against a healthy
+table with rows in it — nothing is dropped, rewritten, or built `CONCURRENTLY` (that cannot run
+inside a transaction, and it is unnecessary while a failing repair already makes logins fail
+closed). The tests drop each column independently, assert first that PostgreSQL really did take the
+dependent indexes with it, then require **all three columns and all four indexes** after one repair
+pass, and pin the executed statement order so a future reordering is a test failure rather than a
+silent regression.
+
+### One identity, one holder (F-6a): uniqueness across two columns, atomically
+
+An account is reachable by **email and by username**, so a string may be one account's username and
+another's email — and the login throttle counts them as one bucket (§ M-R3). The route answers 400
+when the two are supplied inconsistently and 409 when the contested string is already held.
+
+Rejecting the request is the easy half; deciding it **atomically** is not. The first
+implementation ran separate `SELECT`s and then `INSERT`ed, with bcrypt cost 12 (~250 ms) in
+between. Measured with two opposing concurrent requests — one creating `email = X`, the other a
+learner whose generated username is the same string `X` — **both answered 201 and both accounts
+existed**. An eight-way burst produced six unmapped **500**s from the same-column unique-index
+violation.
+
+The check is now inside one transaction, in the database:
+
+```
+BEGIN
+  SET LOCAL lock_timeout = 5000                       -- bounded, transaction-scoped
+  SELECT pg_advisory_xact_lock(hash('easylearn:login-identity'))
+  … uniqueness reads, username generation, the INSERT, the school membership …
+COMMIT                                                -- the lock dies with the transaction
+```
+
+bcrypt runs **before** the transaction, so the lock covers a handful of short statements. The
+membership write is inside the same transaction, so its compensating `DELETE FROM users` is gone —
+a rollback cannot fail the way a compensating delete can. A lock timeout (`55P03`) or deadlock
+(`40P01`) is classified and answered with a retryable **503** and nothing written.
+
+One namespace key is used rather than a key per identifier, deliberately: the generated username is
+not known until the uniqueness reads have run, and those reads must themselves be inside the lock,
+so a per-identifier design has to lock in two phases and two transactions can acquire overlapping
+key sets in opposite order — a deadlock cycle traded for concurrency on an authenticated,
+school-admin-only path. `SERIALIZABLE` isolation was the alternative and was not chosen: it needs a
+retry loop, its aborts are probabilistic rather than prevented, and it would abort every genuinely
+concurrent creation. Cross-column uniqueness is inexpressible without an expression index over
+`COALESCE(email, username)`, which is a Production migration — not authorised here. The invariant
+therefore remains **application-enforced**: a direct `INSERT`/`UPDATE` against the database can
+still create a colliding pair.
+
+Measured: three rounds of two concurrent opposing creations, plus an eight-way burst at
+`NODE_ENV=production` with a two-connection pool, sampling `/api/health` and `SELECT 1` throughout
+— the contested string is held by **exactly one** account across both columns, no cross-column
+collision survives anywhere in the table, the loser lost coherently (409 on the email side, a
+suffixed username on the other), and no advisory lock outlives the requests.
+
 ### What is still not verified
 
 - **Automatic repair has never been observed running in Production** (risk 6d). Production
@@ -1062,6 +1135,16 @@ without a restart.
 - `MAX_IDENTIFIERS_PER_IP = 10` can throttle a whole school NAT for the window when ten
   different people mistype passwords (finding L-R2); no test pins the acceptable blast radius.
 - The `(ip_address, created_at)` index exists only in the self-heal DDL, never on a normally
-  migrated database (finding L-R5).
+  migrated database (finding L-R5). A repair pass creates all four indexes, but a table missing
+  **only** an index does not trigger a repair: the probe reports availability from the columns the
+  throttle reads, and demanding that index would answer 503 for a healthy Production database that
+  legitimately lacks it.
+- **Email-versus-username uniqueness is application-enforced** (finding F-6a). The advisory-lock
+  transaction covers account creation through `POST /api/users`; a direct database write is not
+  covered, because expressing the invariant in a constraint needs an expression index — an
+  unapproved Production migration. Every creation in a deployment serialises on that one lock, so a
+  bulk-import feature would need a different design. `src/app/api/seed/route.ts` also inserts users
+  without taking the lock; it answers 404 in Production, requires `super_admin` and only seeds an
+  empty database, so it is not a Production collision path.
 - Full source IPs are written to the log and to `login_attempts.ip_address` (finding I-R1),
   which matters once log shipping (H-2) exists.

@@ -790,6 +790,175 @@ async function main() {
     );
   });
 
+  /* ── 12. F-1 follow-up: the self-heal must restore columns BEFORE it builds indexes ──
+
+     `ALTER TABLE ... DROP COLUMN` drops every index that depends on the column, and
+     `ensureSchemaFeature` logs and SKIPS a statement that fails instead of aborting. With the
+     four `CREATE INDEX` statements listed before the three additive `ADD COLUMN` repairs — the
+     order this shipped in — a drifted table came back with its columns but only some of its
+     indexes: the index build failed with 42703, was skipped, and because the columns-mode probe
+     then reported the feature AVAILABLE the repair never ran again. Silent, permanent index
+     loss on exactly the table the throttle counts. This asserts the order of the list that is
+     actually executed, not the order it appears in a comment. */
+
+  await test("F-1 follow-up: every login_attempts index is built after every column repair", async () => {
+    const resilience = await import("@/lib/schema-resilience");
+    const statements = resilience.FEATURE_SQL.login_attempts;
+    const kindOf = (statement: string) =>
+      /^\s*CREATE TABLE/i.test(statement)
+        ? "table"
+        : /^\s*ALTER TABLE/i.test(statement)
+          ? "column"
+          : /^\s*CREATE INDEX/i.test(statement)
+            ? "index"
+            : "other";
+    const kinds = statements.map(kindOf);
+
+    assert.strictEqual(statements.length, 8, "the ledger total the health probe and the tests report");
+    assert.deepStrictEqual(
+      kinds.filter((kind) => kind === "other"),
+      [],
+      `every statement must be a table, column or index statement: ${kinds.join(" -> ")}`
+    );
+    assert.strictEqual(kinds[0], "table", "the relation must be created first");
+    assert.strictEqual(kinds.filter((kind) => kind === "column").length, 3, "identifier, ip_address, created_at");
+    assert.strictEqual(kinds.filter((kind) => kind === "index").length, 4, "all four indexes");
+
+    const lastColumn = kinds.lastIndexOf("column");
+    const firstIndex = kinds.indexOf("index");
+    assert(
+      firstIndex > lastColumn,
+      `no index may be attempted before the column repairs: ${kinds.join(" -> ")}`
+    );
+
+    /* And per index: whichever of the three repaired columns it references, it must come after
+       that column's ADD COLUMN — that is the ordering the failure actually depended on. */
+    const columnIndex: Record<string, number> = {};
+    statements.forEach((statement, index) => {
+      const match = /ADD COLUMN IF NOT EXISTS "(\w+)"/.exec(statement);
+      if (match) columnIndex[match[1]] = index;
+    });
+    for (const [name, position] of Object.entries(columnIndex)) {
+      assert(typeof position === "number", `${name} must be repaired by the list`);
+    }
+    statements.forEach((statement, index) => {
+      if (kindOf(statement) !== "index") return;
+      for (const column of Object.keys(columnIndex)) {
+        if (!statement.includes(`"${column}"`)) continue;
+        assert(
+          index > columnIndex[column],
+          `statement ${index} indexes "${column}" but that column is only repaired at ${columnIndex[column]}`
+        );
+      }
+    });
+  });
+
+  await test("F-1 follow-up: the repair list is re-runnable and can never destroy anything", async () => {
+    /* Asserted on the executed list rather than on the source text: a comment that happens to
+       contain the phrase would otherwise satisfy a text-based count. */
+    const resilience = await import("@/lib/schema-resilience");
+    const statements = resilience.FEATURE_SQL.login_attempts;
+    for (const statement of statements) {
+      const head = statement.trim().slice(0, 70);
+      assert(/IF NOT EXISTS/i.test(statement), `every statement must be idempotent: ${head}`);
+      assert(!/DROP\s+(TABLE|COLUMN|INDEX|CONSTRAINT)/i.test(statement), `the repair must never drop anything: ${head}`);
+      assert(!/TRUNCATE|DELETE\s+FROM/i.test(statement), `and must never remove data: ${head}`);
+      assert(
+        !/CONCURRENTLY/i.test(statement),
+        `no CONCURRENTLY: it cannot run inside a transaction and is not needed while logins already fail closed: ${head}`
+      );
+    }
+    /* The ordering contract has to stay documented where the list lives, or the next person to
+       add a statement puts it back in the wrong place. */
+    assert(
+      readFile("src/lib/schema-resilience.ts").includes("ORDERING IS LOAD-BEARING"),
+      "the ordering requirement must be documented next to the list"
+    );
+  });
+
+  /* ── 13. F-6 follow-up: the cross-column identity check must be atomic ──────────────
+
+     Separate SELECTs then an INSERT is check-then-act, and the window was ~250 ms wide because
+     bcrypt cost 12 ran between the checks and the insert. The fix serialises the whole
+     check-generate-insert-membership sequence on one transaction-scoped advisory lock. These
+     pins hold the shape: if the lock, the bound or the transaction go, the race comes back and
+     only the concurrent database test would notice — too late and too rarely. */
+
+  await test("F-6 follow-up: user creation takes the identity lock inside one transaction", () => {
+    const route = readFile("src/app/api/users/route.ts");
+    assert(route.includes("db.transaction("), "the checks and the insert must share one transaction");
+    assert(
+      route.includes("pg_advisory_xact_lock(hashtextextended("),
+      "the transaction must serialise on a PostgreSQL advisory lock"
+    );
+    assert(
+      route.includes("LOGIN_IDENTITY_LOCK_NAMESPACE"),
+      "and the lock key must be the shared identity namespace, not an ad-hoc string"
+    );
+    assert(
+      route.includes("SET LOCAL lock_timeout"),
+      "the wait must be bounded and transaction-scoped, so a stuck creation cannot hold a pooled connection"
+    );
+    assert(
+      /await tx\s*\.insert\(users\)/.test(route),
+      "the account must be written through the transaction, not the pool"
+    );
+    assert(
+      !/await db\s*\n?\s*\.insert\(users\)/.test(route),
+      "no part of the creation may insert outside the transaction"
+    );
+    assert(
+      route.includes("addSchoolMembership(\n          { schoolId: ctx.schoolId, userId: newUser.id, role },\n          tx\n        )") ||
+        /addSchoolMembership\([\s\S]{0,200}?,\s*tx\s*\)/.test(route),
+      "the membership must be written in the same transaction, so a failure rolls the account back"
+    );
+    assert(
+      !route.includes("db.delete(users)"),
+      "the compensating DELETE is gone: rollback replaces it"
+    );
+
+    /* bcrypt outside the lock. This is the ordering that makes the lock cheap AND the ordering
+       whose absence made the old race window hundreds of milliseconds wide. */
+    const hashAt = route.indexOf("await hashPassword(password)");
+    const transactionAt = route.indexOf("db.transaction(");
+    assert(hashAt > 0 && transactionAt > 0, "both calls must exist");
+    assert(
+      hashAt < transactionAt,
+      "bcrypt must run BEFORE the transaction, never inside the lock"
+    );
+    /* The uniqueness reads must run AFTER the lock is taken. */
+    const lockAt = route.indexOf("pg_advisory_xact_lock");
+    const existsAt = route.indexOf("const identifierExists");
+    assert(lockAt > 0 && existsAt > 0, "both the lock and the check must exist");
+    assert(existsAt > lockAt, "no uniqueness check may run before the lock is held");
+  });
+
+  await test("F-6 follow-up: the identity lock is bounded, named and its errors are classified", async () => {
+    const identity = await import("@/lib/login-identity");
+    assert.strictEqual(
+      identity.LOGIN_IDENTITY_LOCK_NAMESPACE,
+      "easylearn:login-identity",
+      "one namespace key: per-identifier locking would need two phases and could form a wait cycle"
+    );
+    assert.strictEqual(identity.LOGIN_IDENTITY_LOCK_TIMEOUT_MS, 5000, "the wait is bounded at five seconds");
+    assert.strictEqual(identity.LOCK_TIMEOUT_SQLSTATE, "55P03");
+    assert.strictEqual(identity.DEADLOCK_SQLSTATE, "40P01");
+    assert.strictEqual(
+      identity.isIdentityLockTimeout({ code: "55P03" }),
+      true,
+      "a direct lock_timeout error must be recognised"
+    );
+    assert.strictEqual(
+      identity.isIdentityLockTimeout({ cause: { code: "55P03" } }),
+      true,
+      "and one wrapped by the driver/or layer"
+    );
+    assert.strictEqual(identity.isIdentityLockTimeout({ code: "23505" }), false, "a unique violation is not a lock timeout");
+    assert.strictEqual(identity.isIdentityLockTimeout(null), false, "nor is a null error");
+    assert.strictEqual(identity.isIdentityDeadlock({ code: "40P01" }), true);
+    assert.strictEqual(identity.isIdentityDeadlock({ code: "55P03" }), false);
+  });
+
   console.log(`\n📊 Results: ${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exitCode = 1;
 }

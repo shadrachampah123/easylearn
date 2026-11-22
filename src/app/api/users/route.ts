@@ -7,8 +7,13 @@ import { eq, sql, ilike, or, desc } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
 import {
   findLoginAliasCollision,
+  isIdentityDeadlock,
+  isIdentityLockTimeout,
   isValidLoginEmail,
+  LOGIN_IDENTITY_LOCK_NAMESPACE,
+  LOGIN_IDENTITY_LOCK_TIMEOUT_MS,
   loginAliasCollisionMessage,
+  type LoginAliasCollision,
 } from "@/lib/login-identity";
 import {
   addSchoolMembership,
@@ -196,105 +201,180 @@ export async function POST(request: NextRequest) {
     }
 
     const baseUsername = (firstName.charAt(0).toLowerCase() + lastName.toLowerCase().replace(/\s+/g, ""));
-    let generatedUsername = baseUsername;
-    let suffix = 1;
+    const normalizedEmail =
+      typeof email === "string" && email.trim().length > 0 ? email.trim().toLowerCase() : null;
 
-    const identifierExists = async (column: "email" | "username", identifier: string) => {
-      const rows = await db
-        .select({ id: users.id })
-        .from(users)
-        .where(column === "email" ? eq(users.email, identifier) : eq(users.username, identifier))
-        .limit(1);
-      return rows.length > 0;
-    };
-
-    /* F-6: a generated username must be unique in BOTH columns. It was only checked against
-       `users.username`, so a generated username that happened to be an existing account's email
-       created two accounts the login throttle cannot tell apart. */
-    const usernameIsTaken = async (candidate: string) =>
-      (await identifierExists("username", candidate)) ||
-      (await findLoginAliasCollision(identifierExists, { username: candidate })) !== null;
-
-    try {
-      let guard = 0;
-      while ((await usernameIsTaken(generatedUsername)) && guard < 1000) {
-        generatedUsername = `${baseUsername}${suffix}`;
-        suffix++;
-        guard++;
-      }
-    } catch (err) {
-      console.error("Username check error:", err);
-      generatedUsername = `${baseUsername}${Date.now().toString().slice(-4)}`;
-    }
-
-    if (email) {
-      const existingEmail = await db
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.email, email.toLowerCase()))
-        .limit(1);
-
-      if (existingEmail.length > 0) {
-        return errorResponse("Email already registered");
-      }
-    }
-
-    /* F-6: the other direction — the supplied email must not already be some account's
-       username. Measured before this guard: signing in to an account whose email equalled a
-       second account's username erased the second account's four recorded failures to zero,
-       because `clearFailedLoginAttempts` releases every alias string of the account that
-       authenticated. 409 rather than 400 because it is a conflict with existing state. */
-    const aliasCollision = await findLoginAliasCollision(identifierExists, {
-      email: email ?? null,
-      username: generatedUsername,
-    });
-    if (aliasCollision) {
-      return errorResponse(loginAliasCollisionMessage(aliasCollision), 409);
-    }
-
+    /* bcrypt cost 12 costs a couple of hundred milliseconds, so it is deliberately OUTSIDE the
+       transaction below: the identity lock has to be held for as few statements as possible and
+       the hash does not depend on anything the lock protects. In the pre-fix code this same call
+       sat BETWEEN the uniqueness checks and the INSERT, which is what made the check-then-act
+       race hundreds of milliseconds wide instead of microseconds (F-6 follow-up). */
     const passwordHash = await hashPassword(password);
 
-    const [newUser] = await db
-      .insert(users)
-      .values({
-        email: email ? email.toLowerCase() : null,
-        username: generatedUsername,
-        passwordHash,
-        firstName,
-        lastName,
-        role: role as ValidRole,
-        phone: phone || null,
-        gender: gender || null,
-        isActive: true,
-        emailVerified: email ? false : true,
-      })
-      .returning({
-        id: users.id,
-        username: users.username,
-        email: users.email,
-        firstName: users.firstName,
-        lastName: users.lastName,
-        role: users.role,
-        isActive: users.isActive,
+    /** Thrown to roll the transaction back for an outcome that is normal and gets mapped below. */
+    class IdentityRollback extends Error {}
+
+    type IdentityOutcome =
+      | {
+          kind: "created";
+          user: {
+            id: string;
+            username: string | null;
+            email: string | null;
+            firstName: string;
+            lastName: string;
+            role: string;
+            isActive: boolean;
+          };
+        }
+      | { kind: "duplicate-email" }
+      | { kind: "collision"; collision: LoginAliasCollision }
+      | { kind: "membership-failed" };
+
+    /* Returned from the transaction rather than assigned inside it: a `let` written from a
+       closure is narrowed to `null` by TypeScript's control-flow analysis at the read site.
+       The pre-insert refusals return normally (they commit an empty transaction, which only
+       releases the lock); the one case that HAS written a row — a failed membership — throws,
+       so the account is rolled back instead of being compensating-deleted. */
+    let outcome: IdentityOutcome = { kind: "membership-failed" };
+
+    try {
+      /* F-6 follow-up: the cross-column uniqueness check is now ATOMIC. Separate SELECTs
+         followed by an INSERT let two concurrent creations both read "no conflict" and both
+         commit — measured with two opposing requests (one creating `email = X`, the other
+         creating an account whose generated `username = X`): both accounts were created and the
+         collision survived, which is exactly the state this guard exists to prevent, because two
+         accounts sharing one identifier string share one login-throttle budget and a successful
+         sign-in to one releases the other's recorded failures.
+
+         The schema cannot express the constraint (`users.email` and `users.username` have
+         separate unique indexes, so cross-column uniqueness would need an expression index — a
+         Production migration this work is not authorised to add), so the check is serialised in
+         the database instead: one transaction-scoped advisory lock over the whole
+         check-generate-insert-membership sequence. See src/lib/login-identity.ts for why one
+         namespace key rather than a key per identifier, and why not SERIALIZABLE. */
+      outcome = await db.transaction(async (tx): Promise<IdentityOutcome> => {
+        /* Bounded, and transaction-scoped so it can never leak into another request's use of the
+           same pooled connection. The constant is an integer interpolated into the statement
+           because `SET` does not accept a bind parameter; there is no string to inject. */
+        await tx.execute(sql.raw(`SET LOCAL lock_timeout = ${LOGIN_IDENTITY_LOCK_TIMEOUT_MS}`));
+        await tx.execute(
+          sql`SELECT pg_advisory_xact_lock(hashtextextended(${LOGIN_IDENTITY_LOCK_NAMESPACE}::text, 0))`
+        );
+
+        const identifierExists = async (column: "email" | "username", identifier: string) => {
+          const rows = await tx
+            .select({ id: users.id })
+            .from(users)
+            .where(column === "email" ? eq(users.email, identifier) : eq(users.username, identifier))
+            .limit(1);
+          return rows.length > 0;
+        };
+
+        /* F-6: a generated username must be unique in BOTH columns. It was only checked against
+           `users.username`, so a generated username that happened to be an existing account's
+           email created two accounts the login throttle cannot tell apart. */
+        const usernameIsTaken = async (candidate: string) =>
+          (await identifierExists("username", candidate)) ||
+          (await findLoginAliasCollision(identifierExists, { username: candidate })) !== null;
+
+        /* Inside the lock, so the candidate this transaction chooses cannot be taken by a
+           concurrent creation between the check and the INSERT. The old timestamp-suffix fallback
+           on error is gone on purpose: swallowing a database error inside a transaction would
+           continue on a possibly aborted transaction, and it never helped anyway — the INSERT
+           below names the `username` column, so a missing column fails there regardless. */
+        let generatedUsername = baseUsername;
+        let suffix = 1;
+        let guard = 0;
+        while ((await usernameIsTaken(generatedUsername)) && guard < 1000) {
+          generatedUsername = `${baseUsername}${suffix}`;
+          suffix++;
+          guard++;
+        }
+
+        if (normalizedEmail && (await identifierExists("email", normalizedEmail))) {
+          return { kind: "duplicate-email" as const };
+        }
+
+        /* F-6: the other direction — the supplied email must not already be some account's
+           username. Measured before this guard: signing in to an account whose email equalled a
+           second account's username erased the second account's four recorded failures to zero,
+           because `clearFailedLoginAttempts` releases every alias string of the account that
+           authenticated. 409 rather than 400 because it is a conflict with existing state. */
+        const collision = await findLoginAliasCollision(identifierExists, {
+          email: normalizedEmail,
+          username: generatedUsername,
+        });
+        if (collision) return { kind: "collision" as const, collision };
+
+        const [newUser] = await tx
+          .insert(users)
+          .values({
+            email: normalizedEmail,
+            username: generatedUsername,
+            passwordHash,
+            firstName,
+            lastName,
+            role: role as ValidRole,
+            phone: phone || null,
+            gender: gender || null,
+            isActive: true,
+            emailVerified: normalizedEmail ? false : true,
+          })
+          .returning({
+            id: users.id,
+            username: users.username,
+            email: users.email,
+            firstName: users.firstName,
+            lastName: users.lastName,
+            role: users.role,
+            isActive: users.isActive,
+          });
+
+        if (!newUser) throw new IdentityRollback();
+
+        /* Phase 2C: the new account is made a member of the CALLER'S school (never a
+           client-supplied one) so membership stays the single source of truth for school
+           context. Inside the same transaction now, so a failure rolls the account back instead
+           of needing a compensating DELETE — an account with an identity and no school is a
+           silent lockout, and a compensating delete could itself fail and leave that state. */
+        const membership = await addSchoolMembership(
+          { schoolId: ctx.schoolId, userId: newUser.id, role },
+          tx
+        );
+        if (!membership) throw new IdentityRollback();
+
+        return { kind: "created" as const, user: newUser };
       });
+    } catch (error) {
+      if (error instanceof IdentityRollback) {
+        outcome = { kind: "membership-failed" };
+      } else if (isIdentityLockTimeout(error) || isIdentityDeadlock(error)) {
+        /* Bounded on purpose: a stuck creation must not be able to hold one of the two
+           Production connections, or every other creation, indefinitely. Nothing was written. */
+        console.error(
+          `[users] could not take the login-identity lock within ${LOGIN_IDENTITY_LOCK_TIMEOUT_MS}ms — refusing this creation, nothing was written`
+        );
+        return errorResponse(
+          "Another account is being created right now. Please retry in a moment.",
+          503
+        );
+      } else {
+        throw error;
+      }
+    }
 
-    /* Phase 2C: the new account is made a member of the CALLER'S school (never a
-       client-supplied one) so membership stays the single source of truth for school
-       context. A failure here rolls the account back rather than leaving a user with an
-       identity and no school — that state would be a silent lockout. */
-    const membership = await addSchoolMembership({
-      schoolId: ctx.schoolId,
-      userId: newUser.id,
-      role,
-    });
-
-    if (!membership) {
-      await db.delete(users).where(eq(users.id, newUser.id));
+    if (outcome.kind === "duplicate-email") return errorResponse("Email already registered");
+    if (outcome.kind === "collision") {
+      return errorResponse(loginAliasCollisionMessage(outcome.collision), 409);
+    }
+    if (outcome.kind !== "created") {
       return errorResponse(
         "The account could not be added to your school. Please retry.",
         503
       );
     }
+    const newUser = outcome.user;
 
     await logActivity({
       schoolId: ctx.schoolId,

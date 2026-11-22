@@ -1326,6 +1326,355 @@ async function main() {
       assert.strictEqual(rows, 0, "no account may hold another account's username as its email");
     });
 
+    /* ── 11. F-1 follow-up: a drifted table must come back with ALL FOUR indexes ────────
+
+       `ALTER TABLE ... DROP COLUMN` also drops every index that depends on the column, and
+       the repair list runs in order, skipping (not aborting on) a statement that fails. With
+       the indexes listed BEFORE the additive column repairs — the order this shipped in —
+       dropping `ip_address` made `login_attempts_ip_created_at_idx` fail with 42703 and be
+       skipped, the ALTERs after it restored the column, the columns-mode probe then reported
+       the feature AVAILABLE, and because it was available the repair never ran again. The
+       table came back with three of its four indexes and nothing would ever notice: the
+       per-source count degrades to a sequential scan (finding L-R5 measured 3 ms empty vs
+       40 ms at 200 001 rows) with no error, no log line and no health signal. */
+
+    const REQUIRED_INDEXES = [
+      "login_attempts_identifier_idx",
+      "login_attempts_created_at_idx",
+      "login_attempts_identifier_created_at_idx",
+      "login_attempts_ip_created_at_idx",
+    ];
+
+    async function loginAttemptColumns(): Promise<string[]> {
+      return (
+        await db.query(
+          `SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'login_attempts' ORDER BY column_name`
+        )
+      ).rows.map((row: { column_name: string }) => row.column_name);
+    }
+
+    async function loginAttemptIndexes(): Promise<string[]> {
+      return (
+        await db.query(
+          `SELECT indexname FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'login_attempts' ORDER BY indexname`
+        )
+      ).rows.map((row: { indexname: string }) => row.indexname);
+    }
+
+    for (const dropped of ["identifier", "ip_address", "created_at"] as const) {
+      await test(`F-1: dropping ${dropped} takes its indexes with it and the repair restores all four`, async () => {
+        await reset();
+        delete process.env.AUTO_SCHEMA_REPAIR;
+        await db.query(`ALTER TABLE login_attempts DROP COLUMN ${dropped}`);
+        resilience.resetSchemaFeatureCache();
+
+        /* Establish the premise: PostgreSQL dropped the dependent indexes with the column, so
+           there is something for the repair to put back. Without this the assertion below could
+           pass vacuously. */
+        const afterDrop = await loginAttemptIndexes();
+        const lost = REQUIRED_INDEXES.filter((index) => !afterDrop.includes(index));
+        assert(
+          lost.length > 0,
+          `dropping ${dropped} must have taken at least one required index with it, found ${afterDrop.join(", ")}`
+        );
+
+        /* Trigger the repair through the real path: one login attempt. The pre-check and the
+           recorder both raise 42703, and either is enough to run the self-heal. */
+        const login = await POST(loginRequest(wrongPassword, DRIFT_IP));
+        assert.strictEqual(login.status, 401, `the throttle must be live again after the repair, got ${login.status}`);
+
+        const columns = await loginAttemptColumns();
+        for (const expected of ["created_at", "id", "identifier", "ip_address"]) {
+          assert(columns.includes(expected), `the repair must restore ${expected} (found ${columns.join(", ")})`);
+        }
+        const indexes = await loginAttemptIndexes();
+        for (const expected of REQUIRED_INDEXES) {
+          assert(
+            indexes.includes(expected),
+            `the repair must recreate ${expected} on a DRIFTED table, not only on a new one ` +
+              `(dropped ${dropped}; lost ${lost.join(", ")}; found ${indexes.join(", ")})`
+          );
+        }
+        assert.strictEqual(
+          resilience.getSchemaRepairFailure("login_attempts"),
+          null,
+          "a repair that delivered every column and index must not be recorded as failed"
+        );
+        const health = await healthBody();
+        assert.strictEqual(health.status, 200, `health must recover, got ${health.status}`);
+        assert.strictEqual(health.body.ok, true);
+        assert.strictEqual(await attemptRows(), 1, "the attempt that triggered the repair must be recorded");
+      });
+    }
+
+    await test("F-1: the repair DDL is idempotent — a second and third pass change nothing", async () => {
+      await reset();
+      await seedFailure(ADMIN_EMAIL, OWNER_IP);
+      const columnsBefore = await loginAttemptColumns();
+      const indexesBefore = await loginAttemptIndexes();
+
+      /* Executed directly, twice, against an already-healthy table: every statement must be
+         re-runnable, must not rewrite or drop anything, and must not touch data. */
+      for (let pass = 1; pass <= 2; pass += 1) {
+        for (const statement of resilience.FEATURE_SQL.login_attempts) {
+          await db.query(statement);
+        }
+      }
+      assert.deepStrictEqual(await loginAttemptColumns(), columnsBefore, "columns must be unchanged");
+      assert.deepStrictEqual(await loginAttemptIndexes(), indexesBefore, "indexes must be unchanged");
+      for (const expected of REQUIRED_INDEXES) {
+        assert(indexesBefore.includes(expected), `${expected} must still exist (found ${indexesBefore.join(", ")})`);
+      }
+      assert.strictEqual(await attemptRows(), 1, "re-running the repair must not touch recorded attempts");
+
+      /* And through the real entry point: two consecutive ensure calls, cache cleared between
+         them so the second one really probes again. */
+      resilience.resetSchemaFeatureCache();
+      const first = await resilience.ensureLoginAttemptSchema();
+      resilience.resetSchemaFeatureCache();
+      const second = await resilience.ensureLoginAttemptSchema();
+      assert.strictEqual(first.available, true, "the first ensure must report the feature available");
+      assert.strictEqual(second.available, true, "and so must the second");
+      assert.strictEqual(resilience.getSchemaRepairFailure("login_attempts"), null, "no failure may be recorded");
+      assert.strictEqual(await attemptRows(), 1);
+    });
+
+    /* ── 12. F-6 follow-up: the cross-column check must survive concurrency ──────────────
+
+       Separate SELECTs followed by an INSERT is a check-then-act race, and the window was not
+       microseconds: the route hashed the password (bcrypt cost 12, ~250 ms) BETWEEN the checks
+       and the insert. Two opposing creations — one taking `email = X`, the other taking
+       `username = X` — could each read "no conflict" and each commit, leaving two accounts that
+       share one login-throttle bucket, where signing in to one releases the other's recorded
+       failures. The repair is a transaction-scoped advisory lock over the whole
+       check-generate-insert-membership sequence, so the second creation reads the first one's
+       committed rows. */
+
+    await test("F-6: two concurrent opposing creations leave the identity held by exactly one account", async () => {
+      const slugSafe = DB_NAME.replace(/[^a-z0-9-]/g, "-");
+      const school = (
+        await db.query(
+          `INSERT INTO schools (name, short_name, slug) VALUES ($1, 'F6C', $2) RETURNING id`,
+          [`Duel School ${DB_NAME}`, `duel-${slugSafe}`]
+        )
+      ).rows[0].id as string;
+      const adminRow = (
+        await db.query(
+          `INSERT INTO users (email, password_hash, role, first_name, last_name, is_active)
+           VALUES ($1, $2, 'school_admin', 'Duel', 'Admin', true) RETURNING id, session_version`,
+          [`duel-admin-${DB_NAME}@school.test`, await bcrypt.hash("Duel-Admin-1!", 4)]
+        )
+      ).rows[0] as { id: string; session_version: number };
+      await db.query(
+        `INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1, $2, 'school_admin', 'active')`,
+        [school, adminRow.id]
+      );
+      const token = await auth.createToken({
+        userId: adminRow.id,
+        role: "school_admin",
+        email: `duel-admin-${DB_NAME}@school.test`,
+        schoolId: school,
+        sessionVersion: Number(adminRow.session_version ?? 0),
+      });
+      const { POST: createUsers } = await import("@/app/api/users/route");
+      const createUser = (payload: Record<string, unknown>) =>
+        createUsers(
+          new NextRequest("http://localhost/api/users", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify(payload),
+          })
+        );
+
+      /** Nobody may hold the same string in both columns, anywhere in the table. */
+      async function crossColumnCollisions(): Promise<number> {
+        return Number(
+          (
+            await db.query(
+              `SELECT count(*)::int AS count
+                 FROM users a JOIN users b ON b.id <> a.id AND lower(b.username) = lower(a.email)
+                WHERE a.email IS NOT NULL`
+            )
+          ).rows[0].count
+        );
+      }
+
+      assert.strictEqual(await crossColumnCollisions(), 0, "the fixtures themselves must start collision-free");
+
+      /* Three rounds, each with its own contested string, because a race is probabilistic: one
+         clean round proves little. Round shape — request A creates `email = X`; request B is a
+         learner whose generated username (first initial + last name) is the SAME string X. */
+      for (let round = 1; round <= 3; round += 1) {
+        const identity = `duel-${slugSafe}-r${round}@school.test`;
+        const [byEmail, byUsername] = await Promise.all([
+          createUser({
+            email: identity,
+            password: "Duel-Email-1!",
+            firstName: "D",
+            lastName: `Uel${round}`,
+            role: "teacher",
+          }),
+          createUser({
+            password: "Duel-Name-1!",
+            firstName: "d",
+            lastName: `uel-${slugSafe}-r${round}@school.test`,
+            role: "learner",
+          }),
+        ]);
+
+        for (const [label, response] of [["email", byEmail], ["username", byUsername]] as const) {
+          assert(
+            response.status === 201 || response.status === 200 || response.status === 409,
+            `the ${label} creation must be accepted or refused as a conflict, got ${response.status}`
+          );
+        }
+
+        const holders = (
+          await db.query(
+            `SELECT count(*) FILTER (WHERE lower(email) = lower($1))::int AS as_email,
+                    count(*) FILTER (WHERE lower(username) = lower($1))::int AS as_username
+               FROM users`,
+            [identity]
+          )
+        ).rows[0] as { as_email: number; as_username: number };
+        assert.strictEqual(
+          holders.as_email + holders.as_username,
+          1,
+          `exactly one account may hold ${identity} across BOTH columns ` +
+            `(email=${holders.as_email}, username=${holders.as_username}, ` +
+            `statuses=${byEmail.status}/${byUsername.status})`
+        );
+        assert.strictEqual(await crossColumnCollisions(), 0, "no cross-column collision may survive the round");
+
+        /* Whichever request lost must have lost COHERENTLY: the username side skips to a
+           suffixed candidate (201 with a different username), the email side is refused (409). */
+        if (holders.as_email === 1) {
+          assert.strictEqual(
+            byEmail.status,
+            201,
+            `the email side holds the identity, so it must be the one that succeeded, got ${byEmail.status}`
+          );
+          const generated: string[] = (
+            await db.query(`SELECT username FROM users WHERE lower(username) LIKE $1 ORDER BY username`, [
+              `${identity}%`,
+            ])
+          ).rows.map((row: { username: string }) => row.username);
+          assert(
+            generated.every((username) => username !== identity),
+            `the losing side must not have taken the contested username, found ${generated.join(", ")}`
+          );
+        } else {
+          assert.strictEqual(
+            byEmail.status,
+            409,
+            `the username side holds the identity, so the email side must be refused as a conflict, got ${byEmail.status}`
+          );
+        }
+      }
+    });
+
+    await test("F-6: a burst of concurrent creations never produces a shared identity", async () => {
+      /* Wider net: eight concurrent requests, four taking the string as an email and four as a
+         generated username. Under the pre-fix code this reliably produced several colliding
+         pairs, because every request cleared its checks before any of them inserted. */
+      const slugSafe = DB_NAME.replace(/[^a-z0-9-]/g, "-");
+      const identity = `burst-${slugSafe}@school.test`;
+      const school = (
+        await db.query(
+          `INSERT INTO schools (name, short_name, slug) VALUES ($1, 'F6B', $2) RETURNING id`,
+          [`Burst School ${DB_NAME}`, `burst-${slugSafe}`]
+        )
+      ).rows[0].id as string;
+      const adminRow = (
+        await db.query(
+          `INSERT INTO users (email, password_hash, role, first_name, last_name, is_active)
+           VALUES ($1, $2, 'school_admin', 'Burst', 'Admin', true) RETURNING id, session_version`,
+          [`burst-admin-${DB_NAME}@school.test`, await bcrypt.hash("Burst-Admin-1!", 4)]
+        )
+      ).rows[0] as { id: string; session_version: number };
+      await db.query(
+        `INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1, $2, 'school_admin', 'active')`,
+        [school, adminRow.id]
+      );
+      const token = await auth.createToken({
+        userId: adminRow.id,
+        role: "school_admin",
+        email: `burst-admin-${DB_NAME}@school.test`,
+        schoolId: school,
+        sessionVersion: Number(adminRow.session_version ?? 0),
+      });
+      const { POST: createUsers } = await import("@/app/api/users/route");
+      const createUser = (payload: Record<string, unknown>) =>
+        createUsers(
+          new NextRequest("http://localhost/api/users", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify(payload),
+          })
+        );
+
+      const responses = await Promise.all([
+        ...Array.from({ length: 4 }, (_, index) =>
+          createUser({
+            email: identity,
+            password: "Burst-Email-1!",
+            firstName: "B",
+            lastName: `urst${index}`,
+            role: "teacher",
+          })
+        ),
+        ...Array.from({ length: 4 }, (_, index) =>
+          createUser({
+            password: "Burst-Name-1!",
+            firstName: "b",
+            /* All four ask for the same generated username, so this also exercises the
+               same-column skip under the lock: one takes it, the rest are suffixed. */
+            lastName: `urst-${slugSafe}@school.test`,
+            role: "learner",
+          })
+        ),
+      ]);
+      const statuses = responses.map((response) => response.status);
+      for (const status of statuses) {
+        assert(
+          status === 201 || status === 200 || status === 409 || status === 400,
+          `every concurrent creation must end in a mapped outcome, got ${status} (${statuses.join(", ")})`
+        );
+      }
+      const holders = Number(
+        (
+          await db.query(
+            `SELECT (count(*) FILTER (WHERE lower(email) = lower($1))
+                   + count(*) FILTER (WHERE lower(username) = lower($1)))::int AS count FROM users`,
+            [identity]
+          )
+        ).rows[0].count
+      );
+      assert.strictEqual(holders, 1, `exactly one account may hold ${identity}, found ${holders} (${statuses.join(", ")})`);
+      const collisions = Number(
+        (
+          await db.query(
+            `SELECT count(*)::int AS count
+               FROM users a JOIN users b ON b.id <> a.id AND lower(b.username) = lower(a.email)
+              WHERE a.email IS NOT NULL`
+          )
+        ).rows[0].count
+      );
+      assert.strictEqual(collisions, 0, `no cross-column collision may survive a burst, found ${collisions}`);
+      const locks = Number(
+        (
+          await db.query(
+            `SELECT count(*)::int AS count FROM pg_locks
+              WHERE locktype = 'advisory'
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`
+          )
+        ).rows[0].count
+      );
+      assert.strictEqual(locks, 0, "the identity lock is transaction-scoped, so none may outlive the requests");
+    });
+
     /* Restore the table so cleanup and any later suite state stay conventional. */
     delete process.env.AUTO_SCHEMA_REPAIR;
     resilience.resetSchemaFeatureCache();

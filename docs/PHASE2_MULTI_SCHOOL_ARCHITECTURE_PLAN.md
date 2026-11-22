@@ -356,6 +356,153 @@ change that: the fixes were written by the same author as the code they correct,
 independent security review of the whole set is required before merge. Because `main` is the
 production branch, merging PR #69 is expected to deploy it to Production.
 
+### Follow-up review of PR #69 (2026-11-22) — F-1a repair ordering, F-6a atomic identity
+
+The F-1…F-10 remediation at `5863052` was re-reviewed, and **two defects survived inside the fixes
+themselves**. Both were invisible to a green CI: every suite passed at `5863052` with both present.
+Each is recorded with the measurement that found it.
+
+**F-1a (Medium) — the self-heal silently lost indexes on a drifted table.** `ALTER TABLE … DROP
+COLUMN` also drops every index that depends on the column, and `ensureSchemaFeature` logs and
+**skips** a statement that fails rather than aborting the feature. The repair list ran `CREATE
+TABLE`, then the four `CREATE INDEX` statements, and only *then* the three additive `ADD COLUMN`
+repairs — so on a drifted table the index builds referenced columns that did not exist yet, failed
+with 42703, were skipped, and the columns were restored afterwards. The columns-mode probe then
+reported the feature **available**, and because it was available the repair never ran again.
+Measured on a disposable database against `5863052` (indexes present after the repair, out of the
+four required):
+
+| Column dropped | Indexes PostgreSQL took with it | Left missing **permanently** after the repair |
+| --- | --- | --- |
+| `identifier` | `identifier_idx`, `identifier_created_at_idx` | **2** — only `created_at_idx` and `ip_created_at_idx` came back |
+| `ip_address` | `ip_created_at_idx` | **1** — `ip_created_at_idx` never came back |
+| `created_at` | `created_at_idx`, `identifier_created_at_idx`, `ip_created_at_idx` | **3** — only `identifier_idx` came back |
+
+No error, no health signal, no ledger entry: the table was "available" with a silently degraded
+count query, which is finding L-R5's 3 ms → 40 ms penalty arriving without anybody deciding it.
+**Fixed** by reordering the list to *relation → columns → indexes* and documenting the ordering as
+load-bearing where the list lives (a statement may only depend on the ones before it). All eight
+statements are `IF NOT EXISTS`, so the list stays re-runnable; nothing drops or rewrites anything,
+and no `CONCURRENTLY` (it cannot run inside a transaction and is not needed while logins already
+fail closed). `FEATURE_SQL` is now exported read-only so the tests assert the order of the list that
+is *executed*, not the order it appears in a comment.
+
+**F-6a (Medium) — the cross-column identity check was a check-then-act race.** The F-6 guard ran
+separate `SELECT`s and then `INSERT`ed, with **bcrypt cost 12 (~250 ms) in between**, so the window
+was hundreds of milliseconds wide. Measured against `5863052` with two opposing concurrent requests
+— one creating `email = X`, the other a learner whose generated username (first initial + last name)
+is the same string `X`: **both answered 201 and both accounts existed**, i.e. `email=1, username=1,
+2 !== 1`. That is precisely the state the guard exists to prevent: two accounts sharing one
+login-throttle bucket, where signing in to one releases the other's recorded failures. A wider burst
+was worse — eight concurrent creations returned `(201, 500, 500, 500, 500, 201, 500, 500)`: the
+same-column race surfaced as an **unmapped 500** from the unique-index violation instead of a
+skipped username.
+
+**Fixed** by making the whole sequence atomic in the database, without a migration (an expression
+index over `COALESCE(email, username)` would need one, and Production migrations are not authorised
+here):
+
+```
+BEGIN
+  SET LOCAL lock_timeout = 5000                       -- bounded, transaction-scoped
+  SELECT pg_advisory_xact_lock(hash('easylearn:login-identity'))
+  … every uniqueness read, the username generation, the INSERT, the membership …
+COMMIT                                                -- the lock dies with the transaction
+```
+
+bcrypt runs **before** the transaction, so the lock covers a handful of short statements. The
+membership write moved inside the same transaction, which also removes the compensating
+`DELETE FROM users` — a rollback cannot fail the way a compensating delete can. A lock timeout or a
+deadlock is classified (`55P03` / `40P01`) and answered with a retryable **503**; nothing is
+written. **One namespace key rather than a key per identifier**, deliberately: the generated
+username is not known until the uniqueness reads have run and those reads must themselves be inside
+the lock, so a per-identifier design has to lock in two phases (base candidate, then chosen
+candidate plus email) and two transactions can acquire overlapping key sets in opposite order — a
+deadlock cycle traded for concurrency on an authenticated, school-admin-only path. `SERIALIZABLE`
+isolation was the alternative and was not chosen: it needs a retry loop, its aborts are
+probabilistic rather than prevented, and it would abort every genuinely concurrent creation.
+
+**Verification (round four).** Same environment shape as before, all `EASY_LEARN_REQUIRE_*` flags
+set: **15/15 CI-mirror steps `EXIT=0`** — `npm audit --omit=dev` 0 vulnerabilities, `npm test`
+(11 suites, **392 assertions, 0 failed**, policy suite **42**), `test:db` (**24 invocations**, 87 s,
+0 failures — login-rate-limit database suite **41**, Production-pool suite **9**), tenant/auth/
+mutation/integration/integrity suites unchanged and green, `typecheck`, `build`, `lint`.
+
+| Suite | `5863052` | this commit |
+| --- | --- | --- |
+| `login-rate-limit-policy` | 38 | **42** |
+| `login-rate-limit-db` | 35 | **41** |
+| `production-pool-throttle-db` | 8 | **9** |
+
+New assertions: for each of `identifier`, `ip_address` and `created_at` — drop the column
+independently, establish that PostgreSQL took the dependent indexes with it (so the test cannot pass
+vacuously), trigger the repair through a real login, then require **all three columns and all four
+indexes**, a clear repair ledger, health 200 and the triggering attempt recorded; the repair list
+executed twice more against a healthy table with a row in it, asserting nothing changes and no data
+is touched; the order of the executed list asserted statement by statement (every index after every
+column repair it references); three rounds of two concurrent opposing creations plus an eight-way
+burst, asserting the contested string is held by **exactly one** account across both columns, that
+no cross-column collision survives anywhere in the table, that the loser lost *coherently* (409 on
+the email side, a suffixed username on the other), and that no advisory lock outlives the requests —
+the burst also runs at `NODE_ENV=production` / `max: 2`, sampling `/api/health` and `SELECT 1`
+throughout.
+
+**Negative controls (one file reverted at a time, so each finding is isolated):**
+
+| Control | Reverted | Result |
+| --- | --- | --- |
+| NC-A | `src/lib/schema-resilience.ts` only (indexes-first order restored; the `FEATURE_SQL` export kept so the difference under test is the *order*) | database suite **37/4** — all three drop-column scenarios fail with the exact index that never came back, plus the idempotency test; policy suite **40/2** |
+| NC-B | `src/app/api/users/route.ts` only (check-then-insert restored) | database suite **39/2** — `email=1, username=1, statuses=201/201` and the burst's unmapped 500s; Production-pool suite **8/1** — `got 500 (201, 500, 500, 201, 500, 500)`; policy suite **41/1** |
+
+**Mutation harness — 8 targeted regressions of the two fixes, all 8 detected:**
+
+| Mutation | What it undoes | Verdict | Suite results |
+| --- | --- | --- | --- |
+| MUT-G1 | repair list reordered, indexes before the column repairs | detected | policy 41/1 · db 37/4 |
+| MUT-G2 | the `ip_address` column repair removed | detected | policy 40/2 · db suite aborts on its own teardown guard ("the throttle table must exist again") — the table can never be repaired |
+| MUT-G3 | the identity advisory lock removed | detected | policy 41/1 · db 39/2 |
+| MUT-G4 | `SET LOCAL lock_timeout` removed from the identity transaction | detected | policy 41/1 |
+| MUT-G5 | bcrypt moved inside the lock | detected | policy 41/1 |
+| MUT-G6 | the account inserted on the pool instead of the transaction | detected | policy 41/1 · **db 41/0** |
+| MUT-G7 | `isIdentityLockTimeout` always false | detected | policy 41/1 |
+| MUT-G8 | the membership moved back out of the transaction | detected | policy 41/1 |
+
+Two honest notes. **MUT-G6 passes the database suite**: with the lock still held, a pool-level
+insert is still serialised against other creations, so the concurrency tests cannot tell the
+difference — what is lost is the atomic rollback of account + membership, which only the source pin
+catches. **MUT-G5 is a performance regression, not a correctness one**, and is likewise caught only
+by the pin. Both are recorded rather than presented as behavioural kills.
+
+**A defect found in the new test code itself, and fixed.** The Production-pool suite's liveness
+sampler stopped only on the success path, so a FAILED assertion inside the sampled block left the
+sampler looping forever and the process never exited: measured, the NC-B run **hung for 900 s**
+instead of reporting `8 passed, 1 failed`. In CI that would have consumed the whole job timeout and
+reported nothing. The sampler now stops in a `finally`; NC-B re-run afterwards finished in 12 s with
+the failure correctly reported.
+
+**Remaining limitations after this round:**
+
+1. The identity invariant is still **application-enforced**. A direct `INSERT`/`UPDATE` against the
+   database can create a colliding pair, because cross-column uniqueness is inexpressible without an
+   expression index — a Production migration, which this work is not authorised to add. Recorded as
+   the F-6 residual in the register above.
+2. Every account creation in a deployment serialises on one advisory lock. The path is
+   authenticated, school-admin-only and low-volume, the lock covers a handful of statements, and the
+   wait is bounded at 5 s with a retryable 503 — but a bulk-import feature would need a different
+   design (batch inside one transaction, or the expression index above).
+3. `src/app/api/seed/route.ts` also inserts users and does **not** take the identity lock. It
+   answers 404 whenever `NODE_ENV=production`, requires `super_admin`, and only seeds an empty
+   database inside its own transaction, so it is not a Production collision path; it is recorded
+   here so the omission is a decision rather than an oversight.
+4. A table missing **only** an index still does not trigger a repair, by design: the probe reports
+   availability from the columns the throttle reads, and requiring `login_attempts_ip_created_at_idx`
+   in the probe would answer 503 for a healthy Production database that legitimately lacks it
+   (L-R5). The repair creates all four indexes whenever it *does* run.
+5. **L-R5 is unchanged and still open**: a healthy Production table still has no
+   `(ip_address, created_at)` index. That needs the reviewed, gated migration, not this list.
+6. Everything else in the F-register stands: F-9 and the F-8 residual remain operator decisions,
+   L-R1, L-R2, H-2 and the Task C register are untouched.
+
 ## Current progress dashboard — 2026-11-19 production status
 
 | Phase | Estimated completion | Status | Main work still outstanding |
@@ -383,6 +530,7 @@ production branch, merging PR #69 is expected to deploy it to Production.
 - **2026-11-19 — PR #69 independently security-reviewed: verdict FAIL, one HIGH finding (H-R1).** The review did not accept the implementation's own claims or the green CI status: all 13 changed files were compared against `main`, the runtime behaviour was re-measured with probe scripts against a disposable database driving the real login handler, and the full CI sequence was re-run locally. It found that the successful-login reset deleted every failure row sharing the source IP, so one valid low-privilege credential could repeatedly erase an attacker's accumulated failures against other accounts (108 unthrottled guesses over three sign-in cycles in the probe) — and that the PR's own test asserted that behaviour as correct. Full register: M-R1, M-R2, M-R3, M-R4 (merge gate), L-R1…L-R5, I-R1…I-R5.
 - **2026-11-19 — H-R1 fixed in code on the same PR branch.** `clearFailedLoginAttempts` is now identifier-scoped and can never widen its DELETE by source IP; the vulnerable assertion was **reversed** and a route-level regression test added (database suite 19 → 20 assertions). Both new tests were validated against the vulnerable code — they fail there with `3 insider sign-ins must release at most one budget of 5 guesses, got 12` and pass 20/20 on the fix. The full local CI mirror was re-run afterwards. **PR #69 remains unmerged and unapproved: an independent security re-review is required before merge, and the M-R4 Production check is a merge gate.** No production connection, deployment, migration, setting change, or backup operation was performed.
 - **2026-11-19 — M-R4 answered by Production evidence; M-R1, M-R2, M-R3 and M-R4a fixed in code on the same PR branch.** An authorized operator ran the read-only M-R4 check against the Production runtime database (this sandbox has no path to Production and none was created): `public.login_attempts` exists, the effective role is `neondb_owner`, `has_schema_privilege(current_user, 'public', 'CREATE')` and `USAGE` are both `true`, and `AUTO_SCHEMA_REPAIR` is absent from the Vercel Production environment — which the code's only parser treats as **enabled**. M-R4 is therefore recorded as **substantially resolved**, keeping the qualification that **actual runtime repair has never been exercised in Production**. Investigating it produced a new finding, **M-R4a**: `/api/health` answered 200 "Login and registration services are ready" whenever repair was merely *enabled*, even with repair broken, while every login answered 503. All four code findings are now fixed — a declared client-IP trust position (`EASY_LEARN_CLIENT_IP_HEADER`, `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS`, rightmost-trusted-hop), advisory-locked insert-then-decide enforcement before the password is verified, one account budget shared by every alias, and a `repairBlocked` health escalation backed by a read-only privilege probe and a repair-failure ledger. Both login-throttle suites grew 20 → **27** assertions; every new test was validated against `5b8fbd1`, where the database suite fails 6 (25 of 25 concurrent guesses allowed, 24 of 24 sprayed, aliases never sharing a budget, health **200**) and the policy suite fails 9. The full 13-step local CI mirror was re-run: every step `EXIT=0`, `0 vulnerabilities`, `✓ Compiled successfully`. **PR #69 remains unmerged and unapproved — an independent security re-review of the whole set is required.** No production connection, deployment, migration, `drizzle-kit push`, environment-variable change, database-permission change, or backup operation was performed.
+- **2026-11-22 — PR #69 follow-up review: two defects inside the F-1…F-10 fixes themselves, both now fixed.** Re-reviewing `5863052` found that the `login_attempts` self-heal listed its four `CREATE INDEX` statements *before* the three additive `ADD COLUMN` repairs, and since `ALTER TABLE … DROP COLUMN` takes the dependent indexes with it while `ensureSchemaFeature` skips (not aborts on) a failing statement, a drifted table came back "available" with 1, 2 or 3 of its four indexes permanently missing — no error, no health signal, no ledger entry (**F-1a**). It also found that the F-6 cross-column identity guard was check-then-act with bcrypt cost 12 (~250 ms) between the checks and the insert: two opposing concurrent creations both answered **201** and both accounts existed, and an eight-way burst returned six unmapped **500**s (**F-6a**). Fixes: the repair list is reordered relation → columns → indexes with the ordering documented as load-bearing and `FEATURE_SQL` exported read-only so tests pin the executed order; account creation now runs its checks, username generation, insert and membership inside one transaction behind a bounded (`SET LOCAL lock_timeout = 5000`) transaction-scoped advisory lock on a single identity namespace, with bcrypt outside the lock and the compensating `DELETE` replaced by rollback. Evidence: policy suite 38 → **42**, login database suite 35 → **41**, Production-pool suite 8 → **9** (the burst also runs at `max: 2`); one-file-at-a-time negative controls give db **37/4** and **39/2** plus Production-pool **8/1**; an 8-mutation harness detects all 8, with two recorded as caught only by source pins; the 15-step CI mirror is green end to end. A defect in the new test code was found and fixed on the way — a failed liveness assertion left the sampler looping so the suite hung for 900 s instead of reporting the failure. **PR #69 remains unmerged and unapproved; a fresh independent security review is still required.** No production connection, deployment, migration, `drizzle-kit push`, environment-variable change, database-permission change, or backup operation was performed.
 - **2026-11-19 — PR #69 reviewed a second time: verdict FAIL again (F-1…F-11); all ten code-and-documentation findings now fixed on the same branch.** The second independent review re-measured `e4c7b41` rather than trusting it, and found one HIGH: a **drifted column** on `login_attempts` was a permanent, invisible login outage — every sign-in answered 503 while `/api/health` answered **200 `ok:true` "Login and registration services are ready."**, because the probe asked only whether the relation existed, the self-heal contained no `ALTER`, and M-R4a's escalation needed a failed repair that nothing ever attempted. Also found: no `'error'` listener on the checked-out client (a `pg_terminate_backend` **killed the isolate**); an attribution chain that ended on client-writable `x-real-ip`; an **unbounded** advisory-lock wait that, at the Production pool of two connections, took `GET /api/health` and a bare pool query down with it; `session_revocation` false-green; a probe error producing `ok:true` next to a `false` flag in the same body; cross-account alias collisions erasing another account's recorded failures; IPv6 "validation" that accepted `:::` and minted 5000 distinct source keys from 5000 junk inputs; and two documentation claims that measured the opposite of what they said. Fixes: a **columns-mode** probe plus a `SECURITY_CRITICAL_FEATURES` escalation on *missing or unverifiable*, three additive column repairs, a checked-out-client error listener with a destroying release, the `x-real-ip` fallback **deleted** and the Vercel marker made exact, `SET LOCAL lock_timeout` (`EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS`, default 2000, clamped) failing closed on `55P03`, `src/lib/login-identity.ts` with 400/409 guards at `POST /api/users`, a retrievable probe-failure cause, and strict-plus-canonical IP parsing. Evidence: policy suite **38** assertions, login database suite **35**, and a new `tests/production-pool-throttle-db.test.ts` (**8**) that sets `NODE_ENV=production` and asserts the pool really is `max: 2` before measuring the budgets, the bounded lock wait and the killed backend in the shape that ships. Run against a pristine `e4c7b41` the same tests fail **14**, **10** and **crash the process** respectively; a 21-mutation harness detects 19 (two documentation survivors recorded and explained). The 15-step local CI mirror is green end to end. **PR #69 remains unmerged and unapproved — a fresh independent security review is required, and this round does not change that: the fixes were written by the same author as the code they correct.** No production connection, deployment, migration, `drizzle-kit push`, environment-variable change, database-permission change, or backup operation was performed.
 - **PR #32 merged** at `90ec04363cbec3222232c6f912fcad69ab038dba`. It integrated the migration-runner/schema-resilience safeguards and the migration-0018 composite-FK work, plus regression evidence. It did not apply migration 0018 to production.
 - **PR #33 merged** at `851156cac0403f1b9e268c0c3584543852399c48`. CI succeeded; scratch database teardown is now shared and asserted, and the LOW-1/2/3 findings were addressed. LOW-4 was deliberately not changed because the proposed change weakened fail-closed authorization.

@@ -85,3 +85,74 @@ export function loginAliasCollisionMessage(collision: LoginAliasCollision): stri
     ? "That email address is already in use as another account's username. Login throttling identifies accounts by that string, so the two would share one guess budget. Choose a different email address."
     : "The generated username is already in use as another account's email address. Login throttling identifies accounts by that string, so the two would share one guess budget. Choose a different first or last name.";
 }
+
+/**
+ * **F-6 follow-up — making the invariant atomic.**
+ *
+ * Enforcing the cross-column rule with separate `SELECT`s followed by an `INSERT` is a
+ * check-then-act race, and the window is not theoretical: `POST /api/users` hashed the
+ * password (bcrypt cost 12, ~250 ms) *between* the checks and the insert, so two concurrent
+ * creations could each read "no conflict" and each commit. Measured with two opposing
+ * requests — one creating `email = X`, the other creating an account whose generated
+ * `username = X` — both accounts were created and the collision survived, which is the exact
+ * state the guard exists to prevent: two accounts sharing one login-throttle bucket, where a
+ * successful sign-in to one releases the other's recorded failures.
+ *
+ * Nothing in the schema can close this with a constraint: `users.email` and `users.username`
+ * are separate columns with separate unique indexes, so cross-column uniqueness would need a
+ * computed union (an expression index over `COALESCE`) — a Production migration, which this
+ * work is not authorised to add. So the invariant is serialised instead, in the database:
+ *
+ *   BEGIN
+ *     SET LOCAL lock_timeout = <bound>            -- a stuck creation cannot wedge the pool
+ *     SELECT pg_advisory_xact_lock(hash(NAMESPACE))
+ *     ...every uniqueness check, the username generation, the INSERT and the membership...
+ *   COMMIT                                        -- the lock is released by the commit
+ *
+ * The checks and the insert are then one atomic step: any second creation waits for the first
+ * to commit and reads its rows.
+ *
+ * **Why one namespace lock rather than a lock per identifier.** Per-identifier keys look
+ * finer-grained, but the generated username is not known until the uniqueness reads have run,
+ * and those reads must themselves be inside the lock — so a per-identifier design has to lock
+ * in two phases (the base candidate, then the chosen one plus the email), and two transactions
+ * can then acquire overlapping key sets in opposite order. That is a deadlock cycle traded for
+ * a little concurrency on an authenticated, school-admin-only path that creates a handful of
+ * accounts at a time, with the slow part (bcrypt) deliberately outside the transaction. One
+ * key cannot form a cycle. The wait is bounded, and hitting the bound is a clean retryable
+ * error rather than a hang.
+ *
+ * `SERIALIZABLE` isolation was the alternative: it would detect the write skew and abort one
+ * transaction with 40001. It was not chosen because it needs a retry loop to be usable, its
+ * aborts are probabilistic rather than prevented, and it costs a serialization failure on
+ * every genuinely concurrent creation. The advisory lock prevents the conflict instead of
+ * detecting it.
+ */
+export const LOGIN_IDENTITY_LOCK_NAMESPACE = "easylearn:login-identity";
+
+/**
+ * How long a user-creation transaction may wait for the identity lock, in milliseconds.
+ * Transaction-scoped (`SET LOCAL`), so it can never leak into another request's use of the
+ * same pooled connection. Deliberately a constant rather than another environment variable:
+ * the value is not a tuning knob an operator should have to reason about, and 5 s is far
+ * longer than the few short statements the lock actually covers.
+ */
+export const LOGIN_IDENTITY_LOCK_TIMEOUT_MS = 5000;
+
+/** SQLSTATE `55P03` — `lock_timeout` expired. */
+export const LOCK_TIMEOUT_SQLSTATE = "55P03";
+
+/** SQLSTATE `40P01` — deadlock detected. Cannot happen with one lock key, but is handled. */
+export const DEADLOCK_SQLSTATE = "40P01";
+
+/** True when a database error means "the identity lock could not be taken in time". */
+export function isIdentityLockTimeout(error: unknown): boolean {
+  const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
+  return candidate?.code === LOCK_TIMEOUT_SQLSTATE || candidate?.cause?.code === LOCK_TIMEOUT_SQLSTATE;
+}
+
+/** True when a database error means PostgreSQL broke a lock wait cycle. */
+export function isIdentityDeadlock(error: unknown): boolean {
+  const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
+  return candidate?.code === DEADLOCK_SQLSTATE || candidate?.cause?.code === DEADLOCK_SQLSTATE;
+}

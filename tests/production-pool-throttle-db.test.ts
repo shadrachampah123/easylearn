@@ -195,10 +195,17 @@ async function main() {
           await new Promise((resolve) => setTimeout(resolve, 150));
         }
       })();
-      await during();
-      await new Promise((resolve) => setTimeout(resolve, 400));
-      running = false;
-      await sampler;
+      /* `finally`, not a straight-line sequence: if an assertion inside `during()` throws, the
+         sampler must still be stopped. Without this a FAILED test left the sampler looping
+         forever and the process never exited — measured, it hung the whole suite (and would have
+         hung the CI step until the job timeout) instead of reporting the failure. */
+      try {
+        await during();
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      } finally {
+        running = false;
+        await sampler;
+      }
       return samples;
     }
 
@@ -387,6 +394,108 @@ async function main() {
         await blocker.query("ROLLBACK").catch(() => undefined);
         await blocker.end().catch(() => undefined);
       }
+    });
+
+    /* ── 5. F-6 follow-up at max:2 — the identity transaction must not starve the pool ──
+
+       User creation now holds a connection for a whole transaction (advisory lock, checks,
+       INSERT, membership). With two connections that is exactly where a nested acquisition —
+       a query on the pool from inside the transaction — would deadlock the application. */
+
+    await test("F-6 under max:2 — concurrent opposing creations serialise and the app stays alive", async () => {
+      const slugSafe = DB_NAME.replace(/[^a-z0-9-]/g, "-");
+      const school = (
+        await db.query(
+          `INSERT INTO schools (name, short_name, slug) VALUES ($1, 'PPS', $2) RETURNING id`,
+          [`Pool School ${DB_NAME}`, `pool-${slugSafe}`]
+        )
+      ).rows[0].id as string;
+      const adminRow = (
+        await db.query(
+          `INSERT INTO users (email, password_hash, role, first_name, last_name, is_active)
+           VALUES ($1, $2, 'school_admin', 'Pool', 'Admin', true) RETURNING id, session_version`,
+          [`pool-admin-${DB_NAME}@school.test`, await bcrypt.hash("Pool-Admin-1!", 4)]
+        )
+      ).rows[0] as { id: string; session_version: number };
+      await db.query(
+        `INSERT INTO school_users (school_id, user_id, role, status) VALUES ($1, $2, 'school_admin', 'active')`,
+        [school, adminRow.id]
+      );
+      const { createToken } = await import("@/lib/auth");
+      const token = await createToken({
+        userId: adminRow.id,
+        role: "school_admin",
+        email: `pool-admin-${DB_NAME}@school.test`,
+        schoolId: school,
+        sessionVersion: Number(adminRow.session_version ?? 0),
+      });
+      const { POST: createUsers } = await import("@/app/api/users/route");
+      const createUser = (payload: Record<string, unknown>) =>
+        createUsers(
+          new NextRequest("http://localhost/api/users", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify(payload),
+          })
+        );
+
+      const identity = `pool-duel-${slugSafe}@school.test`;
+      const samples = await sampleLiveness(async () => {
+        /* Six concurrent creations, three times the Production pool: three take the string as an
+           email, three as a generated username. Every one of them needs a connection for a
+           transaction, so a nested acquisition would wedge here. */
+        const responses = await Promise.all([
+          ...Array.from({ length: 3 }, (_, index) =>
+            createUser({
+              email: identity,
+              password: "Pool-Email-1!",
+              firstName: "P",
+              lastName: `ool${index}`,
+              role: "teacher",
+            })
+          ),
+          ...Array.from({ length: 3 }, () =>
+            createUser({
+              password: "Pool-Name-1!",
+              firstName: "p",
+              lastName: `ool-duel-${slugSafe}@school.test`,
+              role: "learner",
+            })
+          ),
+        ]);
+        const statuses = responses.map((response) => response.status);
+        for (const status of statuses) {
+          assert(
+            status === 200 || status === 201 || status === 409 || status === 400,
+            `every creation must end in a mapped outcome at max:2, got ${status} (${statuses.join(", ")})`
+          );
+        }
+      });
+
+      for (const sample of samples) {
+        assert.strictEqual(sample, "200/ok", `/api/health and pool.query must stay usable, got ${sample}`);
+      }
+      const holders = Number(
+        (
+          await db.query(
+            `SELECT (count(*) FILTER (WHERE lower(email) = lower($1))
+                   + count(*) FILTER (WHERE lower(username) = lower($1)))::int AS count FROM users`,
+            [identity]
+          )
+        ).rows[0].count
+      );
+      assert.strictEqual(holders, 1, `exactly one account may hold ${identity} across both columns, found ${holders}`);
+      const collisions = Number(
+        (
+          await db.query(
+            `SELECT count(*)::int AS count
+               FROM users a JOIN users b ON b.id <> a.id AND lower(b.username) = lower(a.email)
+              WHERE a.email IS NOT NULL`
+          )
+        ).rows[0].count
+      );
+      assert.strictEqual(collisions, 0, `no cross-column collision may survive, found ${collisions}`);
+      assert.strictEqual(await advisoryLocks(), 0, "the identity lock is transaction-scoped: none may outlive the requests");
     });
 
     /* ── 5. Cost of the enforcement transaction at Production pool size ───────── */

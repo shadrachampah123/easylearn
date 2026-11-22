@@ -283,8 +283,16 @@ const FEATURE_MIGRATIONS: Record<SchemaFeature, string> = {
   composite_tenant_foreign_keys: "0018_composite_school_foreign_keys.sql",
 };
 
-/** DDL mirrors the idempotent migration files; safe to run repeatedly. */
-const FEATURE_SQL: Record<SchemaFeature, string[]> = {
+/**
+ * The idempotent DDL each feature may apply at runtime, **in execution order**. It mirrors the
+ * migration files and is safe to run repeatedly.
+ *
+ * Exported for diagnostics and for the repair tests, which execute the list directly to prove
+ * it is re-runnable (F-1 follow-up: idempotency). Treat it as read-only: the order is part of
+ * the contract, because `ensureSchemaFeature` logs and skips a statement that fails rather than
+ * aborting the feature — so a statement may only depend on the ones before it.
+ */
+export const FEATURE_SQL: Readonly<Record<SchemaFeature, readonly string[]>> = {
   dashboard_card_overrides: [
     `DO $$ BEGIN
        CREATE TYPE "public"."dashboard_role" AS ENUM('admin', 'teacher', 'learner', 'parent', 'global');
@@ -378,30 +386,52 @@ const FEATURE_SQL: Record<SchemaFeature, string[]> = {
      brute-force protection at all. Mirrors drizzle/0012_login_attempts.sql so an
      un-migrated database self-heals into a throttled state instead of an unprotected one.
      The final index is ADDITIVE to 0012: the per-source throttle introduced with the H-1
-     fix counts failures by (ip_address, created_at), which 0012 does not index. It is
-     created here only when the table itself is missing; an existing deployment gets it
-     from a reviewed follow-up migration (recorded in the roadmap as an H-1 follow-up). */
+     fix counts failures by (ip_address, created_at), which 0012 does not index.
+
+     **ORDERING IS LOAD-BEARING (F-1 follow-up).** The statements run in list order and a
+     statement that fails is logged and skipped, not fatal — so the COLUMNS must all be
+     restored before any INDEX that references them is attempted. `ALTER TABLE ... DROP
+     COLUMN` also drops every index that depends on the column, which is exactly the drifted
+     state this list has to repair. With the indexes first (the order this list shipped in),
+     dropping `ip_address` made `login_attempts_ip_created_at_idx` fail with 42703 and be
+     skipped, the ALTERs after it restored the column, the columns-mode probe then reported
+     the feature AVAILABLE — and because the feature was available the repair never ran
+     again. The table came back with three of its four indexes and nothing would ever notice.
+     Dropping `created_at` lost three indexes the same way. So: relation, then columns, then
+     indexes. Every statement is `IF NOT EXISTS`, so the whole list stays re-runnable.
+
+     Note what this does and does not do for an existing deployment: the additive
+     (ip_address, created_at) index is created whenever this repair RUNS, and the repair only
+     runs when the feature is unavailable (relation missing, or a required column missing) —
+     i.e. while logins are already failing closed, so a non-CONCURRENT `CREATE INDEX` taking
+     a short SHARE lock is the right trade. A healthy Production table that simply never had
+     that index (finding L-R5) is untouched by this list and still needs the reviewed,
+     gated migration. */
   login_attempts: [
+    /* 1. The relation itself. */
     `CREATE TABLE IF NOT EXISTS "login_attempts" (
        "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
        "identifier" varchar(255) NOT NULL,
        "ip_address" varchar(50),
        "created_at" timestamp DEFAULT now() NOT NULL
      );`,
+    /* 2-4. F-1: `CREATE TABLE IF NOT EXISTS` cannot repair a relation that exists but has
+       drifted, and nothing else in this list could either — which is why a dropped column
+       used to be a permanent, invisible outage. These are additive and idempotent, and they
+       never drop or rewrite anything. Defaults are required for the NOT NULL pair so an
+       existing (ephemeral, 60-minute-retention) table can accept them: a back-filled
+       `identifier` of '' matches no real alias, and a back-filled `created_at` of now()
+       makes throttling stricter, never looser. PostgreSQL 11+ stores these as fast defaults
+       without rewriting the table. They MUST precede the indexes below. */
+    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "identifier" varchar(255) NOT NULL DEFAULT '';`,
+    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "ip_address" varchar(50);`,
+    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "created_at" timestamp DEFAULT now() NOT NULL;`,
+    /* 5-8. Indexes last, so a drifted table ends up with all four and not only the ones whose
+       columns happened to survive. */
     `CREATE INDEX IF NOT EXISTS "login_attempts_identifier_idx" ON "login_attempts" ("identifier");`,
     `CREATE INDEX IF NOT EXISTS "login_attempts_created_at_idx" ON "login_attempts" ("created_at");`,
     `CREATE INDEX IF NOT EXISTS "login_attempts_identifier_created_at_idx" ON "login_attempts" ("identifier", "created_at");`,
     `CREATE INDEX IF NOT EXISTS "login_attempts_ip_created_at_idx" ON "login_attempts" ("ip_address", "created_at");`,
-    /* F-1: `CREATE TABLE IF NOT EXISTS` cannot repair a relation that exists but has drifted,
-       and nothing else in this list could either — which is why a dropped column used to be a
-       permanent, invisible outage. These are additive and idempotent, and they never drop or
-       rewrite anything. Defaults are required for the NOT NULL pair so an existing (ephemeral,
-       60-minute-retention) table can accept them: a back-filled `identifier` of '' matches no
-       real alias, and a back-filled `created_at` of now() makes throttling stricter, never
-       looser. PostgreSQL 11+ stores these as fast defaults without rewriting the table. */
-    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "identifier" varchar(255) NOT NULL DEFAULT '';`,
-    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "ip_address" varchar(50);`,
-    `ALTER TABLE "login_attempts" ADD COLUMN IF NOT EXISTS "created_at" timestamp DEFAULT now() NOT NULL;`,
   ],
   /* The composite tenant foreign keys are intentionally NOT auto-repairable. Migration
      0018 is gated: it needs a reviewed read-only preflight against a restored copy
