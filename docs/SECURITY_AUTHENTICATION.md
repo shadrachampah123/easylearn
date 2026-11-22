@@ -1156,3 +1156,101 @@ suffixed username on the other), and no advisory lock outlives the requests.
   pin matters: the original version (`health.includes("featureProbeUnavailable")`) stayed green with
   the guard deleted, because the name also appears in the declaration and in the `catch` that sets
   it. The pin now matches the condition, and deleting the guard fails the policy suite.
+
+## 12. Observability: what is logged, what is redacted, and what is never (H-2)
+
+Audit finding H-2 said the application had no observability at all. This section records what
+replaced that, and — more importantly for a security document — **what a log line may and may
+not contain**, because logs are the one place where the application writes its own data to a
+third party (Vercel's log store) on every request.
+
+**Status: implemented on branch `arena/3be79ab3-easylearn`. Not merged, not deployed, not
+Production-verified.** Until it is deployed, Production still logs the way it did before.
+
+### The pipeline
+
+1. `src/instrumentation.ts` — the supported Next.js lifecycle. `register()` writes one
+   `server.startup` line per instance (no network I/O, no database query); `onRequestError()`
+   writes one `request.error` line for every error that escapes a route.
+2. `src/lib/logger.ts` — one JSON object per event to stdout/stderr. No vendor SDK, no
+   network call, no dependency: the runtime log is the transport.
+3. `src/lib/log-redaction.ts` — every field, message and error passes through here before
+   serialisation.
+4. `src/lib/request-context.ts` — request **correlation**: an `AsyncLocalStorage` request
+   id carried across `await` boundaries, so a line written inside a `catch` deep in a route
+   still carries the id of the request that caused it.
+5. `src/app/api/internal/client-error/route.ts` — the intake the two error boundaries POST
+   to. Unauthenticated, size-capped, rate-limited per source, and it echoes nothing.
+
+### What is redacted, and how
+
+Two passes, because the three kinds of input differ:
+
+| Input | Example | Caught by |
+| --- | --- | --- |
+| A field whose **name** is sensitive | `{ password_hash: "…" }`, `{ authorization: "Bearer …" }` | the key pass — the key stays, the value becomes `[redacted]` |
+| A secret inside **message text** written by a library | a `pg` error quoting a connection string; an S3 signer quoting a presigned URL | the text pass |
+| A secret in text an **attacker** controls | a token pasted into a query string; a forged user agent | the text pass |
+
+The text pass covers: PostgreSQL/MySQL/MongoDB/Redis connection strings (scheme kept,
+credentials and host dropped — the host names the infrastructure); JWTs; `Bearer`/`Basic`
+credentials; `Cookie`/`Set-Cookie` headers; **bare** `name=value` session cookies with no
+header prefix; `Authorization` headers with an unknown scheme; `AKIA…`/`ASIA…` access key
+ids; presigned-URL signature parameters (the parameter name is kept, the value dropped);
+email addresses; and a 32-character high-entropy fallback for a secret that arrives with no
+key name next to it at all.
+
+Every pass is bounded in depth, breadth and string length, treats a cycle as `[circular]`,
+and **cannot throw**. That last property is the one the brief asked for explicitly: a
+logging failure must not crash a request. A thrown error inside a `catch` block is how a
+diagnostic becomes an outage, so `emit()` catches even a throw from `console.error` itself
+and downgrades to a fixed plain-text line.
+
+**Redaction is deliberately not total.** A UUID, a request id, a route path, an HTTP status
+and a SQLSTATE all survive, because a log nobody can read is not observability. Two
+counterweight tests pin that: one asserts 14 secret shapes are redacted, the other asserts
+eight identifiers are *not*.
+
+### Personal data
+
+Email addresses are redacted in both passes — as a field named `email`, and as an address
+inside a sentence. First names, last names, phone numbers, addresses, dates of birth,
+guardian details and IP addresses are redacted as **fields**. `login_attempts.ip_address`
+still stores the source address (finding I-R1), but it is not written to the log by this
+work.
+
+**This is not a DLP system.** A name inside a free-text log message is not detected. The
+mitigation is structural: the code that writes log lines writes *fields*, not sentences, and
+the fields it writes are enumerated in the source.
+
+### The health endpoint
+
+`/api/health` is unauthenticated, so it is held to a stricter rule than the log:
+
+- `checks.objectStorage` carries **booleans, counts and fixed codes only**. Never the bucket
+  name, the endpoint host, the region, the access key id, the public URL or a signature.
+- `assertNoSecretsInStorageSection` re-checks the finished section against the configured
+  values at runtime and collapses it if any appears. It is a runtime assertion, not a code
+  review.
+- **Configuration presence is not availability.** The default response is
+  `state: "configured-unverified"`, `reachable: null`, `checked: false`. `"verified"` is
+  reachable only after a signed request actually succeeded, on `?deep=1`.
+- A deep check proves **reachability, not writability**: it does not exercise a browser
+  `PUT` or the bucket's CORS, which is what the R2 incident actually involved.
+- `X-Request-Id` is echoed so a monitor's failure maps to a log line. It is validated
+  (8–128 characters, restricted alphabet) and replaced if malformed, so it cannot be used
+  to forge a log line.
+
+### What is not claimed
+
+- Vercel log alerts and the uptime monitor **have not been configured**. They are operator
+  actions requiring Production access; the exact filters and URLs are in the roadmap's H-2
+  section.
+- The counters are per warm instance, so a rate is an approximation. Alerting is on log
+  lines, not aggregated metrics — a metrics backend is the paid dependency this work was
+  not authorised to add.
+- The repair-failure ledger is still process-local: it is now *visible* but still forgotten
+  on redeploy.
+- Client-boundary reporting is best-effort. The server-side `request.error` line is the
+  authoritative record of an escaped error.
+

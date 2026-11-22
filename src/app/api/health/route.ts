@@ -4,32 +4,101 @@ import {
   getDatabaseUrl,
   getJwtConfigurationProblem,
 } from "@/lib/env";
+import { log } from "@/lib/logger";
+import {
+  assertNoSecretsInStorageSection,
+  describeObjectStorage,
+  type ObjectStorageReadiness,
+} from "@/lib/object-storage-readiness";
+import { resolveRequestId } from "@/lib/logger";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+/**
+ * H-2: `/api/health` now answers three more questions than it did, without becoming a
+ * dependency probe.
+ *
+ *  - **Which request is this?** Every response carries `X-Request-Id` and every body
+ *    carries `requestId`, so a failing health check from an uptime monitor can be
+ *    joined to the log line that explains it. An unauthenticated endpoint does not
+ *    normally get to invent identifiers, but this one is a fixed-format value the
+ *    caller can also *supply* (`x-vercel-id`), which is what makes it useful.
+ *  - **Is object storage configured?** Reported as `configured`, `mode` and the
+ *    names-only list of missing variables. This is a *configuration* statement and
+ *    says so.
+ *  - **Is object storage reachable?** Only answered when `?deep=1` is passed, and only
+ *    `state: "verified"` after a real signed request succeeded. The default response
+ *    says `configured-unverified` with `checked: false`, which is the honest answer
+ *    for an endpoint that performed no I/O.
+ *
+ * The storage section never contains a bucket name, endpoint, key, region or signature;
+ * `assertNoSecretsInStorageSection` enforces that at runtime rather than trusting the
+ * code to keep being careful.
+ */
+export async function GET(request?: Request) {
+  const requestId = resolveRequestId({ headers: request?.headers });
+
+  /* `?deep=1` opts into the live object-storage check. Anything else — including a
+     value a monitor might guess at — means "status only". */
+  let deep = false;
+  try {
+    deep = new URL(request?.url ?? "http://localhost/api/health").searchParams.get("deep") === "1";
+  } catch {
+    deep = false;
+  }
   const databaseProblem = getDatabaseConfigurationProblem();
   const jwtProblem = getJwtConfigurationProblem();
+  /* The storage section is computed before the database branch so that a database
+     outage still reports the storage state (they are independent failures, and an
+     operator debugging one should not have to fix the other to see it). It performs no
+     I/O unless `deep` was requested. */
+  let objectStorage: ObjectStorageReadiness;
+  try {
+    objectStorage = assertNoSecretsInStorageSection(await describeObjectStorage({ deep }));
+  } catch (error) {
+    /* A storage probe must never take the endpoint down: the database answer is more
+       important and is computed next. `error` goes through the redactor. */
+    log.warn("health object-storage section failed", { event: "health.object_storage.error", requestId, error });
+    objectStorage = {
+      configured: false,
+      missingVariables: [],
+      mode: "local-disk",
+      state: "error",
+      reachable: null,
+      reason: "live_check_transport_error",
+      checked: false,
+      warnings: [],
+    };
+  }
+
   const checks = {
+    requestId,
     databaseUrlConfigured: Boolean(getDatabaseUrl()),
     jwtSecretConfigured: !jwtProblem,
     databaseConnected: false,
     schemaReady: false,
     optionalMigrations: {} as Record<string, boolean>,
     migrationWarnings: [] as string[],
+    objectStorage,
   };
 
+  /* One place builds every response, so the correlation header cannot be forgotten on a
+     branch added later. `Cache-Control: no-store` is repeated from the previous version
+     for the same reason. */
+  const respond = (body: unknown, status = 200) =>
+    Response.json(body, {
+      status,
+      headers: { "Cache-Control": "no-store", "X-Request-Id": requestId },
+    });
+
   if (databaseProblem) {
-    return Response.json(
-      {
+    return respond({
         ok: false,
         service: "EasyLearn API",
         checks,
         message: databaseProblem,
-      },
-      { status: 503, headers: { "Cache-Control": "no-store" } }
-    );
+      }, 503);
   }
 
   try {
@@ -97,7 +166,11 @@ export async function GET() {
           ]
             .filter(Boolean)
             .join("; ");
-          console.error(`[health] session revocation is unavailable (${cause || "users.session_version is missing"})`);
+          log.error("session revocation is unavailable", {
+            event: "health.session_revocation_unavailable",
+            requestId,
+            cause: cause || "users.session_version is missing",
+          });
         }
         /* Same reasoning for login throttling since the H-1 fix (2026-11-19): the throttle
            now fails CLOSED, so a database without login_attempts and without automatic
@@ -119,7 +192,11 @@ export async function GET() {
           ]
             .filter(Boolean)
             .join("; ");
-          console.error(`[health] login throttling is unavailable and cannot be repaired automatically (${cause || "cause unknown"})`);
+          log.error("login throttling is unavailable and cannot be repaired automatically", {
+            event: "health.login_throttle_unavailable",
+            requestId,
+            cause: cause || "cause unknown",
+          });
         }
         if (!item.present) {
           /* F-1: "missing" now covers a relation that exists without the columns the code
@@ -139,7 +216,11 @@ export async function GET() {
         }
       }
     } catch (error) {
-      console.error("Health optional-schema probe failed:", error);
+      log.error("health optional-schema probe failed", {
+        event: "health.schema_probe_failed",
+        requestId,
+        error,
+      });
       featureProbeUnavailable = true;
     }
 
@@ -157,32 +238,25 @@ export async function GET() {
     }
 
     if (!checks.schemaReady) {
-      return Response.json(
-        {
+      return respond({
           ok: false,
           service: "EasyLearn API",
           checks,
           message: "Neon is connected, but the EasyLearn users table is missing or incompatible. Run the Drizzle schema push for this repository.",
-        },
-        { status: 503, headers: { "Cache-Control": "no-store" } }
-      );
+        }, 503);
     }
 
     if (jwtProblem) {
-      return Response.json(
-        {
+      return respond({
           ok: false,
           service: "EasyLearn API",
           checks,
           message: jwtProblem,
-        },
-        { status: 503, headers: { "Cache-Control": "no-store" } }
-      );
+        }, 503);
     }
 
     if (sessionRevocationUnavailable) {
-      return Response.json(
-        {
+      return respond({
           ok: false,
           service: "EasyLearn API",
           checks,
@@ -191,14 +265,11 @@ export async function GET() {
             "is missing or could not be verified (drizzle/0019_session_revocation.sql), so token " +
             "verification fails closed and authenticated requests will return 503. Apply the " +
             "migration with `node run-migration.js`.",
-        },
-        { status: 503, headers: { "Cache-Control": "no-store" } }
-      );
+        }, 503);
     }
 
     if (loginThrottleUnavailable) {
-      return Response.json(
-        {
+      return respond({
           ok: false,
           service: "EasyLearn API",
           checks,
@@ -207,32 +278,27 @@ export async function GET() {
             "or a column the throttle requires is missing (drizzle/0012_login_attempts.sql), so " +
             "login fails closed and every sign-in attempt will return 503. Apply the migration " +
             "with `node run-migration.js`.",
-        },
-        { status: 503, headers: { "Cache-Control": "no-store" } }
-      );
+        }, 503);
     }
 
     /* Reached only when both security-critical features were probed successfully and are
        present, so "ready" is now a statement this endpoint has actually verified (F-1/F-7). */
-    return Response.json(
-      {
+    return respond({
         ok: true,
         service: "EasyLearn API",
         checks,
         message: "Login and registration services are ready.",
-      },
-      { headers: { "Cache-Control": "no-store" } }
-    );
+      });
   } catch (error) {
-    console.error("Health check error:", error);
-    return Response.json(
-      {
+    /* H-2: the health check's own failure is now a structured line carrying the request
+       id, so a 503 body an operator copied out of a monitor maps to exactly one log
+       entry. The response text is unchanged (it was already sanitised). */
+    log.error("health check failed", { event: "health.check_failed", requestId, error });
+    return respond({
         ok: false,
         service: "EasyLearn API",
         checks,
         message: getDatabaseErrorMessage(error),
-      },
-      { status: 503, headers: { "Cache-Control": "no-store" } }
-    );
+      }, 503);
   }
 }

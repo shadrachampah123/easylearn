@@ -587,7 +587,17 @@ async function main() {
     const messagePart = branch.slice(branch.indexOf("message:"), branch.indexOf("{ status: 503"));
     assert(messagePart.length > 0, "the branch must build a message");
     assert(!messagePart.includes("${"), "no runtime detail may be interpolated into the public message");
-    assert(health.includes("console.error"), "the cause is logged server-side instead");
+    /* The CAUSE must reach the server log. This assertion used to read
+       `health.includes("console.error")`, which pinned a MECHANISM rather than the
+       property: when H-2 replaced those four `console.error` calls with structured
+       `log.error` lines (so the cause carries a request id and survives redaction), the
+       behaviour got BETTER and the pin failed. It now accepts either mechanism and
+       requires that the cause is the thing being logged. */
+    assert(
+      /log\.error\(\s*"login throttling is unavailable[\s\S]{0,200}cause/.test(health) ||
+        (/console\.error/.test(health) && /cause/.test(health)),
+      "the cause is logged server-side instead (structured log or console, but with the cause)"
+    );
   });
 
   /* ── 8. F-1 / F-4 / F-7: health must not be green while a control is broken ───── */
