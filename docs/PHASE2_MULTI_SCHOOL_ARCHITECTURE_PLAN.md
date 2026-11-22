@@ -1,17 +1,561 @@
 # EasyLearn — Canonical Nine-Phase Roadmap
 
-**Roadmap updated:** 2026-10-18 · **Repository:** `shadrachampah123/easylearn`
-**Verified `main`:** `851156cac0403f1b9e268c0c3584543852399c48` (PR #33 merged).
-**Latest application/security checkpoint:** PR #32 merged at `90ec04363cbec3222232c6f912fcad69ab038dba`; PR #33 follow-up merged at `851156cac0403f1b9e268c0c3584543852399c48`.
+**Roadmap updated:** 2026-11-19 · **Repository:** `shadrachampah123/easylearn`
+**Verified `main`:** `4069584e99574a4fe2af7d4317a8bcbf13f9bf73` (PR #68 merged; live Production deployment 2026-11-17T21:20:13Z, alias `https://easylearn-six.vercel.app`).
+**Latest application/security checkpoint:** full production readiness & security audit of 2026-11-19 — `FULL_PRODUCTION_AUDIT_2026-11-19.md`, with `R2_CONFIG_AUDIT_2026-11-19.md` and `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` (all committed at the repository root). Earlier checkpoints: PR #32 merged at `90ec04363cbec3222232c6f912fcad69ab038dba`; PR #33 follow-up merged at `851156cac0403f1b9e268c0c3584543852399c48`.
 **Overall roadmap estimate: 46% complete.** This is a planning estimate across the nine product phases, not a test score or production-readiness certification. Phase 2 code hardening has advanced substantially, but production database state and safe migration gates remain unresolved.
 
-This current roadmap supersedes the historical architecture audit retained below, including its proposed numbering, table counts, future migration numbers and old “remaining” lists. Status distinguishes **implemented**, **merged**, **deployed**, **production DB migrated**, and **production behavior verified** as independent gates. No production connections, migrations, deployments, secrets, or settings were accessed or changed for this roadmap update.
+This current roadmap supersedes the historical architecture audit retained below, including its proposed numbering, table counts, future migration numbers and old “remaining” lists. Status distinguishes **implemented**, **merged**, **deployed**, **production DB migrated**, and **production behavior verified** as independent gates. No production connections, migrations, deployments, secrets, or settings were accessed or changed for this roadmap update. The 2026-11-19 update below is likewise documentation-only on the Production side: no deployment, migration, backup operation, environment-variable change, or Cloudflare/Vercel setting was performed.
 
-## Current progress dashboard — 2026-10-18
+## Production status update — 2026-11-19
+
+This section is the current owner-facing truth about the deployed application. It records the outcome of the full production readiness & security audit of 2026-11-19 (`FULL_PRODUCTION_AUDIT_2026-11-19.md`) against `main` at `4069584`, which **is** the live Production build (deployment 2026-11-17T21:20:13Z, alias `https://easylearn-six.vercel.app`, Vercel project `easylearn`). Supporting reports: `R2_CONFIG_AUDIT_2026-11-19.md` (read-only storage configuration audit) and `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` (upload-failure root-cause analysis).
+
+### Closed — Cloudflare R2 object storage: COMPLETED
+
+R2 integration is **complete and verified in Production**. The owner confirmed that all three production paths work end to end after the bucket CORS correction was applied:
+
+| Production path | Status |
+| --- | --- |
+| Assignment file uploads (teacher browser → R2 presigned `PUT`) | Verified working |
+| Learner submission uploads | Verified working |
+| Assignment and submission downloads from R2 | Verified working |
+
+- The former **C-1** active finding ("the browser cannot complete the presigned `PUT` to R2") is **closed and removed** from every outstanding-work list in this roadmap. Root cause: the missing Cloudflare R2 bucket CORS policy. The earlier `amazonaws.com`-endpoint hypothesis recorded in `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` was investigated and rejected; that report is retained for the record.
+- No application change was required. The code-side configuration was audited read-only and is correct: `OBJECT_STORAGE_PROVIDER=cloudflare-r2`, account-ID-based endpoint construction, `forcePathStyle: true`, `public-read` ACL, and `s3:GetObject`-only presigned download URLs with `OBJECT_STORAGE_URL_EXPIRES_SECONDS=900` (`src/lib/object-storage.ts`).
+- **Standing dependency:** the bucket CORS policy lives in Cloudflare, which the application and its CI cannot read or version. Record its exact allowed origins, methods and headers alongside the environment variables so a future bucket rebuild does not silently reintroduce C-1.
+
+### Pending — migration `0018_composite_school_foreign_keys.sql`
+
+**Status: PREPARED, NOT EXECUTED — deliberately pending.** The R2 completion does not change this gate.
+
+- Production is confirmed drifted: **0/26** composite foreign keys present and **no `easylearn_schema_migrations` ledger** (owner-verified read-only on 2026-10-27, see `docs/PRODUCTION_SCHEMA_RECOVERY_PLAN.md`), while **24/24** migration 0017 objects are present.
+- The migration itself is **ready to run**: Production PostgreSQL is 18.6 (≥ 15, so `ADD CONSTRAINT … NOT VALID` is supported), the migration is gated behind `EASY_LEARN_APPLY_COMPOSITE_TENANT_FOREIGN_KEYS=true`, and both the preflight (`docs/PRODUCTION_PREFLIGHT_0019_0018.md`) and the documented `DROP CONSTRAINT` rollback path are written.
+- `drizzle-kit push` remains **banned** against Production (`docs/PRODUCTION_TENANCY_READ_ONLY_CHECKPOINT.md`).
+- The application already fails closed without 0018 (`users.session_version` enforcement and the SQL tenant predicates live in code), so this is parity and defence-in-depth rather than an outage risk. It stays open until the reviewed preflight and a restored-copy rehearsal have been executed.
+- The related **26 missing child-side FK indexes** also remain outstanding. They have deliberately **not** been written as a migration (no such file exists in `drizzle/` as of 2026-11-19); the analysis and the low-lock approach live in `docs/PRODUCTION_MIGRATION_SAFETY_REVIEW_PR32.md` §"The 26 missing child-side indexes", and they still require their own reviewed, separately authorised gated migration.
+
+### Paused — backup and disaster recovery
+
+**Status: PAUSED.** No backup or disaster-recovery work is scheduled, in progress, or authorised in this cycle, and the 2026-11-19 audit performed no backup operations.
+
+- The verification runbook `docs/BACKUP_RESTORE_VERIFICATION.md` (2026-11-04) stays **prepared and unused**. Its four gates — documented RPO/RTO, a restore rehearsal into a scratch database, object-store versioning or replication for R2, and a point-in-time-recovery test — are all still unmet.
+- Storage hardening that belongs to the same workstream is paused with it rather than closed (audit finding M-3): bucket versioning, lifecycle policy, an explicit `OBJECT_STORAGE_PUBLIC_URL` check, and cleanup of orphaned `uploaded_files` rows left by historically failed uploads.
+- Resumption requires an explicit owner decision. Until then treat restore capability as **unverified** and do not schedule destructive migrations or bulk data operations on the assumption that a restore is available.
+
+### Outstanding findings from the 2026-11-19 audit (preserved)
+
+Only C-1 was closed above. Every other audit finding remains open, with `FULL_PRODUCTION_AUDIT_2026-11-19.md` as the source of truth. File and line references below are against the audited commit `4069584`; the H-1 fix shifts the line numbers in `src/app/api/auth/login/route.ts` and `src/lib/rate-limit.ts`.
+
+| ID | Finding | Status |
+| --- | --- | --- |
+| **H-1** | Login rate limiting fails **open** on any database error; the client IP is recorded but never used in a limit; the per-identifier lockout lets anyone lock any account, including administrators | **Fixed in code 2026-11-19 — PR #69, open for review** (verified locally; see "H-1 remediation" below) |
+| **H-R1** | *(found by independent security review of PR #69, 2026-11-19)* The successful-login reset deleted every failure row sharing the source IP, so one valid low-privilege credential could repeatedly erase an attacker's accumulated failures against other accounts — a throttle-reset oracle, measured at 108 unthrottled guesses over three sign-in cycles | **Fixed in code 2026-11-19 — in PR #69**; the vulnerable assertion was reversed and a route-level regression test added. Awaiting independent re-review |
+| **M-R1** | *(independent review of PR #69)* The client IP was the **leftmost** valid `x-forwarded-for` entry — the element the client writes — so behind any appending proxy an attacker chose its own throttle bucket and could trip the account-wide backstop with forged addresses | **Fixed in code 2026-11-19 — in PR #69**; declared trust position, five spoofed-chain assertions validated against the vulnerable code. Operator must confirm the hop count for the real edge |
+| **M-R2** | *(same review)* Check-then-record race: nothing serialized `checkLoginRateLimit` and `recordFailedLoginAttempt`, so a concurrent burst all read an empty table — measured 30 concurrent requests ⇒ 30 guesses against a budget of 5 | **Fixed in code 2026-11-19 — in PR #69**; advisory-locked insert-then-decide before password verification — 25 concurrent ⇒ exactly 5 guesses |
+| **M-R3** | *(same review)* One account = two budgets, because email and username were separate identifiers — 10 real guesses against a documented budget of 5, and N aliases ⇒ N × 15 distributed guesses | **Fixed in code 2026-11-19 — in PR #69**; the resolved account's alias set shares one budget, unknown accounts keep their own |
+| **M-R4** | *(same review, **merge gate**)* Failing closed turns "table missing" into "nobody can sign in", and there was no runtime evidence that `login_attempts` exists in Production or that `AUTO_SCHEMA_REPAIR` is enabled there | **Substantially resolved 2026-11-19** by operator-supplied read-only evidence: table present, role `neondb_owner`, `CREATE` on `public` = true, `AUTO_SCHEMA_REPAIR` absent ⇒ enabled. **Qualification kept: runtime repair has never been exercised in Production** |
+| **M-R4a** | *(found while investigating M-R4)* `/api/health` reported 200 "Login and registration services are ready" whenever repair was merely *enabled*, even with repair broken — while every login answered 503. Setting `AUTO_SCHEMA_REPAIR=false` was safer to operate than leaving it absent | **Fixed in code 2026-11-19 — in PR #69**; `repairBlocked` (repair off, no `CREATE` privilege, or a recorded repair failure) escalates to 503 for `login_attempts` and `session_revocation`, cause logged server-side |
+| **H-2** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage | Open — M-R4a makes a failed *schema repair* visible, but nothing collects it: no alerting exists |
+| **C-2** | Production schema drift (0/26 composite FKs) and absent migration ledger; 0018 prepared but unexecuted | Pending — see above |
+| **M-1** | Inconsistent password policy: 6-character minimum on admin user create/reset versus 8 on `change-password`; `generatedPassword` echoed in the API response | Open |
+| **M-2** | Missing database-level uniqueness for `submissions(assignment_id, learner_id)`, `parent_learners(school_id, parent_id, learner_id)` and `quiz_attempts(quiz_id, learner_id)` — application-layer or advisory-lock only today | Open |
+| **M-3** | R2 hardening backlog (versioning, lifecycle, `OBJECT_STORAGE_PUBLIC_URL` check, orphaned `uploaded_files` rows) | Paused with backup/DR |
+| **M-4** | Legacy duplicate Vercel project `easylearnn` (`prj_UMJnGXOIWQzDRnCMiM5bM1kKTlBo`) still exists next to the active `easylearn` project | Open — owner must confirm it is disconnected |
+| **M-5** | Mobile-navigation bug is live in Production: PR #61 (Navbar fix, head `e682503`) is open and unmerged | Open |
+| **L-1** | Service worker caches authenticated HTML under the fixed `easylearn-v1` cache key (`public/sw.js`) | Open |
+| **L-2** | `images/search` reuses a stale claim without re-checking `isActive` (the only route that does) | Open |
+| **L-3** | Login error asymmetry (`login/route.ts:81–95`) discloses whether an account exists | Open |
+| **L-4** | Unauthenticated `/api/health` exposes schema-feature state | Open |
+| **L-5** | `school_users.role` enum still admits `super_admin`; exclusion is application-layer only | Open |
+| **L-6** | `npm test` is not hermetic — it fails without CI's `JWT_SECRET` and `DATABASE_URL` | Open |
+| **L-7** | `messages` and `notifications` lack per-user and per-conversation indexes | Open |
+
+### H-1 remediation — PR #69 (implemented 2026-11-19, independently reviewed, H-R1 corrected)
+
+The login-throttle fix is **implemented, verified locally, independently security-reviewed, and open for review as PR #69** (branch `arena/4416888f-easylearn`, base `main` @ `4069584`). The work itself touches no Production system: no migration, deployment, setting change, or backup operation was performed as part of it.
+
+**Correction to a claim made in an earlier revision of this section.** Merging PR #69 into `main` *is* expected to deploy to Production. The GitHub deployments API records a Production deployment of `4069584` — the merge commit of PR #68 — at 2026-11-17T21:20:13Z for the Vercel project `easylearn`, so `main` is the production branch and this PR is **deploy-blocking, not merge-only**. That distinction is what makes finding M-R4 below a merge gate.
+
+**What was wrong.** Three defects from the audit, plus a **fourth found while implementing the fix**, plus a **fifth introduced by the first version of this remediation and caught by independent security review**:
+
+1. `checkLoginRateLimit` caught any database error and returned `{ allowed: true }` — every throttle failure handed out unlimited guesses.
+2. The client IP was recorded but never used in a limit.
+3. The only bucket was the identifier, so five failures locked an account for everybody for 30 minutes: anyone could lock an administrator out with one request.
+4. *(new)* `ip_address` is `varchar(50)` and `getClientIp` returned the raw leftmost `x-forwarded-for` token. A longer header made the INSERT throw, which `recordFailedLoginAttempt` swallowed — an attacker could switch throttling off **for themselves** with a single header while every check kept succeeding.
+5. *(new — **H-R1**, introduced by the first version of this remediation and caught by independent review)* `clearFailedLoginAttempts(identifier, ip)` deleted every row matching the identifier **OR** the source IP, so one successful login wiped all pending failures from that IP — including failures recorded against **other accounts**. Anyone holding one valid low-privilege credential (a malicious insider, or a credential-stuffed account) could sign in from the school's exit IP and erase the attacker's accumulated evidence, making the guess budget **repeatable instead of bounded**. The reproducing probe measured **108 unthrottled guesses** against an administrator account from a single IP across three insider sign-in cycles, with the victim's pair bucket returning to a full budget after every cycle; it also deleted the rows the account-wide aggregate backstop counts. `main` had an identifier-scoped delete, so this PR *widened* it. The vulnerable behaviour was additionally **asserted as correct** by the original test ("clearing releases the account bucket and the source bucket together"), which is why that test had to be reversed rather than merely extended.
+
+**What it does now.**
+
+- **Fails closed.** An unevaluable check refuses the login for 60 seconds (`reason: "unavailable"`) and logs it. This costs no real availability: a database that cannot answer the throttle query cannot answer the user lookup either.
+- **Three buckets, one round trip** over a single windowed scan (`WINDOW_MINUTES = 15`, unchanged):
+
+  | Bucket | Threshold | Cooldown | Purpose |
+  | --- | --- | --- | --- |
+  | (identifier, source IP) | `MAX_ATTEMPTS = 5` (unchanged) | `BLOCK_MINUTES = 30` (unchanged) | The familiar limit, now scoped to the **guesser**, so the account owner is unaffected |
+  | source IP | `MAX_ATTEMPTS_PER_IP = 40` failures **or** `MAX_IDENTIFIERS_PER_IP = 10` distinct identifiers | `IP_BLOCK_MINUTES = 15` | Volume abuse and credential spraying |
+  | **account** (every alias of it), any source | `MAX_ATTEMPTS_PER_IDENTIFIER = 15` | `IDENTIFIER_BLOCK_MINUTES = 15` | Distributed-guessing backstop — unreachable from one source. Counted over the account's whole alias set since M-R3, so email and username share one budget |
+
+- **Enforcement is atomic and happens before the password is checked (M-R2).** The route now runs four steps: a cheap read-only pre-check, the account lookup, `recordFailedLoginAttempt` — which is the *enforcement* point — and only then the outcome. That call opens a transaction, takes two `pg_advisory_xact_lock` keys in a fixed order (source, then account, so concurrent attempts cannot form a wait cycle), **inserts the attempt**, re-counts the budgets *including the row it just wrote*, and commits or rolls back on the verdict. A refused attempt is rolled back, so it can never extend its own cooldown. bcrypt stays outside the transaction and the connection is released before the optional self-heal and the expired-row prune, because the Production pool allows only two connections. Measured: **25 concurrent wrong-password requests from one source now produce exactly 5 guesses and 20 refusals**; the pre-fix code produced 25 guesses (the review's own probe measured 30/30).
+- **A failure that cannot be stored is no longer silent:** `recordFailedLoginAttempt` returns `{ recorded, allowed, decision, reason }`; the route answers 429 when `decision` says a budget is exhausted, 503 when the throttle could not be evaluated, and 503 when an *allowed* attempt could not be stored — so a degraded throttle can never become free guesses.
+- **`clearFailedLoginAttempts(identifier | aliases, ip)` releases only the signing-in account's own recorded failures, under every alias of that account** (H-R1 fix, widened by M-R3 to the alias set so a success via email also releases the budget consumed via username). It is scoped by account and never by source: the rows that account wrote from its own IP are removed — which lowers the whole-source budget by exactly those rows — while **other accounts' failures from the same NAT survive**. The `ip` argument is kept for call-site compatibility and now only attributes the reset in the log; it can no longer widen the DELETE. The NAT case the earlier version tried to serve is still covered, because the source budget is deliberately generous (40 failures or 10 distinct identifiers per 15-minute window) and self-heals as rows age out of the window.
+- **`getClientIp` now takes an explicit trust position instead of a guess (M-R1, hardened by F-3).** In order: `EASY_LEARN_CLIENT_IP_HEADER` if the operator names the platform's own header (used **exclusively** — no fallback to a header the client can also write); otherwise the entry `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS` positions from the **right** of `x-forwarded-for` (default 1, clamped to 8); otherwise `x-vercel-forwarded-for`, but only when `process.env.VERCEL === "1"` — the exact marker Vercel sets, so a client-supplied `VERCEL=true` cannot claim platform provenance. **That is the end of the chain: the `x-real-ip` fallback M-R1 still had was removed by F-3**, because `x-real-ip` is a header any client can send on a direct request, and reading it after the trusted position had already been rejected meant the *rejected* value decided the bucket. When the trusted position holds junk the result is `null`; the chain never scans left towards the value the client wrote. Validation was tightened at the same time (F-10): IPv4 octets may not be zero-padded (`010.001.001.001` is rejected, because it is a different address to a proxy that parses octal), IPv6 must be a real address rather than a colon-and-hex character set (`:::`, `a:b:c`, `1:::1` are all rejected), and both forms are canonicalised to their RFC 5952 / dotted-quad spelling before they are used as a bucket key or stored, so one address cannot occupy two buckets. The legacy `"unknown"` sentinel is still never stored. `null` is not an error: the per-source budgets simply cannot be applied, and the per-account budgets still are. All three variables are documented in `.env.example` and `docs/SECURITY_AUTHENTICATION.md` §11.
+  This module cannot adopt `csrf.ts`'s stricter answer (refuse forwarded headers entirely) because a route handler has no socket address to fall back to; the CSRF convention was consulted and the difference is recorded in the source.
+- **`login_attempts` is now a self-healing schema feature** (`src/lib/schema-resilience.ts`), so an un-migrated database becomes *throttled* instead of silently unprotected.
+- **"Repair is enabled" is no longer mistaken for "repair worked" (M-R4a).** `/api/health` escalates to **503** when an optional feature is missing *and blocked*, where blocked means any of: `AUTO_SCHEMA_REPAIR` disabled; the runtime role lacks `CREATE` on `public`, from a read-only `has_schema_privilege(current_user, 'public', 'CREATE')` probe; or a repair attempt has already **failed**, recorded in an in-process ledger with how many DDL statements were applied and why the rest were not. Before this, only the first case escalated, so a deployment with repair enabled and repair broken answered **200 "Login and registration services are ready"** while every login — correct passwords included — answered 503, and the only signal was a `console.warn` nobody collected. A later successful repair clears the ledger, so health recovers without a restart.
+- **A missing security-critical feature is unhealthy *now*, whatever the repair settings say (F-1, F-4).** M-R4a still required a *failed repair attempt* to escalate, and the second review measured the gap that leaves: dropping one column (`ALTER TABLE login_attempts DROP COLUMN ip_address`) made every login answer 503 while `/api/health` answered **200 `ok:true`** — the probe only asked whether the *relation* existed, and nothing ever attempted a repair, because no login touches `users.session_version` and the relation probe kept answering "present". So `login_attempts` and `session_revocation` are now marked **security-critical** and escalate on *missing or unverifiable* alone; optional features keep the M-R4a rule exactly as it was. The `login_attempts` probe asks about the **columns the throttle actually reads** (`identifier`, `ip_address`, `created_at`) rather than the relation, and the self-heal gained three additive `ADD COLUMN IF NOT EXISTS` statements (its ledger total is now **8**, not 5) so a drifted relation is repaired instead of only a missing one. An errored probe is reported as "could not be verified" and escalates for a security-critical feature, so `ok:true` can never sit next to a `false` flag in the same body (F-7), and the cause is recorded server-side where an operator can retrieve it. The cause is written to the server log only; the public response names the migration, because the endpoint is unauthenticated (finding L-4). An unknown capability (`null`, the probe itself failed) deliberately does **not** escalate on its own.
+- **No role-specific thresholds**, deliberately: the role is unknown before the password verifies, and looking it up per unauthenticated request would create an oracle and add a query to the hottest unauthenticated path. Attributing failures to their **source** protects administrators without leaking anything.
+
+**Verification (local mirror of `.github/workflows/ci.yml`, same environment shape: shared PostgreSQL service as `TEST_DATABASE_URL`, deliberately unreachable `DATABASE_URL`, random `JWT_SECRET`, all `EASY_LEARN_REQUIRE_*` flags set).**
+
+| CI step | Result |
+| --- | --- |
+| `security:check-secret`, `npm audit --omit=dev` | pass · 0 vulnerabilities |
+| `npm test` | pass — includes the **27-assertion** login-throttle policy suite |
+| `test:csp-hydration`, `test:auth-security` | pass |
+| `test:db` | pass — **23 suites**, **0 failures**, including the **27-assertion** login-rate-limit database suite |
+| `test:tenant-auth`, `test:review-pr45`, `test:mutation`, `test:integration`, `test:tenant-integrity` | pass |
+| `typecheck`, `build`, `lint` | pass · `✓ Compiled successfully` |
+| `test:tls-e2e` | not run locally (needs TLS-enabled PostgreSQL 16) — CI only |
+
+**Count correction (audit finding L-R3).** An earlier revision of this section recorded `test:db` as "22 suites" and the database suite as "19 assertions". Both were wrong or stale: `npm run test:db` chains **23 suite invocations** — 22 `npx tsx tests/*.test.ts` commands plus `node tests/tenant-db.test.js` — and the database suite now holds **20 assertions** because the H-R1 regression test was added. The figures above are the post-H-R1 re-run of the same local CI mirror. **Second round (M-R1, M-R2, M-R3, M-R4a):** both login-throttle suites grew from 20 assertions to **27**, and the whole 13-step mirror was re-run afterwards with the same result — `EXIT=0` for every step, `0 vulnerabilities`, `✓ Compiled successfully`, `📊 Results: … 0 failed` for all 18 database suites that print one.
+
+The regression assertions that pin the requirements: *the legitimate owner on another source is NOT locked out (H-1 admin lockout)*, *an over-long x-forwarded-for can no longer switch throttling off*, *with repair disabled the throttle FAILS CLOSED*, *the correct password is still refused while the throttle is degraded*, *the administrator can still sign in from their own source afterwards* (200 + `HttpOnly` cookie), *login still works with no source header at all*, and — for H-R1 — *clearing releases the signing-in account only, never other accounts on the same source* plus the route-level *a successful login by account A cannot clear account B's failures from the same IP (H-R1)*.
+
+Added in the second round: *M-R1: a spoofed prefix in x-forwarded-for is ignored, the trusted hop is used*, *M-R1: junk at the trusted position does not fall back towards the client*, *M-R1: the trusted hop count is configurable and clamped*, *M-R1: a declared platform header is authoritative and used exclusively*, *M-R1: x-vercel-forwarded-for is only consulted when actually running on Vercel*, *M-R2: a concurrent burst from one source yields at most MAX_ATTEMPTS real guesses*, *M-R2: a concurrent burst across many sources still respects the account backstop*, *M-R2: the record is atomic — advisory lock, insert, then a self-inclusive count*, *M-R3: email and username share one budget instead of two*, *M-R3: a successful sign-in releases every alias of that account, and nobody else's*, *M-R3: unknown accounts keep their own budget and cannot borrow a real account's*, *M-R3: budgets are keyed on the account's alias set, not on one identifier*, *M-R4a: an enabled-but-failing repair makes /api/health unhealthy, not 'ready'*, *M-R4a: a successful repair clears the failure and health recovers*, and *M-R4a: 'repair is enabled' is no longer mistaken for 'repair worked'*.
+
+**The H-R1 tests were validated against the vulnerable code, not only against the fixed code.** Re-applying the pre-fix `OR ip_address = $2` DELETE in a scratch copy and re-running the database suite produced exactly two failures — `H-R1: 3 insider sign-ins must release at most one budget of 5 guesses, got 12` and `only the colleague's 4 rows may survive — a shared source is NOT an amnesty (H-R1)` — with the other 18 assertions still passing; the fixed code passes 20/20. The tests therefore detect the vulnerability instead of restating the implementation. The original test that asserted the vulnerable behaviour was **reversed**, and the static guard in `tests/login-rate-limit-policy.test.ts` now pins the scope of the DELETE itself — `.where(eq(loginAttempts.identifier, …))`, no reference to `loginAttempts.ipAddress` inside the clear, and no unused `or` import left in `src/lib/rate-limit.ts` — so a later refactor cannot silently reintroduce it.
+
+**The M-R1/M-R2/M-R3/M-R4a tests were validated against the vulnerable code the same way.** Reverting exactly four files — `src/lib/rate-limit.ts`, `src/app/api/auth/login/route.ts`, `src/lib/schema-resilience.ts`, `src/app/api/health/route.ts` — to `5b8fbd1` while keeping the new suites produced:
+
+| Suite | Against `5b8fbd1` | Against the fix |
+| --- | --- | --- |
+| `tests/login-rate-limit-db.test.ts` | 21 passed / **6 failed** — `concurrency must not raise the pair budget above 5: 25 guesses were allowed`; `a parallel spray must not exceed the 15-failure account backstop, got 24`; `once the shared account budget is gone, the email alias must be refused too`; `only the colleague's rows may survive, got [admin ×2, colleague ×1]`; `a failed repair must be unhealthy, got 200`; `resilience.getSchemaRepairFailure is not a function` | **27 passed / 0 failed** |
+| `tests/login-rate-limit-policy.test.ts` | 18 passed / **9 failed** — all five M-R1 attribution tests, the fail-open literal count, the H-R1 DELETE scope, the M-R2 atomicity invariants and the M-R3 alias counting | **27 passed / 0 failed** |
+
+The numbers in the failure messages are the vulnerabilities, re-measured in the regression harness rather than argued: **25 of 25** concurrent guesses against a budget of 5, **24 of 24** against a 15-failure backstop, an alias pair that never shares a budget, a username login that leaves the email alias's failures behind, and a health endpoint answering **200** while every login answers 503. Every one of the pre-existing assertions still passed against the old code, so the new tests did not weaken the old ones.
+
+**Residual risk, recorded rather than hidden:** a botnet can still trip the account-wide backstop (15 failures from ≥3 sources ⇒ 15-minute cooldown). The application cannot distinguish that from a busy school NAT, so the mitigations are the high threshold, the short cooldown, a loud server-side log carrying the distinct-source count, and — recommended as an owner-side layer — a Cloudflare WAF rate rule on `/api/auth/login`.
+
+**F-9 — that WAF recommendation silently changes the source attribution, and the two must be decided together.** Adding Cloudflare in front of Vercel adds a second appending proxy, so the default `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS=1` would then read the *edge's* address instead of the client's: every visitor shares a handful of Cloudflare IPs. Measured consequence at the shipped constants — five attacker guesses from that shared address exhaust the `(identifier, source)` pair budget and **lock the account owner out** for the cooldown, and 40 guesses from it block **every** user behind that edge for 15 minutes. That is the H-1 lockout shape returning through configuration rather than code. So: if a Cloudflare WAF rate rule is adopted, `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS` must be raised to `2` **or** `EASY_LEARN_CLIENT_IP_HEADER=x-vercel-forwarded-for` must be set, and the choice recorded here. Setting that header alone removes the whole class — nothing is then unattributable — and it is the single owner-side change this roadmap recommends first.
+
+**F-8 — unattributable traffic is *less* volume-limited, not more.** When the source cannot be attributed (`null`), neither source budget can be applied, so the only limits left are per-account: measured, four accounts from one unattributable source absorbed **60** guesses before any refusal, where the same four from an attributed source are capped at **40** by `MAX_ATTEMPTS_PER_IP`. An earlier revision of the source comments claimed the opposite ("stricter, not looser") and was corrected. A **global** bucket for unattributable traffic was considered and deliberately rejected: one shared counter is exactly the denial-of-service shape H-1 removed, since an attacker who can make requests unattributable could then exhaust it and lock out every such user. The honest mitigation is to make traffic attributable (F-9 above); the residual risk stays open.
+
+Added by the second round, and recorded rather than hidden:
+
+- **The trust position is a configuration, not a proof.** `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS=1` is correct for a single honest proxy in front of the application and wrong for a longer chain; if the real chain is longer, the attributed address is a proxy's, which *under*-counts per attacker (many attackers share one bucket) rather than letting an attacker choose its own. Naming the platform header with `EASY_LEARN_CLIENT_IP_HEADER` removes the ambiguity entirely and is the recommended Vercel configuration. Neither variable is set in Production today, so Production currently runs on the default of one trusted hop plus the `process.env.VERCEL` fallback. **No Production setting was changed during this work.**
+- **Counting the in-flight attempt makes enforcement self-inclusive**, which is what makes concurrency safe. `decide` compensates by adding the same one to every threshold, so the observable limits are unchanged (5 guesses and the 6th refused; 15 per account; 40 or 10 distinct accounts per source) — pinned by the pre-existing assertions, which still pass.
+- **Advisory locks serialize attempts that share a source or an account.** That is the point, and the cost is that a burst queues instead of racing; locks are per key (never global), transaction-scoped, and never held across a bcrypt hash. The transaction is **seven statements** — `BEGIN`, `SET LOCAL lock_timeout`, the two `pg_advisory_xact_lock` calls, the `INSERT`, the windowed count and the `COMMIT`/`ROLLBACK` — so the locks are held across the last three, not "two short statements" as an earlier revision claimed.
+- **A lock wait is bounded, and hitting the bound fails closed (F-5).** `pg_advisory_xact_lock` waits forever by default, which with the Production pool at two connections was measured to be an application-wide outage rather than a login problem: two wedged logins held both connections, `GET /api/health` answered **503** and a bare `pool.query('SELECT 1')` errored. The enforcement transaction now runs `SET LOCAL lock_timeout` — transaction-scoped, so it can never leak into another request's use of the same pooled connection — from `EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS` (default **2000 ms**, clamped to 250–10000, non-numeric junk falls back to the default rather than being silently ignored). `55P03` is then treated as contention, not as a broken schema: the login fails closed with 503 + `Retry-After`, the connection goes straight back to the pool, and no advisory lock is left behind. Measured with the Production pool shape: six concurrent logins against a lock held by another backend all answer 503 within the bound plus the pool's acquire timeout, `/api/health` stays **200** throughout, and the next login after the holder releases is an ordinary **401**. A burst therefore queues for at most the bound; it does not "wait rather than deadlock" indefinitely as the earlier revision claimed.
+- **The repair-failure ledger is per process and in memory.** On Vercel that means each isolate learns the failure on its own first attempt, and a redeploy forgets it; the `ddlCapable` privilege probe covers the persistent case (no `CREATE` on `public`) without needing a failed attempt first. A probe that *errors* (as opposed to reporting "missing") is not recorded as a repair failure — in that state the database is unreachable and `/api/health` already fails on its connectivity check.
+- **Automatic schema repair has still never been observed running in Production** (M-R4's surviving qualification). The operator evidence below shows it *can* run; only a disposable-database rehearsal shows it *does*.
+
+### Independent security review of PR #69 (2026-11-19) — findings register
+
+PR #69 was reviewed independently of its own implementation claims: every changed file was compared against `main`, the runtime behaviour was re-measured with probe scripts against a disposable PostgreSQL database driving the **real** `POST /api/auth/login` handler and the real `src/lib/rate-limit.ts`, and the whole CI sequence was re-run locally. The review **failed the PR** on one HIGH finding. Nothing below was accepted on the strength of a green CI status.
+
+*Line references are against the post-H-R1-fix working tree (`5b8fbd1`) on branch `arena/4416888f-easylearn`; they described the code as the review found it. The second round of fixes (M-R1, M-R2, M-R3, M-R4a) rewrote the counting half of `src/lib/rate-limit.ts`, the login route's step order, and parts of `src/lib/schema-resilience.ts` and `src/app/api/health/route.ts`, so **every line number below is now stale** — read them as "the code the reviewer measured", and use the status column for what shipped.*
+
+| ID | Severity | Finding | Status |
+| --- | --- | --- | --- |
+| **H-R1** | High | The successful-login reset deleted every failure row **sharing the source IP** (`clearFailedLoginAttempts`, `src/lib/rate-limit.ts:497`), turning one valid low-privilege credential into a repeatable throttle-reset oracle: **108 unthrottled guesses** across three insider sign-in cycles from one IP, the victim's pair bucket back to a full budget after every cycle, and the rows counted by the account-wide aggregate deleted as well. `main` had an identifier-scoped delete, so the PR *widened* it — and the original test asserted the vulnerable behaviour as correct | **Fixed** — reset is identifier-scoped; the vulnerable assertion was reversed; a route-level regression test was added and validated against the vulnerable code |
+| **M-R1** | Medium | `getClientIp` takes the **first** (leftmost) syntactically valid `x-forwarded-for` entry (`src/lib/rate-limit.ts:195-204`, pinned by `tests/login-rate-limit-policy.test.ts:75`). Safe on plain Vercel, which overwrites the header, but nothing in the code enforces that assumption and the strictly safer `x-vercel-forwarded-for` is not consulted. Behind any proxy that *appends*, the source becomes client-controlled: forged IPs keep the per-source buckets from ever filling, and 15 requests × 15 forged IPs trip the account-wide backstop — **reintroducing the administrator lockout DoS** that H-1 was meant to remove | **Fixed in code 2026-11-19 — in PR #69.** `getClientIp` now takes a declared trust position: `EASY_LEARN_CLIENT_IP_HEADER` (exclusive), else `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS` positions from the **right** of `x-forwarded-for` (default 1, clamped to 8), else `x-vercel-forwarded-for` only when `process.env.VERCEL === "1"`; junk at the trusted position yields `null` and the chain never scans left. **Superseded in part by F-3:** the `x-real-ip` step this row still described was removed, because it let a client-written header decide the bucket after the trusted position had been rejected. Pinned by spoofed-chain / proxy-configuration assertions that **fail against `5b8fbd1`** |
+| **M-R2** | Medium | Check-then-record race: `checkLoginRateLimit` (`:390`) runs before `recordFailedLoginAttempt` (`:419`) with nothing serialising them, so a concurrent burst all passes the check. Probe: **30 concurrent wrong-password requests from one fresh IP → 30 × 401, 0 × 429, budget 5, 30 rows recorded**. Pre-existing on `main`, not introduced here, but it bounds how much "effective per-IP limiting" this design actually delivers, and it is what made H-R1's amplification repeatable | **Fixed in code 2026-11-19 — in PR #69.** The third option, and the first two together: `recordFailedLoginAttempt` is now the enforcement point, called *before* the password is verified, and inside one transaction it takes `pg_advisory_xact_lock` on the source key then the account key (fixed order, no wait cycle), **inserts** the attempt, re-counts the budgets including that row, and commits or rolls back on the verdict. Measured in the regression harness: **25 concurrent wrong passwords from one source → exactly 5 guesses, 20 refusals** (the same harness against `5b8fbd1`: **25 guesses, 0 refusals**); a 24-request spray across 24 sources → exactly the 15-failure backstop (against `5b8fbd1`: 24) |
+| **M-R3** | Medium | One account = two budgets: the identifier is `normalizedEmail \|\| normalizedUsername` and both columns are looked up (`src/app/api/auth/login/route.ts:86,98,106`), so email and username are throttled separately. Probe against one `school_admin` holding both, same IP: **10 real guesses before any 429** against a documented budget of 5. The aggregate backstop is likewise per-identifier, so an account reachable by N aliases tolerates N × 15 distributed guesses per window | **Fixed in code 2026-11-19 — in PR #69.** The route resolves the account first and passes the whole alias set (`supplied identifier`, `user.email`, `user.username`) to both the recorder and the clearer; the counting query matches `identifier = ANY($1::text[])`. Unknown accounts keep a budget of their own, so enumeration is still counted. Not bucketed on `user.id` — the recorded identifier stays the supplied string, which keeps the spraying budget (distinct supplied identities per source) meaningful and avoids a schema change. Measured: 15 guesses across both aliases then 429 through either alias, including against the **correct** password (against `5b8fbd1`: the email alias was never refused) |
+| **M-R4** | Medium (**merge gate**) | Failing closed converts "`login_attempts` missing" into "nobody can sign in" whenever `AUTO_SCHEMA_REPAIR=false` — a documented, supported setting (`README.md:165`). Production has **no migration ledger** (finding C-2), so there is no runtime evidence that the table exists there, and the previous fail-open code would have hidden its absence behind a `console.error` nobody reads (H-2). Whether Production sets `AUTO_SCHEMA_REPAIR=false` is an open question in this repository's own records (`SECURITY_AUDIT_ISSUE54_FOLLOWUP_2026-10-27.md:55`, `docs/PRODUCTION_SCHEMA_RECOVERY_PLAN.md:56`, `docs/PRODUCTION_PREFLIGHT_0019_0018.md:110`). Since `main` is the production branch, this is a **merge** gate, not only a deploy gate | **Substantially resolved 2026-11-19 by operator-supplied read-only evidence; one qualification survives.** An authorized operator ran the check against the Production runtime database (this sandbox has no path to it, and none was created): `public.login_attempts` **exists**; the effective role is **`neondb_owner`**; `has_schema_privilege(current_user, 'public', 'CREATE')` is **true** and `USAGE` is **true**; `AUTO_SCHEMA_REPAIR` is **absent** from the Vercel Production environment, which the code's only parser treats as **enabled**. So the merge-gate scenario — table missing *and* repair off, i.e. nobody can sign in — is not the Production state, and the runtime role can create the table and all four indexes if it ever disappears. **Qualification, kept deliberately: actual runtime repair has never been exercised in Production.** The table's presence means the repair path has never had to run there; the evidence proves capability, not behaviour. The repair path is instead rehearsed against disposable databases by `tests/login-rate-limit-db.test.ts` (drop → self-heal → all four indexes → recording works again), and finding **M-R4a** below makes a repair that fails observable rather than silent. No production connection, setting change, migration, or `drizzle-kit push` was performed during this work |
+| **M-R4a** | Medium | *(found while investigating M-R4, 2026-11-19)* `/api/health` could not see a **failed** repair. Its escalation branch required `!item.repairEnabled`, so with repair enabled but unable to deliver — no `CREATE` privilege, a DDL error, a half-applied statement list — the endpoint answered **200 `ok:true` "Login and registration services are ready"** while every login, correct passwords included, answered **503**. The only signal was a `console.warn`/`console.error` that nothing collects (H-2). Perverse incentive: explicitly setting `AUTO_SCHEMA_REPAIR=false` was *safer to operate* than leaving it absent | **Fixed in code 2026-11-19 — in PR #69.** `OptionalSchemaStatus` gained `ddlCapable` (read-only `has_schema_privilege` probe, cached, `null` when the probe itself fails and then deliberately non-escalating), `repairFailed` (an in-process ledger written by `ensureSchemaFeature` with `appliedStatements`/`totalStatements`/`reason`, cleared on success) and `repairBlocked`; both the `login_attempts` and the `session_revocation` escalation branches now gate on `repairBlocked`. The cause goes to the server log; the public response stays a fixed string naming `node run-migration.js` (finding L-4). Regression: with DDL blocked and repair **enabled**, `/api/health` answers **503** — against `5b8fbd1` the same test measured **200** |
+| **L-R1** | Low | The documented 30-minute cooldown is not delivered: `decide` (`:289`) only blocks while `blockedUntil > now`, but every count is windowed at `WINDOW_MINUTES = 15` (`:55`), so `BLOCK_MINUTES = 30` (`:57`) — and both other cooldowns — can never outlive the window. Probe: 5 failures 14 minutes ago ⇒ blocked; **16 minutes ago ⇒ allowed**. Real budgets: 5 per 15 min per (account, IP), 40 per 15 min per IP, 15 per 15 min per account ⇒ **1,440 guesses/day/account** | Open — either correct the constants and the documentation, or evaluate the cooldown against rows outside the counting window |
+| **L-R2** | Low | `MAX_IDENTIFIERS_PER_IP = 10` (`:70`) can lock a whole school for 15 minutes: a mass password reset, or a start-of-term morning with more than ten distinct staff mistyping behind one NAT, blocks every login from that IP — including correct passwords. Not attacker-inducible from outside the NAT, but realistic for this product's deployment shape | Open — consider a higher cap, a progressive cooldown, or exempting sources with a recent success |
+| **L-R3** | Low | This roadmap recorded `test:db` as "22 suites" and the database suite as "19 assertions"; the actual chain is **23 suite invocations** and the suite now holds 20 | **Corrected above** |
+| **L-R4** | Low | The earlier revision of this section recorded only the favourable residual risk (botnet/aggregate) and claimed per-source limiting was effective and that an attacker could no longer lock an administrator out, without recording H-R1, M-R2, M-R3 or L-R1 | **Corrected by this register** |
+| **L-R5** | Low | `login_attempts_ip_created_at_idx` never exists on a normally migrated database: it ships only in the self-heal DDL (`src/lib/schema-resilience.ts:373`), which does not run when the table already exists. `EXPLAIN` on the count query with 500 rows shows `Seq Scan on login_attempts`. Negligible while the 60-minute prune holds; note that the recorded follow-up **overstates** the benefit, since the planner ignored the existing indexes too — an `OR` predicate wants BitmapOr | Open — measure before adding a reviewed, gated migration |
+| **I-R1** | Info | Full source IPs are logged (`decide` warnings and the new reset log in `src/lib/rate-limit.ts`). Consistent with storing `ip_address`, but relevant once H-2 ships log shipping | Accepted |
+| **I-R2** | Info | Scope: 13 files, +2037/−124, of which only 5 are code; three 186–195-line audit reports ride along in a security-fix PR | Accepted |
+| **I-R3** | Info | `remainingAttempts` ignores the credential-spraying budget, so a source at 9 distinct identifiers reports 5 remaining for a fresh identifier. Not client-visible | Accepted |
+| **I-R4** | Info | Deactivated-account attempts are now recorded (`src/app/api/auth/login/route.ts:119-124`), which changes an existing response sequence: a deactivated user receives 429 after five tries instead of a persistent 403. Correct for the source budget, but untested | Open — add a test |
+| **I-R5** | Info | `docs/PRODUCTION_MIGRATION_SAFETY_REVIEW_PR32.md:972` enumerates the runtime-DDL surface and no longer lists `login_attempts`. Compliant with the "never create tenant-critical objects at runtime" rule — this table is not tenant-critical | Open — refresh that inventory |
+
+**Tests the review found missing** — status after the second round:
+
+| Missing test | Finding | Status |
+| --- | --- | --- |
+| Concurrency: N parallel wrong-password requests must not exceed the budget | M-R2 | **Added** — 25 parallel from one source must yield exactly 5 guesses, and a 24-request parallel spray exactly the 15-failure backstop; both validated against `5b8fbd1` |
+| Alias budget: email and username for one account must share a budget | M-R3 | **Added** — 15 shared guesses then 429 through either alias, alias-wide clearing on success, and unknown accounts keeping their own budget |
+| Spoofed `x-forwarded-for` chain: pin which entry is trusted and state the platform assumption | M-R1 | **Added** — five assertions covering a forged prefix, junk at the trusted position, the hop count, a declared platform header and the Vercel-only fallback. The assertion that used to pin the weaker leftmost choice was **reversed**, exactly as the H-R1 assertion was |
+| Effective cooldown: a blocked pair must still be blocked at window + 1 minute, or the constant corrected | L-R1 | **Still missing** — the finding is open; writing the test first would pin behaviour nobody has decided on |
+| NAT blast radius: more than ten distinct legitimate identifiers failing from one source | L-R2 | **Still missing** — open |
+| Deactivated-account recording | I-R4 | **Still missing** — open, and now cheaper to write: the provisional row is inserted before the deactivated branch returns 403, so the assertion is one `count(*)` |
+
+**Risks that cannot be closed from the repository:** ~~the Production presence of `login_attempts` and the Production value of `AUTO_SCHEMA_REPAIR`~~ — **answered 2026-11-19 by operator-supplied read-only evidence** (table present, role `neondb_owner`, `CREATE` on `public` granted, `AUTO_SCHEMA_REPAIR` absent ⇒ enabled); what remains is that **runtime repair has never been exercised in Production**, which no repository-side check can close. Still open: the absence of observability, so an exploited throttle bypass would raise no alert (H-2 open — M-R4a only makes a *failed repair* visible, and only to whoever reads `/api/health` or the logs); the real edge behaviour in front of Production, which decides whether one trusted hop is the right number (M-R1's configuration is a decision the operator must confirm, not something the code can verify); `test:tls-e2e`, runnable in CI only; and bcrypt cost 12, which remains the only real brake on the 1,440-guesses-per-day aggregate.
+
+**Follow-ups created by this work:** ~~M-R1 (source-IP trust model), M-R2 (check-then-record race), M-R3 (email/username double budget)~~ — **fixed in code 2026-11-19, in PR #69**; ~~M-R4 (**merge gate** — verify `login_attempts` exists in Production and record the `AUTO_SCHEMA_REPAIR` setting)~~ — **answered by operator evidence, with the "runtime repair never exercised" qualification kept**; **new:** the operator decision on `EASY_LEARN_CLIENT_IP_HEADER` / `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS` for the real Production edge (nothing is set today, so the default of one trusted hop applies), and M-R4a's ledger is per-process — a durable signal needs H-2. Still open: L-R1 (the 30-minute cooldown is unreachable), L-R2 (NAT blast radius of `MAX_IDENTIFIERS_PER_IP`), L-R5 (the `(ip_address, created_at)` index exists only in the self-heal DDL — measure first, then add it in a reviewed, gated migration), I-R4 (deactivated-account recording is untested) and I-R5 (the runtime-DDL inventory in `docs/PRODUCTION_MIGRATION_SAFETY_REVIEW_PR32.md` is stale). Also: re-verify throttling live after deployment, and decide on the Cloudflare WAF rate rule. L-3 (login error asymmetry) was **not** fixed here, and this work takes care not to widen it.
+
+Controls re-verified as working at `4069584` are listed in §3.1 of the audit report: the JWT chokepoint (HS256 pinned, strict secret policy), fail-closed session revocation, cookie-only sessions, the single CSRF chokepoint in `src/proxy.ts`, nonce CSP plus the file-response sandbox CSP, database-re-read membership roles, SQL tenant predicates on all 60 API routes, enrollment-gated submit/attempt, teacher-own-submission grading, parent-link predicates, magic-byte upload validation, server-derived download content type, seed 404 and registration 403 in Production, verified-TLS Postgres, the gated migration runner, and bcrypt cost 12. The 60-route sweep found **no new IDOR, privilege-escalation, injection, or tenant-isolation defect**.
+
+**Audit verdict:** CONDITIONAL NO-GO for formal production sign-off, with the Issue #54 posture retained. H-1, H-2 and M-4 are the blocking items. H-1 and **all five** of the review's code-level findings against it — H-R1, M-R1, M-R2, M-R3 and M-R4a — are now addressed in code in PR #69, and the M-R4 merge gate has been answered by operator-supplied read-only Production evidence. PR #69 is still **not approved for merge**: every one of those fixes was written by the same author as the original change, so an independent security re-review of the whole set is required, and the surviving M-R4 qualification (runtime repair never exercised in Production) plus the operator's edge-configuration decision for M-R1 must be recorded by the reviewer. Because `main` is the production branch, merging PR #69 is expected to deploy it to Production.
+
+### Second independent security review of PR #69 (2026-11-19) — findings register F-1…F-11
+
+The second-round fixes (H-R1 at `5b8fbd1`, then M-R1/M-R2/M-R3/M-R4a at `e4c7b41`) were reviewed
+independently of their own claims, the same way as the first round: every changed file was compared
+against the commit it claimed to be, runtime behaviour was re-measured with probe scripts against a
+disposable PostgreSQL database driving the **real** `POST /api/auth/login`, `GET /api/health` and
+`POST /api/users` handlers, the whole CI sequence was re-run, and the fixes were mutation-tested.
+The review **failed the PR again** — one HIGH, four MEDIUM, four LOW and two INFO findings. All
+eleven are recorded below with what was measured, what changed, and what no repository-side change
+can close.
+
+*Measurements labelled "before" were taken against `e4c7b41`; "after" against the working tree that
+became this commit. Nothing below was accepted on the strength of a green CI status.*
+
+| ID | Severity | Finding (measured) | Status |
+| --- | --- | --- | --- |
+| **F-1** | **High** | Column drift was an invisible total login outage. `ALTER TABLE login_attempts DROP COLUMN ip_address` ⇒ **every** login answered 503 while `GET /api/health` answered **200 `ok:true` "Login and registration services are ready."** The probe asked only whether the *relation* existed (`to_regclass`), so it reported the feature present; the self-heal contained no `ALTER`, so it could never repair a drifted relation; and M-R4a's escalation needed a *failed repair*, which never happened because nothing attempted one. A **fresh process** answered 200 before any login had been tried | **Fixed.** `login_attempts` is probed in **columns mode** for the three columns the throttle actually reads (`identifier`, `ip_address`, `created_at`); `login_attempts` and `session_revocation` are marked **security-critical** and escalate on *missing or unverifiable* alone; the self-heal gained three additive `ADD COLUMN IF NOT EXISTS` statements (ledger total **8**, was 5). Measured after: drift ⇒ health **503**, one login self-heals the column and answers **401**, health **200** again; a fresh process with DDL blocked is **503 before any login** |
+| **F-2** | Medium | The enforcing client had no `'error'` listener. `pg-pool` detaches its own idle listener on checkout and re-attaches it only on release, so a backend termination *during* the transaction was an unhandled `'error'` event: `pg_terminate_backend` on the enforcing backend **killed the probe process** (`Unhandled 'error' event: Connection terminated unexpectedly`). On a serverless deployment that takes every in-flight request in the isolate with it | **Fixed.** The enforcement path attaches its own listener for the whole checkout, removes it before releasing, and releases *with* the error when the connection is broken so `pg-pool` destroys the client instead of pooling a dead one; a statement-level error (missing column, lock timeout) keeps the connection. Measured after: the same kill degrades **one** login (503 + `Retry-After`, 0 rows recorded), the process survives, `/api/health` stays **200**, ≤1 advisory lock and ≤1 `idle in transaction` backend remain, and the next login is an ordinary **401**. The negative control still reproduces the crash (below) |
+| **F-3** | Medium | The attribution chain ended on `x-real-ip` — an ordinary header any client can send — and treated *any* truthy `process.env.VERCEL` as platform provenance. Measured: a request carrying `x-real-ip: 203.0.113.66` plus a forged `x-forwarded-for` prefix was attributed to the forged address and bought a fresh budget | **Fixed.** The `x-real-ip` fall-through is **deleted**; the Vercel step requires the exact marker `process.env.VERCEL === "1"`; an edge header is honoured only when the operator names it with `EASY_LEARN_CLIENT_IP_HEADER` (used exclusively). Measured after, through the real route: five forged-header requests ⇒ **5 × 401 then 429** with all five rows stored as `ip_address IS NULL` — the forged value buys nothing |
+| **F-4** | Medium | `session_revocation` had the same false-green as F-1: with repair **enabled** and DDL blocked, a missing `users.session_version` still answered **200 `ok:true`** while token verification failed closed on every authenticated request | **Fixed** by the same security-critical rule. Measured after: health **503 `ok:false`**, and the assertion in `tests/health-session-revocation-route-db.test.ts` that used to *require* 200 was inverted — it had been pinning the false-green as correct behaviour |
+| **F-5** | Low → Medium | `pg_advisory_xact_lock` waits forever by default. At the **Production pool (`max: 2`)** two logins wedged on a lock held elsewhere consumed both connections: `GET /api/health` answered **503** and a bare `pool.query('SELECT 1')` errored — an application-wide outage caused by one contested login | **Fixed.** The enforcement transaction runs `SET LOCAL lock_timeout` (transaction-scoped, so it cannot leak into another request's use of the same pooled connection) from `EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS` — default **2000 ms**, clamped 250–10000, non-numeric junk falling back to the default rather than being silently ignored, interpolated as an integer. SQLSTATE `55P03` is contention, not a broken schema: 503 + `Retry-After`, connection straight back to the pool. Measured after, with `NODE_ENV=production` so the pool really is `max: 2`: six concurrent logins against a held lock all answer **503** within bound + acquire timeout, `/api/health` and `SELECT 1` stay healthy **at every 150 ms sample through a 200-way burst**, recovery is **401**, 0 advisory locks left behind |
+| **F-6** | Low | Two accounts could share one identifier string. Measured: signing in to an account whose `email` equalled a **second** account's `username` erased the second account's recorded failures **4 → 0**, because `clearFailedLoginAttempts` releases every alias of the account that authenticated and the throttle keys on strings. `POST /api/users` also accepted *any* string as an email | **Fixed** at the only path that creates accounts (public registration is a disabled 403 stub): new `src/lib/login-identity.ts` validates the email format (400), generated usernames must be free in **both** columns, and a cross-column collision is refused with **409**. Measured after: 409 for an email that is another account's username, 400 for a bare username, 200 with a skipped username for an ordinary creation. Cross-column uniqueness is **inexpressible in the schema** (separate unique indexes, no computed union) so an operator with direct database access can still create a collision — recorded as a residual |
+| **F-7** | Low | An errored probe produced a self-contradicting body: **`ok:true` with `login_attempts: false` in the same response**, so flag-based alerting fires while `ok` says healthy — and the cause was unretrievable, "(cause unknown)" | **Fixed.** A probe error escalates for security-critical features, and the cause is recorded (`getSchemaProbeFailure`, with SQLSTATE) and cleared by the next probe that answers. Measured after: a stubbed `08006` on the probe ⇒ **503 `ok:false`**, cause retrievable, the *repair* ledger unpolluted (a probe that errored applied no statements), health **200** again once the blip passes |
+| **F-8** | Medium | The source documentation claimed an unattributable source made throttling "stricter, not looser". Measured the opposite: with `null` as the source neither source budget applies, so four accounts absorbed **60** guesses before any refusal where the same four from an attributed source are capped at **40** | **Documentation corrected** in `src/lib/rate-limit.ts`, this roadmap and `docs/SECURITY_AUTHENTICATION.md` §11. A **global** bucket for unattributable traffic was considered and **deliberately rejected**: one shared counter is the same denial-of-service shape H-1 removed, since whoever can make traffic unattributable could then exhaust it for everybody. The honest mitigation is to make traffic attributable (F-9); the residual risk stays open |
+| **F-9** | Low | The default trust position is a **lockout** decision, not only an attribution one. Behind a second appending proxy — Cloudflare in front of Vercel, which the recommended WAF rate rule implies — the rightmost `x-forwarded-for` entry is the *edge's* address, shared by every visitor: five attacker guesses then exhaust the `(identifier, source)` pair budget and the **account owner is locked out** of their own account, and 40 guesses lock out **everybody** behind that edge for `IP_BLOCK_MINUTES` | **Documentation + an operator decision; no code change is possible.** The Cloudflare WAF recommendation and `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS` are now cross-referenced wherever either appears (this roadmap and §11): adopting the WAF rule requires raising the hop count to `2` **or** setting `EASY_LEARN_CLIENT_IP_HEADER=x-vercel-forwarded-for`, and recording the choice. Setting that header is the single change that removes the class, because nothing is then unattributable. The code cannot see the real edge, so no repository-side test can settle it |
+| **F-10** | Low | `normalizeLoginIp` validated IPv6 as "colons and hex digits": `:::`, `a:b:c`, `1:::1`, `....::`, `1:2`, `1:2:3:4:5:6:7:8:9` and `::ffff:999.1.1.1` were all accepted, and **5000 junk inputs produced 5000 distinct source keys** — an attacker could mint a fresh per-source budget per request. Zero-padded IPv4 (`010.001.001.001`) was accepted too, and is a *different host* to a proxy that parses octal. Equivalent spellings of one address occupied two buckets | **Fixed.** Strict parse plus canonicalisation before the value is used as a bucket key or stored: RFC 5952 for IPv6 (`2001:0db8:0000::0001` → `2001:db8::1`), dotted-quad for IPv4-mapped forms (`0:0:0:0:0:ffff:203.0.113.7` → `::ffff:203.0.113.7`), zero-padded octets rejected. Measured after: every junk form above ⇒ `null`; canonical forms unchanged. Valid-but-distinct addresses still produce distinct keys (5000/5000), which is correct |
+| **F-11** | Info | Three items: M-R1's trust model was pinned only by **static** assertions (round 2's MUT-08 survived), so the source could have been rewritten without a test noticing; `remainingAttempts` overstates by one; and **L-R5** — `login_attempts_ip_created_at_idx` still exists only in the self-heal DDL, measured at **3 ms** on an empty table versus **40 ms** at 200 001 rows | **Partially addressed.** M-R1 is now pinned **behaviourally through the real route** (the F-3 forged-header test), not only by source assertions. `remainingAttempts` is unchanged (not client-visible, accepted as I-R3). The index decision is unchanged and still open: measure, then add it in a reviewed, gated migration — this PR adds no migration. Also recorded: an attempt costs ~4 pool acquisitions and ~10 statements, which at `max: 2` is why the Production-pool suite now measures a 200-way burst end to end instead of arguing about it |
+
+**Verification (third round).** Local mirror of `.github/workflows/ci.yml` with the same environment
+shape — shared PostgreSQL as `TEST_DATABASE_URL`, a deliberately unreachable `DATABASE_URL`, a random
+`JWT_SECRET`, and **every** `EASY_LEARN_REQUIRE_*` flag set so a silent skip fails the run:
+
+| CI step | Result |
+| --- | --- |
+| `security:check-secret`, `npm audit --omit=dev` | pass · **0 vulnerabilities** |
+| `npm test` | pass — 11 suites, **388 assertions, 0 failed**, including the login-throttle policy suite at **38** |
+| `test:csp-hydration`, `test:auth-security` | pass — 11 and 13 assertions |
+| `test:db` | pass — **24 suite invocations**, 83 s, **0 failures**; login-rate-limit database suite **35**, the new Production-pool suite **8**, health-session-revocation route **3** / probe **4** / auto-repair **2** |
+| `test:tenant-auth`, `test:review-pr45`, `test:mutation`, `test:integration`, `test:tenant-integrity` | pass — 21, 5, 9, 11 and 24 assertions |
+| `typecheck`, `build`, `lint` | pass · `✓ Compiled successfully` · `eslint .` clean |
+| `test:tls-e2e` | not run locally (needs TLS-enabled PostgreSQL 16) — CI only |
+
+The chain grew by one suite this round: `tests/production-pool-throttle-db.test.ts`, wired into
+`test:db` and hard-required in CI by `EASY_LEARN_REQUIRE_PRODUCTION_POOL_DB=true`. It sets
+`NODE_ENV=production` before importing `@/db` and asserts the pool really is `max: 2` with a 10 s
+acquire timeout, so the F-2/F-5 and M-R2 measurements are taken in the shape that ships rather than
+the development pool of 10 every other suite uses.
+
+**Negative control — the new tests were run against the code they accuse.** A pristine copy of
+`e4c7b41` (`git archive`, sources untouched) with only the four changed test files laid over it:
+
+| Suite | Against `e4c7b41` | Against this commit |
+| --- | --- | --- |
+| `login-rate-limit-policy` | **24 passed / 14 failed** | 38 / 0 |
+| `login-rate-limit-db` | **25 passed / 10 failed** | 35 / 0 |
+| `production-pool-throttle-db` | **process died** after 5 passes — `Unhandled 'error' event: Connection terminated unexpectedly` (F-2) | 8 / 0 |
+| `health-session-revocation-route-db` | **2 passed / 1 failed** (the inverted F-4 assertion) | 3 / 0 |
+
+The 14 policy failures name F-3 (×2), F-10 (×3), F-1 (×3 incl. the M-R4a pins the enlarged ledger
+moved), F-2, F-5, F-6, F-8 and F-9; the 10 database failures name F-1 (×3), F-2, F-3, F-4, F-6,
+F-7, F-5 and M-R4a. Every finding in the register is therefore detected by a test that fails on the
+vulnerable code, and the Production-pool suite does not merely fail against it — it reproduces the
+isolate crash.
+
+**Mutation harness — 21 targeted regressions, each a single minimal edit.** Fifteen undo a code
+fix, six undo a corrected documentation claim; a mutation that leaves every suite green is a
+survivor, i.e. a fix nobody would notice being removed.
+
+| Mutation | What it undoes | Verdict | Suite results |
+| --- | --- | --- | --- |
+| MUT-F1a | `login_attempts` probe back to relation-mode | detected | policy 37/1 · db 33/2 |
+| MUT-F1b | escalation ignores `securityCritical` | detected | policy 36/2 |
+| MUT-F1c | the three additive column repairs removed | detected | policy 37/1 · db 33/2 |
+| MUT-F4 | `session_revocation` no longer security-critical | detected | policy 37/1 |
+| MUT-F2 | no `'error'` listener on the checked-out client | detected | policy 37/1 · db **crashed** · prodpool **crashed** |
+| MUT-F2b | broken client released back into the pool | detected | policy 37/1 |
+| MUT-F3 | `x-real-ip` fall-through restored | detected | policy 37/1 · db 34/1 |
+| MUT-F3b | platform marker becomes a truthiness check | detected | policy 37/1 |
+| MUT-F5 | `SET LOCAL lock_timeout` removed | detected | policy 37/1 · prodpool **hung** (120 s bound) |
+| MUT-F5b | operator lock-timeout value silently ignored | detected | policy 37/1 |
+| MUT-F6 | alias-collision 409 guard removed | detected | db 32/3 |
+| MUT-F6b | email format validation accepts anything | detected | policy 37/1 · db 32/3 |
+| MUT-F7 | errored probe no longer forces unavailable | detected | db 33/2 |
+| MUT-F10 | IPv4 canonicalisation/strictness bypassed | detected | policy 36/2 |
+| MUT-F10b | IPv6 accepted on the character set alone | detected | policy 36/2 |
+
+Documentation mutations, run against the policy suite's doc pins:
+
+| Mutation | What it undoes | Verdict | Suite results |
+| --- | --- | --- | --- |
+| MUT-F9d | the `F-9` register row loses its marker | detected | policy 37/1 |
+| MUT-F9e | the F-9 row no longer says anyone is **locked out** | detected | policy 37/1 |
+| MUT-F8d | the recorded decision *not* to add a global cap is deleted | detected | policy 37/1 |
+| MUT-F8f | the disproved "stricter, not looser" claim is restored | detected | policy 37/1 |
+| MUT-F9f | the §11 heading stops calling the hop count a lockout decision | **survived** | policy 38/0 |
+| MUT-F8e | one of the two quotes of the F-8 measurement is removed | **survived** | policy 38/0 |
+
+**Both survivors are reported rather than buried, and both are weaker mutations than they look.**
+MUT-F9f edits a *heading*; the body two lines below still states the lockout consequence and the
+remedy, which is what the pin asserts. MUT-F8e removes the measurement's *second* appearance in the
+`rate-limit.ts` header — it is quoted twice, and the surviving quote still carries "measured across
+12 accounts … refused after 40 … after 60". Neither survivor leaves a false claim in the tree.
+
+One process note, because it changed a test: the first harness run reported **MUT-F9d as a
+survivor**. It was a real gap — the assertion was `roadmap.includes("F-9")`, and the marker appeared
+in three other places, so deleting it from the register row went unnoticed. The assertion now pins
+the row itself (`| **F-9** | <severity> | … locked out … EASY_LEARN_CLIENT_IP_TRUSTED_HOPS`) and the
+§11 tie between the hop count and the lockout, and the mutation was re-run to confirm detection.
+
+**A flake found while verifying, and fixed.** The first full mirror run of this round failed
+`test:db` with `3 !== 0` on the F-5 assertion that no advisory lock outlives its request. The three
+locks were real but not this suite's: they belonged to backends in a *different* scratch database,
+left behind when the mutation harness killed the hung MUT-F5 run mid-wait. `pg_locks` is
+**cluster-wide**, so the assertion was counting other databases' locks — a false failure that a
+shared CI PostgreSQL service could produce on any run. All three counts (two in the login database
+suite, one in the Production-pool suite) are now scoped with
+`AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`, and the fix was
+verified by holding a foreign advisory lock in another database of the same cluster while the suite
+ran: it passes. The orphans were terminated and their scratch databases dropped; the re-run mirror
+is green.
+
+Two of the code mutations are worth more than a tick in a table. **MUT-F5** does not fail an assertion, it
+*hangs* the Production-pool suite — which is the finding restated as a test result: without the
+bound, the suite never finishes. **MUT-F2** crashes two suites outright, because removing the
+listener returns the code to the unhandled-`'error'`-event behaviour the review measured.
+**MUT-F1b** and **MUT-F4** are the two that a green CI would previously have hidden: with either
+applied, the database suites still pass, and only the policy suite's pins notice — which is exactly
+why the escalation rule is asserted in source as well as in behaviour.
+
+**Files changed this round:** `src/lib/rate-limit.ts`, `src/lib/schema-resilience.ts`,
+`src/app/api/health/route.ts`, `src/app/api/users/route.ts`, new `src/lib/login-identity.ts`;
+`tests/login-rate-limit-policy.test.ts`, `tests/login-rate-limit-db.test.ts`,
+`tests/health-session-revocation-route-db.test.ts`, new `tests/production-pool-throttle-db.test.ts`;
+`package.json`, `.github/workflows/ci.yml`, `.env.example`, `README.md`,
+`docs/SECURITY_AUTHENTICATION.md` and this roadmap. No migration was added and none was run against
+any Production database; no Production environment variable, permission, backup or deployment was
+touched.
+
+**Preserved, and re-measured this round:** H-R1 (four insider sign-in cycles ⇒ 5 allowed / 15
+refused, the victim's rows survive), M-R2 (40 parallel from one source ⇒ exactly 5 guesses; 40
+sources ⇒ exactly 15; a mixed burst ⇒ 0 deadlocks; 600 parallel ⇒ 5 × 401 / 595 × 429 in 2.2 s with
+health 200; refusals do not extend a cooldown — `Retry-After` stays 1800 s), M-R3 (a username switch
+from the same source is refused; case and whitespace collapse onto one budget) and the
+no-disclosure-leak sweep (14 terms, `[]`). All of these still pass, and the M-R2 budgets are now
+additionally measured under the Production pool.
+
+**Still open after this round** (owner-side or explicitly deferred, none introduced by it): **L-R1**
+(the 30-minute cooldown is unreachable inside a 15-minute window ⇒ 1,440 guesses/day/account),
+**L-R2** (NAT blast radius of `MAX_IDENTIFIERS_PER_IP`), **L-R5** (the `(ip_address, created_at)`
+index exists only in the self-heal DDL), **F-8/F-9** (unattributable traffic is less volume-limited,
+and the edge topology is an operator decision), **F-6's residual** (cross-column uniqueness is
+inexpressible in this schema), **F-11's** `remainingAttempts` off-by-one, **H-2** (no observability —
+every signal in this register is a log line or a health body somebody must poll), I-R3, I-R4, I-R5,
+and the Task C register (C-2, M-1…M-5, L-1…L-7) which is unchanged.
+
+**Verdict after the third round:** the code-level findings F-1…F-8, F-10 and F-11(a) are fixed and
+each is pinned by a test that fails against `e4c7b41`; F-9 and the F-8 residual are documented and
+remain **operator decisions**. PR #69 is still **not approved for merge**, and this round does not
+change that: the fixes were written by the same author as the code they correct, so a fresh
+independent security review of the whole set is required before merge. Because `main` is the
+production branch, merging PR #69 is expected to deploy it to Production.
+
+### Follow-up review of PR #69 (2026-11-22) — F-1a repair ordering, F-6a atomic identity
+
+The F-1…F-10 remediation at `5863052` was re-reviewed, and **two defects survived inside the fixes
+themselves**. Both were invisible to a green CI: every suite passed at `5863052` with both present.
+Each is recorded with the measurement that found it.
+
+**F-1a (Medium) — the self-heal silently lost indexes on a drifted table.** `ALTER TABLE … DROP
+COLUMN` also drops every index that depends on the column, and `ensureSchemaFeature` logs and
+**skips** a statement that fails rather than aborting the feature. The repair list ran `CREATE
+TABLE`, then the four `CREATE INDEX` statements, and only *then* the three additive `ADD COLUMN`
+repairs — so on a drifted table the index builds referenced columns that did not exist yet, failed
+with 42703, were skipped, and the columns were restored afterwards. The columns-mode probe then
+reported the feature **available**, and because it was available the repair never ran again.
+Measured on a disposable database against `5863052` (indexes present after the repair, out of the
+four required):
+
+| Column dropped | Indexes PostgreSQL took with it | Left missing **permanently** after the repair |
+| --- | --- | --- |
+| `identifier` | `identifier_idx`, `identifier_created_at_idx` | **2** — only `created_at_idx` and `ip_created_at_idx` came back |
+| `ip_address` | `ip_created_at_idx` | **1** — `ip_created_at_idx` never came back |
+| `created_at` | `created_at_idx`, `identifier_created_at_idx`, `ip_created_at_idx` | **3** — only `identifier_idx` came back |
+
+No error, no health signal, no ledger entry: the table was "available" with a silently degraded
+count query, which is finding L-R5's 3 ms → 40 ms penalty arriving without anybody deciding it.
+**Fixed** by reordering the list to *relation → columns → indexes* and documenting the ordering as
+load-bearing where the list lives (a statement may only depend on the ones before it). All eight
+statements are `IF NOT EXISTS`, so the list stays re-runnable; nothing drops or rewrites anything,
+and no `CONCURRENTLY` (it cannot run inside a transaction and is not needed while logins already
+fail closed). `FEATURE_SQL` is now exported read-only so the tests assert the order of the list that
+is *executed*, not the order it appears in a comment.
+
+**F-6a (Medium) — the cross-column identity check was a check-then-act race.** The F-6 guard ran
+separate `SELECT`s and then `INSERT`ed, with **bcrypt cost 12 (~250 ms) in between**, so the window
+was hundreds of milliseconds wide. Measured against `5863052` with two opposing concurrent requests
+— one creating `email = X`, the other a learner whose generated username (first initial + last name)
+is the same string `X`: **both answered 201 and both accounts existed**, i.e. `email=1, username=1,
+2 !== 1`. That is precisely the state the guard exists to prevent: two accounts sharing one
+login-throttle bucket, where signing in to one releases the other's recorded failures. A wider burst
+was worse — eight concurrent creations returned `(201, 500, 500, 500, 500, 201, 500, 500)`: the
+same-column race surfaced as an **unmapped 500** from the unique-index violation instead of a
+skipped username.
+
+**Fixed** by making the whole sequence atomic in the database, without a migration (an expression
+index over `COALESCE(email, username)` would need one, and Production migrations are not authorised
+here):
+
+```
+BEGIN
+  SET LOCAL lock_timeout = 5000                       -- bounded, transaction-scoped
+  SELECT pg_advisory_xact_lock(hash('easylearn:login-identity'))
+  … every uniqueness read, the username generation, the INSERT, the membership …
+COMMIT                                                -- the lock dies with the transaction
+```
+
+bcrypt runs **before** the transaction, so the lock covers a handful of short statements. The
+membership write moved inside the same transaction, which also removes the compensating
+`DELETE FROM users` — a rollback cannot fail the way a compensating delete can. A lock timeout or a
+deadlock is classified (`55P03` / `40P01`) and answered with a retryable **503**; nothing is
+written. **One namespace key rather than a key per identifier**, deliberately: the generated
+username is not known until the uniqueness reads have run and those reads must themselves be inside
+the lock, so a per-identifier design has to lock in two phases (base candidate, then chosen
+candidate plus email) and two transactions can acquire overlapping key sets in opposite order — a
+deadlock cycle traded for concurrency on an authenticated, school-admin-only path. `SERIALIZABLE`
+isolation was the alternative and was not chosen: it needs a retry loop, its aborts are
+probabilistic rather than prevented, and it would abort every genuinely concurrent creation.
+
+**Verification (round four).** Same environment shape as before, all `EASY_LEARN_REQUIRE_*` flags
+set: **15/15 CI-mirror steps `EXIT=0`** — `npm audit --omit=dev` 0 vulnerabilities, `npm test`
+(11 suites, **392 assertions, 0 failed**, policy suite **42**), `test:db` (**24 invocations**, 87 s,
+0 failures — login-rate-limit database suite **41**, Production-pool suite **9**), tenant/auth/
+mutation/integration/integrity suites unchanged and green, `typecheck`, `build`, `lint`.
+
+| Suite | `5863052` | this commit |
+| --- | --- | --- |
+| `login-rate-limit-policy` | 38 | **42** |
+| `login-rate-limit-db` | 35 | **41** |
+| `production-pool-throttle-db` | 8 | **9** |
+
+New assertions: for each of `identifier`, `ip_address` and `created_at` — drop the column
+independently, establish that PostgreSQL took the dependent indexes with it (so the test cannot pass
+vacuously), trigger the repair through a real login, then require **all three columns and all four
+indexes**, a clear repair ledger, health 200 and the triggering attempt recorded; the repair list
+executed twice more against a healthy table with a row in it, asserting nothing changes and no data
+is touched; the order of the executed list asserted statement by statement (every index after every
+column repair it references); three rounds of two concurrent opposing creations plus an eight-way
+burst, asserting the contested string is held by **exactly one** account across both columns, that
+no cross-column collision survives anywhere in the table, that the loser lost *coherently* (409 on
+the email side, a suffixed username on the other), and that no advisory lock outlives the requests —
+the burst also runs at `NODE_ENV=production` / `max: 2`, sampling `/api/health` and `SELECT 1`
+throughout.
+
+**Negative controls (one file reverted at a time, so each finding is isolated):**
+
+| Control | Reverted | Result |
+| --- | --- | --- |
+| NC-A | `src/lib/schema-resilience.ts` only (indexes-first order restored; the `FEATURE_SQL` export kept so the difference under test is the *order*) | database suite **37/4** — all three drop-column scenarios fail with the exact index that never came back, plus the idempotency test; policy suite **40/2** |
+| NC-B | `src/app/api/users/route.ts` only (check-then-insert restored) | database suite **39/2** — `email=1, username=1, statuses=201/201` and the burst's unmapped 500s; Production-pool suite **8/1** — `got 500 (201, 500, 500, 201, 500, 500)`; policy suite **41/1** |
+
+**Mutation harness — 8 targeted regressions of the two fixes, all 8 detected:**
+
+| Mutation | What it undoes | Verdict | Suite results |
+| --- | --- | --- | --- |
+| MUT-G1 | repair list reordered, indexes before the column repairs | detected | policy 41/1 · db 37/4 |
+| MUT-G2 | the `ip_address` column repair removed | detected | policy 40/2 · db suite aborts on its own teardown guard ("the throttle table must exist again") — the table can never be repaired |
+| MUT-G3 | the identity advisory lock removed | detected | policy 41/1 · db 39/2 |
+| MUT-G4 | `SET LOCAL lock_timeout` removed from the identity transaction | detected | policy 41/1 |
+| MUT-G5 | bcrypt moved inside the lock | detected | policy 41/1 |
+| MUT-G6 | the account inserted on the pool instead of the transaction | detected | policy 41/1 · **db 41/0** |
+| MUT-G7 | `isIdentityLockTimeout` always false | detected | policy 41/1 |
+| MUT-G8 | the membership moved back out of the transaction | detected | policy 41/1 |
+
+Two honest notes. **MUT-G6 passes the database suite**: with the lock still held, a pool-level
+insert is still serialised against other creations, so the concurrency tests cannot tell the
+difference — what is lost is the atomic rollback of account + membership, which only the source pin
+catches. **MUT-G5 is a performance regression, not a correctness one**, and is likewise caught only
+by the pin. Both are recorded rather than presented as behavioural kills.
+
+**The earlier 21-mutation harness was re-run against the rewritten code, and it found two things.**
+Its `MUT-F6` anchor (`if (aliasCollision) { … }`) no longer existed after the route was restructured,
+so the harness would have reported a phantom `BAD-PATCH`; the anchor was re-pointed at the guard
+inside the transaction and all 16 code mutations were re-verified to have exactly one match before
+the run. The run then detected **14 of 16** and left two survivors, both of which were investigated
+rather than filed:
+
+| Mutation | Verdict on re-run | What it turned out to be |
+| --- | --- | --- |
+| MUT-F7 — `if (featureProbeUnavailable \|\| securityCriticalMissing)` becomes `if (securityCriticalMissing)` | **survived** — policy 42/0 · db 41/0 | a **real test gap**, now closed |
+| MUT-F9d — the `F-9` *narrative* heading loses its marker | **survived** — policy 42/0 | a **stale anchor**, not a gap |
+
+*MUT-F7 was a genuine gap, and it is worth stating exactly why, because the obvious explanation is
+wrong.* The obvious explanation is that `securityCriticalMissing` already covers the probe-error
+case, because `probeSchemaFeatures` records a failed probe as `present: false`. It does not: that is
+only true for a **security-critical** feature, and it does not cover the case the clause exists for —
+`await import("@/lib/schema-resilience")` throwing, i.e. the probe module cannot be loaded at all. In
+that case nothing sets any `optionalMigrations` entry, `securityCriticalMissing` is `false`, and the
+remaining guard is the only thing standing between an unreadable schema state and `ok:true`. Deleting
+it survived everything, including the database test written for F-7, because that test stubs
+`pool.query` and so the module always imports. That the policy pin did not catch it either is the
+instructive half: the pin was `health.includes("featureProbeUnavailable")`, and the flag is
+*declared* in the route and *set* in the `catch`, so the assertion was satisfied by the two places
+that do not matter and said nothing about the guard that reads it. A name appearing in a file is not
+a behaviour. The pin is now a regex on the condition itself —
+`/if\s*\(\s*featureProbeUnavailable\s*\|\|\s*securityCriticalMissing\s*\)/` — and the mutation
+is now caught (policy **41/1**) with the assertion message saying that the guard must *read* the flag,
+not merely declare it. This is the second time in this review that a static pin was satisfied by an
+irrelevant occurrence of the string it was looking for; the first was MUT-F9d.
+
+*MUT-F9d was not a gap at all.* The register-row pin it was supposed to exercise
+(`| **F-9** | <severity> | … locked out … EASY_LEARN_CLIENT_IP_TRUSTED_HOPS`) was added in the
+previous round and does fire: stripping the row marker alone turns the suite **41/1**. What the
+harness was mutating was a *prose* heading elsewhere in the roadmap that no assertion reads, which is
+a harmless edit. The mutation was re-pointed at the register row, where it represents the claim the
+finding is actually recorded by, and it is detected. Nothing in the documentation changed as a
+result — this is an artefact of a harness written against an older revision, and it is recorded in
+the table above rather than quietly deleted so that the "14/16" is not mistaken for a defect in the
+fixes.
+
+After both corrections the same 16 mutations were re-run against the final tree and **16 of 16 are
+detected**, with `HARNESS_EXIT=0`. The per-mutation results are reproducible from `mutate.py`; the
+two that changed are MUT-F7 (policy **41/1**) and MUT-F9d (policy **41/1**). One incidental
+confirmation: MUT-F7's database suite now *passes* while the policy suite fails, which is exactly the
+asymmetry described above — the behaviour is unreachable through the stubbed-probe path, so the
+source pin is what protects it, and the roadmap says so rather than implying the database test covers
+it.
+
+**A defect found in the new test code itself, and fixed.** The Production-pool suite's liveness
+sampler stopped only on the success path, so a FAILED assertion inside the sampled block left the
+sampler looping forever and the process never exited: measured, the NC-B run **hung for 900 s**
+instead of reporting `8 passed, 1 failed`. In CI that would have consumed the whole job timeout and
+reported nothing. The sampler now stops in a `finally`; NC-B re-run afterwards finished in 12 s with
+the failure correctly reported.
+
+**Remaining limitations after this round:**
+
+1. The identity invariant is still **application-enforced**. A direct `INSERT`/`UPDATE` against the
+   database can create a colliding pair, because cross-column uniqueness is inexpressible without an
+   expression index — a Production migration, which this work is not authorised to add. Recorded as
+   the F-6 residual in the register above.
+2. Every account creation in a deployment serialises on one advisory lock. The path is
+   authenticated, school-admin-only and low-volume, the lock covers a handful of statements, and the
+   wait is bounded at 5 s with a retryable 503 — but a bulk-import feature would need a different
+   design (batch inside one transaction, or the expression index above).
+3. `src/app/api/seed/route.ts` also inserts users and does **not** take the identity lock. It
+   answers 404 whenever `NODE_ENV=production`, requires `super_admin`, and only seeds an empty
+   database inside its own transaction, so it is not a Production collision path; it is recorded
+   here so the omission is a decision rather than an oversight.
+4. A table missing **only** an index still does not trigger a repair, by design: the probe reports
+   availability from the columns the throttle reads, and requiring `login_attempts_ip_created_at_idx`
+   in the probe would answer 503 for a healthy Production database that legitimately lacks it
+   (L-R5). The repair creates all four indexes whenever it *does* run.
+5. **L-R5 is unchanged and still open**: a healthy Production table still has no
+   `(ip_address, created_at)` index. That needs the reviewed, gated migration, not this list.
+6. Everything else in the F-register stands: F-9 and the F-8 residual remain operator decisions,
+   L-R1, L-R2, H-2 and the Task C register are untouched.
+
+## Current progress dashboard — 2026-11-19 production status
 
 | Phase | Estimated completion | Status | Main work still outstanding |
 | --- | ---: | --- | --- |
-| 1. Critical Security & Access Control | **100%** | Complete for bounded Phase 1 scope | Verify live role-denial, rate-limit and DB prerequisites; broader session/CSRF security is later scope. |
+| 1. Critical Security & Access Control | **100%** | Complete for bounded Phase 1 scope; the H-1 login-throttle fix is under review (2026-11-19) | Review and merge the H-1 rate-limit fix, then verify throttling live; verify live role-denial and DB prerequisites; broader session/CSRF security is later scope. |
 | 2. Multi-School / Multi-Tenant Architecture | **78%** | Code hardening merged; production gate blocked | Read-only production evidence for migrations 0013–0017 and tenant behavior; safely rehearse migration 0018 against a restored production copy; plan and validate 26 missing child-side FK indexes; separately authorize any production change. |
 | 3. School Management & Administration | **25%** | Legacy LMS baseline exists; SaaS workflows not started | Platform school onboarding/provisioning, invitations, membership administration, school lifecycle/settings, safe offboarding and independent-school E2E. |
 | 4. Academic & Results Management | **45%** | Core teaching workflows exist | Configurable grading/scales, moderation and result publication, report cards, promotion/rollover, historical-year handling and school-specific configuration. |
@@ -23,22 +567,35 @@ This current roadmap supersedes the historical architecture audit retained below
 
 **How to read the percentages:** estimates reflect delivered scope against each phase’s full roadmap, not the share of code merged. The overall 46% is a rounded planning estimate across the nine phases. Merged code and passing disposable-database tests do **not** count as production migration or behavior verification.
 
+**What changed in the 2026-11-19 update:** no phase percentage was revised. Two gates moved: Cloudflare R2 object storage went from *deployed, production behaviour unverified* to **production behaviour verified** (assignment uploads, learner submissions and downloads — see "Closed" above), and Phase 1 gained one open review item, the H-1 login-throttle fix. Migration 0018, the 26 child-side FK indexes, and every backup/disaster-recovery gate are unchanged.
+
 ### Confirmed progress since the previous roadmap checkpoint
 
+- **2026-11-19 — Cloudflare R2 object storage verified in Production (owner-confirmed).** Assignment uploads, learner submissions and downloads all work end to end after the bucket CORS correction. The C-1 active upload failure is closed and removed from this roadmap; the audit reports are committed at the repository root.
+- **2026-11-19 — deployed build identity confirmed.** The GitHub deployments API records a Production deployment of `4069584e99574a4fe2af7d4317a8bcbf13f9bf73` at 2026-11-17T21:20:13Z for the Vercel project `easylearn` (alias `https://easylearn-six.vercel.app`), with CI green on that commit (PostgreSQL isolation suites, typecheck, build, lint) and a successful Vercel build. The legacy duplicate project `easylearnn` still exists and is audit finding M-4.
+- **2026-11-19 — full production readiness & security audit completed read-only** (`FULL_PRODUCTION_AUDIT_2026-11-19.md`). A 60-route sweep found no new IDOR, privilege-escalation, injection or tenant-isolation defect, and the existing controls were re-verified in code at HEAD. Verdict: CONDITIONAL NO-GO for formal sign-off, blocked on H-1 (fix now under review), H-2 (observability) and M-4.
+- **2026-11-19 — H-1 login throttling remediated in code: PR #69, open for review.** The throttle no longer fails open, client IPs are now limited (per-source volume and credential-spraying budgets), the five-attempt budget is scoped to (identifier, source) so one attacker can no longer lock an administrator out, and two regression suites were added (`tests/login-rate-limit-policy.test.ts`, `tests/login-rate-limit-db.test.ts`). Migration 0018 and backup/DR were untouched by this work.
+- **2026-11-19 — PR #69 independently security-reviewed: verdict FAIL, one HIGH finding (H-R1).** The review did not accept the implementation's own claims or the green CI status: all 13 changed files were compared against `main`, the runtime behaviour was re-measured with probe scripts against a disposable database driving the real login handler, and the full CI sequence was re-run locally. It found that the successful-login reset deleted every failure row sharing the source IP, so one valid low-privilege credential could repeatedly erase an attacker's accumulated failures against other accounts (108 unthrottled guesses over three sign-in cycles in the probe) — and that the PR's own test asserted that behaviour as correct. Full register: M-R1, M-R2, M-R3, M-R4 (merge gate), L-R1…L-R5, I-R1…I-R5.
+- **2026-11-19 — H-R1 fixed in code on the same PR branch.** `clearFailedLoginAttempts` is now identifier-scoped and can never widen its DELETE by source IP; the vulnerable assertion was **reversed** and a route-level regression test added (database suite 19 → 20 assertions). Both new tests were validated against the vulnerable code — they fail there with `3 insider sign-ins must release at most one budget of 5 guesses, got 12` and pass 20/20 on the fix. The full local CI mirror was re-run afterwards. **PR #69 remains unmerged and unapproved: an independent security re-review is required before merge, and the M-R4 Production check is a merge gate.** No production connection, deployment, migration, setting change, or backup operation was performed.
+- **2026-11-19 — M-R4 answered by Production evidence; M-R1, M-R2, M-R3 and M-R4a fixed in code on the same PR branch.** An authorized operator ran the read-only M-R4 check against the Production runtime database (this sandbox has no path to Production and none was created): `public.login_attempts` exists, the effective role is `neondb_owner`, `has_schema_privilege(current_user, 'public', 'CREATE')` and `USAGE` are both `true`, and `AUTO_SCHEMA_REPAIR` is absent from the Vercel Production environment — which the code's only parser treats as **enabled**. M-R4 is therefore recorded as **substantially resolved**, keeping the qualification that **actual runtime repair has never been exercised in Production**. Investigating it produced a new finding, **M-R4a**: `/api/health` answered 200 "Login and registration services are ready" whenever repair was merely *enabled*, even with repair broken, while every login answered 503. All four code findings are now fixed — a declared client-IP trust position (`EASY_LEARN_CLIENT_IP_HEADER`, `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS`, rightmost-trusted-hop), advisory-locked insert-then-decide enforcement before the password is verified, one account budget shared by every alias, and a `repairBlocked` health escalation backed by a read-only privilege probe and a repair-failure ledger. Both login-throttle suites grew 20 → **27** assertions; every new test was validated against `5b8fbd1`, where the database suite fails 6 (25 of 25 concurrent guesses allowed, 24 of 24 sprayed, aliases never sharing a budget, health **200**) and the policy suite fails 9. The full 13-step local CI mirror was re-run: every step `EXIT=0`, `0 vulnerabilities`, `✓ Compiled successfully`. **PR #69 remains unmerged and unapproved — an independent security re-review of the whole set is required.** No production connection, deployment, migration, `drizzle-kit push`, environment-variable change, database-permission change, or backup operation was performed.
+- **2026-11-22 — PR #69 follow-up review: two defects inside the F-1…F-10 fixes themselves, both now fixed.** Re-reviewing `5863052` found that the `login_attempts` self-heal listed its four `CREATE INDEX` statements *before* the three additive `ADD COLUMN` repairs, and since `ALTER TABLE … DROP COLUMN` takes the dependent indexes with it while `ensureSchemaFeature` skips (not aborts on) a failing statement, a drifted table came back "available" with 1, 2 or 3 of its four indexes permanently missing — no error, no health signal, no ledger entry (**F-1a**). It also found that the F-6 cross-column identity guard was check-then-act with bcrypt cost 12 (~250 ms) between the checks and the insert: two opposing concurrent creations both answered **201** and both accounts existed, and an eight-way burst returned six unmapped **500**s (**F-6a**). Fixes: the repair list is reordered relation → columns → indexes with the ordering documented as load-bearing and `FEATURE_SQL` exported read-only so tests pin the executed order; account creation now runs its checks, username generation, insert and membership inside one transaction behind a bounded (`SET LOCAL lock_timeout = 5000`) transaction-scoped advisory lock on a single identity namespace, with bcrypt outside the lock and the compensating `DELETE` replaced by rollback. Evidence: policy suite 38 → **42**, login database suite 35 → **41**, Production-pool suite 8 → **9** (the burst also runs at `max: 2`); one-file-at-a-time negative controls give db **37/4** and **39/2** plus Production-pool **8/1**; an 8-mutation harness detects all 8, with two recorded as caught only by source pins; the 15-step CI mirror is green end to end. A defect in the new test code was found and fixed on the way — a failed liveness assertion left the sampler looping so the suite hung for 900 s instead of reporting the failure. **PR #69 remains unmerged and unapproved; a fresh independent security review is still required.** No production connection, deployment, migration, `drizzle-kit push`, environment-variable change, database-permission change, or backup operation was performed.
+- **2026-11-19 — PR #69 reviewed a second time: verdict FAIL again (F-1…F-11); all ten code-and-documentation findings now fixed on the same branch.** The second independent review re-measured `e4c7b41` rather than trusting it, and found one HIGH: a **drifted column** on `login_attempts` was a permanent, invisible login outage — every sign-in answered 503 while `/api/health` answered **200 `ok:true` "Login and registration services are ready."**, because the probe asked only whether the relation existed, the self-heal contained no `ALTER`, and M-R4a's escalation needed a failed repair that nothing ever attempted. Also found: no `'error'` listener on the checked-out client (a `pg_terminate_backend` **killed the isolate**); an attribution chain that ended on client-writable `x-real-ip`; an **unbounded** advisory-lock wait that, at the Production pool of two connections, took `GET /api/health` and a bare pool query down with it; `session_revocation` false-green; a probe error producing `ok:true` next to a `false` flag in the same body; cross-account alias collisions erasing another account's recorded failures; IPv6 "validation" that accepted `:::` and minted 5000 distinct source keys from 5000 junk inputs; and two documentation claims that measured the opposite of what they said. Fixes: a **columns-mode** probe plus a `SECURITY_CRITICAL_FEATURES` escalation on *missing or unverifiable*, three additive column repairs, a checked-out-client error listener with a destroying release, the `x-real-ip` fallback **deleted** and the Vercel marker made exact, `SET LOCAL lock_timeout` (`EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS`, default 2000, clamped) failing closed on `55P03`, `src/lib/login-identity.ts` with 400/409 guards at `POST /api/users`, a retrievable probe-failure cause, and strict-plus-canonical IP parsing. Evidence: policy suite **38** assertions, login database suite **35**, and a new `tests/production-pool-throttle-db.test.ts` (**8**) that sets `NODE_ENV=production` and asserts the pool really is `max: 2` before measuring the budgets, the bounded lock wait and the killed backend in the shape that ships. Run against a pristine `e4c7b41` the same tests fail **14**, **10** and **crash the process** respectively; a 21-mutation harness detects 19 (two documentation survivors recorded and explained). The 15-step local CI mirror is green end to end. **PR #69 remains unmerged and unapproved — a fresh independent security review is required, and this round does not change that: the fixes were written by the same author as the code they correct.** No production connection, deployment, migration, `drizzle-kit push`, environment-variable change, database-permission change, or backup operation was performed.
 - **PR #32 merged** at `90ec04363cbec3222232c6f912fcad69ab038dba`. It integrated the migration-runner/schema-resilience safeguards and the migration-0018 composite-FK work, plus regression evidence. It did not apply migration 0018 to production.
 - **PR #33 merged** at `851156cac0403f1b9e268c0c3584543852399c48`. CI succeeded; scratch database teardown is now shared and asserted, and the LOW-1/2/3 findings were addressed. LOW-4 was deliberately not changed because the proposed change weakened fail-closed authorization.
 - The scratch-database leak was reproduced before the fix (four databases left behind by the worst suites); the PR reports repeated suite runs and the complete CI sequence leaving zero scratch databases.
-- **Still not confirmed:** production execution of migrations 0013–0017, current production schema/data integrity, intended deployed build identity, and post-change live tenant-isolation behavior.
-- **Still outstanding:** 26 child-side FK indexes identified as a performance/locking risk. They require a separate reviewed and gated migration; PR #32/#33 did not add them.
-- No production connection, migration, data/settings change, manual deployment, or branch-protection change was performed as part of these merges or this roadmap update.
+- **Still not confirmed:** production execution of migrations 0013–0017 (no `easylearn_schema_migrations` ledger exists in Production), current production schema/data integrity beyond the owner-verified 2026-10-27 read-only checkpoint (**0/26** composite FKs from 0018, **24/24** objects from 0017), and post-change live tenant-isolation behavior.
+- **Still outstanding:** 26 child-side FK indexes identified as a performance/locking risk. They require a separate reviewed and gated migration; PR #32/#33 did not add them, and no such migration exists as of 2026-11-19.
+- No production connection, migration, data/settings change, manual deployment, backup operation, or branch-protection change was performed as part of these merges, the 2026-11-19 audit, or this roadmap update.
 
 ## Immediate remaining work (ordered)
 
-1. **Read-only production checkpoint:** an authorized operator verifies the intended Vercel project/alias and production build identity, then captures sanitized catalog/data evidence for migrations 0013–0017, required NULLs, orphan/cross-school rows, FK validation and indexes, and post-repair role/dual-school behavior. Do not expose secrets.
-2. **Restored-copy rehearsal for migration 0018:** use a restored copy of production only. Check PostgreSQL version (migration syntax requires PostgreSQL 15+), row/table sizes, preflight results, lock duration and rollback behavior. Record results and review them before any production application.
-3. **Index plan and separate migration:** enumerate the 26 missing child-side FK indexes, inspect query plans and table sizes, design a low-lock/concurrent-index approach compatible with the migration runner, and test it on the restored copy. Do not bundle this into an unreviewed production action.
-4. **Decision gate:** reconcile the evidence. If production is already at the expected state, do not rerun migrations. If there is a gap, prepare a narrowly scoped remediation plan for explicit authorization, with backup/recovery and post-checks.
-5. **Only after Phase 2 gates:** complete independent-school onboarding/lifecycle workflows and proceed with the remaining Phase 3–9 product scope. Phase 3 is not launch-ready while the tenancy production gate is unresolved.
+1. **Re-review, then merge, the H-1 login-throttle fix — PR #69.** It is the only code-level blocker with a finished implementation, and it now carries the H-R1 correction **and** the fixes for M-R1, M-R2, M-R3 and M-R4a. Two gates stand before merge, in order: **(a)** an **independent security re-review of the whole set** — every fix was written by the same author as the original change, so it must not self-approve, and green CI is not approval; **(b)** the reviewer records the two decisions that only an operator can make — the **M-R1 edge configuration** (how many proxies actually append to `X-Forwarded-For` in front of Production, or which platform header to name; nothing is set today, so the default of one trusted hop applies) and the surviving **M-R4 qualification** (runtime repair has never been exercised in Production; the evidence proves the role *can* create the table, not that repair *works*). The former M-R4 gate is **answered**: `login_attempts` exists, the role is `neondb_owner` with `CREATE` on `public`, and `AUTO_SCHEMA_REPAIR` is absent ⇒ enabled. The former M-R1/M-R2/M-R3 decision is **answered in code**, with the vulnerabilities re-measured in the regression harness rather than argued. After merging and deploying, verify in Production that a throttled login returns 429 with a `Retry-After` header, that a degraded throttle returns 503 rather than signing anyone in, that legitimate users — including administrators signing in from a different network than an attacker — are unaffected, that **a successful login by one account no longer releases another account's throttle on the same network**, that **email and username attempts against one account share a single budget**, and that `/api/health` reports the `login_attempts` feature — and returns **503** if that table ever disappears and repair cannot recreate it.
+2. **Read-only production checkpoint:** an authorized operator verifies the intended Vercel project/alias and production build identity (both now recorded above for 2026-11-19), then captures sanitized catalog/data evidence for migrations 0013–0017, required NULLs, orphan/cross-school rows, FK validation and indexes, and post-repair role/dual-school behavior. Do not expose secrets.
+3. **Restored-copy rehearsal for migration 0018:** use a restored copy of production only. Check PostgreSQL version (confirmed 18.6, and the migration syntax requires PostgreSQL 15+), row/table sizes, preflight results, lock duration and rollback behavior. Record results and review them before any production application. **Blocked in practice while backup/disaster recovery stays paused** — there is no verified restore to rehearse against, so this step needs the DR workstream to resume first or an explicitly authorized alternative source copy.
+4. **Index plan and separate migration:** enumerate the 26 missing child-side FK indexes, inspect query plans and table sizes, design a low-lock/concurrent-index approach compatible with the migration runner, and test it on the restored copy. Do not bundle this into an unreviewed production action. The H-1 fix adds one more candidate for the same reviewed migration: an `(ip_address, created_at)` index on `login_attempts`, which the new per-source throttle counts with and which migration 0012 does not create.
+5. **Decision gate:** reconcile the evidence. If production is already at the expected state, do not rerun migrations. If there is a gap, prepare a narrowly scoped remediation plan for explicit authorization, with backup/recovery and post-checks.
+6. **Close the remaining audit blockers:** H-2 (no `error.tsx`/`global-error.tsx`/`not-found.tsx`, no instrumentation, `/api/health` blind to object storage) and M-4 (confirm the legacy Vercel project `easylearnn` is disconnected or delete it). M-5 (the mobile-navigation fix in PR #61) is still open and live in Production, and the M/L findings in the table above remain scheduled behind these.
+7. **Only after Phase 2 gates:** complete independent-school onboarding/lifecycle workflows and proceed with the remaining Phase 3–9 product scope. Phase 3 is not launch-ready while the tenancy production gate is unresolved.
 
 This current roadmap supersedes the historical architecture audit retained below, including
 its proposed numbering, table counts, future migration numbers and old “remaining” lists.
@@ -311,16 +868,22 @@ actual PRs used 2D direct access and 2E hardening. The table above is authoritat
   proof, recovery exercises and pilot acceptance before general availability. Deploy operational changes;
   migrations only for reviewed supporting schema, never as an audit side effect.
 
-## Single next action — read-only production tenancy checkpoint before migration rehearsal
+## Single next action — independent security re-review of PR #69, then the read-only production tenancy checkpoint
 
-**Request an authorized, read-only production tenancy verification checkpoint** for the intended
-Vercel project/alias and migrations 0013–0017. Capture timestamped sanitized build identity,
-column/nullability/catalog FK/index evidence, required NULL/orphan/cross-school counts and
-post-repair role/dual-school smoke-test results. Establish the actual production state before
-planning any execution. Then rehearse migration 0018 and the separate child-side-index plan on a
-restored production copy. If production is missing/partial, stop and prepare a separately approved,
-backup-rehearsed remediation; do not blindly rerun migrations. No production migration or deploy
-is authorized by this roadmap update.
+**Updated 2026-11-19, after the independent review and the H-R1 fix.** Two actions are outstanding, and only the first needs no production access:
+
+1. **Commission an independent security re-review of PR #69 (H-1 + H-R1 + M-R1 + M-R2 + M-R3 + M-R4a), then merge only if it passes.** The PR is covered by two regression suites (**54 assertions**, both green locally) whose new tests were validated against the vulnerable code — against `5b8fbd1` the database suite fails 6 and the policy suite fails 9, with the failure messages carrying the measured bypasses. It is **not approved for merge** by this roadmap: every fix was written by the same author as the original change, so an independent reviewer must confirm it. The **M-R4 gate is answered** (table present, `neondb_owner`, `CREATE` on `public`, `AUTO_SCHEMA_REPAIR` absent ⇒ enabled) with one qualification the reviewer must carry forward: **runtime repair has never been exercised in Production**. Merging into `main` is expected to deploy to Production. The work touches no migration 0018, no database, no Production setting, and no backup/DR.
+2. **Request an authorized, read-only production tenancy verification checkpoint** for the intended
+   Vercel project/alias (identity confirmed 2026-11-19: project `easylearn`, `4069584`, deployed
+   2026-11-17) and migrations 0013–0017. Capture timestamped sanitized build identity,
+   column/nullability/catalog FK/index evidence, required NULL/orphan/cross-school counts and
+   post-repair role/dual-school smoke-test results. Establish the actual production state before
+   planning any execution. Then rehearse migration 0018 and the separate child-side-index plan on a
+   restored production copy — noting that restore capability is **unverified while backup and
+   disaster recovery stay paused**, so that rehearsal needs the DR workstream to resume first.
+   If production is missing/partial, stop and prepare a separately approved,
+   backup-rehearsed remediation; do not blindly rerun migrations. No production migration or deploy
+   is authorized by this roadmap update.
 
 ---
 

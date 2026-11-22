@@ -10,11 +10,47 @@ import {
   recordFailedLoginAttempt,
   clearFailedLoginAttempts,
   getClientIp,
+  RATE_LIMIT_UNAVAILABLE_MESSAGE,
+  UNAVAILABLE_RETRY_SECONDS,
+  type RateLimitResult,
 } from "@/lib/rate-limit";
 import { SESSION_COOKIE_NAME } from "@/lib/session-cookie";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/**
+ * Throttle responses carry `Retry-After` so a well-behaved client (and any intermediary)
+ * stops hammering the endpoint, and `no-store` so a shared cache never replays a 429/503.
+ */
+function throttleResponse(message: string, status: number, retryAfterSeconds?: number) {
+  const response = errorResponse(message, status);
+  if (typeof retryAfterSeconds === "number" && retryAfterSeconds > 0) {
+    response.headers.set("Retry-After", String(Math.ceil(retryAfterSeconds)));
+  }
+  response.headers.set("Cache-Control", "no-store");
+  return response;
+}
+
+function rateLimitResponse(rateLimit: RateLimitResult) {
+  // A refused *check* is a service problem (503), not a client abuse problem (429): the
+  // caller is not necessarily over any budget, the throttle simply could not be evaluated.
+  const status = rateLimit.reason === "unavailable" ? 503 : 429;
+  return throttleResponse(
+    rateLimit.message || "Too many failed login attempts. Please try again later.",
+    status,
+    rateLimit.retryAfterSeconds
+  );
+}
+
+/**
+ * A failed attempt that could not be stored leaves the throttle blind to it. Answering 401
+ * anyway would hand an attacker free guesses — that is precisely the fail-open behaviour
+ * audit finding H-1 describes — so the login is paused until recording works again.
+ */
+function degradedThrottleResponse() {
+  return throttleResponse(RATE_LIMIT_UNAVAILABLE_MESSAGE, 503, UNAVAILABLE_RETRY_SECONDS);
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -45,20 +81,26 @@ export async function POST(request: NextRequest) {
 
     const { db } = await import("@/db");
 
-    // Rate limiting - DB-backed, works across Vercel instances
-    const identifier = normalizedEmail || normalizedUsername;
+    // Rate limiting — DB-backed so it works across Vercel instances, and layered per source IP
+    // as well as per account (see src/lib/rate-limit.ts for the H-1, M-R2 and M-R3 rationale).
+    const suppliedIdentifier = normalizedEmail || normalizedUsername;
+    // M-R1: getClientIp only ever returns an address this deployment has declared trustworthy.
+    // `null` is a normal outcome (an unattributable source) and simply means the per-source
+    // budgets cannot be applied — the per-account budgets still are.
     const clientIp = getClientIp(request);
-    const rateLimit = await checkLoginRateLimit(identifier, clientIp);
-    if (!rateLimit.allowed) {
-      return errorResponse(
-        rateLimit.message || "Too many failed login attempts. Please try again later.",
-        429
-      );
+
+    // Step 1 — cheap read-only pre-check. It refuses an obvious repeat offender without
+    // spending a transaction, but it is NOT the enforcement point: a concurrent burst can all
+    // pass it before any row exists, which is exactly what M-R2 measured (30 simultaneous
+    // wrong-password requests, 30 real guesses).
+    const preCheck = await checkLoginRateLimit(suppliedIdentifier, clientIp);
+    if (!preCheck.allowed) {
+      return rateLimitResponse(preCheck);
     }
 
-    // Search by email first, then by username. Both reads go through findAuthUser so that a
-    // database without drizzle/0006 (users.username) can still sign people in - previously the
-    // `select()` picked every schema column and login itself threw.
+    // Step 2 — resolve the account. Search by email first, then by username. Both reads go
+    // through findAuthUser so that a database without drizzle/0006 (users.username) can still
+    // sign people in - previously the `select()` picked every schema column and login itself threw.
     let user: Record<string, any> | null = null;
     if (normalizedEmail) {
       user = await findAuthUser(eq(users.email, normalizedEmail), {
@@ -76,23 +118,54 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // M-R3: one account, ONE budget. The supplied identifier comes first (it is the one
+    // recorded, so the spraying budget still counts distinct supplied identities); every other
+    // alias of the resolved account joins the count, so an account reachable by both email and
+    // username can no longer be guessed twice over. For an unknown account the supplied
+    // identifier is all we have, and it stays protected exactly as before.
+    const aliases = user
+      ? [suppliedIdentifier, user.email, user.username]
+      : [suppliedIdentifier];
+
+    // Step 3 — enforce and record atomically, BEFORE the password is verified (M-R2). The
+    // attempt is inserted under a PostgreSQL advisory lock and the budgets are re-decided on a
+    // count that already includes it, so a concurrent burst cannot all slip past step 1. The row
+    // is provisional: a correct password deletes it below, a wrong one leaves it as the record.
+    const attempt = await recordFailedLoginAttempt(aliases, clientIp);
+    if (!attempt.allowed) {
+      // 429 when a budget is exhausted, 503 when the throttle could not be evaluated.
+      return rateLimitResponse(attempt.decision);
+    }
+    if (!attempt.recorded) {
+      // Defence in depth: an allowed-but-unstored attempt would leave the throttle blind.
+      return degradedThrottleResponse();
+    }
+
+    // Step 4 — outcome. Nothing further is recorded here: the attempt is already stored, and
+    // only a success removes it.
     if (!user) {
-      await recordFailedLoginAttempt(identifier, clientIp);
       return errorResponse("Invalid email/username or password", 401);
     }
 
     if (!user.isActive) {
+      // Counted as a failed attempt on purpose: deactivated accounts are a favourite
+      // enumeration target, so those guesses should consume the source IP budget too. The
+      // provisional row above is that record — this branch must not add a second one.
       return errorResponse("Account is deactivated. Contact the school administrator.", 403);
     }
 
     const isValid = await verifyPassword(password, user.passwordHash);
     if (!isValid) {
-      await recordFailedLoginAttempt(identifier, clientIp);
+      // Same here: the wrong password is already counted, and counting it twice would halve
+      // the effective budget.
       return errorResponse("Invalid email or password", 401);
     }
 
-    // Successful login - clear failed attempts
-    await clearFailedLoginAttempts(identifier);
+    // Successful login — release only *this account's* recorded failures, under every alias it
+    // can be reached by (H-R1 + M-R3). Clearing by source IP as well would let anyone holding
+    // one valid credential wipe another account's pending failures from the same NAT, making
+    // the throttle repeatable to bypass; see clearFailedLoginAttempts.
+    await clearFailedLoginAttempts(aliases, clientIp);
 
     // Phase 2B — school context. Resolved from `school_users` on the server; a client
     // supplied school id is never read or trusted (see src/lib/tenant.ts). This helper

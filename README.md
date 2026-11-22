@@ -157,13 +157,36 @@ Notes:
 
 - Check `GET /api/health` any time: it reports `databaseConnected`, `jwtSecretConfigured`, and
   `optionalMigrations` (`dashboard_card_overrides`, `activity_logs_enrichment`,
-  `optional_user_columns`, `quiz_question_images`) with a `migrationWarnings` entry per missing
-  file.
+  `optional_user_columns`, `quiz_question_images`, plus the two security-critical features
+  `login_attempts` and `session_revocation`) with a `migrationWarnings` entry per missing file.
 - The dashboards are **degrade-instead-of-crash**: a missing migration disables that section and
   shows a warning banner on the admin dashboard, it no longer returns a 500 blank page.
 - On request, EasyLearn will try to create the *optional* objects above itself using idempotent
   DDL (logged as "created automatically"). Set `AUTO_SCHEMA_REPAIR=false` if your database role is
-  not allowed to run DDL.
+  not allowed to run DDL. **Absent means enabled.**
+- Repair being *enabled* is not repair *working*, and the login throttle fails **closed**: with
+  `login_attempts` unusable nobody can sign in, not even with a correct password. `GET /api/health`
+  therefore answers **503** whenever that table is missing *and* automatic repair cannot create it —
+  repair disabled, no `CREATE` privilege on `public`, or a repair attempt that already failed —
+  and names the migration to apply (`node run-migration.js`). The underlying reason (privilege
+  probe, how many DDL statements were applied, the database error) is written to the server log
+  only, because the endpoint is unauthenticated.
+- For the two **security-critical** features — `login_attempts` (login throttling) and
+  `users.session_version` (session revocation) — health answers **503** when the feature is
+  missing **or cannot be verified**, whatever the repair settings say. "Repair is enabled" is a
+  promise about the future; this endpoint answers whether sign-in works now. `login_attempts` is
+  probed by the columns the throttle actually reads (`identifier`, `ip_address`, `created_at`), so
+  a drifted column is caught instead of hiding behind a present relation, and the self-heal can put
+  a missing column back with additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. An errored probe
+  is reported as unverifiable rather than as healthy, so `ok: true` can never sit next to a `false`
+  feature flag in the same response body.
+- The throttle records each failed attempt inside one transaction that takes two PostgreSQL advisory
+  locks. That wait is bounded by `EASY_LEARN_LOGIN_LOCK_TIMEOUT_MS` (default 2000, clamped to
+  250-10000): hitting the bound fails **closed** for that one login with 503 + `Retry-After` and
+  returns the connection to the pool at once, which matters because Production allows the pool only
+  two connections. See `docs/SECURITY_AUTHENTICATION.md` §11 for the source-attribution variables
+  (`EASY_LEARN_CLIENT_IP_HEADER`, `EASY_LEARN_CLIENT_IP_TRUSTED_HOPS`) and the shared-edge lockout
+  risk they carry.
 - `0004`/`0005` used to contain shell-escaped `\"` quotes, so they failed with a syntax error that
   the old runner swallowed. The files are fixed and `run-migration.js` now exits non-zero whenever
   a statement genuinely could not be applied.
