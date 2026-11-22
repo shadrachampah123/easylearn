@@ -871,6 +871,20 @@ export interface OptionalSchemaStatus {
    * discover the failure means the endpoint cannot answer the question it exists to answer.
    */
   repairBlocked: boolean;
+  /**
+   * Progress detail for a feature the probe can count (post-deployment H-2 review).
+   *
+   * The composite tenant probe already computes `expected` / `present` / `valid` for the
+   * 26 constraints, but the endpoint only ever reported the derived boolean. An operator
+   * reading `composite_tenant_foreign_keys: false` could not tell "none of the 26 are
+   * there" (migration never ran) from "25 of 26 are there" (a partially-applied or
+   * hand-edited schema, which is a different and more alarming situation). The counts are
+   * schema metadata — table and constraint names are not secrets — and they make the
+   * warning actionable without adding any new query or any new exposure.
+   *
+   * Absent for features whose probe has no meaningful count.
+   */
+  detail?: { expected: number; present: number; valid: number };
 }
 
 /**
@@ -909,9 +923,16 @@ export async function probeSchemaFeatures(
       const securityCritical = isSecurityCriticalFeature(feature);
       let present = false;
       let probeError = false;
+      let detail: OptionalSchemaStatus["detail"];
       try {
         const probe = await pool.query(probeSql(spec));
         present = probeSatisfied(spec, probe.rows);
+        if (spec.mode === "compositeTenantConstraints") {
+          /* One row per expected constraint, so the same result set that produced the
+             boolean also yields the progress counts. No extra query. */
+          const summary = summarizeConstraintInventory(probe.rows as never);
+          detail = { expected: summary.expected, present: summary.present, valid: summary.valid };
+        }
         /* F-7: a probe that answers clears the previous failure, so the cause never outlives
            the blip that produced it. */
         clearSchemaProbeFailure(feature);
@@ -941,6 +962,7 @@ export async function probeSchemaFeatures(
            rule unchanged. */
         repairBlocked:
           !present && (securityCritical || !repairEnabled || ddlCapable === false || repairFailed),
+        ...(detail ? { detail } : {}),
       };
     })
   );

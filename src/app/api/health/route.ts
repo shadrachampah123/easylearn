@@ -99,6 +99,13 @@ async function healthCheck(request: Request | undefined, requestId: string) {
     databaseConnected: false,
     schemaReady: false,
     optionalMigrations: {} as Record<string, boolean>,
+    /**
+     * Progress for probes that can count (currently only the 0018 composite tenant keys).
+     * `present < expected` with `present > 0` means the schema was partially changed —
+     * a different situation from a migration that never ran, and one an operator must
+     * look at before re-running anything.
+     */
+    migrationDetail: {} as Record<string, { expected: number; present: number; valid: number }>,
     migrationWarnings: [] as string[],
     objectStorage,
   };
@@ -162,6 +169,13 @@ async function healthCheck(request: Request | undefined, requestId: string) {
       const optional = await probeSchemaFeatures();
       for (const item of optional) {
         checks.optionalMigrations[item.feature] = item.present;
+        /* Post-deployment H-2 review: a bare `false` could not distinguish "the migration
+           never ran" from "it ran and left the schema half-changed". For the composite
+           tenant probe the counts are already computed, so report them — schema metadata
+           only, no names, no data. */
+        if (item.detail) {
+          checks.migrationDetail[item.feature] = item.detail;
+        }
         /* Session revocation is security-critical, not optional polish. If the column is
            missing AND automatic repair is disabled, verifyToken fails closed and every
            authenticated request answers 503 — while this endpoint was reporting "ready"
@@ -239,12 +253,21 @@ async function healthCheck(request: Request | undefined, requestId: string) {
             : "EasyLearn never creates this automatically. An administrator must run " +
               "`node run-migration.js` under the documented preflight, because the tenant " +
               "boundary must not change without review.";
+          /* A partially-applied migration is not the same finding as one that never ran,
+             and it is the case an operator is most likely to make worse by re-running
+             something. Say which it is. */
+          const progress = item.detail
+            ? item.detail.present === 0
+              ? `; 0 of ${item.detail.expected} constraints present, so the migration has not run`
+              : `; only ${item.detail.present} of ${item.detail.expected} constraints present ` +
+                `(${item.detail.valid} validated) — the schema is PARTIALLY migrated, inspect before re-running`
+            : "";
           checks.migrationWarnings.push(
             `${item.migration} has not been applied (${item.feature} ${
               item.probeError
                 ? "could not be verified"
                 : "is missing or incomplete"
-            }) - ${remedy}`,
+            })${progress} - ${remedy}`,
           );
         }
       }

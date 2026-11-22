@@ -29,6 +29,8 @@
  *   endpoint that returns 500 creates a second error for the boundary to handle.
  */
 
+import { randomUUID } from "node:crypto";
+
 import { describeError, log } from "@/lib/logger";
 import { currentRequestId, runWithCurrentRequest } from "@/lib/request-context";
 import { redactText } from "@/lib/log-redaction";
@@ -109,8 +111,16 @@ async function handleReport(request: Request): Promise<Response> {
     });
 
   try {
-    /* Inherited from the context `runWithCurrentRequest` established above. */
-    const requestId = currentRequestId();
+    /* Inherited from the context `runWithCurrentRequest` established above.
+     *
+     * `currentRequestId()` is typed `string | undefined` because it answers `undefined`
+     * when `node:async_hooks` is unavailable — a runtime where correlation degrades but
+     * the application must keep working. Logging `requestId: undefined` there would drop
+     * the field entirely (and, before the logger fix in this review, could overwrite a
+     * resolved id with an empty one). The intake's whole value is that a browser-visible
+     * failure can be joined to a server line, so it falls back to a fresh id rather than
+     * emitting an uncorrelated report. Post-deployment H-2 review, 2026-11-19. */
+    const requestId = currentRequestId() ?? randomUUID();
     const source = getClientIp(request) ?? "unattributable";
     if (isRateLimited(source, Date.now())) {
       /* `isRateLimited` logs the first suppression in a window and nothing after it. */

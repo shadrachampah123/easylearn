@@ -158,6 +158,18 @@ export function emit(level: LogLevel, message: string, fields: LogFields = {}): 
         ? redactedFields.requestId
         : activeRequestId();
 
+    /* `requestId` must be removed from the spread before it is re-attached.
+       POST-DEPLOYMENT H-2 REVIEW (2026-11-19) — this was a real defect: the spread used
+       to come last, so a caller that passed `requestId: ""` or `requestId: undefined`
+       overwrote the resolved value with an empty/absent one and the line lost its
+       correlation. Traced on a real call: an explicit empty string produced
+       `"requestId":""` even though the request context held a valid id. Deleting the key
+       from the spread and adding the resolved value back afterwards makes the resolved
+       id (caller-supplied when non-empty, else ambient) the only possible outcome, and
+       means the field is either a non-empty string or absent — never `""` or `undefined`,
+       both of which are hostile to log queries and to `GROUP BY requestId`. */
+    delete redactedFields.requestId;
+
     const record = {
       level,
       /* A timestamp is added here rather than left to the platform so that a line

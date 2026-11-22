@@ -1052,6 +1052,18 @@ public response stays a fixed string naming the migration, because the endpoint 
 unauthenticated (finding L-4). A later successful repair clears the ledger, so health recovers
 without a restart.
 
+### Health reporting of migration progress (post-deployment H-2 review, 2026-11-19)
+
+`/api/health` now also reports `checks.migrationDetail.<feature>: { expected, present, valid }`
+for probes that can count — currently only the 0018 composite tenant keys. This exists
+because a bare `false` cannot distinguish "the migration never ran" (0 of 26) from "the
+schema is partially migrated" (23 of 26), and those call for opposite actions: apply it, or
+stop and inspect. The counts are **schema metadata, not data**: constraint counts, table
+names and migration filenames, all of which the endpoint already disclosed through
+`optionalMigrations` and `migrationWarnings`. No row counts, no tenant data, no
+connection detail. The disclosure boundary is unchanged; only the granularity of an
+already-public fact improved.
+
 ### Repair order (F-1a): the self-heal must build a table before it indexes it
 
 `ALTER TABLE … DROP COLUMN` also drops every index that depends on the column, and
