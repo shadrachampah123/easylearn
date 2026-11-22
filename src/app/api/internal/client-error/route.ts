@@ -29,7 +29,8 @@
  *   endpoint that returns 500 creates a second error for the boundary to handle.
  */
 
-import { describeError, log, resolveRequestId } from "@/lib/logger";
+import { describeError, log } from "@/lib/logger";
+import { currentRequestId, runWithCurrentRequest } from "@/lib/request-context";
 import { redactText } from "@/lib/log-redaction";
 import { getClientIp } from "@/lib/rate-limit";
 
@@ -56,7 +57,9 @@ const announcedSuppression = new Set<string>();
 function isRateLimited(source: string, now: number): boolean {
   try {
     const windowStart = now - 60_000;
-    const timestamps = (recentReports.get(source) ?? []).filter((at) => at > windowStart);
+    const timestamps = (recentReports.get(source) ?? []).filter(
+      (at) => at > windowStart,
+    );
     if (timestamps.length >= MAX_REPORTS_PER_SOURCE_PER_MINUTE) {
       recentReports.set(source, timestamps);
       if (!announcedSuppression.has(source)) {
@@ -93,6 +96,12 @@ function isRateLimited(source: string, now: number): boolean {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  /* Same wiring as the health route: enter the correlation context so the line this
+     handler writes carries the id the proxy published instead of a fresh one. */
+  return runWithCurrentRequest(request, () => handleReport(request));
+}
+
+async function handleReport(request: Request): Promise<Response> {
   const respond = () =>
     new Response(null, {
       status: 204,
@@ -100,7 +109,8 @@ export async function POST(request: Request): Promise<Response> {
     });
 
   try {
-    const requestId = resolveRequestId({ headers: request.headers });
+    /* Inherited from the context `runWithCurrentRequest` established above. */
+    const requestId = currentRequestId();
     const source = getClientIp(request) ?? "unattributable";
     if (isRateLimited(source, Date.now())) {
       /* `isRateLimited` logs the first suppression in a window and nothing after it. */
@@ -126,23 +136,36 @@ export async function POST(request: Request): Promise<Response> {
     if (!parsed || typeof parsed !== "object") return respond();
 
     const body = parsed as Record<string, unknown>;
-    const digest = typeof body.digest === "string" && DIGEST_PATTERN.test(body.digest) ? body.digest : undefined;
-    const name = typeof body.name === "string" && ERROR_NAME_PATTERN.test(body.name) ? body.name : "Error";
+    const digest =
+      typeof body.digest === "string" && DIGEST_PATTERN.test(body.digest)
+        ? body.digest
+        : undefined;
+    const name =
+      typeof body.name === "string" && ERROR_NAME_PATTERN.test(body.name)
+        ? body.name
+        : "Error";
     /* The route is a pathname the boundary read from `window.location`; it can still be
        attacker-shaped if a tool calls this directly. Only the shape is kept. */
     const route =
-      typeof body.route === "string" && body.route.startsWith("/") ? redactText(body.route.slice(0, 256)) : undefined;
+      typeof body.route === "string" && body.route.startsWith("/")
+        ? redactText(body.route.slice(0, 256))
+        : undefined;
     const fatal = body.fatal === true;
 
-    log.error(fatal ? "client fatal error boundary fired" : "client error boundary fired", {
-      event: fatal ? "client_error.fatal" : "client_error",
-      requestId,
-      error: { name, digest },
-      route,
-      /* The reporter cannot say whether the server already logged this; a digest with
+    log.error(
+      fatal
+        ? "client fatal error boundary fired"
+        : "client error boundary fired",
+      {
+        event: fatal ? "client_error.fatal" : "client_error",
+        requestId,
+        error: { name, digest },
+        route,
+        /* The reporter cannot say whether the server already logged this; a digest with
          no matching server line means the error happened during hydration. */
-      phase: digest ? "server-or-hydration" : "client-only",
-    });
+        phase: digest ? "server-or-hydration" : "client-only",
+      },
+    );
 
     return respond();
   } catch (error) {
@@ -161,5 +184,8 @@ export async function POST(request: Request): Promise<Response> {
 
 /** A GET on this path is a misconfiguration, not a resource. Say so without detail. */
 export async function GET(): Promise<Response> {
-  return new Response(null, { status: 405, headers: { Allow: "POST", "Cache-Control": "no-store" } });
+  return new Response(null, {
+    status: 405,
+    headers: { Allow: "POST", "Cache-Control": "no-store" },
+  });
 }

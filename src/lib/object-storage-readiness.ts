@@ -95,6 +95,16 @@ const REQUIRED_VARIABLES = [
   "OBJECT_STORAGE_SECRET_ACCESS_KEY",
 ] as const;
 
+/**
+ * The HTTP method the storage probe signs AND sends.
+ *
+ * Exported because the regression is "the two drifted apart", and the only way to pin
+ * that is for a test to read one value and compare it against both the signed canonical
+ * request and the dispatched request. A test that re-declares the string would pass while
+ * the code drifted again.
+ */
+export const OBJECT_STORAGE_PROBE_METHOD = "HEAD" as const;
+
 /** Default bound for the live probe. Overridable, clamped, and never unbounded. */
 export const DEFAULT_STORAGE_PROBE_TIMEOUT_MS = 2_500;
 export const MIN_STORAGE_PROBE_TIMEOUT_MS = 250;
@@ -185,12 +195,25 @@ export async function checkObjectStorageReachability(
   const fetchImpl = options?.fetchImpl ?? fetch;
   const startedAt = Date.now();
 
+  /* THE METHOD IS A SINGLE CONSTANT, USED FOR SIGNING AND FOR THE REQUEST.
+     This was a real defect (PR #70 review): the probe signed `GET` and then sent `HEAD`.
+     SigV4 puts the method in the canonical request, so the two signatures differ and a
+     correctly configured bucket answers 403 SignatureDoesNotMatch — the probe would have
+     reported every healthy store as unreachable. Keeping one constant makes the two uses
+     impossible to desynchronise, and
+     `tests/observability-correlation.test.ts` proves the constant reached both — it runs
+     this function against a fake transport and checks the dispatched URL's signature
+     against a recomputation for the dispatched verb.
+     `HEAD` is the right verb for this check: it asks whether the bucket answers with our
+     credentials without reading or writing a byte. */
+  const PROBE_METHOD = OBJECT_STORAGE_PROBE_METHOD;
+
   /* A key under a reserved prefix, so a real upload is never overwritten and an
      operator can see the probe's fingerprint in a bucket listing if they care. */
   let url: string;
   try {
     url = presignUrl(config, {
-      method: "GET",
+      method: PROBE_METHOD,
       key: "health/probe-not-an-object",
       /* One minute: the URL is used immediately and then discarded. A long-lived
          signed URL in a health check is a credential with no reason to exist. */
@@ -210,7 +233,7 @@ export async function checkObjectStorageReachability(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(url, {
-      method: "HEAD",
+      method: PROBE_METHOD,
       signal: controller.signal,
       /* A redirect from a store is a configuration surprise, not a success. */
       redirect: "manual",

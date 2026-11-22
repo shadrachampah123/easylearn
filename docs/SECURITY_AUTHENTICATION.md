@@ -1178,7 +1178,14 @@ Production-verified.** Until it is deployed, Production still logs the way it di
    serialisation.
 4. `src/lib/request-context.ts` — request **correlation**: an `AsyncLocalStorage` request
    id carried across `await` boundaries, so a line written inside a `catch` deep in a route
-   still carries the id of the request that caused it.
+   still carries the id of the request that caused it. The id is resolved **once**, in
+   `src/proxy.ts`, and published as `x-request-id`; `runWithCurrentRequest()` is called by
+   the route handlers and by `onRequestError()`, and `logger.emit()` fills `requestId` from
+   the current context whenever the caller did not supply one. A caller-supplied id always
+   wins. The value is accepted only when it matches `^[A-Za-z0-9._:-]{8,128}$`; anything
+   else is replaced with a fresh UUID and the rejected text is never logged. Node's header
+   parser independently refuses a newline in a header value, so a newline cannot be used to
+   forge a second log line.
 5. `src/app/api/internal/client-error/route.ts` — the intake the two error boundaries POST
    to. Unauthenticated, size-capped, rate-limited per source, and it echoes nothing.
 

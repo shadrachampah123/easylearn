@@ -29,6 +29,37 @@
 import { randomUUID } from "node:crypto";
 import { redactText, redactValue } from "@/lib/log-redaction";
 
+/**
+ * Fills `requestId` from the ambient request, when the caller did not supply one.
+ *
+ * WHY THIS IS INDIRECTED. `src/lib/request-context.ts` imports `isAcceptableRequestId`
+ * from this module, so a static import in the other direction is a cycle. The reader is
+ * therefore installed once by `request-context` at module load. Until then — and in a
+ * runtime that never loads it — this is `undefined` and the logger simply logs no
+ * request id, which is the pre-existing behaviour and never an error.
+ *
+ * The first version of H-2 shipped WITHOUT this hookup: `emit` emitted `requestId` only
+ * when a caller passed one, so a `log.error` three awaits deep inside a route carried no
+ * id at all. PR #70 review caught it. The regression is an end-to-end test, because a
+ * unit test on `emit` cannot tell "the logger reads the context" from "the test passed
+ * one in".
+ */
+let activeRequestIdReader: (() => string | undefined) | null = null;
+
+/** Called once by `src/lib/request-context.ts`. Module-internal contract. */
+export function __setActiveRequestIdReader(reader: () => string | undefined): void {
+  activeRequestIdReader = reader;
+}
+
+function activeRequestId(): string | undefined {
+  try {
+    return activeRequestIdReader ? activeRequestIdReader() : undefined;
+  } catch {
+    /* Correlation is a diagnostic; a broken reader must not drop the line. */
+    return undefined;
+  }
+}
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface LogFields {
@@ -118,6 +149,15 @@ export function emit(level: LogLevel, message: string, fields: LogFields = {}): 
   try {
     if (!shouldLog(level)) return;
 
+    const redactedFields = redactValue(fields) as Record<string, unknown>;
+    /* The caller's explicit id wins; otherwise the ambient one is used. This is the line
+       that makes correlation automatic — without it a route deep in a call stack has to
+       thread an id through every function signature to be searchable. */
+    const requestId =
+      typeof redactedFields.requestId === "string" && redactedFields.requestId.length > 0
+        ? redactedFields.requestId
+        : activeRequestId();
+
     const record = {
       level,
       /* A timestamp is added here rather than left to the platform so that a line
@@ -126,7 +166,8 @@ export function emit(level: LogLevel, message: string, fields: LogFields = {}): 
       service: SERVICE,
       env: DEPLOYMENT,
       msg: redactText(String(message ?? "")),
-      ...(redactValue(fields) as Record<string, unknown>),
+      ...(requestId ? { requestId } : {}),
+      ...redactedFields,
     };
 
     const line = JSON.stringify(record);

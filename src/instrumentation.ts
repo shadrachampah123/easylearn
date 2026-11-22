@@ -41,8 +41,10 @@ export async function register(): Promise<void> {
       import("@/lib/logger"),
       import("@/lib/request-context"),
     ]);
-    const { getDatabaseConfigurationProblem, getJwtConfigurationProblem } = await import("@/lib/env");
-    const { inspectObjectStorageConfiguration } = await import("@/lib/object-storage-readiness");
+    const { getDatabaseConfigurationProblem, getJwtConfigurationProblem } =
+      await import("@/lib/env");
+    const { inspectObjectStorageConfiguration } =
+      await import("@/lib/object-storage-readiness");
 
     const jwtProblem = getJwtConfigurationProblem();
     const databaseProblem = getDatabaseConfigurationProblem();
@@ -56,7 +58,8 @@ export async function register(): Promise<void> {
       event: "server.startup",
       runtime: process.env.NEXT_RUNTIME,
       nodeVersion: process.version,
-      deployment: process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "development",
+      deployment:
+        process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "development",
       /* Vercel's git metadata is not secret and is the first thing anyone asks. */
       gitCommit: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) ?? null,
       gitBranch: process.env.VERCEL_GIT_COMMIT_REF ?? null,
@@ -88,10 +91,13 @@ export async function register(): Promise<void> {
        error, so this line cannot leak the very configuration it is complaining about. */
     try {
       const { log } = await import("@/lib/logger");
-      log.warn("instrumentation register() failed; continuing without the startup report", {
-        event: "server.startup_failed",
-        error,
-      });
+      log.warn(
+        "instrumentation register() failed; continuing without the startup report",
+        {
+          event: "server.startup_failed",
+          error,
+        },
+      );
     } catch {
       /* Even the logger is unavailable. Booting matters more than reporting. */
     }
@@ -109,36 +115,55 @@ export async function register(): Promise<void> {
  */
 export async function onRequestError(
   error: unknown,
-  request: Readonly<{ path: string; method: string; headers: NodeJS.Dict<string | string[]> }>,
+  request: Readonly<{
+    path: string;
+    method: string;
+    headers: NodeJS.Dict<string | string[]>;
+  }>,
   context: Readonly<{
     routerKind: "Pages Router" | "App Router";
     routePath: string;
     routeType: "render" | "route" | "action" | "proxy";
-    renderSource?: "react-server-components" | "react-server-components-payload" | "server-rendering";
+    renderSource?:
+      | "react-server-components"
+      | "react-server-components-payload"
+      | "server-rendering";
     revalidateReason: "on-demand" | "stale" | undefined;
-  }>
+  }>,
 ): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
   try {
     const { log, describeError } = await import("@/lib/logger");
+    const { runWithCurrentRequest } = await import("@/lib/request-context");
 
-    /* `request.path` is attacker-controlled. `logger` redacts strings, so a token
+    /* The framework hands us its own request view, not the proxy-stamped one, so the id
+       is resolved the same way the proxy resolves it: reuse `x-request-id` when it is
+       well-formed, otherwise Vercel's id, otherwise generate. Logging inside
+       `runWithCurrentRequest` means `emit` picks this id up automatically — the same
+       mechanism every other line of the request uses, rather than a second code path
+       that could drift. */
+    const headers = new Headers();
+    const incoming = safeHeader(request.headers, "x-request-id");
+    if (incoming) headers.set("x-request-id", incoming);
+    const vercel = safeHeader(request.headers, "x-vercel-id");
+    if (vercel) headers.set("x-vercel-id", vercel);
+
+    await runWithCurrentRequest({ headers }, async () => {
+      /* `request.path` is attacker-controlled. `logger` redacts strings, so a token
        pasted into a query string is removed; the length is bounded for the same reason
        every other field is. */
-    log.error("unhandled request error", {
-      event: "request.error",
-      /* Correlation: the id an operator can quote, either from the response or from a
-         neighbouring line of the same request. */
-      requestId: safeHeader(request.headers, "x-vercel-id"),
-      path: String(request.path ?? "").slice(0, 512),
-      method: String(request.method ?? "").slice(0, 16),
-      routerKind: context?.routerKind,
-      routePath: context?.routePath,
-      routeType: context?.routeType,
-      renderSource: context?.renderSource,
-      userAgent: safeHeader(request.headers, "user-agent")?.slice(0, 256),
-      error: describeError(error),
+      log.error("unhandled request error", {
+        event: "request.error",
+        path: String(request.path ?? "").slice(0, 512),
+        method: String(request.method ?? "").slice(0, 16),
+        routerKind: context?.routerKind,
+        routePath: context?.routePath,
+        routeType: context?.routeType,
+        renderSource: context?.renderSource,
+        userAgent: safeHeader(request.headers, "user-agent")?.slice(0, 256),
+        error: describeError(error),
+      });
     });
   } catch {
     /* The observability hook must never create a second failure on top of the one it
@@ -149,7 +174,7 @@ export async function onRequestError(
 /** Read one header from the framework's `NodeJS.Dict<string | string[]>` view. */
 function safeHeader(
   headers: NodeJS.Dict<string | string[]> | undefined,
-  name: string
+  name: string,
 ): string | undefined {
   if (!headers) return undefined;
   const value = headers[name] ?? headers[name.toLowerCase()];

@@ -216,6 +216,59 @@ every 60 seconds, alerting on **any non-200** and on a **body without `"ok":true
    Production log alerts (step 1) and the uptime monitor (step 2) have not been configured
    by anyone, because that requires Production access this work is not authorised to use.
 
+### H-2 review round 2 — two defects found in the first PR head, and how they were proven
+
+The reviewer inspected `157bf66` (the first H-2 head) and found two defects. Both were
+real, both are fixed on the branch, and both now have a test that fails if the fix is
+reverted. The negative controls are recorded here because "the fix works" is only half the
+evidence; "the test would have caught it" is the other half.
+
+**Defect 1 — the object-storage probe signed one HTTP verb and sent another.**
+`checkObjectStorageReachability()` passed `method: "GET"` to `presignUrl()` and then
+dispatched `fetch(url, { method: "HEAD" })`. SigV4 puts the method in the canonical
+request, so the two signatures differ: over identical key and timestamp, the GET signature
+is `6ed18d4f40e5976a…` and the HEAD signature is `f87fa944c7ededd0…`. A correctly
+configured bucket would therefore have answered **403 SignatureDoesNotMatch**, and the
+health endpoint would have reported a healthy store as unreachable. The fix is one
+exported constant, `OBJECT_STORAGE_PROBE_METHOD`, used for both signing and dispatch;
+`PresignRequest.method` was widened to accept `"HEAD"`.
+
+**Defect 2 — the correlation context was never entered by anything.**
+`runWithRequestContext()` had **zero production callers** and `emit()` never consulted the
+ambient store, so every line produced deep inside a request had no correlation id unless
+the author threaded one through by hand. The unit test that "covered" correlation called
+the helper directly, which proves `AsyncLocalStorage` works but not that a request is ever
+wrapped in it. The fix wires the chain end to end: `src/proxy.ts` resolves one id per
+request and publishes it as `x-request-id`; route handlers and `onRequestError()` call
+`runWithCurrentRequest()`; `emit()` fills `requestId` from the ambient context when the
+caller did not supply one.
+
+**Evidence.** `tests/observability-correlation.test.ts` — 12 assertions, all through real
+entry points (the proxy's default export, the real route handlers, the real
+`onRequestError`, the real readiness check with a fake transport). Against the previous
+head `157bf66` the same file reports **4 passed / 8 failed** and exits non-zero. Two
+surgical controls against the *fixed* tree isolate each defect:
+
+| Control | Mutation | Result |
+|---|---|---|
+| NC-A | sign `GET`, dispatch `HEAD` (the original defect) | exactly **1** failure — the method-equality test; all 3 storage assertions otherwise green |
+| NC-B | remove the proxy publication **and** the logger's ambient read | exactly **5** failures — the correlation assertions; all 3 storage assertions pass |
+
+The two controls fail disjoint sets of tests, so neither fix can be credited by the
+other's test. An end-to-end check against a real `next start` production build confirmed
+what the unit-level tests only model: three requests returned `x-request-id` values
+`e2e-corr-abcdef12`, `89040ee7-1f98-42c9-b362-b2f79f94818a` and
+`9ecfab40-b077-4c83-a135-302cfbc618dd`, and each appeared as `requestId` on exactly the
+matching server log line; the deliberately malformed id was replaced, never echoed. The
+startup line reported `requestCorrelationAvailable: true`, which also proves
+`node:async_hooks` survived the Next 16 middleware bundle.
+
+**A gap found while fixing this.** Neither `tests/observability-h2.test.ts` (52 assertions,
+shipped in `157bf66`) nor the new suite was referenced by `npm test`, `npm run test:all` or
+`.github/workflows/ci.yml` — CI never ran them. Both are now part of `npm test` and a new
+`npm run test:observability` script, so a regression fails the build instead of being
+found by a reviewer.
+
 ## Production status update — 2026-11-22 (PR #69)
 
 This update records the merge and owner-observed Production verification after PR #69. It does not change the historical 2026-11-19 audit findings below; those remain a point-in-time record.
@@ -303,7 +356,7 @@ Only C-1 was closed above. Every other audit finding remains open, with `FULL_PR
 | **M-R3** | *(same review)* One account = two budgets, because email and username were separate identifiers — 10 real guesses against a documented budget of 5, and N aliases ⇒ N × 15 distributed guesses | **Fixed in code 2026-11-19 — in PR #69**; the resolved account's alias set shares one budget, unknown accounts keep their own |
 | **M-R4** | *(same review, **merge gate**)* Failing closed turns "table missing" into "nobody can sign in", and there was no runtime evidence that `login_attempts` exists in Production or that `AUTO_SCHEMA_REPAIR` is enabled there | **Substantially resolved 2026-11-19** by operator-supplied read-only evidence: table present, role `neondb_owner`, `CREATE` on `public` = true, `AUTO_SCHEMA_REPAIR` absent ⇒ enabled. **Qualification kept: runtime repair has never been exercised in Production** |
 | **M-R4a** | *(found while investigating M-R4)* `/api/health` reported 200 "Login and registration services are ready" whenever repair was merely *enabled*, even with repair broken — while every login answered 503. Setting `AUTO_SCHEMA_REPAIR=false` was safer to operate than leaving it absent | **Fixed in code 2026-11-19 — in PR #69**; `repairBlocked` (repair off, no `CREATE` privilege, or a recorded repair failure) escalates to 503 for `login_attempts` and `session_revocation`, cause logged server-side |
-| **H-2** | **High** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage — the C-1 outage produced no server-side signal at all | **Implemented on branch `arena/3be79ab3-easylearn`; NOT merged, NOT deployed, NOT Production-verified.** Three boundaries (segment, root, 404) with digest-only reporting to a bounded `POST /api/internal/client-error`; `src/instrumentation.ts` with `register()` and `onRequestError()` (Node-only, no I/O at boot, allow-listed headers); structured JSON logging with `AsyncLocalStorage` request correlation and a two-pass redactor covering passwords, JWTs, cookies, authorization headers, database URLs, API keys and personal data; `/api/health` reports object-storage **configuration** and, only on `?deep=1`, real **availability** — `configured-unverified` is the default and `verified` requires a successful signed request; every health response carries `X-Request-Id`. 49 new assertions in `tests/observability-h2.test.ts`, including a positive control that fails on unredacted input and a counterweight proving identifiers survive. **The live check proves reachability, not writability** — it does not exercise a browser `PUT` or the bucket's CORS, which is what the R2 incident actually involved. Log alerting and the uptime monitor are operator actions and **have not been configured** |
+| **H-2** | **High** | No observability: no `error.tsx`, `global-error.tsx` or `not-found.tsx`; no instrumentation or APM; `/api/health` is blind to object storage — the C-1 outage produced no server-side signal at all | **Implemented on branch `arena/3be79ab3-easylearn`; NOT merged, NOT deployed, NOT Production-verified.** Three boundaries (segment, root, 404) with digest-only reporting to a bounded `POST /api/internal/client-error`; `src/instrumentation.ts` with `register()` and `onRequestError()` (Node-only, no I/O at boot, allow-listed headers); structured JSON logging with `AsyncLocalStorage` request correlation and a two-pass redactor covering passwords, JWTs, cookies, authorization headers, database URLs, API keys and personal data; `/api/health` reports object-storage **configuration** and, only on `?deep=1`, real **availability** — `configured-unverified` is the default and `verified` requires a successful signed request; every health response carries `X-Request-Id`. 49 new assertions in `tests/observability-h2.test.ts` plus 12 in `tests/observability-correlation.test.ts` (the review-round-2 end-to-end correlation suite), including a positive control that fails on unredacted input and a counterweight proving identifiers survive. **The live check proves reachability, not writability** — it does not exercise a browser `PUT` or the bucket's CORS, which is what the R2 incident actually involved. Log alerting and the uptime monitor are operator actions and **have not been configured** |
 | **C-2** | Production schema drift (0/26 composite FKs) and absent migration ledger; 0018 prepared but unexecuted | Pending — see above |
 | **M-1** | Inconsistent password policy: 6-character minimum on admin user create/reset versus 8 on `change-password`; `generatedPassword` echoed in the API response | Open |
 | **M-2** | Missing database-level uniqueness for `submissions(assignment_id, learner_id)`, `parent_learners(school_id, parent_id, learner_id)` and `quiz_attempts(quiz_id, learner_id)` — application-layer or advisory-lock only today | Open |
