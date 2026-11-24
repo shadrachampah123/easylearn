@@ -1,1 +1,1 @@
-Temporary trigger for the isolated migration-runner lock/recovery rehearsal workflow.
+Temporary trigger for the corrected isolated migration-runner rehearsal.
