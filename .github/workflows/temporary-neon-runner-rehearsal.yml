@@ -39,3 +39,96 @@ jobs:
         env:
           EASY_LEARN_TEST_DATABASE: "true"
         run: node run-migration.js
+      - name: Verify runner lock serialization, termination, and recovery
+        env:
+          EASY_LEARN_TEST_DATABASE: "true"
+        run: |
+          node <<'NODE'
+          const { Client } = require("pg");
+          const { spawn } = require("node:child_process");
+
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const key = [1163416649, 1296125510];
+
+          function startRunner() {
+            const child = spawn(process.execPath, ["run-migration.js"], {
+              cwd: process.cwd(),
+              env: process.env,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let stdout = "";
+            let stderr = "";
+            child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+            child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+            const done = new Promise((resolve) => {
+              child.on("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+            });
+            return { child, done };
+          }
+
+          async function waitForWaitingRunners(client, expected) {
+            for (let attempt = 0; attempt < 100; attempt += 1) {
+              const result = await client.query(
+                `SELECT count(*)::int AS count
+                   FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND usename = current_user
+                    AND wait_event_type = 'Lock'
+                    AND wait_event = 'advisory'
+                    AND query ILIKE '%pg_advisory_lock%'`
+              );
+              if (result.rows[0].count >= expected) return;
+              await sleep(100);
+            }
+            throw new Error(`Timed out waiting for ${expected} runner(s) to block on the migration advisory lock`);
+          }
+
+          (async () => {
+            const blocker = new Client({ connectionString: process.env.DATABASE_URL });
+            blocker.on("error", () => {});
+            await blocker.connect();
+            let held = false;
+            let first;
+            let second;
+            try {
+              await blocker.query("SELECT pg_advisory_lock($1, $2)", key);
+              held = true;
+
+              first = startRunner();
+              await waitForWaitingRunners(blocker, 1);
+              second = startRunner();
+              await waitForWaitingRunners(blocker, 2);
+
+              first.child.kill("SIGTERM");
+              const firstResult = await first.done;
+              if (firstResult.signal !== "SIGTERM") {
+                throw new Error(`Expected the waiting runner to terminate by SIGTERM; got code=${firstResult.code}, signal=${firstResult.signal}`);
+              }
+
+              await blocker.query("SELECT pg_advisory_unlock($1, $2)", key);
+              held = false;
+
+              const secondResult = await second.done;
+              if (secondResult.code !== 0) {
+                throw new Error(`Surviving runner failed (code=${secondResult.code}): ${secondResult.stderr.slice(-3000)}`);
+              }
+
+              const final = startRunner();
+              const finalResult = await final.done;
+              if (finalResult.code !== 0) {
+                throw new Error(`Runner did not recover/idempotently complete after termination (code=${finalResult.code}): ${finalResult.stderr.slice(-3000)}`);
+              }
+              console.log("PASS: two runners serialized behind the advisory lock.");
+              console.log("PASS: a waiting runner was terminated without blocking the surviving runner.");
+              console.log("PASS: the surviving and subsequent runner completed successfully.");
+            } finally {
+              if (held) await blocker.query("SELECT pg_advisory_unlock($1, $2)", key).catch(() => {});
+              await blocker.end().catch(() => {});
+              if (first && first.child.exitCode === null && first.child.signalCode === null) first.child.kill("SIGKILL");
+              if (second && second.child.exitCode === null && second.child.signalCode === null) second.child.kill("SIGKILL");
+            }
+          })().catch((error) => {
+            console.error(error);
+            process.exitCode = 1;
+          });
+          NODE
