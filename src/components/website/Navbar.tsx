@@ -63,10 +63,20 @@ export default function Navbar() {
 
           {/* Mobile Menu Button */}
           <button
-            onClick={() => setIsOpen(!isOpen)}
-            className="lg:hidden p-2 rounded-xl hover:bg-slate-100 transition-colors"
+            type="button"
+            aria-label={isOpen ? "Close navigation menu" : "Open navigation menu"}
+            aria-expanded={isOpen}
+            aria-controls="mobile-navigation-menu"
+            onClick={() => setIsOpen((open) => !open)}
+            className="relative z-10 lg:hidden flex min-h-11 min-w-11 items-center justify-center touch-manipulation p-2 rounded-xl hover:bg-slate-100 transition-colors"
           >
-            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg
+              aria-hidden="true"
+              className="pointer-events-none w-6 h-6"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
               {isOpen ? (
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
               ) : (
@@ -77,37 +87,43 @@ export default function Navbar() {
         </div>
       </div>
 
-      {/* Mobile Menu */}
-      {isOpen && (
-        <div className="lg:hidden glass border-t border-white/30 animate-slide-up">
-          <div className="px-4 py-3 space-y-1">
-            {navLinks.map((link) => (
-              <Link
-                key={link.name}
-                href={link.href}
-                onClick={() => setIsOpen(false)}
-                className="block px-4 py-3 rounded-xl text-sm font-medium text-slate-600 hover:text-primary-600 hover:bg-primary-50 transition-all"
-              >
-                {link.name}
-              </Link>
-            ))}
-            <div className="flex gap-2 pt-3 border-t border-slate-200">
-              <Link
-                href="/login"
-                className="flex-1 text-center px-4 py-3 text-sm font-semibold text-primary-600 border border-primary-200 rounded-xl"
-              >
-                Log In
-              </Link>
-              <Link
-                href="/register"
-                className="flex-1 text-center px-4 py-3 text-sm font-semibold text-white gradient-primary rounded-xl"
-              >
-                Register
-              </Link>
-            </div>
+      {/* Mobile Menu: keep the controlled element mounted so aria-controls always resolves.
+          The native hidden attribute also removes closed-menu links from the accessibility
+          tree and sequential keyboard focus. */}
+      <div
+        id="mobile-navigation-menu"
+        hidden={!isOpen}
+        className="relative z-10 lg:hidden glass border-t border-white/30 animate-slide-up"
+      >
+        <div className="px-4 py-3 space-y-1">
+          {navLinks.map((link) => (
+            <Link
+              key={link.name}
+              href={link.href}
+              onClick={() => setIsOpen(false)}
+              className="block px-4 py-3 rounded-xl text-sm font-medium text-slate-600 hover:text-primary-600 hover:bg-primary-50 transition-all"
+            >
+              {link.name}
+            </Link>
+          ))}
+          <div className="flex gap-2 pt-3 border-t border-slate-200">
+            <Link
+              href="/login"
+              onClick={() => setIsOpen(false)}
+              className="flex-1 text-center px-4 py-3 text-sm font-semibold text-primary-600 border border-primary-200 rounded-xl"
+            >
+              Log In
+            </Link>
+            <Link
+              href="/register"
+              onClick={() => setIsOpen(false)}
+              className="flex-1 text-center px-4 py-3 text-sm font-semibold text-white gradient-primary rounded-xl"
+            >
+              Register
+            </Link>
           </div>
         </div>
-      )}
+      </div>
     </nav>
   );
 }
