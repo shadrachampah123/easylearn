@@ -84,14 +84,22 @@ jobs:
             return result.rows[0] || null;
           }
 
-          async function waitForRunnerState(client, tag, predicate, description) {
+          async function waitForRunnerState(client, runner, predicate, description) {
             let last = null;
             for (let attempt = 0; attempt < 150; attempt += 1) {
-              last = await inspectRunner(client, tag);
+              last = await inspectRunner(client, runner.tag);
               if (last && predicate(last)) return last;
+              if (runner.child.exitCode !== null || runner.child.signalCode !== null) {
+                const result = await runner.done;
+                throw new Error(
+                  `Runner exited before ${description}; code=${result.code}, signal=${result.signal}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`
+                );
+              }
               await sleep(100);
             }
-            throw new Error(`Timed out waiting for ${description}; last connection state: ${JSON.stringify(last)}`);
+            throw new Error(
+              `Timed out waiting for ${description}; last connection state: ${JSON.stringify(last)}\nRunner still running: ${runner.child.exitCode === null && runner.child.signalCode === null}`
+            );
           }
 
           (async () => {
@@ -110,14 +118,14 @@ jobs:
 
               first = startRunner(`runner-rehearsal-first-${randomUUID()}`);
               const firstState = await waitForRunnerState(
-                blocker, first.tag,
+                blocker, first,
                 (row) => row.wait_event_type === "Lock" && row.wait_event === "advisory",
                 "the first runner to wait on the advisory lock"
               );
 
               second = startRunner(`runner-rehearsal-second-${randomUUID()}`);
               const secondState = await waitForRunnerState(
-                blocker, second.tag,
+                blocker, second,
                 (row) => row.wait_event_type === "Lock" && row.wait_event === "advisory",
                 "the second runner to wait on the advisory lock"
               );
