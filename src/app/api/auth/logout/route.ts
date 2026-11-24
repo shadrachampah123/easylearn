@@ -7,10 +7,9 @@ import { assertJwtSecretIsUsable } from "@/lib/jwt-policy";
 import { successResponse } from "@/lib/api-helpers";
 
 /**
- * Revoke all tokens for the signed-in user by incrementing session_version.
- * Verify the signature independently of verifyToken so an already-revoked
- * token can still trigger a bump. A failed DB write is never reported as a
- * successful server-side logout; the browser cookie is cleared either way.
+ * Revoke the token's session generation exactly once. A replay of an older,
+ * correctly signed token is an idempotent logout and must not revoke sessions
+ * created after that token was issued.
  */
 export async function POST(request?: Request) {
   let revocationSucceeded = true;
@@ -21,29 +20,53 @@ export async function POST(request?: Request) {
       const secret = getJwtSecret();
       assertJwtSecretIsUsable(secret);
 
-      // Invalid, expired, or forged credentials cannot identify a user to revoke.
       let userId: string | undefined;
+      let tokenSessionVersion: number | undefined;
       try {
         const { payload } = await jwtVerify(token, new TextEncoder().encode(secret), {
           algorithms: ["HS256"],
         });
-        if (typeof payload.userId === "string" && payload.userId.length > 0) {
+        if (
+          typeof payload.userId === "string" &&
+          payload.userId.length > 0 &&
+          typeof payload.sessionVersion === "number" &&
+          Number.isSafeInteger(payload.sessionVersion) &&
+          payload.sessionVersion >= 0
+        ) {
           userId = payload.userId;
+          tokenSessionVersion = payload.sessionVersion;
         }
       } catch {
         userId = undefined;
+        tokenSessionVersion = undefined;
       }
 
-      if (userId) {
+      if (userId && tokenSessionVersion !== undefined) {
         const { db } = await import("@/db");
         const { users } = await import("@/db/schema");
-        const { eq, sql } = await import("drizzle-orm");
+        const { and, eq, sql } = await import("drizzle-orm");
+
+        // Compare-and-increment makes revocation atomic and prevents a stale
+        // token replay from incrementing the version of a newer session.
         const rows = await db
           .update(users)
           .set({ sessionVersion: sql`${users.sessionVersion} + 1`, updatedAt: new Date() })
-          .where(eq(users.id, userId))
+          .where(and(eq(users.id, userId), eq(users.sessionVersion, tokenSessionVersion)))
           .returning({ id: users.id });
-        revocationSucceeded = rows.length === 1;
+
+        if (rows.length === 0) {
+          // No update means either this token was already revoked or its user
+          // no longer exists. Confirm the former without changing any state.
+          const [currentUser] = await db
+            .select({ sessionVersion: users.sessionVersion })
+            .from(users)
+            .where(eq(users.id, userId))
+            .limit(1);
+          revocationSucceeded =
+            currentUser !== undefined && currentUser.sessionVersion > tokenSessionVersion;
+        } else {
+          revocationSucceeded = rows.length === 1;
+        }
       }
     }
   } catch (error) {
