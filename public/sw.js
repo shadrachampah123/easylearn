@@ -1,97 +1,80 @@
-const CACHE_NAME = 'easylearn-v1';
-const OFFLINE_URL = '/offline.html';
+const CACHE_NAME = 'easylearn-static-v2';
+const APP_CACHE_PREFIX = 'easylearn-';
+const PRECACHE_ASSETS = ['/manifest.json'];
 
-// Assets to cache immediately
-const PRECACHE_ASSETS = [
-  '/',
-  '/login',
-  '/manifest.json',
-  '/icons/icon-192.png',
-  '/icons/icon-512.png',
-];
+function isCacheableStaticAsset(requestUrl, origin) {
+  if (requestUrl.origin !== origin) return false;
+  const path = requestUrl.pathname;
+  return path === '/manifest.json' || path.startsWith('/_next/static/') || path.startsWith('/icons/');
+}
 
-// Install event - cache essential assets
+function isExplicitlyPrivate(response) {
+  const cacheControl = response.headers.get('Cache-Control') || '';
+  return /(?:^|,)\s*(?:private|no-store)\b/i.test(cacheControl);
+}
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      console.log('EasyLearn: Caching app shell');
-      return cache.addAll(PRECACHE_ASSETS);
-    })
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_ASSETS))
   );
   self.skipWaiting();
 });
 
-// Activate event - clean up old caches
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames
-          .filter((name) => name !== CACHE_NAME)
-          .map((name) => caches.delete(name))
-      );
-    })
-  );
-  self.clients.claim();
+  event.waitUntil(Promise.all([
+    caches.keys().then((cacheNames) => Promise.all(
+      cacheNames
+        .filter((name) => name.startsWith(APP_CACHE_PREFIX) && name !== CACHE_NAME)
+        .map((name) => caches.delete(name))
+    )),
+    self.clients.claim(),
+  ]));
 });
 
-// Fetch event - network first, then cache
 self.addEventListener('fetch', (event) => {
-  // Skip non-GET requests
-  if (event.request.method !== 'GET') return;
+  const request = event.request;
+  if (request.method !== 'GET') return;
 
-  // Skip API requests (always fetch fresh)
-  if (event.request.url.includes('/api/')) return;
+  const requestUrl = new URL(request.url);
+  if (!isCacheableStaticAsset(requestUrl, self.location.origin)) return;
 
   event.respondWith(
-    fetch(event.request)
-      .then((response) => {
-        // Clone the response before caching
-        const responseClone = response.clone();
-        caches.open(CACHE_NAME).then((cache) => {
-          cache.put(event.request, responseClone);
-        });
+    fetch(request)
+      .then(async (response) => {
+        if (response.ok && response.type === 'basic' && !isExplicitlyPrivate(response)) {
+          try {
+            const cache = await caches.open(CACHE_NAME);
+            await cache.put(request, response.clone());
+          } catch {
+            // A cache write failure must not turn a successful asset response into an error.
+          }
+        }
         return response;
       })
-      .catch(() => {
-        // If fetch fails, try cache
-        return caches.match(event.request).then((cachedResponse) => {
-          if (cachedResponse) {
-            return cachedResponse;
-          }
-          // Return offline page for navigation requests
-          if (event.request.mode === 'navigate') {
-            return caches.match('/');
-          }
-          return new Response('Offline', { status: 503 });
+      .catch(async () => {
+        const cached = await caches.match(request);
+        return cached || new Response('Offline', {
+          status: 503,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
         });
       })
   );
 });
 
-// Push notifications (future feature)
 self.addEventListener('push', (event) => {
-  if (event.data) {
-    const data = event.data.json();
-    const options = {
-      body: data.body,
-      icon: '/icons/icon-192.png',
-      badge: '/icons/icon-96.png',
-      vibrate: [100, 50, 100],
-      data: {
-        url: data.url || '/',
-      },
-    };
-    event.waitUntil(
-      self.registration.showNotification(data.title || 'EasyLearn', options)
-    );
-  }
+  if (!event.data) return;
+  const data = event.data.json();
+  const options = {
+    body: data.body,
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-96.png',
+    vibrate: [100, 50, 100],
+    data: { url: data.url || '/' },
+  };
+  event.waitUntil(self.registration.showNotification(data.title || 'EasyLearn', options));
 });
 
-// Notification click handler
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  event.waitUntil(
-    clients.openWindow(event.notification.data.url || '/')
-  );
+  event.waitUntil(clients.openWindow(event.notification.data.url || '/'));
 });
