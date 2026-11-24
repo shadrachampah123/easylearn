@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - arena/dc9adcab-easylearn
+      - arena/b160e05a-easylearn
 
 jobs:
   quality:
