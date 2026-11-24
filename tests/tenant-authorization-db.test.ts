@@ -448,7 +448,7 @@ async function main() {
     /* ════════════════════ 1. Tenant boundary: authentication & membership ════════════════════ */
 
     await test("Boundary: unauthenticated requests are rejected with 401", async () => {
-      for (const pathName of ["users", "notifications", "attendance", "enrollments", "announcements"]) {
+      for (const pathName of ["users", "notifications", "attendance", "enrollments", "announcements", "images/search"]) {
         const result = await call(pathName, { token: null });
         assertEq(result.status, 401, `${pathName} must be 401 without a token`);
       }
@@ -474,14 +474,38 @@ async function main() {
     });
 
     await test("Boundary: a DISABLED membership grants no context (403)", async () => {
-      for (const pathName of ["users", "notifications", "attendance"]) {
+      for (const pathName of ["users", "notifications", "attendance", "images/search"]) {
         const result = await call(pathName, { token: tokens["disabled-a"] });
         assertEq(result.status, 403, `${pathName} for a disabled membership`);
       }
     });
 
+    await test("Images: search requires a live active staff membership, not token role claims", async () => {
+      const acceptedStaff = await call("images/search", { token: tokens["teacher-a"], query: { q: "x" } });
+      assertEq(acceptedStaff.status, 400, "active teacher passes authorization and reaches query validation");
+
+      const learner = await call("images/search", { token: tokens["learner-a"], query: { q: "x" } });
+      assertEq(learner.status, 403, "a learner is not staff");
+
+      await q(`UPDATE users SET is_active = false WHERE id = $1`, [ids["teacher-a"]]);
+      try {
+        const deactivated = await call("images/search", { token: tokens["teacher-a"], query: { q: "x" } });
+        assertEq(deactivated.status, 401, "a still-valid token for a deactivated user must be rejected");
+      } finally {
+        await q(`UPDATE users SET is_active = true WHERE id = $1`, [ids["teacher-a"]]);
+      }
+
+      await q(`UPDATE school_users SET role = 'learner' WHERE school_id = $1 AND user_id = $2`, [schoolA, ids["teacher-a"]]);
+      try {
+        const demoted = await call("images/search", { token: tokens["teacher-a"], query: { q: "x" } });
+        assertEq(demoted.status, 403, "a stale teacher claim must not override a demoted school membership");
+      } finally {
+        await q(`UPDATE school_users SET role = 'teacher' WHERE school_id = $1 AND user_id = $2`, [schoolA, ids["teacher-a"]]);
+      }
+    });
+
     await test("Boundary: super_admin has no school context and no implicit school access (403)", async () => {
-      for (const pathName of ["users", "notifications", "attendance", "enrollments", "announcements"]) {
+      for (const pathName of ["users", "notifications", "attendance", "enrollments", "announcements", "images/search"]) {
         const result = await call(pathName, { token: tokens["platform"] });
         assertEq(result.status, 403, `${pathName} must not open for a platform account without membership`);
       }

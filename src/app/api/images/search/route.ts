@@ -1,8 +1,6 @@
 import { NextRequest } from "next/server";
-import { getTokenFromRequest, verifyToken } from "@/lib/auth";
-import { errorResponse, successResponse, unauthorizedResponse } from "@/lib/api-helpers";
-
-const STAFF_ROLES = ["super_admin", "school_admin", "head_teacher", "teacher"];
+import { errorResponse, successResponse } from "@/lib/api-helpers";
+import { guardSchoolContext, hasSchoolStaffRole } from "@/lib/tenant";
 
 interface ImageResult {
   id: string;
@@ -94,11 +92,9 @@ async function searchOpenverse(query: string): Promise<ImageResult[]> {
 
 export async function GET(request: NextRequest) {
   try {
-    const token = getTokenFromRequest(request);
-    if (!token) return unauthorizedResponse();
-    const payload = await verifyToken(token);
-    if (!payload) return unauthorizedResponse();
-    if (!STAFF_ROLES.includes(payload.role)) return errorResponse("Only staff can search for quiz images", 403);
+    const auth = await guardSchoolContext(request);
+    if (!auth.ok) return auth.response;
+    if (!hasSchoolStaffRole(auth.context)) return errorResponse("Only staff can search for quiz images", 403);
 
     const query = makeQuery(request);
     if (query.length < 2) {
