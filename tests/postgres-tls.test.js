@@ -6,10 +6,12 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 const pgConnectionString = require("pg-connection-string");
 const {
+  assertSessionAdvisoryLockCompatibleEndpoint,
   buildPostgresConnectionConfig,
   createPostgresConnectionConfig,
   getDatabaseUrlFromEnvironment,
 } = require("../src/lib/postgres-tls.js");
+const { buildPoolConfig: buildMigrationPoolConfig } = require("../run-migration.js");
 
 let passed = 0;
 
@@ -146,6 +148,40 @@ test("pg-connection-string is a declared production dependency, not a transitive
     resolved.version,
     declared,
     "the locked pg-connection-string version must match the declared dependency"
+  );
+});
+
+test("session advisory-lock migrations reject known Neon transaction-pooling endpoints without leaking URL details", () => {
+  const poolerUrl = "postgresql://private-user:do-not-log@ep-private-pooler.us-east-2.aws.neon.tech/neondb";
+  assert.throws(
+    () => assertSessionAdvisoryLockCompatibleEndpoint(poolerUrl),
+    (error) => {
+      assert.match(error.message, /direct PostgreSQL endpoint/i);
+      assert.match(error.message, /session advisory-lock affinity/i);
+      assert(!error.message.includes("private-user"));
+      assert(!error.message.includes("do-not-log"));
+      assert(!error.message.includes("ep-private-pooler"));
+      return true;
+    }
+  );
+
+  const directUrl = "postgresql://private-user:do-not-log@ep-private.us-east-2.aws.neon.tech/neondb";
+  assert.doesNotThrow(() => assertSessionAdvisoryLockCompatibleEndpoint(directUrl));
+  const runnerConfig = buildMigrationPoolConfig(directUrl);
+  assert.strictEqual(runnerConfig.ssl.rejectUnauthorized, true);
+  assert.strictEqual(runnerConfig.ssl.servername, "ep-private.us-east-2.aws.neon.tech");
+
+  assert.throws(
+    () => buildMigrationPoolConfig(poolerUrl),
+    /direct PostgreSQL endpoint/i,
+    "the actual migration runner pool builder must fail closed on Neon transaction pooling"
+  );
+
+  /* A harmless query parameter or username must not trigger the hostname policy. */
+  assert.doesNotThrow(() =>
+    assertSessionAdvisoryLockCompatibleEndpoint(
+      "postgresql://pooler-user:secret@db.example.test/app?application_name=pooler"
+    )
   );
 });
 

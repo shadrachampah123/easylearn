@@ -55,6 +55,31 @@ function localDatabaseUrl(value) {
   }
 }
 
+/**
+ * Session-level advisory locks require a connection pinned to one PostgreSQL
+ * backend for the full migration process. Neon `-pooler` endpoints use
+ * transaction pooling, which cannot provide that session guarantee. Refuse a
+ * known pooled endpoint rather than silently running migrations without a
+ * reliable process-wide lock. Unknown providers must also be configured with a
+ * direct endpoint for migration execution.
+ */
+function assertSessionAdvisoryLockCompatibleEndpoint(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(cleanEnvironmentValue(rawUrl, "DATABASE_URL"));
+  } catch {
+    // The normal URL validator will provide the detailed configuration error.
+    return;
+  }
+
+  if (/(?:^|[-.])pooler(?:[-.]|$)/i.test(parsed.hostname)) {
+    throw new Error(
+      "Migration runner requires a direct PostgreSQL endpoint: transaction-pooling " +
+        "endpoints (including Neon -pooler hosts) cannot guarantee session advisory-lock affinity."
+    );
+  }
+}
+
 function buildPostgresConnectionConfig(rawUrl, options = {}) {
   const databaseUrl = cleanEnvironmentValue(rawUrl, "DATABASE_URL");
   if (!databaseUrl) throw new Error("A PostgreSQL connection string is required");
@@ -146,6 +171,7 @@ function createPostgresConnectionConfig(rawUrl, options = {}) {
 
 module.exports = {
   DATABASE_ENV_KEYS,
+  assertSessionAdvisoryLockCompatibleEndpoint,
   buildPostgresConnectionConfig,
   cleanEnvironmentValue,
   createPostgresConnectionConfig,

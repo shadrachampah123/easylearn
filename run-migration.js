@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const {
+  assertSessionAdvisoryLockCompatibleEndpoint,
   createPostgresConnectionConfig,
   getDatabaseUrlFromEnvironment,
 } = require("./src/lib/postgres-tls.js");
@@ -95,12 +96,17 @@ const GATED_MIGRATIONS = {
 // explicit disposable-test opt-in, which is never set for a production invocation.
 const databaseUrl = getDatabaseUrlFromEnvironment(process.env);
 
-function buildPoolConfig() {
-  if (!databaseUrl) {
+function buildPoolConfig(rawUrl = databaseUrl) {
+  if (!rawUrl) {
     throw new Error("A PostgreSQL connection string is required to run EasyLearn migrations");
   }
 
-  return createPostgresConnectionConfig(databaseUrl, {
+  // The runner holds a session advisory lock across multiple transactions. A known
+  // transaction-pooling endpoint can move one client between PostgreSQL backends, so the
+  // lock would not reliably serialize the whole migration process. Fail before connecting.
+  assertSessionAdvisoryLockCompatibleEndpoint(rawUrl);
+
+  return createPostgresConnectionConfig(rawUrl, {
     // CI/disposable database suites explicitly set this flag. It must never be set for a
     // production migration invocation; the default is verified certificate + hostname TLS.
     allowInsecureLocal: process.env.EASY_LEARN_TEST_DATABASE === "true",
@@ -604,7 +610,24 @@ async function main() {
   let lockHeld = false;
   try {
     client = await pool.connect();
-    await client.query("SELECT pg_advisory_lock($1, $2)", [1163416649, 1296125510]);
+    if (process.env.EASY_LEARN_MIGRATION_LOCK_DIAGNOSTICS === "true") {
+      /* Emit identity before blocking on the lock. This identifies the exact checked-out
+         backend, and lets the rehearsal correlate its PID with pg_locks even when the
+         observer cannot see that session's pg_stat_activity details. */
+      const identity = await client.query(
+        `SELECT current_database() AS database_name,
+                current_user AS database_user,
+                inet_server_addr()::text AS server_address,
+                inet_server_port() AS server_port,
+                pg_backend_pid() AS backend_pid,
+                current_setting('server_version') AS server_version,
+                current_setting('application_name') AS application_name,
+                (SELECT oid FROM pg_database WHERE datname = current_database()) AS database_oid`
+      );
+      // These are connection identity fields only; never log the connection URL or secret.
+      console.log(`Migration lock backend identity: ${JSON.stringify(identity.rows[0])}`);
+    }
+    await client.query("SELECT pg_advisory_lock($1::integer, $2::integer)", [1163416649, 1296125510]);
     lockHeld = true;
     client.on("notice", (notice) => {
       if (notice && notice.message) console.log(`  ℹ️  ${notice.message}`);
@@ -730,5 +753,6 @@ module.exports = {
   HISTORY_TABLE,
   MIGRATIONS,
   REPAIR_CONFIRMATION,
+  buildPoolConfig,
   findOrderingViolation,
 };
