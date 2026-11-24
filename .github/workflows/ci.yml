@@ -100,6 +100,11 @@ jobs:
           # has to actually run against a database.
           EASY_LEARN_REQUIRE_HEALTH_MIGRATION_DETAIL: "true"
         run: npm run test:db
+      - name: Logout session-revocation regressions (PostgreSQL required)
+        env:
+          # This suite must run in CI; a silent skip is a failure.
+          EASY_LEARN_REQUIRE_LOGOUT_REVOCATION_DB: "true"
+        run: npx tsx tests/logout-revocation-fail-closed-db.test.ts
       - name: Tenant authorization suites (PostgreSQL required)
         run: npm run test:tenant-auth
       - name: "PR #45 reviewer regressions (PostgreSQL required)"
