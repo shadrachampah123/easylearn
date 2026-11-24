@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { apiFetch } from "../../lib/api-client";
+import { getPasswordPolicyError, MIN_PASSWORD_CHARACTERS } from "@/lib/password-policy";
 
 export default function ChangePasswordPage() {
   const router = useRouter();
@@ -54,8 +55,9 @@ export default function ChangePasswordPage() {
       return;
     }
 
-    if (newPassword.length < 8) {
-      setError("Password must be at least 8 characters long");
+    const passwordPolicyError = getPasswordPolicyError(newPassword);
+    if (passwordPolicyError) {
+      setError(passwordPolicyError);
       return;
     }
 
@@ -133,9 +135,10 @@ export default function ChangePasswordPage() {
             <input
               type="password"
               required
+              minLength={MIN_PASSWORD_CHARACTERS}
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="Min 8 characters"
+              placeholder={`At least ${MIN_PASSWORD_CHARACTERS} characters`}
               className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-primary-500 outline-none text-sm"
             />
           </div>

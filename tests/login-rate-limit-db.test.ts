@@ -1302,6 +1302,21 @@ async function main() {
       });
       assert.strictEqual(malformed.status, 400, `a bare username must not be storable as an email, got ${malformed.status}`);
 
+      const weakPassword = await createUser({
+        password: "short123",
+        firstName: "Weak",
+        lastName: "Password",
+        role: "learner",
+      });
+      assert.strictEqual(weakPassword.status, 400, "admin-created passwords below the shared minimum must be refused");
+      const commonPassword = await createUser({
+        password: "Password123",
+        firstName: "Common",
+        lastName: "Password",
+        role: "learner",
+      });
+      assert.strictEqual(commonPassword.status, 400, "common passwords must be refused on account creation");
+
       /* The reverse direction: the generated username must skip an existing email, so an
          ordinary creation still succeeds instead of being refused. */
       const generated = await createUser({
@@ -1311,9 +1326,15 @@ async function main() {
         role: "learner",
       });
       assert.ok(generated.status === 200 || generated.status === 201, `an ordinary creation must succeed, got ${generated.status}`);
-      const createdUsername = String(
-        (await db.query(`SELECT username FROM users WHERE last_name = $1`, [`smith-${DB_NAME}`])).rows[0]?.username ?? ""
-      );
+      const createdResponse = await generated.json();
+      assert.equal(createdResponse.data.generatedPassword, undefined, "the API must not echo a plaintext password");
+      assert.equal(createdResponse.data.password, undefined, "the API must not expose a password field");
+      const createdRow = (await db.query(
+        `SELECT username, must_change_password FROM users WHERE last_name = $1`,
+        [`smith-${DB_NAME}`]
+      )).rows[0];
+      const createdUsername = String(createdRow?.username ?? "");
+      assert.strictEqual(createdRow.must_change_password, true, "new admin-created credentials must be temporary");
       assert.notStrictEqual(createdUsername, `jsmith-${DB_NAME}`, "the generated username must not be an existing email");
       assert(
         createdUsername.startsWith(`jsmith-${DB_NAME}`.toLowerCase()),

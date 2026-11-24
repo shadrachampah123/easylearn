@@ -5,6 +5,7 @@ import { eq, sql } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { findAuthUser, getTokenFromRequest, hashPassword, isSessionRevocationCheckError, verifyToken } from "@/lib/auth";
 import { unauthorizedResponse, errorResponse } from "@/lib/api-helpers";
+import { getPasswordPolicyError } from "@/lib/password-policy";
 
 export async function POST(request: NextRequest) {
   try {
@@ -25,8 +26,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, error: "Current password and new password are required" }, { status: 400 });
     }
 
-    if (newPassword.length < 8) {
-      return NextResponse.json({ success: false, error: "New password must be at least 8 characters" }, { status: 400 });
+    const passwordPolicyError = getPasswordPolicyError(newPassword);
+    if (passwordPolicyError) {
+      return NextResponse.json({ success: false, error: passwordPolicyError }, { status: 400 });
     }
 
     // Never trust client-supplied userId for normal users - derive from token

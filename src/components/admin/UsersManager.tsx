@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { apiFetch } from "../../lib/api-client";
+import { getPasswordPolicyError, MIN_PASSWORD_CHARACTERS } from "@/lib/password-policy";
 
 interface UserRow {
   id: string;
@@ -86,6 +87,11 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
     e.preventDefault();
     setFormError("");
     setFormSuccess("");
+    const passwordPolicyError = getPasswordPolicyError(newPassword);
+    if (passwordPolicyError) {
+      setFormError(passwordPolicyError);
+      return;
+    }
     setSaving(true);
 
     try {
@@ -106,11 +112,11 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
       });
       const data = await res.json();
       if (data.success) {
-        // Show credentials if user was created without email
-        if (data.data.username && data.data.generatedPassword) {
+        // Keep credentials for the one-time local display only; the API never echoes passwords.
+        if (data.data.username && newPassword) {
           setCreatedCredentials({
             username: data.data.username,
-            password: data.data.generatedPassword,
+            password: newPassword,
             firstName: newFirstName,
             lastName: newLastName,
             role,
@@ -166,7 +172,12 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
   }
 
   async function handleResetPassword() {
-    if (!resetUser || resetPwd.length < 6) return;
+    if (!resetUser) return;
+    const passwordPolicyError = getPasswordPolicyError(resetPwd);
+    if (passwordPolicyError) {
+      setFormError(passwordPolicyError);
+      return;
+    }
     setSaving(true);
     setFormError("");
 
@@ -182,8 +193,9 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
       if (data.success) {
         setResetUser(null);
         setResetPwd("");
-        setFormSuccess("Password reset successfully!");
-        setTimeout(() => setFormSuccess(""), 3000);
+        setFormSuccess("Password reset successfully. The user must choose a new password at next sign-in.");
+        fetchUsers();
+        setTimeout(() => setFormSuccess(""), 4000);
       } else {
         setFormError(data.error || "Failed to reset password");
       }
@@ -307,8 +319,9 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
                   className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm" />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Password * (min 6 characters)</label>
-                <input type="password" required minLength={6} value={newPassword}
+                <label className="block text-sm font-medium text-slate-700 mb-1">Password * (at least {MIN_PASSWORD_CHARACTERS} characters)</label>
+                <p className="mb-1 text-xs text-slate-500">New users must choose a new password at first sign-in.</p>
+                <input type="password" required minLength={MIN_PASSWORD_CHARACTERS} value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   placeholder="Create a password"
                   className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm" />
@@ -428,11 +441,11 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
               {formError && <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-sm">❌ {formError}</div>}
               <p className="text-sm text-slate-600">
                 Reset password for <strong>{resetUser.firstName} {resetUser.lastName}</strong>{" "}
-                ({resetUser.email || `@${resetUser.username}`})
+                ({resetUser.email || `@${resetUser.username}`}). They will have to choose a new password at their next sign-in.
               </p>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">New Password (min 6 chars)</label>
-                <input type="password" minLength={6} value={resetPwd}
+                <label className="block text-sm font-medium text-slate-700 mb-1">New Password (at least {MIN_PASSWORD_CHARACTERS} characters)</label>
+                <input type="password" minLength={MIN_PASSWORD_CHARACTERS} value={resetPwd}
                   onChange={(e) => setResetPwd(e.target.value)}
                   placeholder="Enter new password"
                   className="w-full px-4 py-3 rounded-xl border border-slate-200 outline-none text-sm" />
@@ -442,7 +455,7 @@ export default function UsersManager({ role, title, subtitle, emptyEmoji }: User
                   className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200">
                   Cancel
                 </button>
-                <button onClick={handleResetPassword} disabled={saving || resetPwd.length < 6}
+                <button onClick={handleResetPassword} disabled={saving || !resetPwd}
                   className="flex-1 py-3 rounded-xl bg-orange-500 text-white font-semibold hover:bg-orange-600 disabled:opacity-50">
                   {saving ? "Resetting..." : "Reset Password"}
                 </button>

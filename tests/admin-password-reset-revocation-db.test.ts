@@ -107,9 +107,10 @@ async function main() {
       assert.strictEqual(await auth.verifyToken(victimTokenBefore), null, "pre-reset token must no longer verify");
     });
 
-    await test("new password is stored and a token at the bumped version verifies", async () => {
-      const row = (await db.query(`SELECT password_hash, session_version FROM users WHERE id=$1`, [victim.id])).rows[0];
+    await test("new password is stored, marked temporary, and a token at the bumped version verifies", async () => {
+      const row = (await db.query(`SELECT password_hash, session_version, must_change_password FROM users WHERE id=$1`, [victim.id])).rows[0];
       assert(await bcrypt.compare("Victim-New-2!", row.password_hash), "new password must be stored");
+      assert.strictEqual(row.must_change_password, true, "administrative reset must require a password change at next login");
       const fresh = await auth.createToken({ userId: victim.id, role: "learner", email: "victim@test.test", sessionVersion: row.session_version });
       assert(await auth.verifyToken(fresh), "post-reset token should verify");
     });

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { hashPassword } from "@/lib/auth";
+import { getPasswordPolicyError } from "@/lib/password-policy";
 import { successResponse, errorResponse } from "@/lib/api-helpers";
 import { eq, sql, ilike, or, desc } from "drizzle-orm";
 import { logActivity } from "@/lib/activity";
@@ -190,9 +191,8 @@ export async function POST(request: NextRequest) {
       return errorResponse("Enter a valid email address, for example name@school.edu");
     }
 
-    if (password.length < 6) {
-      return errorResponse("Password must be at least 6 characters");
-    }
+    const passwordPolicyError = getPasswordPolicyError(password);
+    if (passwordPolicyError) return errorResponse(passwordPolicyError);
 
     const validRoles = ["teacher", "parent", "learner", "school_admin", "head_teacher"] as const;
     type ValidRole = typeof validRoles[number];
@@ -319,6 +319,7 @@ export async function POST(request: NextRequest) {
             phone: phone || null,
             gender: gender || null,
             isActive: true,
+            mustChangePassword: true,
             emailVerified: normalizedEmail ? false : true,
           })
           .returning({
@@ -386,7 +387,9 @@ export async function POST(request: NextRequest) {
       details: JSON.stringify({ role, email: email ? "[REDACTED]" : null }),
     });
 
-    return successResponse({ ...newUser, generatedPassword: password }, 201);
+    // The password was supplied by the administrator and remains only in their current UI
+    // state if the account has no email; never echo it from the server in the response.
+    return successResponse(newUser, 201);
   } catch (error) {
     console.error("Create user error:", error);
     if (isSchemaOutOfDate(error)) {

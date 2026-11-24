@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { users, parentLearners, learnerClasses } from "@/db/schema";
 import { hashPassword } from "@/lib/auth";
+import { getPasswordPolicyError } from "@/lib/password-policy";
 import { successResponse, errorResponse, notFoundResponse } from "@/lib/api-helpers";
 import { and, eq, sql } from "drizzle-orm";
 import {
@@ -199,9 +200,8 @@ export async function PATCH(
     const { id } = await params;
     const body = await request.json();
     const { password } = body;
-    if (!password || typeof password !== "string" || password.length < 6) {
-      return errorResponse("Password must be at least 6 characters");
-    }
+    const passwordPolicyError = getPasswordPolicyError(password);
+    if (passwordPolicyError) return errorResponse(passwordPolicyError);
 
     /* An administrative reset must revoke the account's existing sessions
        in the SAME atomic update as the password change — resetting the
@@ -220,7 +220,12 @@ export async function PATCH(
     const passwordHash = await hashPassword(password);
     const [updated] = await db
       .update(users)
-      .set({ passwordHash, sessionVersion: sql`${users.sessionVersion} + 1`, updatedAt: new Date() })
+      .set({
+        passwordHash,
+        mustChangePassword: true,
+        sessionVersion: sql`${users.sessionVersion} + 1`,
+        updatedAt: new Date(),
+      })
       .where(eq(users.id, id))
       .returning({ id: users.id });
     if (!updated) return notFoundResponse("User");
