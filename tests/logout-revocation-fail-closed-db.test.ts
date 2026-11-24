@@ -87,16 +87,25 @@ async function main() {
     assert.strictEqual(await auth.verifyToken(token), null, "old token must be rejected after logout");
     console.log("PASS: valid logout increments session_version and invalidates the old token");
 
+    const freshToken = await auth.createToken({
+      userId: user.id,
+      role: "learner",
+      email: "logout@test.test",
+      sessionVersion: 1,
+    });
+    assert(await auth.verifyToken(freshToken), "new session token should be valid after login");
+
     const repeated = await logout(token);
-    assert.strictEqual(repeated.status, 200, "already-revoked but correctly signed token can logout again");
+    assert.strictEqual(repeated.status, 200, "already-revoked token should be an idempotent logout");
     row = (await db.query("SELECT session_version FROM users WHERE id=$1", [user.id])).rows[0];
-    assert.strictEqual(row.session_version, 2, "repeated logout must still increment session_version");
-    console.log("PASS: an already-revoked signed token can still trigger revocation");
+    assert.strictEqual(row.session_version, 1, "replaying an old token must not increment session_version");
+    assert(await auth.verifyToken(freshToken), "replaying an old token must not invalidate the newer session");
+    console.log("PASS: stale-token replay is idempotent and cannot invalidate a newer session");
 
     const invalid = await logout("not-a-valid-jwt");
     assert.strictEqual(invalid.status, 200, "invalid token only clears the browser cookie");
     row = (await db.query("SELECT session_version FROM users WHERE id=$1", [user.id])).rows[0];
-    assert.strictEqual(row.session_version, 2, "invalid token must not change any user's session version");
+    assert.strictEqual(row.session_version, 1, "invalid token must not change any user's session version");
     console.log("PASS: invalid token cannot trigger an arbitrary user revocation");
 
     await db.query("ALTER TABLE users RENAME TO users_hidden_logout_test");
