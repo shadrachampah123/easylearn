@@ -170,6 +170,31 @@ async function main() {
 
     const wrongPassword = { email: ADMIN_EMAIL, password: "not-the-password" };
     const rightPassword = { email: ADMIN_EMAIL, password: ADMIN_PASSWORD };
+    const inactiveEmail = `inactive-${DB_NAME}@test.test`;
+    await db.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, is_active)
+       VALUES ($1, $2, 'learner', 'Inactive', 'User', false)`,
+      [inactiveEmail, await bcrypt.hash("Inactive-Password-1!", 4)]
+    );
+
+    await test("unknown, incorrect-password and deactivated accounts share one generic login error", async () => {
+      await reset();
+      const unknown = await POST(loginRequest({ email: `missing-${DB_NAME}@test.test`, password: "wrong-password" }));
+      await reset();
+      const incorrect = await POST(loginRequest(wrongPassword));
+      await reset();
+      const deactivated = await POST(loginRequest({ email: inactiveEmail, password: "Inactive-Password-1!" }));
+
+      const failures = await Promise.all([unknown, incorrect, deactivated].map(async (response) => ({
+        status: response.status,
+        error: (await response.json()).error,
+      })));
+      assert.deepStrictEqual(failures, [
+        { status: 401, error: "Invalid email or password" },
+        { status: 401, error: "Invalid email or password" },
+        { status: 401, error: "Invalid email or password" },
+      ]);
+    });
 
     /* ── 1. Baseline: a clean account is unaffected ─────────────────────────────── */
 

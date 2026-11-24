@@ -506,10 +506,12 @@ async function main() {
     assert(content.includes("Cache-Control"), "throttle responses must not be cacheable");
   });
 
-  await test("legitimate login behaviour is untouched", () => {
+  await test("failed login states share a generic response while successful login remains unchanged", () => {
     const content = readFile("src/app/api/auth/login/route.ts");
     assert(content.includes("verifyPassword(password, user.passwordHash)"), "password verification unchanged");
-    assert(content.includes("Account is deactivated"), "deactivated-account message unchanged");
+    assert(content.includes('const INVALID_LOGIN_MESSAGE = "Invalid email or password"'), "one generic failure message is defined");
+    assert(!content.includes("Invalid email/username or password"), "unknown accounts must not use a distinguishable message");
+    assert(!content.includes("Account is deactivated. Contact the school administrator."), "deactivated accounts must not disclose their state");
     assert(content.includes("httpOnly: true"), "the session cookie is still httpOnly");
   });
 

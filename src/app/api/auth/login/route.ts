@@ -19,6 +19,8 @@ import { SESSION_COOKIE_NAME } from "@/lib/session-cookie";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const INVALID_LOGIN_MESSAGE = "Invalid email or password";
+
 /**
  * Throttle responses carry `Retry-After` so a well-behaved client (and any intermediary)
  * stops hammering the endpoint, and `no-store` so a shared cache never replays a 429/503.
@@ -144,21 +146,21 @@ export async function POST(request: NextRequest) {
     // Step 4 — outcome. Nothing further is recorded here: the attempt is already stored, and
     // only a success removes it.
     if (!user) {
-      return errorResponse("Invalid email/username or password", 401);
+      return errorResponse(INVALID_LOGIN_MESSAGE, 401);
     }
 
     if (!user.isActive) {
       // Counted as a failed attempt on purpose: deactivated accounts are a favourite
       // enumeration target, so those guesses should consume the source IP budget too. The
       // provisional row above is that record — this branch must not add a second one.
-      return errorResponse("Account is deactivated. Contact the school administrator.", 403);
+      return errorResponse(INVALID_LOGIN_MESSAGE, 401);
     }
 
     const isValid = await verifyPassword(password, user.passwordHash);
     if (!isValid) {
       // Same here: the wrong password is already counted, and counting it twice would halve
       // the effective budget.
-      return errorResponse("Invalid email or password", 401);
+      return errorResponse(INVALID_LOGIN_MESSAGE, 401);
     }
 
     // Successful login — release only *this account's* recorded failures, under every alias it
