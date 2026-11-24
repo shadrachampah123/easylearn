@@ -406,7 +406,8 @@ test('Login: Phase 1 protections are intact (rate limit, password check, deactiv
     'recordFailedLoginAttempt',
     'clearFailedLoginAttempts',
     'verifyPassword(password, user.passwordHash)',
-    'Account is deactivated',
+    'if (!user.isActive)',
+    'INVALID_LOGIN_MESSAGE',
     'httpOnly: true',
   ]) {
     assert(loginRoute.includes(marker), `login must keep ${marker}`);

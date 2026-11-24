@@ -316,18 +316,30 @@ async function main() {
       role: "learner",
     });
     assert.ok(token, "a token must be produced");
-    /* This unit suite runs without a database, so verification must now
-       stop at the revocation stage with SessionRevocationCheckError —
-       proof the signature WAS accepted (a bad secret fails earlier) and
-       that revocation fails closed instead of silently accepting the
-       token (the pre-fix fail-open behaviour this test used to rely on).
-       End-to-end verification of a valid token against a real database
-       lives in the DB suites (session-revocation-*, membership-auth-db). */
-    await assert.rejects(
-      () => verifyToken(token),
-      (error: unknown) => isSessionRevocationCheckError(error),
-      "without a database, verification must fail closed at revocation, not accept"
-    );
+    /* Force the database resolver onto a known-unreachable local port for this assertion.
+       The CI job also provisions PostgreSQL for later DB suites, so relying on inherited
+       environment variables made this unit assertion non-hermetic and order-sensitive. */
+    const databaseKeys = ["DATABASE_URL", "POSTGRES_URL", "POSTGRES_PRISMA_URL", "NEON_DATABASE_URL"] as const;
+    const previousDatabaseValues = new Map(databaseKeys.map((key) => [key, process.env[key]]));
+    for (const key of databaseKeys) delete process.env[key];
+    process.env.DATABASE_URL = "postgres://test:test@127.0.0.1:1/easylearn-no-database";
+    try {
+      /* Verification must stop at revocation with SessionRevocationCheckError —
+         proof the signature WAS accepted (a bad secret fails earlier) and that revocation
+         fails closed rather than silently accepting the token. End-to-end verification
+         against a real database lives in the DB suites. */
+      await assert.rejects(
+        () => verifyToken(token),
+        (error: unknown) => isSessionRevocationCheckError(error),
+        "with an explicitly unreachable database, verification must fail closed at revocation"
+      );
+    } finally {
+      for (const key of databaseKeys) {
+        const previous = previousDatabaseValues.get(key);
+        if (previous === undefined) delete process.env[key];
+        else process.env[key] = previous;
+      }
+    }
   });
 
   await test("Chokepoint: the env helper and the policy agree on every verdict", async () => {
