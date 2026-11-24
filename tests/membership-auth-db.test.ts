@@ -843,9 +843,10 @@ async function main() {
           password: TEST_PASSWORD,
         }) as never
       );
-      assertEq(response.status, 403, "deactivated account status");
+      assertEq(response.status, 401, "deactivated account shares the generic invalid-credentials status");
       const body: any = await response.json();
       assertEq(body.success, false, "login refused");
+      assertEq(body.error, "Invalid email or password", "deactivated account does not disclose its state");
       assert(!body.data, "no session data");
     });
 
