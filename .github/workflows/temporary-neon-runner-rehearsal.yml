@@ -1,0 +1,41 @@
+name: Temporary Neon migration-runner rehearsal
+
+on:
+  push:
+    branches:
+      - test/runner-rehearsal-empty-db
+
+permissions:
+  contents: read
+
+concurrency:
+  group: easylearn-runner-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  migration-runner:
+    name: Fresh database migration runner and checksum ledger
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.EASY_LEARN_RUNNER_REHEARSAL_DATABASE_URL }}
+    steps:
+      - name: Check out isolated rehearsal branch
+        uses: actions/checkout@v5
+      - name: Require the temporary Neon secret
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::Add repository secret EASY_LEARN_RUNNER_REHEARSAL_DATABASE_URL using the connection string for the temporary empty Neon project, then rerun this workflow."
+            exit 1
+          fi
+      - name: Use Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run EasyLearn migration runner on the empty rehearsal database
+        env:
+          EASY_LEARN_TEST_DATABASE: "true"
+        run: node run-migration.js
