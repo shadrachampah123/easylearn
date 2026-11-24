@@ -388,6 +388,28 @@ This update records the merge and owner-observed Production verification after P
 | Production database-failure injection | **NOT TESTED** (intentionally) |
 | Migration 0018 composite tenant foreign keys | **PENDING — NOT EXECUTED** |
 
+## Active-branch security audit follow-up — no deployment
+
+This follow-up records work on `arena/b160e05a-easylearn`; it supplements the Production status above and does not change it. The branch is not merged or deployed, and no Production database, bucket, environment, backup, or deployment was touched.
+
+| Finding / item | Branch remediation and evidence |
+|---|---|
+| M-1 — password policy | Shared policy now enforces at least 10 Unicode code points, at most 72 UTF-8 bytes for bcrypt, and rejects common passwords on account creation, administrative reset, and self-service change. Administrative credentials require a password change; the create-user API no longer echoes plaintext credentials. Commit `b7abd3f`; targeted suites and full CI passed. |
+| L-2 — stale image-search authorization | Image search now requires active server-derived school context and database-derived staff membership/role rather than JWT role claims. Tenant authorization DB suite passed 83/83 at commit `ad3e082`. |
+| L-3 — login account enumeration | Unknown-account, wrong-password, and deactivated-account login failures now share the same generic `401` response; successful login behavior remains unchanged. Policy and embedded-PostgreSQL login suites passed 42/42 each. The DB membership regression now asserts the generic response. |
+| L-6 — JWT revocation test environment dependence | The revocation policy assertion explicitly uses a loopback database URL known to be unreachable, restores the prior environment afterward, and continues to require fail-closed `SessionRevocationCheckError`. The full DB membership suite and unit suite pass; no security check was weakened. |
+| L-1 — service-worker privacy | Service worker now caches only same-origin static assets, not navigations, application pages, API responses, or cross-origin resources. It rejects private/no-store and unsuccessful responses, versions its cache, and deletes the legacy `easylearn-v1` cache on activation. Ten cache-policy assertions cover those boundaries. |
+
+The final branch source SHA for these changes is `f314a21710afa4c3aa1d559db8edd7e7316c1383`; exact-SHA GitHub Actions run [45505103686](https://github.com/shadrachampah123/easylearn/actions/runs/45505103686) passed all workflow steps, including unit/source security, TLS and database suites, tenant authorization, integration/mutation tests, typecheck, production build, and lint. Local `npm test`, `npm run test:db` with disposable embedded PostgreSQL, `npm run typecheck`, and `npm run lint` also passed.
+
+### Remaining release/readiness gates
+
+- **0018 / migration ledger:** still pending; the 2026-11-23 rehearsal report documents only a disposable local PostgreSQL replay. The named Neon branch was not inspected because branch credentials were unavailable. No Production migration or baseline was run.
+- **M-2 and child-side indexes:** still require data/duplicate analysis, independent review, and a separately authorized migration plan.
+- **M-3 backup/object-store hardening:** remains paused pending an owner decision; Production bucket versioning, lifecycle policy, restore coverage, and orphan reconciliation remain unverified.
+- **M-4 / M-5:** legacy Vercel project status and the mobile-navigation Production issue remain owner/release follow-ups.
+- **Operations:** log alerting and uptime monitoring remain unconfigured / unverified. This branch CI does not constitute Production verification.
+
 ## Production status update — 2026-11-19
 
 This section is the current owner-facing truth about the deployed application. It records the outcome of the full production readiness & security audit of 2026-11-19 (`FULL_PRODUCTION_AUDIT_2026-11-19.md`) against `main` at `4069584`, which **is** the live Production build (deployment 2026-11-17T21:20:13Z, alias `https://easylearn-six.vercel.app`, Vercel project `easylearn`). Supporting reports: `R2_CONFIG_AUDIT_2026-11-19.md` (read-only storage configuration audit) and `R2_UPLOAD_FAILURE_INVESTIGATION_2026-11-19.md` (upload-failure root-cause analysis).
